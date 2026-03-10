@@ -1,6 +1,7 @@
 export interface Session {
   sessionId: string;
   chatId: string;
+  chatType?: 'group' | 'p2p';
   rootMessageId: string;
   title: string;
   status: 'active' | 'closed';
@@ -23,7 +24,6 @@ export interface LarkMessage {
   msgType: string;
   content: string;
   createTime: string;
-  reactionId?: string;
   attachments?: LarkAttachment[];
 }
 

@@ -39,7 +39,7 @@ export async function sendMessage(chatId: string, content: string, msgType: stri
   return messageId;
 }
 
-export async function replyMessage(messageId: string, content: string, msgType: string = 'text'): Promise<string> {
+export async function replyMessage(messageId: string, content: string, msgType: string = 'text', replyInThread: boolean = false): Promise<string> {
   const c = getLarkClient();
   const body = msgType === 'text' ? JSON.stringify({ text: content }) : content;
 
@@ -48,6 +48,7 @@ export async function replyMessage(messageId: string, content: string, msgType: 
     data: {
       msg_type: msgType as any,
       content: body,
+      ...(replyInThread ? { reply_in_thread: true } : {}),
     },
   });
 
@@ -57,7 +58,7 @@ export async function replyMessage(messageId: string, content: string, msgType: 
 
   const replyId = res.data?.message_id;
   if (!replyId) throw new Error('No message_id in reply response');
-  logger.info(`Replied ${replyId} to message ${messageId}`);
+  logger.info(`Replied ${replyId} to message ${messageId}${replyInThread ? ' (in thread)' : ''}`);
   return replyId;
 }
 

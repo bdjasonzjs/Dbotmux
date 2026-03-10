@@ -87,7 +87,6 @@ Configuration is stored at `~/.claude-code-robot/.env`. Run `claude-code-robot s
 |----------|-------------|
 | `LARK_APP_ID` | Lark app ID |
 | `LARK_APP_SECRET` | Lark app secret |
-| `LARK_DEFAULT_CHAT_ID` | Default Lark chat ID for the topic group |
 
 ### Optional
 

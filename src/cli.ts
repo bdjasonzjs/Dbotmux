@@ -120,7 +120,6 @@ async function cmdSetup(): Promise<void> {
 
   const appId = await ask(rl, 'LARK_APP_ID: ');
   const appSecret = await ask(rl, 'LARK_APP_SECRET: ');
-  const chatId = await ask(rl, 'LARK_DEFAULT_CHAT_ID (话题群 ID): ');
 
   console.log('\n── 可选配置 ──');
   const model = await ask(rl, 'Claude 模型 (opus/sonnet/haiku) [opus]: ');
@@ -134,7 +133,6 @@ async function cmdSetup(): Promise<void> {
     '# Lark (Feishu) App Credentials',
     `LARK_APP_ID=${appId}`,
     `LARK_APP_SECRET=${appSecret}`,
-    `LARK_DEFAULT_CHAT_ID=${chatId}`,
     '',
     '# Session data directory',
     `SESSION_DATA_DIR=${DATA_DIR}`,

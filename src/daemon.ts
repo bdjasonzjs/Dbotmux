@@ -5,7 +5,7 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { config, validateConfig } from './config.js';
-import { replyMessage, addReaction, removeReaction, downloadMessageResource, sendUserMessage, updateMessage } from './services/lark-client.js';
+import { sendMessage, replyMessage, downloadMessageResource, sendUserMessage, updateMessage } from './services/lark-client.js';
 import * as sessionStore from './services/session-store.js';
 import * as messageQueue from './services/message-queue.js';
 import { parseEventMessage } from './utils/message-parser.js';
@@ -28,6 +28,7 @@ interface DaemonSession {
   workerPort: number | null;     // HTTP port for xterm.js
   workerToken: string | null;    // write token for xterm.js
   chatId: string;
+  chatType: 'group' | 'p2p';    // p2p chats need reply_in_thread to create topics
   spawnedAt: number;
   claudeVersion: string;
   lastMessageAt: number;
@@ -51,8 +52,19 @@ const lastRepoScan = new Map<string, import('./services/project-scanner.js').Pro
 let currentClaudeVersion: string = 'unknown';
 let lastVersionCheckAt = 0;
 const VERSION_CHECK_INTERVAL = 60_000; // cache 1 min
+let botOpenId: string | undefined;  // filled at startup, used for @mention detection
 
 const DAEMON_COMMANDS = new Set(['/close', '/clear', '/restart', '/status', '/help', '/cd', '/repo', '/cost', '/schedule']);
+
+/**
+ * Reply to a message, automatically using reply_in_thread for p2p sessions.
+ * In p2p chats, Lark needs reply_in_thread=true to create/continue a thread.
+ */
+async function sessionReply(rootId: string, content: string, msgType: string = 'text'): Promise<string> {
+  const ds = activeSessions.get(rootId);
+  const inThread = ds?.chatType === 'p2p';
+  return replyMessage(rootId, content, msgType, inThread);
+}
 
 // ─── PID file ────────────────────────────────────────────────────────────────
 
@@ -209,10 +221,8 @@ Session ID: ${sessionId}
 请处理用户的请求，通过 send_to_thread 回复用户（session_id: "${sessionId}"）。
 
 注意：
-- 用户可以通过飞书卡片实时看到你的终端输出，不需要频繁发送进度更新
 - 回复使用 send_to_thread（重要结论、方案确认、最终结果）
 - 对于代码修改任务，先通过 send_to_thread 发送执行方案给用户确认后再执行
-- 你的会话是持久的，处理完消息后等待即可，用户的后续消息会直接发给你
 - 消息可能包含 attachments，每个有 path 字段，用 Read 工具查看
 - 不要使用 EnterPlanMode / ExitPlanMode 工具`;
 }
@@ -282,7 +292,7 @@ function forkWorker(ds: DaemonSession, prompt: string, resume = false): void {
             '',
             'starting',
           );
-          ds.streamCardId = await replyMessage(ds.session.rootMessageId, streamCardJson, 'interactive');
+          ds.streamCardId = await sessionReply(ds.session.rootMessageId, streamCardJson, 'interactive');
         } catch (err) {
           logger.warn(`[${t}] Failed to send streaming card, falling back to static card: ${err}`);
           // Fallback: send static session card
@@ -292,7 +302,7 @@ function forkWorker(ds: DaemonSession, prompt: string, resume = false): void {
             readOnlyUrl,
             ds.session.title || 'Claude Code',
           );
-          await replyMessage(ds.session.rootMessageId, cardJson, 'interactive');
+          await sessionReply(ds.session.rootMessageId, cardJson, 'interactive');
         }
 
         break;
@@ -319,7 +329,7 @@ function forkWorker(ds: DaemonSession, prompt: string, resume = false): void {
         if (ds.streamCardPending || !ds.streamCardId) {
           // New turn — create a fresh card, old card freezes at its last state
           ds.streamCardPending = false;
-          replyMessage(ds.session.rootMessageId, cardJson, 'interactive')
+          sessionReply(ds.session.rootMessageId, cardJson, 'interactive')
             .then(msgId => { ds.streamCardId = msgId; })
             .catch(err => logger.debug(`[${t}] Failed to create streaming card: ${err}`));
         } else {
@@ -349,7 +359,7 @@ function forkWorker(ds: DaemonSession, prompt: string, resume = false): void {
           logger.warn(`[${t}] Claude crashed ${rc.count} times in 1 min, not auto-restarting`);
           // Kill the worker process to free resources
           killWorker(ds);
-          await replyMessage(ds.session.rootMessageId, `⚠️ Claude 在 1 分钟内崩溃 ${rc.count} 次，已停止自动重启。发消息可触发重新启动。`);
+          await sessionReply(ds.session.rootMessageId, `⚠️ Claude 在 1 分钟内崩溃 ${rc.count} 次，已停止自动重启。发消息可触发重新启动。`);
           break;
         }
 
@@ -482,6 +492,7 @@ async function executeScheduledTask(task: ScheduledTask): Promise<void> {
     workerPort: null,
     workerToken: null,
     chatId: task.chatId,
+    chatType: 'group',
     spawnedAt: Date.now(),
     claudeVersion: currentClaudeVersion,
     lastMessageAt: Date.now(),
@@ -503,7 +514,7 @@ async function handleScheduleCommand(args: string, rootId: string, chatId: strin
   if (!trimmed || trimmed === 'list' || trimmed === '列表') {
     const tasks = scheduleStore.listTasks();
     if (tasks.length === 0) {
-      await replyMessage(rootId, '暂无定时任务。\n\n用法示例：\n/schedule 每日17:50 帮我看看今天AI圈有什么新闻\n/schedule 工作日每天9:00 检查服务状态\n/schedule 每周一10:00 生成周报');
+      await sessionReply(rootId, '暂无定时任务。\n\n用法示例：\n/schedule 每日17:50 帮我看看今天AI圈有什么新闻\n/schedule 工作日每天9:00 检查服务状态\n/schedule 每周一10:00 生成周报');
       return;
     }
     const lines = tasks.map(t => {
@@ -513,7 +524,7 @@ async function handleScheduleCommand(args: string, rootId: string, chatId: strin
       const lastStr = t.lastRunAt ? ` | 上次: ${new Date(t.lastRunAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}` : '';
       return `${status} [${t.id}] ${t.schedule} | ${t.name}\n   prompt: ${t.prompt.substring(0, 50)}${t.prompt.length > 50 ? '...' : ''}${nextStr}${lastStr}`;
     });
-    await replyMessage(rootId, `定时任务列表 (${tasks.length})：\n\n${lines.join('\n\n')}`);
+    await sessionReply(rootId, `定时任务列表 (${tasks.length})：\n\n${lines.join('\n\n')}`);
     return;
   }
 
@@ -522,9 +533,9 @@ async function handleScheduleCommand(args: string, rootId: string, chatId: strin
   if (removeMatch) {
     const id = removeMatch[1];
     if (scheduler.removeTask(id)) {
-      await replyMessage(rootId, `已删除定时任务 ${id}`);
+      await sessionReply(rootId, `已删除定时任务 ${id}`);
     } else {
-      await replyMessage(rootId, `未找到任务 ${id}`);
+      await sessionReply(rootId, `未找到任务 ${id}`);
     }
     return;
   }
@@ -534,9 +545,9 @@ async function handleScheduleCommand(args: string, rootId: string, chatId: strin
   if (enableMatch) {
     const id = enableMatch[1];
     if (scheduler.enableTask(id)) {
-      await replyMessage(rootId, `已启用定时任务 ${id}`);
+      await sessionReply(rootId, `已启用定时任务 ${id}`);
     } else {
-      await replyMessage(rootId, `未找到任务 ${id}`);
+      await sessionReply(rootId, `未找到任务 ${id}`);
     }
     return;
   }
@@ -546,9 +557,9 @@ async function handleScheduleCommand(args: string, rootId: string, chatId: strin
   if (disableMatch) {
     const id = disableMatch[1];
     if (scheduler.disableTask(id)) {
-      await replyMessage(rootId, `已禁用定时任务 ${id}`);
+      await sessionReply(rootId, `已禁用定时任务 ${id}`);
     } else {
-      await replyMessage(rootId, `未找到任务 ${id}`);
+      await sessionReply(rootId, `未找到任务 ${id}`);
     }
     return;
   }
@@ -558,9 +569,9 @@ async function handleScheduleCommand(args: string, rootId: string, chatId: strin
   if (runMatch) {
     const id = runMatch[1];
     if (scheduler.runTaskNow(id)) {
-      await replyMessage(rootId, `已触发定时任务 ${id} 立即执行`);
+      await sessionReply(rootId, `已触发定时任务 ${id} 立即执行`);
     } else {
-      await replyMessage(rootId, `未找到任务 ${id}`);
+      await sessionReply(rootId, `未找到任务 ${id}`);
     }
     return;
   }
@@ -580,12 +591,12 @@ async function handleScheduleCommand(args: string, rootId: string, chatId: strin
     });
     const next = scheduler.getNextRun(task.id);
     const nextStr = next ? next.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }) : 'N/A';
-    await replyMessage(rootId, `✅ 定时任务已创建！\n\nID: ${task.id}\n名称: ${task.name}\nCron: ${task.schedule}\nPrompt: ${task.prompt}\n工作目录: ${expandHome(workingDir)}\n下次执行: ${nextStr}`);
+    await sessionReply(rootId, `✅ 定时任务已创建！\n\nID: ${task.id}\n名称: ${task.name}\nCron: ${task.schedule}\nPrompt: ${task.prompt}\n工作目录: ${expandHome(workingDir)}\n下次执行: ${nextStr}`);
     return;
   }
 
   // Unrecognized format
-  await replyMessage(rootId, `无法解析定时任务，请使用自然语言格式：\n\n/schedule 每日17:50 帮我看看今天AI圈有什么新闻\n/schedule 工作日每天9:00 检查服务状态\n/schedule 每周一10:00 生成周报\n/schedule 每小时 检查服务健康状态\n/schedule 每30分钟 ping一下服务\n/schedule 每月1号9:00 生成月报\n\n管理命令：\n/schedule list — 查看所有任务\n/schedule remove <id> — 删除任务\n/schedule enable <id> — 启用任务\n/schedule disable <id> — 禁用任务\n/schedule run <id> — 立即执行一次`);
+  await sessionReply(rootId, `无法解析定时任务，请使用自然语言格式：\n\n/schedule 每日17:50 帮我看看今天AI圈有什么新闻\n/schedule 工作日每天9:00 检查服务状态\n/schedule 每周一10:00 生成周报\n/schedule 每小时 检查服务健康状态\n/schedule 每30分钟 ping一下服务\n/schedule 每月1号9:00 生成月报\n\n管理命令：\n/schedule list — 查看所有任务\n/schedule remove <id> — 删除任务\n/schedule enable <id> — 启用任务\n/schedule disable <id> — 禁用任务\n/schedule run <id> — 立即执行一次`);
 }
 
 // ─── Command handling ────────────────────────────────────────────────────────
@@ -603,10 +614,10 @@ async function handleCommand(cmd: string, rootId: string, message: LarkMessage):
           killWorker(ds);
           sessionStore.closeSession(ds.session.sessionId);
           activeSessions.delete(rootId);
-          await replyMessage(rootId, '会话已关闭，Claude 进程已终止。');
+          await sessionReply(rootId, '会话已关闭，Claude 进程已终止。');
           logger.info(`[${t}] Session closed by /close command`);
         } else {
-          await replyMessage(rootId, '当前话题没有活跃的会话。');
+          await sessionReply(rootId, '当前话题没有活跃的会话。');
         }
         break;
       }
@@ -615,14 +626,14 @@ async function handleCommand(cmd: string, rootId: string, message: LarkMessage):
         if (ds) {
           killWorker(ds);
           sessionStore.closeSession(ds.session.sessionId);
-          const newSession = sessionStore.createSession(ds.chatId, rootId, ds.session.title);
+          const newSession = sessionStore.createSession(ds.chatId, rootId, ds.session.title, ds.chatType);
           ds.session = newSession;
           ds.claudeVersion = currentClaudeVersion;
           ds.hasHistory = false;
-          await replyMessage(rootId, `上下文已清除，下次发消息时将使用新会话。\nNew Session: ${newSession.sessionId}`);
+          await sessionReply(rootId, `上下文已清除，下次发消息时将使用新会话。\nNew Session: ${newSession.sessionId}`);
           logger.info(`[${t}] Context cleared by /clear command, new session: ${newSession.sessionId}`);
         } else {
-          await replyMessage(rootId, '当前话题没有活跃的会话。');
+          await sessionReply(rootId, '当前话题没有活跃的会话。');
         }
         break;
       }
@@ -631,14 +642,14 @@ async function handleCommand(cmd: string, rootId: string, message: LarkMessage):
         if (ds) {
           if (ds.worker && !ds.worker.killed) {
             ds.worker.send({ type: 'restart' } as DaemonToWorker);
-            await replyMessage(rootId, '🔄 正在重启 Claude...');
+            await sessionReply(rootId, '🔄 正在重启 Claude...');
           } else {
             killWorker(ds);
-            await replyMessage(rootId, 'Claude 进程已终止，下次发消息时将自动恢复。');
+            await sessionReply(rootId, 'Claude 进程已终止，下次发消息时将自动恢复。');
           }
           logger.info(`[${t}] Restart by /restart command`);
         } else {
-          await replyMessage(rootId, '当前话题没有活跃的会话。');
+          await sessionReply(rootId, '当前话题没有活跃的会话。');
         }
         break;
       }
@@ -646,27 +657,27 @@ async function handleCommand(cmd: string, rootId: string, message: LarkMessage):
       case '/cd': {
         const targetPath = message.content.replace(/^\/cd\s*/, '').trim();
         if (!targetPath) {
-          await replyMessage(rootId, '用法：/cd <path>\n例如：/cd ~/projects/my-app');
+          await sessionReply(rootId, '用法：/cd <path>\n例如：/cd ~/projects/my-app');
           break;
         }
         const resolvedPath = resolve(expandHome(targetPath));
         if (!existsSync(resolvedPath)) {
-          await replyMessage(rootId, `目录不存在：${resolvedPath}`);
+          await sessionReply(rootId, `目录不存在：${resolvedPath}`);
           break;
         }
         // Ensure resolved path is under home directory to prevent traversal
         const homeDir = homedir();
         if (!resolvedPath.startsWith(homeDir)) {
-          await replyMessage(rootId, `路径必须在用户主目录 (${homeDir}) 下`);
+          await sessionReply(rootId, `路径必须在用户主目录 (${homeDir}) 下`);
           break;
         }
         if (ds) {
           killWorker(ds);
           ds.workingDir = targetPath;
-          await replyMessage(rootId, `工作目录已切换到 ${resolvedPath}，下次发消息时将在新目录下恢复。`);
+          await sessionReply(rootId, `工作目录已切换到 ${resolvedPath}，下次发消息时将在新目录下恢复。`);
           logger.info(`[${t}] Working directory changed to ${resolvedPath} by /cd command`);
         } else {
-          await replyMessage(rootId, '当前话题没有活跃的会话。');
+          await sessionReply(rootId, '当前话题没有活跃的会话。');
         }
         break;
       }
@@ -674,24 +685,24 @@ async function handleCommand(cmd: string, rootId: string, message: LarkMessage):
       case '/repo': {
         // If Claude is already running, warn user — switching repo means closing the session
         if (ds?.worker && !ds.worker.killed) {
-          await replyMessage(rootId, '⚠️ 当前会话已在运行中，切换仓库将关闭当前会话并创建新会话。\n如需切换，请在下方卡片中选择新仓库。');
+          await sessionReply(rootId, '⚠️ 当前会话已在运行中，切换仓库将关闭当前会话并创建新会话。\n如需切换，请在下方卡片中选择新仓库。');
         }
 
         // Show project list card (works both for pending-repo and mid-session switch)
         const scanDir = getProjectScanDir(ds);
         if (!existsSync(scanDir)) {
-          await replyMessage(rootId, `扫描目录不存在：${scanDir}\n请设置 PROJECT_SCAN_DIR 环境变量。`);
+          await sessionReply(rootId, `扫描目录不存在：${scanDir}\n请设置 PROJECT_SCAN_DIR 环境变量。`);
           break;
         }
         const projects = scanProjects(scanDir);
         if (projects.length === 0) {
-          await replyMessage(rootId, `在 ${scanDir} 下未找到 git 仓库。`);
+          await sessionReply(rootId, `在 ${scanDir} 下未找到 git 仓库。`);
           break;
         }
         if (ds) lastRepoScan.set(ds.chatId, projects);
         const currentCwd = getSessionWorkingDir(ds);
         const cardJson = buildRepoSelectCard(projects, currentCwd, rootId);
-        await replyMessage(rootId, cardJson, 'interactive');
+        await sessionReply(rootId, cardJson, 'interactive');
         logger.info(`[${t}] Sent repo card with ${projects.length} project(s)`);
         break;
       }
@@ -711,9 +722,9 @@ async function handleCommand(cmd: string, rootId: string, message: LarkMessage):
             `Last message: ${idle} ago`,
             `Active sessions: ${getActiveCount()}`,
           ];
-          await replyMessage(rootId, lines.join('\n'));
+          await sessionReply(rootId, lines.join('\n'));
         } else {
-          await replyMessage(rootId, `当前话题没有活跃的会话。\nDaemon active sessions: ${getActiveCount()}\nClaude: v${currentClaudeVersion}`);
+          await sessionReply(rootId, `当前话题没有活跃的会话。\nDaemon active sessions: ${getActiveCount()}\nClaude: v${currentClaudeVersion}`);
         }
         break;
       }
@@ -733,20 +744,20 @@ async function handleCommand(cmd: string, rootId: string, message: LarkMessage):
               `Cache creation: ${formatNumber(cost.cacheCreateTokens)}`,
               `Estimated cost: $${cost.costUSD.toFixed(2)}`,
             ];
-            await replyMessage(rootId, lines.join('\n'));
+            await sessionReply(rootId, lines.join('\n'));
           } else {
-            await replyMessage(rootId, `未找到会话 ${ds.session.sessionId} 的 token 数据。`);
+            await sessionReply(rootId, `未找到会话 ${ds.session.sessionId} 的 token 数据。`);
           }
           logger.info(`[${t}] Cost queried for session ${ds.session.sessionId}`);
         } else {
-          await replyMessage(rootId, '当前话题没有活跃的会话。');
+          await sessionReply(rootId, '当前话题没有活跃的会话。');
         }
         break;
       }
 
       case '/schedule': {
         const scheduleArgs = message.content.replace(/^\/schedule\s*/, '');
-        const chatId = activeSessions.get(rootId)?.chatId ?? config.lark.defaultChatId;
+        const chatId = activeSessions.get(rootId)?.chatId!;
         await handleScheduleCommand(scheduleArgs, rootId, chatId);
         logger.info(`[${t}] Schedule command handled`);
         break;
@@ -775,7 +786,7 @@ async function handleCommand(cmd: string, rootId: string, message: LarkMessage):
           '',
           '/help       - 显示此帮助',
         ];
-        await replyMessage(rootId, help.join('\n'));
+        await sessionReply(rootId, help.join('\n'));
         break;
       }
     }
@@ -828,6 +839,7 @@ function restoreActiveSessions(): void {
       workerPort: null,
     workerToken: null,
       chatId: session.chatId,
+      chatType: session.chatType ?? 'group',
       spawnedAt: Date.now(),
       claudeVersion: currentClaudeVersion,
       lastMessageAt: Date.now(),
@@ -867,12 +879,12 @@ async function handleCardAction(data: any): Promise<void> {
         // Worker alive — tell it to restart Claude
         logger.info(`[${tag(ds)}] Restart via card button`);
         ds.worker.send({ type: 'restart' } as DaemonToWorker);
-        await replyMessage(rootId, '🔄 已重启 Claude');
+        await sessionReply(rootId, '🔄 已重启 Claude');
       } else {
         // Worker gone (e.g. after daemon restart) — re-fork
         logger.info(`[${tag(ds)}] Re-forking worker via card button`);
         forkWorker(ds, '', ds.hasHistory);
-        await replyMessage(rootId, '🔄 已重新启动 Claude');
+        await sessionReply(rootId, '🔄 已重新启动 Claude');
         // DM card will be sent by the ready handler when worker starts
       }
     }
@@ -881,7 +893,7 @@ async function handleCardAction(data: any): Promise<void> {
       killWorker(ds);
       sessionStore.closeSession(ds.session.sessionId);
       activeSessions.delete(rootId);
-      await replyMessage(rootId, '✅ 会话已关闭');
+      await sessionReply(rootId, '✅ 会话已关闭');
       logger.info(`[${tag(ds)}] Closed via card button`);
     }
 
@@ -899,7 +911,7 @@ async function handleCardAction(data: any): Promise<void> {
         );
         logger.info(`[${tag(ds)}] Sent write link via DM to ${operatorOpenId}`);
       } else {
-        await replyMessage(rootId, '⚠️ 终端尚未就绪，请稍后再试。');
+        await sessionReply(rootId, '⚠️ 终端尚未就绪，请稍后再试。');
       }
     }
 
@@ -915,7 +927,7 @@ async function handleCardAction(data: any): Promise<void> {
       ds.pendingAttachments = undefined;
       forkWorker(ds, prompt);
       const cwd = getSessionWorkingDir(ds);
-      await replyMessage(rootId, `▶️ 已直接开启会话（工作目录：${cwd}）`);
+      await sessionReply(rootId, `▶️ 已直接开启会话（工作目录：${cwd}）`);
       logger.info(`[${tag(ds)}] Skip repo, spawning Claude in ${cwd}`);
     }
     return;
@@ -961,24 +973,46 @@ async function handleCardAction(data: any): Promise<void> {
     targetDs.pendingPrompt = undefined;
     targetDs.pendingAttachments = undefined;
     forkWorker(targetDs, prompt);
-    await replyMessage(rootId, `✅ 已选择 ${displayName}`);
+    await sessionReply(rootId, `✅ 已选择 ${displayName}`);
     logger.info(`[${tag(targetDs)}] Repo selected: ${selectedPath}, spawning Claude`);
   } else {
     // Mid-session repo switch — close old session, start fresh
     killWorker(targetDs);
     sessionStore.closeSession(targetDs.session.sessionId);
-    const session = sessionStore.createSession(targetDs.chatId, rootId, displayName);
+    const session = sessionStore.createSession(targetDs.chatId, rootId, displayName, targetDs.chatType);
     targetDs.session = session;
     targetDs.hasHistory = false;
     forkWorker(targetDs, '', false);
-    await replyMessage(rootId, `🔄 已切换到 ${displayName}\n旧会话已关闭，新会话已创建。`);
+    await sessionReply(rootId, `🔄 已切换到 ${displayName}\n旧会话已关闭，新会话已创建。`);
     logger.info(`[${tag(targetDs)}] Repo switched to ${selectedPath}, new session created`);
   }
 }
 
 // ─── Event handling ──────────────────────────────────────────────────────────
 
-async function handleNewTopic(data: any, chatId: string, messageId: string): Promise<void> {
+/**
+ * Check if a group message is addressed to the bot.
+ * - If bot was @mentioned → true
+ * - If allowedUsers has exactly 1 entry and sender matches → true (solo mode, no @ needed)
+ * - Otherwise → false
+ */
+function isMessageAddressedToBot(message: any, senderOpenId: string | undefined): boolean {
+  // Check @mention
+  const mentions: any[] = message.mentions ?? [];
+  if (botOpenId && mentions.some((m: any) => m.id?.open_id === botOpenId)) {
+    return true;
+  }
+
+  // Solo mode: only one allowed user, and sender is that user
+  const allowedUsers = config.daemon.allowedUsers;
+  if (allowedUsers.length === 1 && senderOpenId && allowedUsers[0] === senderOpenId) {
+    return true;
+  }
+
+  return false;
+}
+
+async function handleNewTopic(data: any, chatId: string, messageId: string, chatType: 'group' | 'p2p' = 'group'): Promise<void> {
   const { parsed, resources } = parseEventMessage(data);
   const content = parsed.content.trim();
   const senderOpenId: string | undefined = data.sender?.sender_id?.open_id;
@@ -988,13 +1022,14 @@ async function handleNewTopic(data: any, chatId: string, messageId: string): Pro
   if (content.startsWith('/')) {
     const cmd = content.split(/\s+/)[0].toLowerCase();
     if (DAEMON_COMMANDS.has(cmd)) {
-      const session = sessionStore.createSession(chatId, messageId, content.substring(0, 50));
+      const session = sessionStore.createSession(chatId, messageId, content.substring(0, 50), chatType);
       activeSessions.set(messageId, {
         session,
         worker: null,
         workerPort: null,
     workerToken: null,
         chatId,
+        chatType,
         spawnedAt: Date.now(),
         claudeVersion: currentClaudeVersion,
         lastMessageAt: Date.now(),
@@ -1015,7 +1050,7 @@ async function handleNewTopic(data: any, chatId: string, messageId: string): Pro
   refreshClaudeVersion();
 
   // Create session in pending-repo state — don't spawn Claude yet
-  const session = sessionStore.createSession(chatId, messageId, parsed.content.substring(0, 50));
+  const session = sessionStore.createSession(chatId, messageId, parsed.content.substring(0, 50), chatType);
   messageQueue.ensureQueue(messageId);
   messageQueue.appendMessage(messageId, parsed);
 
@@ -1025,6 +1060,7 @@ async function handleNewTopic(data: any, chatId: string, messageId: string): Pro
     workerPort: null,
     workerToken: null,
     chatId,
+    chatType,
     spawnedAt: Date.now(),
     claudeVersion: currentClaudeVersion,
     lastMessageAt: Date.now(),
@@ -1047,7 +1083,7 @@ async function handleNewTopic(data: any, chatId: string, messageId: string): Pro
     lastRepoScan.set(chatId, projects);
     const currentCwd = getSessionWorkingDir(ds);
     const cardJson = buildRepoSelectCard(projects, currentCwd, messageId);
-    await replyMessage(messageId, cardJson, 'interactive');
+    await sessionReply(messageId, cardJson, 'interactive');
     logger.info(`[${tag(ds)}] Waiting for repo selection (${projects.length} projects)`);
   } else {
     // No projects found — skip repo selection, spawn directly
@@ -1073,14 +1109,6 @@ async function handleThreadReply(data: any, rootId: string): Promise<void> {
 
   logger.info(`Thread reply in ${rootId}: ${content.substring(0, 100)} (resources: ${resources.length})`);
 
-  // Add OnIt reaction immediately
-  try {
-    const reactionId = await addReaction(parsed.messageId, 'OnIt');
-    parsed.reactionId = reactionId;
-  } catch (err: any) {
-    logger.warn(`Failed to add OnIt reaction: ${err.message}`);
-  }
-
   // Download attachments
   const attachments = await downloadResources(parsed.messageId, resources);
   if (attachments.length > 0) {
@@ -1093,8 +1121,7 @@ async function handleThreadReply(data: any, rootId: string): Promise<void> {
 
   // If waiting for repo selection, remind user
   if (ds?.pendingRepo) {
-    await replyMessage(rootId, '请先在上方卡片中选择仓库，再发送消息。');
-    if (parsed.reactionId) removeReaction(parsed.messageId, parsed.reactionId).catch(e => logger.debug(`removeReaction failed: ${e}`));
+    await sessionReply(rootId, '请先在上方卡片中选择仓库，再发送消息。');
     return;
   }
 
@@ -1104,16 +1131,18 @@ async function handleThreadReply(data: any, rootId: string): Promise<void> {
 
   if (!ds) {
     // No active session for this thread — auto-create one so the message is not lost
-    const chatId = data?.message?.chat_id ?? config.lark.defaultChatId;
+    const chatId: string = data?.message?.chat_id ?? '';
+    const chatType = (data?.message?.chat_type === 'p2p' ? 'p2p' : 'group') as 'group' | 'p2p';
     logger.info(`No active session for thread ${rootId}, auto-creating new session...`);
     refreshClaudeVersion();
-    const session = sessionStore.createSession(chatId, rootId, parsed.content.substring(0, 50));
+    const session = sessionStore.createSession(chatId, rootId, parsed.content.substring(0, 50), chatType);
     const newDs: DaemonSession = {
       session,
       worker: null,
       workerPort: null,
     workerToken: null,
       chatId,
+      chatType,
       spawnedAt: Date.now(),
       claudeVersion: currentClaudeVersion,
       lastMessageAt: Date.now(),
@@ -1125,10 +1154,6 @@ async function handleThreadReply(data: any, rootId: string): Promise<void> {
     const prompt = buildNewTopicPrompt(parsed.content, session.sessionId, attachments);
     forkWorker(newDs, prompt);
 
-    // Remove OnIt reaction
-    if (parsed.reactionId) {
-      removeReaction(parsed.messageId, parsed.reactionId).catch(e => logger.debug(`removeReaction failed: ${e}`));
-    }
     return;
   }
 
@@ -1141,26 +1166,18 @@ async function handleThreadReply(data: any, rootId: string): Promise<void> {
     ds.streamCardPending = true;
     ds.currentTurnTitle = parsed.content.substring(0, 50);
     ds.worker.send({ type: 'message', content: msgContent } as DaemonToWorker);
-    // Remove OnIt reaction after sending
-    if (parsed.reactionId) {
-      removeReaction(parsed.messageId, parsed.reactionId).catch(e => logger.debug(`removeReaction failed: ${e}`));
-    }
   } else {
     // Worker not running — re-fork with resume
     logger.info(`[${tag(ds)}] Worker not running, re-forking...`);
     ds.currentTurnTitle = parsed.content.substring(0, 50);
     forkWorker(ds, parsed.content, ds.hasHistory);
-    // Remove OnIt reaction
-    if (parsed.reactionId) {
-      removeReaction(parsed.messageId, parsed.reactionId).catch(e => logger.debug(`removeReaction failed: ${e}`));
-    }
   }
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 export async function startDaemon(): Promise<void> {
-  validateConfig({ requireChatId: false });
+  validateConfig();
   writePidFile();
 
   // Get initial Claude version
@@ -1168,7 +1185,7 @@ export async function startDaemon(): Promise<void> {
   logger.info(`Claude version: ${currentClaudeVersion}`);
   lastVersionCheckAt = Date.now();
 
-  // Fetch bot open_id (informational)
+  // Fetch bot open_id (used for @mention detection in groups)
   try {
     const { getLarkClient } = await import('./services/lark-client.js');
     const client = getLarkClient();
@@ -1177,7 +1194,8 @@ export async function startDaemon(): Promise<void> {
       path: { user_id: 'me' },
     });
     if (res.code === 0 && res.data?.user?.open_id) {
-      logger.info(`Bot open_id: ${res.data.user.open_id}`);
+      botOpenId = res.data.user.open_id;
+      logger.info(`Bot open_id: ${botOpenId}`);
     }
   } catch (e) {
     logger.debug(`Bot open_id fetch skipped: ${e}`);
@@ -1233,10 +1251,22 @@ export async function startDaemon(): Promise<void> {
 
         const rootId = message.root_id;
         const chatId = message.chat_id;
+        const chatType = message.chat_type;  // 'group' or 'p2p'
         const messageId = message.message_id;
+        const senderOpenId = sender?.sender_id?.open_id as string | undefined;
 
+        // For group new topics (no rootId): require @bot or solo mode
+        if (chatType === 'group' && !rootId) {
+          if (!isMessageAddressedToBot(message, senderOpenId)) {
+            logger.debug(`Ignoring group message not addressed to bot: ${messageId}`);
+            return;
+          }
+        }
+
+        // p2p messages without rootId → create session directly in the DM chat
+        // group messages → normal flow
         const promise = !rootId
-          ? handleNewTopic(data, chatId, messageId)
+          ? handleNewTopic(data, chatId, messageId, chatType as 'group' | 'p2p')
           : handleThreadReply(data, rootId);
         promise.catch(err => logger.error(`Error handling message event: ${err}`));
       } catch (err) {

@@ -87,7 +87,6 @@ claude-code-robot start
 |------|------|
 | `LARK_APP_ID` | 飞书应用 App ID |
 | `LARK_APP_SECRET` | 飞书应用 App Secret |
-| `LARK_DEFAULT_CHAT_ID` | 话题群的 Chat ID |
 
 ### 可选
 

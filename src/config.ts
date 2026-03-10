@@ -14,7 +14,6 @@ export const config = {
   lark: {
     appId: process.env.LARK_APP_ID ?? '',
     appSecret: process.env.LARK_APP_SECRET ?? '',
-    defaultChatId: process.env.LARK_DEFAULT_CHAT_ID ?? '',
   },
   session: {
     dataDir: process.env.SESSION_DATA_DIR ?? new URL('../data', import.meta.url).pathname,
@@ -33,10 +32,7 @@ export const config = {
   },
 } as const;
 
-export function validateConfig(opts?: { requireChatId?: boolean }): void {
+export function validateConfig(): void {
   if (!config.lark.appId) throw new Error('LARK_APP_ID is required');
   if (!config.lark.appSecret) throw new Error('LARK_APP_SECRET is required');
-  if (opts?.requireChatId !== false && !config.lark.defaultChatId) {
-    throw new Error('LARK_DEFAULT_CHAT_ID is required');
-  }
 }

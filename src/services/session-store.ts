@@ -48,11 +48,12 @@ function save(): void {
   renameSync(tmpFp, fp);
 }
 
-export function createSession(chatId: string, rootMessageId: string, title: string): Session {
+export function createSession(chatId: string, rootMessageId: string, title: string, chatType?: 'group' | 'p2p'): Session {
   load();
   const session: Session = {
     sessionId: randomUUID(),
     chatId,
+    chatType,
     rootMessageId,
     title,
     status: 'active',
