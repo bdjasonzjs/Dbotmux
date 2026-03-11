@@ -96,7 +96,7 @@ claude-code-robot start
 | `LARK_BRIDGE_MAX_TURNS` | `500` | 每个会话的最大对话轮数 |
 | `CLAUDE_PATH` | `claude` | CLI 路径（`claude` 或 `aiden`） |
 | `CLAUDE_WORKING_DIR` | `~` | 默认工作目录 |
-| `ALLOWED_USERS` | _(空 = 不限制)_ | 允许的飞书用户 open_id，逗号分隔 |
+| `ALLOWED_USERS` | _(空 = 不限制)_ | 允许的用户，邮箱前缀或 open_id，逗号分隔 |
 | `PROJECT_SCAN_DIR` | _(工作目录的上级)_ | 扫描 Git 仓库的目录 |
 | `WEB_HOST` | `0.0.0.0` | HTTP 服务绑定地址 |
 | `WEB_EXTERNAL_HOST` | _(自动检测局域网 IP)_ | 终端链接中的外部主机名/IP |

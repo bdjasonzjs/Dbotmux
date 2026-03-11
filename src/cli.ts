@@ -125,7 +125,7 @@ async function cmdSetup(): Promise<void> {
   const model = await ask(rl, '模型 (opus/sonnet/haiku) [opus]: ');
   const claudePath = await ask(rl, 'CLI 路径 (claude 或 aiden) [claude]: ');
   const workingDir = await ask(rl, '默认工作目录 [~]: ');
-  const allowedUsers = await ask(rl, '允许的用户 open_id (逗号分隔，留空=不限制): ');
+  const allowedUsers = await ask(rl, '允许的用户 (邮箱前缀或 open_id，逗号分隔，留空=不限制): ');
   const externalHost = await ask(rl, '外部 IP/域名 (终端链接用，留空=自动检测): ');
   rl.close();
 

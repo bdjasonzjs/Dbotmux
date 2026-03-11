@@ -173,6 +173,50 @@ export async function downloadMessageResource(messageId: string, fileKey: string
   logger.info(`Downloaded ${type} ${fileKey} → ${savePath}`);
 }
 
+/**
+ * Resolve email prefixes (e.g. "shenhan.sh") to Lark open_ids via batch user lookup.
+ * Accepts mixed input: items starting with "ou_" are kept as-is; everything else
+ * is treated as an email prefix and looked up as `${prefix}@bytedance.com`.
+ * Returns an array of open_ids (unresolvable entries are dropped with a warning).
+ */
+export async function resolveAllowedUsers(raw: string[]): Promise<string[]> {
+  const openIds: string[] = [];
+  const emailPrefixes: string[] = [];
+  for (const v of raw) {
+    if (v.startsWith('ou_')) {
+      openIds.push(v);
+    } else {
+      emailPrefixes.push(v);
+    }
+  }
+  if (emailPrefixes.length === 0) return openIds;
+
+  const emails = emailPrefixes.map(p => p.includes('@') ? p : `${p}@bytedance.com`);
+  const c = getLarkClient();
+  try {
+    const res = await (c as any).contact.v3.user.batchGetId({
+      params: { user_id_type: 'open_id' },
+      data: { emails, include_resigned: false },
+    });
+    if (res.code !== 0) {
+      logger.warn(`Failed to resolve emails to open_ids: ${res.msg} (code: ${res.code})`);
+      return openIds;
+    }
+    const userList: any[] = res.data?.user_list ?? [];
+    for (const item of userList) {
+      if (item.user_id) {
+        openIds.push(item.user_id);
+        logger.info(`Resolved ${item.email} → ${item.user_id}`);
+      } else {
+        logger.warn(`Could not resolve email: ${item.email}`);
+      }
+    }
+  } catch (err: any) {
+    logger.warn(`resolveAllowedUsers failed: ${err.message}`);
+  }
+  return openIds;
+}
+
 export async function listThreadMessages(chatId: string, rootMessageId: string, pageSize: number = 50): Promise<any[]> {
   const c = getLarkClient();
   const allMessages: any[] = [];

@@ -48,7 +48,10 @@ export const config = {
     host: process.env.WEB_HOST ?? '0.0.0.0',
     externalHost: process.env.WEB_EXTERNAL_HOST ?? getLocalIp(),
   },
-} as const;
+};
+
+// allowedUsers is mutable — daemon resolves email prefixes to open_ids at startup
+export type Config = typeof config;
 
 export function validateConfig(): void {
   if (!config.lark.appId) throw new Error('LARK_APP_ID is required');

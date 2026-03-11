@@ -96,7 +96,7 @@ Configuration is stored at `~/.claude-code-robot/.env`. Run `claude-code-robot s
 | `LARK_BRIDGE_MAX_TURNS` | `500` | Max conversation turns per session |
 | `CLAUDE_PATH` | `claude` | Path to CLI binary (`claude` or `aiden`) |
 | `CLAUDE_WORKING_DIR` | `~` | Default working directory |
-| `ALLOWED_USERS` | _(empty = allow all)_ | Comma-separated Lark open_ids |
+| `ALLOWED_USERS` | _(empty = allow all)_ | Comma-separated email prefixes or Lark open_ids |
 | `PROJECT_SCAN_DIR` | _(parent of CWD)_ | Directory to scan for git repos |
 | `WEB_HOST` | `0.0.0.0` | HTTP server bind address |
 | `WEB_EXTERNAL_HOST` | _(auto-detect LAN IP)_ | External hostname/IP for terminal URLs |

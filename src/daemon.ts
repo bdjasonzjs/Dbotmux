@@ -5,7 +5,7 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { config, validateConfig } from './config.js';
-import { sendMessage, replyMessage, downloadMessageResource, sendUserMessage, updateMessage, getChatInfo } from './services/lark-client.js';
+import { sendMessage, replyMessage, downloadMessageResource, sendUserMessage, updateMessage, getChatInfo, resolveAllowedUsers } from './services/lark-client.js';
 import * as sessionStore from './services/session-store.js';
 import * as messageQueue from './services/message-queue.js';
 import { parseEventMessage } from './utils/message-parser.js';
@@ -1347,6 +1347,19 @@ export async function startDaemon(): Promise<void> {
   currentClaudeVersion = getClaudeVersion();
   logger.info(`Claude version: ${currentClaudeVersion}`);
   lastVersionCheckAt = Date.now();
+
+  // Resolve email prefixes in ALLOWED_USERS to open_ids
+  if (config.daemon.allowedUsers.length > 0) {
+    const hasEmails = config.daemon.allowedUsers.some(u => !u.startsWith('ou_'));
+    if (hasEmails) {
+      try {
+        config.daemon.allowedUsers = await resolveAllowedUsers(config.daemon.allowedUsers);
+        logger.info(`Resolved allowedUsers: ${config.daemon.allowedUsers.join(', ')}`);
+      } catch (err: any) {
+        logger.warn(`Failed to resolve allowedUsers: ${err.message}`);
+      }
+    }
+  }
 
   // Probe bot open_id at startup (non-blocking)
   probeBotOpenId().catch(err => {
