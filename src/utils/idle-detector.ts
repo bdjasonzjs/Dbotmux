@@ -1,0 +1,98 @@
+import type { CliAdapter } from '../adapters/cli/types.js';
+
+/** Spinner frames — animate while CLI is working */
+const SPINNER_RE = /[·✢✳✶✻✽]/;
+
+/** Default quiescence timeout (ms) — idle if PTY silent + no recent spinner */
+const QUIESCENCE_MS = 2_000;
+/** Spinner guard — don't declare idle if spinner seen within this window */
+const SPINNER_GUARD_MS = 3_000;
+
+export class IdleDetector {
+  private outputTail = '';
+  private lastSpinnerAt = 0;
+  private quiescenceTimer: ReturnType<typeof setTimeout> | null = null;
+  private isIdle = false;
+  private idleCallback: (() => void) | null = null;
+  private completionPattern: RegExp | undefined;
+
+  constructor(cli: CliAdapter) {
+    this.completionPattern = cli.completionPattern;
+  }
+
+  onIdle(cb: () => void): void {
+    this.idleCallback = cb;
+  }
+
+  feed(data: string): void {
+    if (this.isIdle) return;
+
+    const stripped = this.stripAnsi(data);
+    this.outputTail = (this.outputTail + stripped).slice(-500);
+
+    // Track spinner — but not if it's part of completion marker
+    if (SPINNER_RE.test(stripped) && !(this.completionPattern?.test(this.outputTail))) {
+      this.lastSpinnerAt = Date.now();
+    }
+
+    // Strategy 1: CLI-specific completion marker
+    if (this.completionPattern?.test(this.outputTail)) {
+      this.clearTimer();
+      this.quiescenceTimer = setTimeout(() => {
+        this.quiescenceTimer = null;
+        if (!this.isIdle) this.markIdle();
+      }, 500);
+      return;
+    }
+
+    // Strategy 2: quiescence (PTY silence + no recent spinner)
+    this.clearTimer();
+    this.quiescenceTimer = setTimeout(() => this.quiescenceCheck(), QUIESCENCE_MS);
+  }
+
+  reset(): void {
+    this.isIdle = false;
+    this.outputTail = '';
+    this.lastSpinnerAt = Date.now();
+    this.clearTimer();
+  }
+
+  dispose(): void {
+    this.clearTimer();
+    this.idleCallback = null;
+  }
+
+  private quiescenceCheck(): void {
+    this.quiescenceTimer = null;
+    if (this.isIdle) return;
+    const sinceSpinner = Date.now() - this.lastSpinnerAt;
+    if (sinceSpinner < SPINNER_GUARD_MS) {
+      this.quiescenceTimer = setTimeout(
+        () => this.quiescenceCheck(),
+        SPINNER_GUARD_MS - sinceSpinner + 200,
+      );
+      return;
+    }
+    this.markIdle();
+  }
+
+  private markIdle(): void {
+    this.isIdle = true;
+    this.outputTail = '';
+    this.clearTimer();
+    this.idleCallback?.();
+  }
+
+  private clearTimer(): void {
+    if (this.quiescenceTimer) {
+      clearTimeout(this.quiescenceTimer);
+      this.quiescenceTimer = null;
+    }
+  }
+
+  private stripAnsi(str: string): string {
+    return str
+      .replace(/\x1b\[(\d*)C/g, (_m, n) => ' '.repeat(Number(n) || 1))
+      .replace(/\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[()][0-9A-B]|\x1b\[[\?]?[0-9;]*[hlmsuJ]/g, '');
+  }
+}
