@@ -64,6 +64,8 @@ const TUI_STATUS_PATTERN = /bypass permissions|\/model/;
 const TRUST_DIALOG_PATTERN = /Yes, I trust this folder/;
 /** Claude Code spinner frames — these animate while Claude is actively working */
 const SPINNER_CHARS_RE = /[·✢✳✶✻✽]/;
+/** "✻ Worked for Xm Ys" — completion marker, NOT a spinner */
+const WORKED_FOR_RE = /Worked for \d/;
 const QUIESCENCE_MS = 2_000;
 let outputTail = '';
 let trustHandled = false;
@@ -107,8 +109,9 @@ function onPtyData(data: string): void {
   const stripped = stripAnsi(data);
   outputTail = (outputTail + stripped).slice(-500);
 
-  // Track spinner animation — spinner chars mean Claude is actively working
-  if (SPINNER_CHARS_RE.test(stripped)) {
+  // Track spinner animation — spinner chars mean Claude is actively working.
+  // But "✻ Worked for Xm Ys" is a static completion marker, not animation.
+  if (SPINNER_CHARS_RE.test(stripped) && !WORKED_FOR_RE.test(stripped)) {
     lastSpinnerAt = Date.now();
   }
 
@@ -127,7 +130,21 @@ function onPtyData(data: string): void {
     return;
   }
 
-  // Strategy 2 — quiescence: TUI renders ❯ via cursor positioning so it's not
+  // Strategy 2 — "Worked for" completion marker: Claude prints this after finishing.
+  // Use a short delay to let the ❯ prompt render before marking ready.
+  if (!isPromptReady && WORKED_FOR_RE.test(stripped)) {
+    if (quiescenceTimer) clearTimeout(quiescenceTimer);
+    quiescenceTimer = setTimeout(() => {
+      quiescenceTimer = null;
+      if (!isPromptReady) {
+        log('Prompt detected (Worked for)');
+        markPromptReady();
+      }
+    }, 500);
+    return;
+  }
+
+  // Strategy 3 — quiescence: TUI renders ❯ via cursor positioning so it's not
   // at the end of the data stream.  Wait for PTY silence, then check for ❯ or
   // known status-bar markers anywhere in the output tail.
   // Also require that the spinner hasn't been seen recently — spinner animation
