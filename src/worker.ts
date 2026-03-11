@@ -32,6 +32,8 @@ let sessionId = '';
 let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
 let isPromptReady = false;
 const pendingMessages: string[] = [];
+/** Suppress screen updates until first prompt detected (avoids history replay in card on --resume) */
+let awaitingFirstPrompt = true;
 
 // ─── PTY Dimensions ──────────────────────────────────────────────────────────
 // Wide PTY so Claude Code positions right-aligned TUI overlays (timer, timeout)
@@ -83,6 +85,14 @@ function markPromptReady(): void {
   isPromptReady = true;
   outputTail = '';
   if (quiescenceTimer) { clearTimeout(quiescenceTimer); quiescenceTimer = null; }
+
+  // On first prompt after spawn/resume: reset the renderer baseline so history
+  // output (from --resume replay) is excluded from subsequent snapshots.
+  if (awaitingFirstPrompt) {
+    awaitingFirstPrompt = false;
+    renderer?.markNewTurn();
+  }
+
   send({ type: 'prompt_ready' });
   // Send a final screen snapshot so the card updates to "idle" immediately
   if (renderer) {
@@ -142,18 +152,23 @@ function onPtyData(data: string): void {
     return;
   }
 
-  // Strategy 3 — quiescence: TUI renders ❯ via cursor positioning so it's not
+  // Strategy 2 — quiescence: TUI renders ❯ via cursor positioning so it's not
   // at the end of the data stream.  Wait for PTY silence, then check for ❯ or
   // known status-bar markers anywhere in the output tail.
   // Also require that the spinner hasn't been seen recently — spinner animation
   // means Claude is still actively working even if the PTY goes briefly silent.
   if (quiescenceTimer) clearTimeout(quiescenceTimer);
   if (!isPromptReady) {
-    quiescenceTimer = setTimeout(() => {
+    quiescenceTimer = setTimeout(function quiescenceCheck() {
       quiescenceTimer = null;
       if (isPromptReady) return;
-      // If spinner was seen within the last 3s, Claude is still working — skip
-      if (Date.now() - lastSpinnerAt < 3_000) return;
+      // If spinner was seen within the last 3s, Claude is still working —
+      // reschedule to check again after the guard expires (don't get stuck)
+      const sinceSpinner = Date.now() - lastSpinnerAt;
+      if (sinceSpinner < 3_000) {
+        quiescenceTimer = setTimeout(quiescenceCheck, 3_000 - sinceSpinner + 200);
+        return;
+      }
       if (PROMPT_ANYWHERE.test(outputTail) || TUI_STATUS_PATTERN.test(outputTail)) {
         log('Prompt detected (quiescence)');
         markPromptReady();
@@ -200,7 +215,7 @@ function sendToPty(content: string): void {
 function startScreenUpdates(): void {
   renderer = new TerminalRenderer(PTY_COLS, PTY_ROWS);
   screenUpdateTimer = setInterval(() => {
-    if (!renderer) return;
+    if (!renderer || awaitingFirstPrompt) return;
     const { content, changed } = renderer.snapshot();
     if (changed) {
       send({ type: 'screen_update', content, status: isPromptReady ? 'idle' : 'working' });
@@ -462,6 +477,7 @@ process.on('message', async (raw: unknown) => {
     case 'restart': {
       log('Restart requested');
       killClaude();
+      awaitingFirstPrompt = true; // suppress history during --resume replay
       // Brief delay for PTY cleanup, then re-spawn with --resume
       setTimeout(() => {
         if (lastInitConfig) {
