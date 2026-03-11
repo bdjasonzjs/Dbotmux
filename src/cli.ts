@@ -122,8 +122,8 @@ async function cmdSetup(): Promise<void> {
   const appSecret = await ask(rl, 'LARK_APP_SECRET: ');
 
   console.log('\n── 可选配置 ──');
-  const model = await ask(rl, '模型 (opus/sonnet/haiku) [opus]: ');
-  const claudePath = await ask(rl, 'CLI 路径 (claude / aiden / trae) [claude]: ');
+  const cliId = await ask(rl, 'CLI 适配器 (claude-code / aiden / coco / codex) [claude-code]: ');
+  const cliPath = await ask(rl, 'CLI 可执行文件路径 (留空=自动检测): ');
   const workingDir = await ask(rl, '默认工作目录 [~]: ');
   const allowedUsers = await ask(rl, '允许的用户 (邮箱前缀或 open_id，逗号分隔，留空=不限制): ');
   const externalHost = await ask(rl, '外部 IP/域名 (终端链接用，留空=自动检测): ');
@@ -138,9 +138,9 @@ async function cmdSetup(): Promise<void> {
     `SESSION_DATA_DIR=${DATA_DIR}`,
     '',
     '# Daemon settings',
-    `LARK_BRIDGE_MODEL=${model || 'opus'}`,
-    `CLAUDE_PATH=${claudePath || 'claude'}`,
-    `CLAUDE_WORKING_DIR=${workingDir || '~'}`,
+    `CLI_ID=${cliId || 'claude-code'}`,
+    ...(cliPath ? [`CLI_PATH=${cliPath}`] : []),
+    `WORKING_DIR=${workingDir || '~'}`,
   ];
 
   if (allowedUsers) lines.push(`ALLOWED_USERS=${allowedUsers}`);
@@ -218,7 +218,7 @@ function cmdUpgrade(): void {
 
 function showHelp(): void {
   console.log(`
-claude-code-robot — 飞书话题 ↔ Claude Code 桥接
+claude-code-robot — 飞书话题 ↔ AI 编程 CLI 桥接
 
 命令:
   setup       交互式配置（首次使用）

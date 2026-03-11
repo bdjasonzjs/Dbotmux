@@ -143,6 +143,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     rootMessageId: ds.session.rootMessageId,
     workingDir: cwd,
     cliId: config.daemon.cliId,
+    cliPathOverride: config.daemon.cliPathOverride,
     backendType: config.daemon.backendType,
     prompt,
     resume,

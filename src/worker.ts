@@ -156,7 +156,7 @@ function stopScreenUpdates(): void {
 // ─── PTY Management ──────────────────────────────────────────────────────────
 
 function spawnClaude(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
-  cliAdapter = createCliAdapterSync(cfg.cliId as any, process.env.CLAUDE_PATH);
+  cliAdapter = createCliAdapterSync(cfg.cliId as any, cfg.cliPathOverride);
   backend = new PtyBackend();
 
   const args = cliAdapter.buildArgs({

@@ -1,3 +1,4 @@
+import { execSync } from 'node:child_process';
 import { resolveCommand } from './registry.js';
 import type { CliAdapter, PtyHandle, McpServerEntry } from './types.js';
 
@@ -8,22 +9,36 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     resolvedBin: bin,
 
     buildArgs({ sessionId, resume }) {
-      // Codex uses subcommand pattern: `codex resume <id>`
-      if (resume) return ['resume', sessionId];
-      return ['--yolo'];
+      // Codex uses subcommand pattern: `codex resume <id>` for resume, plain `codex` for new
+      const args: string[] = [];
+      if (resume) {
+        args.push('resume', sessionId);
+      }
+      args.push('--full-auto');       // auto-approve with sandboxed execution
+      args.push('--no-alt-screen');   // inline mode for PTY capture
+      return args;
     },
 
     async writeInput(pty: PtyHandle, content: string) {
       pty.write(content + '\r');
     },
 
-    ensureMcpConfig(_entry: McpServerEntry) {
-      // Codex uses TOML config (~/.codex/config.toml). Stub — log only.
-      console.warn('[codex] MCP config requires TOML support — skipping auto-install');
+    ensureMcpConfig(entry: McpServerEntry) {
+      // Use `codex mcp add` CLI to register MCP server
+      const envArgs = Object.entries(entry.env)
+        .map(([k, v]) => `--env ${k}=${v}`)
+        .join(' ');
+      const cmd = `${bin} mcp add ${entry.name} ${envArgs} -- ${entry.command} ${entry.args.join(' ')}`;
+      try {
+        execSync(cmd, { encoding: 'utf-8', timeout: 10_000, stdio: 'ignore' });
+      } catch (err: any) {
+        // May fail if already registered — not critical
+        console.warn(`[codex] Failed to add MCP config: ${err.message}`);
+      }
     },
 
     completionPattern: undefined,
-    altScreen: true,
+    altScreen: false,   // --no-alt-screen disables alternate screen
   };
 }
 

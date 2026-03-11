@@ -98,12 +98,10 @@ claude-code-robot start
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `LARK_BRIDGE_MODEL` | `opus` | Claude 模型（`opus`、`sonnet`、`haiku`） |
-| `LARK_BRIDGE_MAX_TURNS` | `500` | 每个会话的最大对话轮数 |
 | `CLI_ID` | `claude-code` | CLI 适配器（`claude-code`、`aiden`、`coco`、`codex`） |
-| `CLAUDE_PATH` | _(自动检测)_ | CLI 可执行文件路径覆盖 |
+| `CLI_PATH` | _(按 CLI_ID 自动检测)_ | CLI 可执行文件路径覆盖 |
 | `BACKEND_TYPE` | `pty` | 会话后端（`pty`、`tmux`） |
-| `CLAUDE_WORKING_DIR` | `~` | 默认工作目录 |
+| `WORKING_DIR` | `~` | 默认工作目录 |
 | `ALLOWED_USERS` | _(空 = 不限制)_ | 允许的用户，邮箱前缀或 open_id，逗号分隔 |
 | `PROJECT_SCAN_DIR` | _(工作目录的上级)_ | 扫描 Git 仓库的目录 |
 | `WEB_HOST` | `0.0.0.0` | HTTP 服务绑定地址 |

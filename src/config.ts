@@ -1,22 +1,4 @@
 import { networkInterfaces } from 'node:os';
-import { execSync } from 'node:child_process';
-import { isAbsolute } from 'node:path';
-
-/** Resolve a command name to its absolute path via a login-shell `which`.
- *  pm2 inherits a minimal PATH that may miss user-installed CLIs,
- *  so we run `which` inside a login shell to pick up the full profile PATH. */
-function resolveCommand(cmd: string): string {
-  if (isAbsolute(cmd)) return cmd;
-  // Try shells in order: user's default shell, then zsh, then bash
-  const shell = process.env.SHELL || '/bin/zsh';
-  const shells = [shell, '/bin/zsh', '/bin/bash'].filter((v, i, a) => a.indexOf(v) === i);
-  for (const sh of shells) {
-    try {
-      return execSync(`${sh} -lc 'which ${cmd}'`, { encoding: 'utf-8', timeout: 5_000 }).trim();
-    } catch { /* try next shell */ }
-  }
-  return cmd;
-}
 
 /** Get the first non-loopback IPv4 address, fallback to localhost. */
 function getLocalIp(): string {
@@ -37,13 +19,10 @@ export const config = {
     dataDir: process.env.SESSION_DATA_DIR ?? new URL('../data', import.meta.url).pathname,
   },
   daemon: {
-    model: process.env.LARK_BRIDGE_MODEL ?? 'opus',
-    maxTurns: Number(process.env.LARK_BRIDGE_MAX_TURNS ?? '500'),
     cliId: (process.env.CLI_ID ?? 'claude-code') as import('./adapters/cli/types.js').CliId,
-    cliPathOverride: process.env.CLAUDE_PATH,
+    cliPathOverride: process.env.CLI_PATH ?? process.env.CLAUDE_PATH,  // CLAUDE_PATH kept for backward compat
     backendType: (process.env.BACKEND_TYPE ?? 'pty') as 'pty' | 'tmux',
-    claudePath: resolveCommand(process.env.CLAUDE_PATH ?? 'claude'),  // kept for backward compat
-    workingDir: process.env.CLAUDE_WORKING_DIR ?? '~',
+    workingDir: process.env.WORKING_DIR ?? process.env.CLAUDE_WORKING_DIR ?? '~',  // CLAUDE_WORKING_DIR kept for backward compat
     allowedUsers: (process.env.ALLOWED_USERS ?? '').split(',').map(s => s.trim()).filter(Boolean),
     projectScanDir: process.env.PROJECT_SCAN_DIR ?? '',
   },
