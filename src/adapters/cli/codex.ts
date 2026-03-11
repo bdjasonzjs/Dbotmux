@@ -14,7 +14,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       if (resume) {
         args.push('resume', sessionId);
       }
-      args.push('--full-auto');       // auto-approve with sandboxed execution
+      args.push('--dangerously-bypass-approvals-and-sandbox');
       args.push('--no-alt-screen');   // inline mode for PTY capture
       return args;
     },
