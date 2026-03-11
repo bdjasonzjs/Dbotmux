@@ -93,7 +93,7 @@ function onPtyData(data: string): void {
   idleDetector?.feed(data);
 }
 
-async function markPromptReady(): Promise<void> {
+function markPromptReady(): void {
   if (isPromptReady) return;  // guard against duplicate calls
   isPromptReady = true;
   if (awaitingFirstPrompt) {
@@ -106,27 +106,29 @@ async function markPromptReady(): Promise<void> {
     const { content } = renderer.snapshot();
     send({ type: 'screen_update', content, status: 'idle' });
   }
-  await flushPending();
+  flushPending();
 }
 
-async function flushPending(): Promise<void> {
+function flushPending(): void {
   log(`flushPending: ${pendingMessages.length} pending, promptReady=${isPromptReady}, hasPty=${!!backend}`);
   while (pendingMessages.length > 0 && isPromptReady && backend && cliAdapter) {
     const msg = pendingMessages.shift()!;
     isPromptReady = false;
     idleDetector?.reset();
     log(`Writing to PTY (flush): "${msg.substring(0, 80)}"`);
-    await cliAdapter.writeInput(backend, msg);
+    // Fire-and-forget: Aiden's delayed writes are internal to the adapter.
+    // Idle detector re-arms on next PTY output, not on write completion.
+    cliAdapter.writeInput(backend, msg);
   }
 }
 
-async function sendToPty(content: string): Promise<void> {
+function sendToPty(content: string): void {
   if (!backend || !cliAdapter) return;
   if (isPromptReady) {
     isPromptReady = false;
     idleDetector?.reset();
     log(`Writing to PTY: "${content.substring(0, 80)}"`);
-    await cliAdapter.writeInput(backend, content);
+    cliAdapter.writeInput(backend, content);
   } else {
     pendingMessages.push(content);
     log(`Queued message (${pendingMessages.length} pending): "${content.substring(0, 80)}" — Claude is busy`);
@@ -395,7 +397,7 @@ process.on('message', async (raw: unknown) => {
     case 'message': {
       // Mark new turn baseline so the streaming card only shows this turn's content
       renderer?.markNewTurn();
-      await sendToPty(msg.content);
+      sendToPty(msg.content);
       break;
     }
 
