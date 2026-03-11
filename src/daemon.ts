@@ -5,7 +5,7 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { config, validateConfig } from './config.js';
-import { sendMessage, replyMessage, downloadMessageResource, sendUserMessage, updateMessage, getChatInfo, getMessageDetail } from './services/lark-client.js';
+import { sendMessage, replyMessage, downloadMessageResource, sendUserMessage, updateMessage, getChatInfo } from './services/lark-client.js';
 import * as sessionStore from './services/session-store.js';
 import * as messageQueue from './services/message-queue.js';
 import { parseEventMessage } from './utils/message-parser.js';
@@ -848,10 +848,10 @@ function restoreActiveSessions(): void {
       hasHistory: true,  // restored sessions have prior Claude history
     });
 
-    logger.info(`Registered session ${session.sessionId} (thread: ${session.rootMessageId})`);
+    logger.debug(`Registered session ${session.sessionId} (thread: ${session.rootMessageId})`);
   }
 
-  logger.info(`Registered ${active.length} session(s), waiting for messages to resume`);
+  logger.info(`Restored ${active.length} session(s), waiting for messages to resume`);
 }
 
 // ─── Card action handling ────────────────────────────────────────────────────
@@ -1019,27 +1019,31 @@ async function getGroupUserCount(chatId: string): Promise<number> {
 async function probeBotOpenId(): Promise<void> {
   if (botOpenId) return; // already known
 
-  const targetUser = config.daemon.allowedUsers[0];
-  if (!targetUser) {
-    logger.info('No allowed users configured, skipping bot open_id probe');
-    return;
+  // Call /bot/v3/info to get the bot's open_id using tenant_access_token
+  const tokenRes = await fetch('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ app_id: config.lark.appId, app_secret: config.lark.appSecret }),
+  });
+  const tokenData = await tokenRes.json() as any;
+  if (tokenData.code !== 0) {
+    throw new Error(`Failed to get tenant_access_token: ${tokenData.msg}`);
   }
 
-  try {
-    const msgId = await sendUserMessage(targetUser, '🤖 Bot started');
-    const detail = await getMessageDetail(msgId);
-    // detail is { items: [{ sender: { sender_type, sender_id: { open_id, ... } }, ... }] }
-    // or directly the message object depending on API version
-    const item = detail?.items?.[0] ?? detail;
-    const senderOpenId = item?.sender?.sender_id?.open_id;
-    if (senderOpenId) {
-      botOpenId = senderOpenId;
-      logger.info(`Probed bot open_id: ${botOpenId}`);
-    } else {
-      logger.warn('Bot open_id probe: no sender info in message detail');
-    }
-  } catch (err: any) {
-    throw err;
+  const botRes = await fetch('https://open.feishu.cn/open-apis/bot/v3/info/', {
+    headers: { Authorization: `Bearer ${tokenData.tenant_access_token}` },
+  });
+  const botData = await botRes.json() as any;
+  if (botData.code !== 0) {
+    throw new Error(`Failed to get bot info: ${botData.msg}`);
+  }
+
+  const openId = botData.bot?.open_id;
+  if (openId) {
+    botOpenId = openId;
+    logger.info(`Bot open_id: ${botOpenId}`);
+  } else {
+    throw new Error('No open_id in bot info response');
   }
 }
 
