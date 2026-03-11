@@ -1,4 +1,5 @@
 import { networkInterfaces } from 'node:os';
+import { execSync } from 'node:child_process';
 
 /** Get the first non-loopback IPv4 address, fallback to localhost. */
 function getLocalIp(): string {
@@ -8,6 +9,15 @@ function getLocalIp(): string {
     }
   }
   return 'localhost';
+}
+
+function detectDefaultBackend(): 'pty' | 'tmux' {
+  try {
+    execSync('tmux -V', { stdio: 'ignore' });
+    return 'tmux';
+  } catch {
+    return 'pty';
+  }
 }
 
 export const config = {
@@ -21,7 +31,7 @@ export const config = {
   daemon: {
     cliId: (process.env.CLI_ID ?? 'claude-code') as import('./adapters/cli/types.js').CliId,
     cliPathOverride: process.env.CLI_PATH,
-    backendType: (process.env.BACKEND_TYPE ?? 'pty') as 'pty' | 'tmux',
+    backendType: (process.env.BACKEND_TYPE ?? detectDefaultBackend()) as 'pty' | 'tmux',
     workingDir: process.env.WORKING_DIR ?? '~',
     allowedUsers: (process.env.ALLOWED_USERS ?? '').split(',').map(s => s.trim()).filter(Boolean),
     projectScanDir: process.env.PROJECT_SCAN_DIR ?? '',
