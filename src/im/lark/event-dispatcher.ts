@@ -4,33 +4,32 @@
  * Extracted from daemon.ts for modularity.
  */
 import * as Lark from '@larksuiteoapi/node-sdk';
-import { config } from '../../config.js';
+import { getBot } from '../../bot-registry.js';
 import { getChatInfo, replyMessage } from './client.js';
 import { logger } from '../../utils/logger.js';
 
 // ─── Bot identity ─────────────────────────────────────────────────────────
 
-let botOpenId: string | undefined;
-
-export function getBotOpenId(): string | undefined {
-  return botOpenId;
+export function getBotOpenId(larkAppId: string): string | undefined {
+  return getBot(larkAppId).botOpenId;
 }
 
-export function setBotOpenId(id: string): void {
-  botOpenId = id;
+export function setBotOpenId(larkAppId: string, id: string): void {
+  getBot(larkAppId).botOpenId = id;
 }
 
 /**
  * Probe the bot's own open_id at startup via the Lark bot info API.
  */
-export async function probeBotOpenId(): Promise<void> {
-  if (botOpenId) return; // already known
+export async function probeBotOpenId(larkAppId: string): Promise<void> {
+  const bot = getBot(larkAppId);
+  if (bot.botOpenId) return; // already known
 
   // Call /bot/v3/info to get the bot's open_id using tenant_access_token
   const tokenRes = await fetch('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ app_id: config.lark.appId, app_secret: config.lark.appSecret }),
+    body: JSON.stringify({ app_id: bot.config.larkAppId, app_secret: bot.config.larkAppSecret }),
   });
   const tokenData = await tokenRes.json() as any;
   if (tokenData.code !== 0) {
@@ -47,8 +46,8 @@ export async function probeBotOpenId(): Promise<void> {
 
   const openId = botData.bot?.open_id;
   if (openId) {
-    botOpenId = openId;
-    logger.info(`Bot open_id: ${botOpenId}`);
+    bot.botOpenId = openId;
+    logger.info(`Bot open_id: ${bot.botOpenId}`);
   } else {
     throw new Error('No open_id in bot info response');
   }
@@ -59,14 +58,15 @@ export async function probeBotOpenId(): Promise<void> {
 const chatUserCountCache = new Map<string, { count: number; fetchedAt: number }>();
 export const CHAT_CACHE_TTL = 5 * 60_000; // 5 minutes
 
-export async function getGroupUserCount(chatId: string): Promise<number> {
-  const cached = chatUserCountCache.get(chatId);
+export async function getGroupUserCount(larkAppId: string, chatId: string): Promise<number> {
+  const cacheKey = `${larkAppId}:${chatId}`;
+  const cached = chatUserCountCache.get(cacheKey);
   if (cached && Date.now() - cached.fetchedAt < CHAT_CACHE_TTL) {
     return cached.count;
   }
   try {
-    const info = await getChatInfo(chatId);
-    chatUserCountCache.set(chatId, { count: info.userCount, fetchedAt: Date.now() });
+    const info = await getChatInfo(larkAppId, chatId);
+    chatUserCountCache.set(cacheKey, { count: info.userCount, fetchedAt: Date.now() });
     return info.userCount;
   } catch (err) {
     logger.debug(`Failed to get chat user count for ${chatId}: ${err}`);
@@ -77,10 +77,11 @@ export async function getGroupUserCount(chatId: string): Promise<number> {
 // ─── @mention detection ──────────────────────────────────────────────────
 
 /** Check if the bot was @mentioned in this message */
-export function isBotMentioned(message: any, _senderOpenId: string | undefined): boolean {
+export function isBotMentioned(larkAppId: string, message: any, _senderOpenId: string | undefined): boolean {
   const mentions: any[] = message.mentions ?? [];
   if (mentions.length === 0) return false;
 
+  const botOpenId = getBot(larkAppId).botOpenId;
   if (!botOpenId) {
     // Bot open_id unknown — cannot reliably detect @bot mentions.
     // Will be resolved once probeBotOpenId() completes or first bot message event arrives.
@@ -100,10 +101,10 @@ export function isBotMentioned(message: any, _senderOpenId: string | undefined):
  * - 'ignore'      -> not addressed to bot at all
  */
 export async function checkGroupMessageAccess(
-  message: any, chatId: string, senderOpenId: string | undefined,
+  larkAppId: string, message: any, chatId: string, senderOpenId: string | undefined,
 ): Promise<'allowed' | 'not_allowed' | 'ignore'> {
-  const mentioned = isBotMentioned(message, senderOpenId);
-  const allowedUsers = config.daemon.allowedUsers;
+  const mentioned = isBotMentioned(larkAppId, message, senderOpenId);
+  const allowedUsers = getBot(larkAppId).resolvedAllowedUsers;
   const isAllowed = allowedUsers.length === 0 || (!!senderOpenId && allowedUsers.includes(senderOpenId));
 
   if (mentioned) {
@@ -112,7 +113,7 @@ export async function checkGroupMessageAccess(
 
   // No @mention — only allow if sender is the sole human in the group
   if (isAllowed) {
-    const userCount = await getGroupUserCount(chatId);
+    const userCount = await getGroupUserCount(larkAppId, chatId);
     if (userCount <= 1) {
       return 'allowed';
     }
@@ -124,20 +125,20 @@ export async function checkGroupMessageAccess(
 // ─── Event callbacks ─────────────────────────────────────────────────────
 
 export interface EventHandlers {
-  handleCardAction: (data: any) => Promise<void>;
-  handleNewTopic: (data: any, chatId: string, messageId: string, chatType: 'group' | 'p2p') => Promise<void>;
-  handleThreadReply: (data: any, rootId: string) => Promise<void>;
+  handleCardAction: (data: any, larkAppId: string) => Promise<void>;
+  handleNewTopic: (data: any, chatId: string, messageId: string, chatType: 'group' | 'p2p', larkAppId: string) => Promise<void>;
+  handleThreadReply: (data: any, rootId: string, larkAppId: string) => Promise<void>;
 }
 
 /**
  * Create and start the Lark WSClient with event dispatching.
  * Returns the WSClient instance for lifecycle management.
  */
-export function startLarkEventDispatcher(handlers: EventHandlers): Lark.WSClient {
+export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: string, handlers: EventHandlers): Lark.WSClient {
   const eventDispatcher = new Lark.EventDispatcher({}).register({
     'card.action.trigger': async (data: any) => {
       try {
-        await handlers.handleCardAction(data);
+        await handlers.handleCardAction(data, larkAppId);
       } catch (err) {
         logger.error(`Error handling card action: ${err}`);
       }
@@ -152,9 +153,10 @@ export function startLarkEventDispatcher(handlers: EventHandlers): Lark.WSClient
 
         // Learn bot's own open_id from its outgoing messages
         if (sender?.sender_type === 'app') {
+          const botOpenId = getBotOpenId(larkAppId);
           if (!botOpenId && sender.sender_id?.open_id) {
-            botOpenId = sender.sender_id.open_id;
-            logger.info(`Learned bot open_id from message event: ${botOpenId}`);
+            setBotOpenId(larkAppId, sender.sender_id.open_id);
+            logger.info(`Learned bot open_id from message event: ${getBotOpenId(larkAppId)}`);
           }
           // Allow bot's own messages only if they are /close commands in threads
           const rootId = message.root_id;
@@ -165,7 +167,7 @@ export function startLarkEventDispatcher(handlers: EventHandlers): Lark.WSClient
           } catch {
             return;
           }
-          handlers.handleThreadReply(data, rootId).catch(err => logger.error(`Error handling message event: ${err}`));
+          handlers.handleThreadReply(data, rootId, larkAppId).catch(err => logger.error(`Error handling message event: ${err}`));
           return;
         }
 
@@ -174,14 +176,14 @@ export function startLarkEventDispatcher(handlers: EventHandlers): Lark.WSClient
         const chatType = message.chat_type;  // 'group' or 'p2p'
         const messageId = message.message_id;
         const senderOpenId = sender?.sender_id?.open_id as string | undefined;
-        const allowedUsers = config.daemon.allowedUsers;
+        const allowedUsers = getBot(larkAppId).resolvedAllowedUsers;
         const isAllowed = allowedUsers.length === 0 || (!!senderOpenId && allowedUsers.includes(senderOpenId));
 
         // Group new topics (no rootId): check @mention + permissions
         if (chatType === 'group' && !rootId) {
-          const access = await checkGroupMessageAccess(message, chatId, senderOpenId);
+          const access = await checkGroupMessageAccess(larkAppId, message, chatId, senderOpenId);
           if (access === 'not_allowed') {
-            replyMessage(messageId, JSON.stringify({ text: '⚠️ 无操作权限' }))
+            replyMessage(larkAppId, messageId, JSON.stringify({ text: '⚠️ 无操作权限' }))
               .catch(err => logger.debug(`Failed to send permission denied: ${err}`));
             return;
           }
@@ -191,7 +193,7 @@ export function startLarkEventDispatcher(handlers: EventHandlers): Lark.WSClient
           }
         } else if (chatType === 'group' && rootId) {
           // Group thread replies: require @mention or solo group (same as new topics)
-          const access = await checkGroupMessageAccess(message, chatId, senderOpenId);
+          const access = await checkGroupMessageAccess(larkAppId, message, chatId, senderOpenId);
           if (access === 'not_allowed') {
             // @mentioned but not in allowlist — silently ignore in threads
             logger.debug(`Ignoring thread reply from non-allowed user: ${senderOpenId}`);
@@ -210,8 +212,8 @@ export function startLarkEventDispatcher(handlers: EventHandlers): Lark.WSClient
         // p2p messages without rootId -> create session directly in the DM chat
         // group messages -> normal flow
         const promise = !rootId
-          ? handlers.handleNewTopic(data, chatId, messageId, chatType as 'group' | 'p2p')
-          : handlers.handleThreadReply(data, rootId);
+          ? handlers.handleNewTopic(data, chatId, messageId, chatType as 'group' | 'p2p', larkAppId)
+          : handlers.handleThreadReply(data, rootId, larkAppId);
         promise.catch(err => logger.error(`Error handling message event: ${err}`));
       } catch (err) {
         logger.error(`Error handling message event: ${err}`);
@@ -221,8 +223,8 @@ export function startLarkEventDispatcher(handlers: EventHandlers): Lark.WSClient
 
   // Start WSClient
   const wsClient = new Lark.WSClient({
-    appId: config.lark.appId,
-    appSecret: config.lark.appSecret,
+    appId: larkAppId,
+    appSecret: larkAppSecret,
     loggerLevel: Lark.LoggerLevel.info,
   });
 

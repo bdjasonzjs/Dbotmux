@@ -10,6 +10,7 @@ export interface DaemonSession {
   worker: ChildProcess | null;   // fork'd worker process
   workerPort: number | null;     // HTTP port for xterm.js
   workerToken: string | null;    // write token for xterm.js
+  larkAppId: string;
   chatId: string;
   chatType: 'group' | 'p2p';    // p2p chats need reply_in_thread to create topics
   spawnedAt: number;
