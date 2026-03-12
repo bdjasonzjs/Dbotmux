@@ -17,9 +17,10 @@ pnpm daemon:logs          # 查看日志
 
 ## 模块结构
 
-- `daemon.ts` — 薄编排层（~400 行），组装各模块并启动
+- `bot-registry.ts` — 多机器人配置加载 + 状态管理（per-bot Lark client、botOpenId、allowedUsers）
+- `daemon.ts` — 薄编排层，组装各模块并启动，支持多 bot 循环初始化
 - `worker.ts` — Worker 子进程，通过适配器管理 CLI + PTY
-- `adapters/cli/` — CLI 适配器：每种 CLI 的参数构建、输入写入、MCP 配置。通过 `CLI_ID` 环境变量选择
+- `adapters/cli/` — CLI 适配器：每种 CLI 的参数构建、输入写入、MCP 配置
 - `adapters/backend/` — 会话后端：`PtyBackend`（node-pty）、`TmuxBackend`（tmux + node-pty，会话常驻）
 - `core/` — 核心逻辑：`worker-pool`（进程池）、`command-handler`（斜杠命令）、`session-manager`（会话生命周期）、`cost-calculator`、`scheduler`
 - `core/types.ts` — `DaemonSession` 是核心类型，所有模块从此导入
@@ -27,9 +28,15 @@ pnpm daemon:logs          # 查看日志
 - `im/types.ts` — `ImAdapter` 接口定义（多 IM 抽象，预留）
 - `utils/idle-detector.ts` — CLI 空闲检测（静默 + Spinner + 完成标记）
 
+## 多机器人配置
+
+单机多 bot：创建 `~/.botmux/bots.json`（或设置 `BOTS_CONFIG` 环境变量指向配置文件），格式见 `bots.json.example`。
+每个 bot 独立配置 `larkAppId`、`larkAppSecret`、`cliId`、`allowedUsers` 等。
+不配置 `bots.json` 时，回退到 `LARK_APP_ID` + `LARK_APP_SECRET` 环境变量（单 bot 模式，完全兼容）。
+
 ## 添加新 CLI 适配器
 
 1. 在 `src/adapters/cli/` 下创建新文件，实现 `CliAdapter` 接口
 2. 在 `src/adapters/cli/types.ts` 的 `CliId` 类型中添加新 ID
 3. 在 `src/adapters/cli/registry.ts` 的 switch 中添加 case
-4. 设置 `CLI_ID=<new-id>` 环境变量即可使用
+4. 在 `bots.json` 中设置 `"cliId": "<new-id>"` 即可使用

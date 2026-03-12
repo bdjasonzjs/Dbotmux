@@ -6,6 +6,7 @@ import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { config } from '../config.js';
+import { getBot, getAllBots } from '../bot-registry.js';
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
@@ -127,7 +128,7 @@ async function handleScheduleCommand(
   const parsed = scheduler.parseNaturalSchedule(trimmed);
   if (parsed) {
     const ds = activeSessions.get(rootId);
-    const workingDir = ds?.workingDir ?? config.daemon.workingDir;
+    const workingDir = ds?.workingDir ?? (ds?.larkAppId ? getBot(ds.larkAppId).config.workingDir ?? '~' : getAllBots()[0]?.config.workingDir ?? '~');
     const task = scheduler.addTask({
       name: parsed.name,
       type: parsed.type,
@@ -195,11 +196,11 @@ export async function handleCommand(
         if (ds) {
           if (ds.worker && !ds.worker.killed) {
             ds.worker.send({ type: 'restart' } as DaemonToWorker);
-            const cliName = getCliDisplayName(config.daemon.cliId);
+            const cliName = getCliDisplayName(getBot(ds.larkAppId).config.cliId);
             await sessionReply(rootId, `🔄 正在重启 ${cliName}...`);
           } else {
             killWorker(ds);
-            const cliName = getCliDisplayName(config.daemon.cliId);
+            const cliName = getCliDisplayName(getBot(ds.larkAppId).config.cliId);
             await sessionReply(rootId, `${cliName} 进程已终止，下次发消息时将自动恢复。`);
           }
           logger.info(`[${t}] Restart by /restart command`);
@@ -321,7 +322,8 @@ export async function handleCommand(
       }
 
       case '/help': {
-        const cliName = getCliDisplayName(config.daemon.cliId);
+        const botCfg = ds ? getBot(ds.larkAppId).config : getAllBots()[0]?.config;
+        const cliName = getCliDisplayName(botCfg?.cliId ?? 'claude-code');
         const help = [
           '📌 会话管理：',
           `/close      - 关闭当前会话，终止 ${cliName} 进程`,
