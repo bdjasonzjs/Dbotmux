@@ -1,38 +1,30 @@
 # botmux
 
-飞书话题群 ↔ AI 编程 CLI 桥接。Daemon 监听飞书消息，每个新话题自动 spawn 一个独立 CLI 进程（Claude Code / Aiden / CoCo / Codex / Gemini）。
+飞书话题群 ↔ AI 编程 CLI 桥接。Daemon 监听飞书消息，每个新话题自动 spawn 一个独立 CLI 进程（Claude Code / Aiden / CoCo / Codex / Gemini / OpenCode）。
 
 ## 构建 & 运行
 
 ```bash
 pnpm build                # tsc 编译
-pnpm daemon:start         # pm2 启动 daemon（生产）
-pnpm daemon:stop          # 停止
-pnpm daemon:restart       # 重启（自动恢复 active sessions）
+pnpm daemon:restart       # 重启 daemon（自动恢复 active sessions）
 pnpm daemon:logs          # 查看日志
 ```
 
-## 注意事项
-- 每次修改后需要重新编译（`pnpm build`）然后再重启 daemon（`pnpm daemon:restart`）
+- 每次修改后需要 `pnpm build` 然后 `pnpm daemon:restart`
 
 ## 模块结构
 
-- `bot-registry.ts` — 多机器人配置加载 + 状态管理（per-bot Lark client、botOpenId、allowedUsers）
-- `daemon.ts` — 薄编排层，组装各模块并启动，支持多 bot 循环初始化
+- `daemon.ts` — 薄编排层，组装各模块并启动
 - `worker.ts` — Worker 子进程，通过适配器管理 CLI + PTY
-- `adapters/cli/` — CLI 适配器：每种 CLI 的参数构建、输入写入、MCP 配置
-- `adapters/backend/` — 会话后端：`PtyBackend`（node-pty）、`TmuxBackend`（tmux + node-pty，会话常驻）
-- `core/` — 核心逻辑：`worker-pool`（进程池）、`command-handler`（斜杠命令）、`session-manager`（会话生命周期）、`cost-calculator`、`scheduler`
+- `server.ts` — Web 终端 HTTP 服务（xterm.js）
+- `bot-registry.ts` — 多机器人配置加载 + 状态管理
+- `config.ts` — 全局配置
+- `adapters/cli/` — CLI 适配器（参数构建、输入写入、MCP 配置），每种 CLI 一个文件
+- `adapters/backend/` — 会话后端：`PtyBackend`、`TmuxBackend`
 - `core/types.ts` — `DaemonSession` 是核心类型，所有模块从此导入
-- `im/lark/` — 飞书专属：事件路由、卡片交互、API 封装、消息解析
-- `im/types.ts` — `ImAdapter` 接口定义（多 IM 抽象，预留）
-- `utils/idle-detector.ts` — CLI 空闲检测（静默 + Spinner + 完成标记）
-
-## 多机器人配置
-
-单机多 bot：创建 `~/.botmux/bots.json`（或设置 `BOTS_CONFIG` 环境变量指向配置文件），格式见 `bots.json.example`。
-每个 bot 独立配置 `larkAppId`、`larkAppSecret`、`cliId`、`allowedUsers` 等。
-不配置 `bots.json` 时，回退到 `LARK_APP_ID` + `LARK_APP_SECRET` 环境变量（单 bot 模式，完全兼容）。
+- `core/` — `worker-pool`、`command-handler`、`session-manager`、`cost-calculator`、`scheduler`
+- `im/lark/` — 飞书：事件路由（`event-dispatcher`）、卡片（`card-builder`/`card-handler`）、API（`client`）、消息解析（`message-parser`）
+- `utils/` — `idle-detector`（CLI 空闲检测）、`terminal-renderer`（xterm.js 截屏）、`logger`
 
 ## Git 提交 & 发版规范
 
@@ -52,7 +44,10 @@ git push origin v1.x.x
 
 ## 添加新 CLI 适配器
 
-1. 在 `src/adapters/cli/` 下创建新文件，实现 `CliAdapter` 接口
-2. 在 `src/adapters/cli/types.ts` 的 `CliId` 类型中添加新 ID
-3. 在 `src/adapters/cli/registry.ts` 的 switch 中添加 case
-4. 在 `bots.json` 中设置 `"cliId": "<new-id>"` 即可使用
+1. `src/adapters/cli/` 下创建新文件，实现 `CliAdapter` 接口
+2. `src/adapters/cli/types.ts` 的 `CliId` 联合类型中添加新 ID
+3. `src/adapters/cli/registry.ts` 添加 import、switch case、export
+4. `src/worker.ts` 的 `CLI_DISPLAY_NAMES` 添加显示名
+5. `src/im/lark/card-builder.ts` 的 `cliDisplayNames` 添加显示名
+6. `src/cli.ts` 的 setup 交互菜单添加选项
+7. `.env.example`、`README.md`、`README.en.md` 更新 CLI 列表
