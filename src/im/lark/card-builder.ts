@@ -96,6 +96,7 @@ export function buildStreamingCard(
   status: 'starting' | 'working' | 'idle',
   cliId?: CliId,
   expanded?: boolean,
+  cardNonce?: string,
 ): string {
   const cliName = getCliDisplayName(cliId ?? 'claude-code');
   const templateMap = { starting: 'yellow', working: 'blue', idle: 'green' } as const;
@@ -118,7 +119,7 @@ export function buildStreamingCard(
     tag: 'button',
     text: { tag: 'plain_text', content: expanded ? '📕 收起输出' : '📖 展开输出' },
     type: 'default' as const,
-    value: { action: 'toggle_stream', root_id: rootId, session_id: sessionId },
+    value: { action: 'toggle_stream', root_id: rootId, session_id: sessionId, ...(cardNonce ? { card_nonce: cardNonce } : {}) },
   };
 
   elements.push({

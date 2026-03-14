@@ -128,7 +128,7 @@ export async function checkGroupMessageAccess(
 // ─── Event callbacks ─────────────────────────────────────────────────────
 
 export interface EventHandlers {
-  handleCardAction: (data: any, larkAppId: string) => Promise<void>;
+  handleCardAction: (data: any, larkAppId: string) => Promise<any>;
   handleNewTopic: (data: any, chatId: string, messageId: string, chatType: 'group' | 'p2p', larkAppId: string) => Promise<void>;
   handleThreadReply: (data: any, rootId: string, larkAppId: string) => Promise<void>;
   /** Check if this bot owns an active session for the given rootId. */
@@ -143,11 +143,13 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
   const eventDispatcher = new Lark.EventDispatcher({}).register({
     'card.action.trigger': async (data: any) => {
       try {
-        await handlers.handleCardAction(data, larkAppId);
+        const cardBody = await handlers.handleCardAction(data, larkAppId);
+        // If the handler returns a card body (e.g. toggle_stream), return it
+        // so Lark renders the update immediately without waiting for an API PATCH.
+        if (cardBody) return { card: { type: 'raw', data: cardBody } };
       } catch (err) {
         logger.error(`Error handling card action: ${err}`);
       }
-      // Return undefined so WSClient sends no response body (avoids error 200672)
       return undefined;
     },
     'im.message.receive_v1': async (data: any) => {

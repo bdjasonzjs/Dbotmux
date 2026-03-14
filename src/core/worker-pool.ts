@@ -6,6 +6,7 @@ import { fork } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { randomBytes } from 'node:crypto';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
 import { updateMessage, MessageWithdrawnError } from '../im/lark/client.js';
@@ -49,6 +50,50 @@ function requireCallbacks(): WorkerPoolCallbacks {
 
 function tag(ds: DaemonSession): string {
   return ds.session.sessionId.substring(0, 8);
+}
+
+// ─── Card PATCH serialization queue ─────────────────────────────────────────
+// Only one PATCH in-flight at a time per session. New PATCHes queue on
+// ds.pendingCardJson (latest wins). When the in-flight PATCH completes,
+// the pending one is flushed. This prevents concurrent PATCHes to the
+// same Feishu message — delivery order is unpredictable and a stale
+// screen_update could overwrite a toggle result.
+
+/**
+ * Queue a card PATCH. If no PATCH is in-flight, sends immediately.
+ * Otherwise stores the card JSON on `ds.pendingCardJson` (overwriting
+ * any previously queued value — only the latest state matters).
+ */
+export function scheduleCardPatch(ds: DaemonSession, cardJson: string): void {
+  ds.pendingCardJson = cardJson;
+  if (ds.cardPatchInFlight) return;
+  flushCardPatch(ds);
+}
+
+function flushCardPatch(ds: DaemonSession): void {
+  const json = ds.pendingCardJson;
+  const cardId = ds.streamCardId;
+  if (!json || !cardId) {
+    ds.pendingCardJson = undefined;
+    return;
+  }
+  ds.pendingCardJson = undefined;
+  ds.cardPatchInFlight = true;
+  updateMessage(ds.larkAppId, cardId, json)
+    .catch(err => {
+      if (err instanceof MessageWithdrawnError) {
+        logger.warn(`[${tag(ds)}] Stream card withdrawn, clearing reference`);
+        ds.streamCardId = undefined;
+        return;
+      }
+      logger.debug(`[${tag(ds)}] Failed to update streaming card: ${err}`);
+    })
+    .finally(() => {
+      ds.cardPatchInFlight = false;
+      if (ds.pendingCardJson) {
+        flushCardPatch(ds);
+      }
+    });
 }
 
 // ─── Restart rate-limiting ──────────────────────────────────────────────────
@@ -179,6 +224,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
 
         // Send streaming card to group thread (read-only link, will be PATCHed with live output)
         try {
+          ds.streamCardNonce = randomBytes(4).toString('hex');
           const initTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);
           const streamCardJson = buildStreamingCard(
             ds.session.sessionId,
@@ -189,6 +235,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
             'starting',
             botCfg.cliId,
             ds.streamExpanded,
+            ds.streamCardNonce,
           );
           ds.streamCardId = await cb.sessionReply(ds.session.rootMessageId, streamCardJson, 'interactive', ds.larkAppId);
         } catch (err) {
@@ -233,26 +280,28 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
         ds.lastScreenContent = msg.content;
         ds.lastScreenStatus = msg.status;
 
-        // Skip PATCH if another card update is in-flight (e.g. toggle_stream)
-        // to avoid concurrent PATCHes on the same message. Next tick will catch up.
-        if (ds.cardPatchInFlight && ds.streamCardId && !ds.streamCardPending) break;
-
         const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);
-        const cardJson = buildStreamingCard(
-          ds.session.sessionId,
-          ds.session.rootMessageId,
-          readUrl,
-          turnTitle,
-          msg.content,
-          msg.status,
-          botCfg.cliId,
-          ds.streamExpanded,
-        );
 
         if (ds.streamCardPending || !ds.streamCardId) {
-          // New turn — create a fresh card, old card freezes at its last state
+          // New turn — create a fresh card, old card freezes at its last state.
+          // Generate new nonce so old card buttons are distinguishable.
+          ds.streamCardNonce = randomBytes(4).toString('hex');
+          const cardJson = buildStreamingCard(
+            ds.session.sessionId,
+            ds.session.rootMessageId,
+            readUrl,
+            turnTitle,
+            msg.content,
+            msg.status,
+            botCfg.cliId,
+            ds.streamExpanded,
+            ds.streamCardNonce,
+          );
+          // Clear streamCardId immediately so that screen_updates arriving while
+          // the POST is in-flight are dropped rather than PATCHed onto the old card.
           ds.streamCardPending = false;
+          ds.streamCardId = undefined;
           cb.sessionReply(ds.session.rootMessageId, cardJson, 'interactive', ds.larkAppId)
             .then(msgId => { ds.streamCardId = msgId; })
             .catch(err => {
@@ -265,19 +314,19 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
               logger.debug(`[${t}] Failed to create streaming card: ${err}`);
             });
         } else {
-          // Same turn — PATCH existing card
-          ds.cardPatchInFlight = true;
-          updateMessage(ds.larkAppId, ds.streamCardId, cardJson)
-            .catch(err => {
-              if (err instanceof MessageWithdrawnError) {
-                logger.warn(`[${t}] Stream card message withdrawn, clearing card reference`);
-                ds.streamCardId = undefined;
-                return;
-              }
-              logger.debug(`[${t}] Failed to update streaming card: ${err}`);
-              ds.streamCardId = undefined;
-            })
-            .finally(() => { ds.cardPatchInFlight = false; });
+          // Same turn — queue PATCH (serialized, latest-wins), reuse existing nonce
+          const cardJson = buildStreamingCard(
+            ds.session.sessionId,
+            ds.session.rootMessageId,
+            readUrl,
+            turnTitle,
+            msg.content,
+            msg.status,
+            botCfg.cliId,
+            ds.streamExpanded,
+            ds.streamCardNonce,
+          );
+          scheduleCardPatch(ds, cardJson);
         }
         break;
       }
@@ -297,6 +346,16 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
 
         if (rc.count > 3) {
           logger.warn(`[${t}] ${getCliDisplayName(botCfg.cliId)} crashed ${rc.count} times in 1 min, not auto-restarting`);
+          // Freeze the last streaming card so it doesn't stay at "working" forever
+          if (ds.streamCardId && ds.workerPort) {
+            const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
+            const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);
+            const frozenCard = buildStreamingCard(
+              ds.session.sessionId, ds.session.rootMessageId, readUrl, turnTitle,
+              ds.lastScreenContent ?? '', 'idle', botCfg.cliId, ds.streamExpanded, ds.streamCardNonce,
+            );
+            scheduleCardPatch(ds, frozenCard);
+          }
           // Kill the worker process to free resources
           killWorker(ds);
           const cliName = getCliDisplayName(botCfg.cliId);

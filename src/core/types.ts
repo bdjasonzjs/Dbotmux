@@ -24,12 +24,14 @@ export interface DaemonSession {
   pendingAttachments?: LarkAttachment[];
   ownerOpenId?: string;          // topic creator's open_id — receives write-enabled terminal link via DM
   streamCardId?: string;         // message_id of the streaming card in group (PATCHed with live output)
+  streamCardNonce?: string;       // unique nonce for the current streaming card — embedded in button values to distinguish old vs current card
   streamCardPending?: boolean;    // true when a new turn started, next screen_update creates a new card
   streamExpanded?: boolean;       // whether streaming output is visible in card (default: collapsed)
   lastScreenContent?: string;    // last screen_update content — used to freeze card at idle
   lastScreenStatus?: 'starting' | 'working' | 'idle';  // last screen_update status
   currentTurnTitle?: string;      // title for the current turn's streaming card
-  cardPatchInFlight?: boolean;    // true while a card PATCH is in-flight — screen_update skips to avoid concurrent PATCHes
+  cardPatchInFlight?: boolean;    // true while a card PATCH is in-flight
+  pendingCardJson?: string;       // queued card JSON — flushed when in-flight PATCH completes (latest wins)
 }
 
 /** Composite key for activeSessions — allows multiple bots to have independent sessions for the same thread. */

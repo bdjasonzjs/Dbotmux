@@ -9,7 +9,7 @@ import { sendUserMessage, updateMessage } from './client.js';
 import { buildSessionCard, buildStreamingCard, getCliDisplayName } from './card-builder.js';
 import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
-import { forkWorker, killWorker } from '../../core/worker-pool.js';
+import { forkWorker, killWorker, scheduleCardPatch } from '../../core/worker-pool.js';
 import { getSessionWorkingDir, buildNewTopicPrompt } from '../../core/session-manager.js';
 import type { DaemonToWorker } from '../../types.js';
 import { sessionKey } from '../../core/types.js';
@@ -32,7 +32,7 @@ function tag(ds: DaemonSession): string {
 
 // ─── Main handler ─────────────────────────────────────────────────────────
 
-export async function handleCardAction(data: any, deps: CardHandlerDeps, larkAppId?: string): Promise<void> {
+export async function handleCardAction(data: any, deps: CardHandlerDeps, larkAppId?: string): Promise<any> {
   const { activeSessions, lastRepoScan } = deps;
   const sessionReply = (rid: string, content: string, msgType?: string) =>
     deps.sessionReply(rid, content, msgType, larkAppId);
@@ -119,28 +119,37 @@ export async function handleCardAction(data: any, deps: CardHandlerDeps, larkApp
     }
 
     if (actionType === 'toggle_stream' && ds) {
-      const botCfg = getBot(ds.larkAppId).config;
-      ds.streamExpanded = !ds.streamExpanded;
-      // Immediately rebuild and PATCH the current streaming card
-      if (ds.streamCardId && ds.workerPort) {
-        const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
-        const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);
-        const cardJson = buildStreamingCard(
-          ds.session.sessionId,
-          ds.session.rootMessageId,
-          readUrl,
-          turnTitle,
-          ds.lastScreenContent || '',
-          ds.lastScreenStatus || 'working',
-          botCfg.cliId,
-          ds.streamExpanded,
-        );
-        ds.cardPatchInFlight = true;
-        updateMessage(ds.larkAppId, ds.streamCardId, cardJson)
-          .catch(err => logger.warn(`[${tag(ds)}] Failed to update card on toggle: ${err}`))
-          .finally(() => { ds.cardPatchInFlight = false; });
+      // Only toggle the current (latest) streaming card — ignore clicks on frozen older cards.
+      // We embed a card_nonce in the button value at build time. When clicked, compare
+      // the nonce from the event with ds.streamCardNonce to distinguish old vs current.
+      const clickedNonce: string | undefined = value?.card_nonce;
+      if (clickedNonce && ds.streamCardNonce && clickedNonce !== ds.streamCardNonce) {
+        logger.debug(`[${tag(ds)}] Ignoring toggle on old card: nonce=${clickedNonce}, current=${ds.streamCardNonce}`);
+      } else {
+        const botCfg = getBot(ds.larkAppId).config;
+        ds.streamExpanded = !ds.streamExpanded;
+        if (ds.streamCardId && ds.workerPort) {
+          const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
+          const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);
+          const cardJson = buildStreamingCard(
+            ds.session.sessionId,
+            ds.session.rootMessageId,
+            readUrl,
+            turnTitle,
+            ds.lastScreenContent || '',
+            ds.lastScreenStatus || 'working',
+            botCfg.cliId,
+            ds.streamExpanded,
+            ds.streamCardNonce,
+          );
+          // Queue PATCH as backup — but also return card JSON for instant rendering
+          scheduleCardPatch(ds, cardJson);
+          logger.info(`[${tag(ds)}] Stream display toggled: ${ds.streamExpanded ? 'expanded' : 'collapsed'}`);
+          // Return parsed card so event dispatcher can send it as immediate callback response
+          try { return JSON.parse(cardJson); } catch { /* fall through */ }
+        }
+        logger.info(`[${tag(ds)}] Stream display toggled: ${ds.streamExpanded ? 'expanded' : 'collapsed'}`);
       }
-      logger.info(`[${tag(ds)}] Stream display toggled: ${ds.streamExpanded ? 'expanded' : 'collapsed'}`);
     }
 
     if (actionType === 'skip_repo' && ds && ds.pendingRepo) {

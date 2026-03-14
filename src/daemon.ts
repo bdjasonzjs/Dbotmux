@@ -3,7 +3,7 @@ import { writeFileSync, existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { config } from './config.js';
-import { replyMessage, updateMessage, resolveAllowedUsers } from './im/lark/client.js';
+import { replyMessage, resolveAllowedUsers } from './im/lark/client.js';
 import { loadBotConfigs, registerBot, getBot, getAllBots } from './bot-registry.js';
 import * as sessionStore from './services/session-store.js';
 import * as messageQueue from './services/message-queue.js';
@@ -22,6 +22,7 @@ import {
   initWorkerPool,
   forkWorker,
   killWorker,
+  scheduleCardPatch,
   setCurrentCliVersion,
   getCurrentCliVersion,
 } from './core/worker-pool.js';
@@ -373,12 +374,11 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
       const prevTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(dsBotCfg.cliId);
       const frozenCard = buildStreamingCard(
         ds.session.sessionId, ds.session.rootMessageId, readUrl, prevTitle,
-        ds.lastScreenContent ?? '', 'idle', dsBotCfg.cliId, ds.streamExpanded,
+        ds.lastScreenContent ?? '', 'idle', dsBotCfg.cliId, ds.streamExpanded, ds.streamCardNonce,
       );
-      ds.cardPatchInFlight = true;
-      updateMessage(ds.larkAppId, ds.streamCardId, frozenCard)
-        .catch(() => {})
-        .finally(() => { ds.cardPatchInFlight = false; });
+      // Freeze through the serialization queue to avoid racing with an in-flight PATCH.
+      // scheduleCardPatch replaces any stale pending item (latest-wins).
+      scheduleCardPatch(ds, frozenCard);
     }
     // Mark new turn — next screen_update will create a fresh streaming card
     ds.streamCardPending = true;
