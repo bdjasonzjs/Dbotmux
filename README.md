@@ -1,5 +1,9 @@
 # botmux
 
+<p align="center">
+  <img src="cover.svg" alt="botmux cover" width="800">
+</p>
+
 中文 | [English](README.en.md)
 
 飞书话题群与 AI 编程 CLI 的桥接工具。Daemon 监听飞书消息，为每个新话题自动启动一个独立的 CLI 进程（支持 Claude Code、Aiden、CoCo、Codex、Gemini），提供实时流式卡片和 Web 终端。

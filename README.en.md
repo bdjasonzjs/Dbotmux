@@ -1,5 +1,9 @@
 # botmux
 
+<p align="center">
+  <img src="cover.svg" alt="botmux cover" width="800">
+</p>
+
 [中文](README.md) | English
 
 Bridge between Lark (Feishu) topic groups and AI coding CLIs. The daemon listens for Lark messages and automatically spawns an independent CLI process (supporting Claude Code, Aiden, CoCo, Codex, Gemini) for each new topic thread, with live streaming cards and a web-based terminal.
