@@ -4,83 +4,274 @@
   <img src="cover.svg" alt="botmux cover" width="800">
 </p>
 
-[中文](README.md) | English
-
-Bridge between Lark (Feishu) topic groups and AI coding CLIs. The daemon listens for Lark messages and automatically spawns an independent CLI process (supporting Claude Code, Aiden, CoCo, Codex, Gemini) for each new topic thread, with live streaming cards and a web-based terminal.
-
-## Demo
-
 <p align="center">
-  <img src="gif/fold&unfold.gif" alt="Lark card interaction — streaming output fold/unfold" width="600">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License MIT"></a>
+  <img src="https://img.shields.io/badge/node-%3E%3D20-brightgreen.svg" alt="Node.js >= 20">
+  <a href="https://www.npmjs.com/package/botmux"><img src="https://img.shields.io/npm/v/botmux.svg" alt="npm version"></a>
+  <a href="https://github.com/deepcoldy/botmux"><img src="https://img.shields.io/github/stars/deepcoldy/botmux?style=social" alt="GitHub Stars"></a>
 </p>
 
+<p align="center">
+  <a href="#design-philosophy">Design</a> &middot;
+  <a href="#key-advantages">Advantages</a> &middot;
+  <a href="#5-minute-setup">Quick Start</a> &middot;
+  <a href="#usage">Usage</a> &middot;
+  <a href="#configuration">Config</a>
+</p>
+
+[中文](README.md) | English
+
+**Plug any AI coding CLI into Lark (Feishu) topic groups — one thread per session, streaming cards, web terminal, zero glue code.**
+
+| Lark Streaming Cards | Web Terminal | tmux Session Management |
+|:-:|:-:|:-:|
+| <img src="gif/fold&unfold.gif" width="280" /> | <img src="gif/web_terminal.gif" width="280" /> | <img src="gif/tmux.gif" width="280" /> |
+
 <details>
-<summary>📺 Full demo video</summary>
+<summary>Full demo video</summary>
 
 [Demo Video](https://github.com/user-attachments/assets/3ba4c681-0a7e-4a03-89c8-b8d26b544a65)
 </details>
 
-## Features
+---
 
-- **One topic = one AI coding session** — each Lark thread gets its own isolated CLI process
-- **Multi-CLI support** — adapter architecture supports Claude Code, Aiden, CoCo, Codex, Gemini, and is extensible
-- **Live streaming cards** — real-time terminal output rendered in Feishu cards with markdown support, per-turn card lifecycle
-- **Web terminal (xterm.js)** — full PTY output in the browser with a mobile shortcut toolbar and on-demand write access via DM link
-- **Session persistence** — sessions survive daemon restarts; with tmux backend, CLI processes persist across restarts with zero interruption
-- **Scheduled tasks** — cron-based recurring prompts with natural language scheduling (Chinese supported)
-- **Project management** — interactive repo selector, per-session working directory
-- **MCP integration** — CLI can reply to Lark threads, read message history, and add reactions via MCP tools
-- **Access control** — allowlist for users, token-based write access for terminals, button restrictions on cards
+## Why botmux?
+
+### Design Philosophy
+
+Core philosophy: **Bridge CLIs, don't rebuild them**. botmux doesn't reimplement Agent capabilities — it bridges existing AI coding CLIs (Claude Code, Codex, Aiden, CoCo, Gemini, OpenCode) directly. Every CLI upgrade — new tools, stronger reasoning, more MCP support — benefits botmux automatically with zero adaptation.
+
+### Key Advantages
+
+Compared to OpenClaw-style approaches built on Agent SDKs:
+
+| Feature | botmux | OpenClaw-style |
+|---------|--------|---------------|
+| Architecture | Bridges full CLI processes directly | Rebuilds on Agent SDK |
+| CLI Capabilities | Full runtime (hooks, memory, plan mode, MCP ecosystem, `/` commands) | SDK API subset, missing features must be reimplemented |
+| CLI Upgrades | Zero-adaptation automatic benefit | Must track SDK version changes |
+| Multi-CLI Support | 6 CLIs, switch with one config (Claude Code / Codex / Aiden / CoCo / Gemini / OpenCode) | Tied to a single SDK, cannot switch CLIs |
+| Web Terminal | Interactive full terminal, mobile shortcut toolbar, phone/desktop/Lark tri-screen sync | Usually web chat UI or read-only output |
+| Multi-Bot Collaboration | Multiple bots in same group via @mention routing, isolated processes, different CLIs sparring | Usually single bot |
+| Terminal Access | tmux attach directly into the CLI process, same as local dev experience | No direct terminal access |
+| Installation | `npm install -g botmux`, no Docker / web service needed | Full web service + Docker deployment |
+
+---
 
 ## Prerequisites
 
 - **Node.js** >= 20
 - **AI coding CLI** installed and authenticated (`claude`, `aiden`, `coco`, `codex`, `gemini`, or `opencode` in PATH)
-- **Lark app** with Bot and Message permissions (WebSocket event subscription)
 - **tmux** >= 3.x (optional — auto-enabled when installed for persistent CLI sessions)
 
-## Installation
+## 5-Minute Setup
 
-```bash
-npm install -g botmux
+### Step 1: Create a Lark App
+
+Go to the [Lark Open Platform](https://open.larkoffice.com/app) and click "Create Custom App".
+
+![Create App](docs/setup/create-app.png)
+
+### Step 2: Get Credentials
+
+Open the app details page → "Credentials & Basic Info", and copy the **App ID** and **App Secret**.
+
+![Get Credentials](docs/setup/credentials.png)
+
+### Step 3: Add Permissions
+
+Go to "Permissions & Scopes" → "Batch Import/Export", and paste the following JSON to import all permissions at once:
+
+![Permissions](docs/setup/permissions.png)
+
+<details>
+<summary>Click to expand batch import JSON</summary>
+
+```json
+{
+  "scopes": {
+    "tenant": [
+      "contact:user.base:readonly",
+      "contact:user.id:readonly",
+      "im:chat:read",
+      "im:chat.members:bot_access",
+      "im:chat.members:read",
+      "im:message",
+      "im:message:readonly",
+      "im:message:send_as_bot",
+      "im:message:update",
+      "im:message.group_at_msg",
+      "im:message.group_at_msg:readonly",
+      "im:message.group_msg",
+      "im:message.p2p_msg:readonly",
+      "im:message.reactions:write_only",
+      "im:resource"
+    ]
+  }
+}
 ```
+</details>
 
-## Quick Start
+### Step 4: Install & Start botmux
 
 ```bash
-# 1. Interactive setup — creates ~/.botmux/bots.json
+# Install
+npm install -g botmux
+
+# Interactive setup — enter the App ID and App Secret from Step 2
 botmux setup
 
-# 2. Start the daemon
+# Start (must be running before configuring WebSocket subscription — Lark checks for an active connection)
 botmux start
 ```
 
-The `setup` command will guide you through:
-- Creating a Lark app (with required permissions listed)
-- Entering App ID, App Secret, Chat ID
-- Optional: Claude model, working directory, access control
+### Step 5: Configure Event Subscription
 
-## CLI Commands
+Back in the Lark Open Platform, go to "Events & Callbacks":
+
+1. **Subscription mode**: Click the edit icon, select "Receive events via persistent connection" (WebSocket) — requires botmux to be running so Lark can detect the connection
+
+![WebSocket subscription](docs/setup/event-websocket.png)
+
+2. **Add event**: Click "Add Event", search and add `im.message.receive_v1` (Receive messages v2.0)
+
+![Add event](docs/setup/event-receive-msg.png)
+
+3. **Enable callback**: Switch to the "Callback Configuration" tab, turn on "Card action callback" (`card.action.trigger`)
+
+### Step 6: Publish the App
+
+Go to "Version Management & Release", click "Create Version" and publish. Set availability to "Visible to me only" for automatic approval.
+
+![Publish](docs/setup/publish.png)
+
+### Step 7: Create a Group and Start Chatting
+
+1. Create a **topic-enabled group** in Lark
+2. Go to Group Settings → Bots → Add the bot you just created
+3. Send a message in the group — the bot responds automatically
+
+![Add bot to group](docs/setup/add-bot-to-group.png)
+
+---
+
+## Features
+
+### Streaming Cards
+
+Each conversation turn gets a live-updating Feishu card that shows:
+
+- Real-time terminal output rendered as Markdown, TUI chrome auto-filtered to show only actual work output
+- Status indicator: Starting > Working > Idle
+- Action buttons: Open Terminal, Get Write Link, Restart CLI, Close Session
+
+
+### Web Terminal (Interactive)
+
+Each session exposes a web terminal at `http://<WEB_EXTERNAL_HOST>:<port>`.
+
+- **Read-only link** — shown on the streaming card in the group thread
+- **Write-enabled link** — sent via DM on demand (click "Get Write Link" on the card)
+
+On mobile/tablet, a floating shortcut toolbar provides Esc, Ctrl+C, Tab, arrow keys and other control keys missing from virtual keyboards — full CLI control from your phone.
+
+### Multi-Bot Collaboration
+
+Run multiple Lark bots on a single machine, each mapped to a different CLI. In the same group chat, messages are routed via @mention — each bot gets its own isolated CLI process. With a single bot in the group, it responds automatically without @.
+
+### Tmux Persistence
+
+When tmux is installed, botmux automatically uses it. CLI processes persist inside tmux sessions — all features work unchanged.
+
+**Key benefit: daemon restarts don't interrupt the CLI.** During `botmux restart`, the worker process exits but the tmux session (and the CLI inside it) keeps running. The next incoming message triggers a re-attach — no `--resume` context reload needed.
+
+```bash
+# Recommended: interactive session picker — select and attach to tmux
+npx botmux list
+
+# Or manually attach (session name = bmx-<first 8 chars of session ID>)
+tmux attach -t bmx-<first-8-chars-of-session-id>
+# Ctrl+B, D to detach — CLI keeps running
+
+# Force pure pty mode (disable tmux)
+BACKEND_TYPE=pty botmux start
+```
+
+`botmux list` provides an interactive TUI showing all active sessions with ID, title, working directory, PID, uptime, and status. Use arrow keys to select and Enter to attach. Use `botmux list --plain` for plain-text table output suitable for scripting.
+
+**Session naming:** `bmx-<first 8 chars of session UUID>`
+
+**Lifecycle:**
+
+| Event | tmux session | CLI process |
+|-------|-------------|-------------|
+| `botmux restart` | Survives | Survives (re-attaches on next message) |
+| `/close` or close button | Destroyed | Terminated (SIGHUP) |
+| CLI exits / crashes | Closes with it | Already exited (auto-restart creates new session) |
+
+### Scheduled Tasks
+
+Create recurring tasks with natural language:
+
+```
+/schedule every day at 17:50 check AI news
+/schedule weekdays at 9:00 run health check
+/schedule every Monday at 10:00 generate weekly report
+```
+
+### MCP Integration
+
+botmux exposes MCP tools so the CLI can interact with Lark directly:
+
+- Reply to the current Lark thread
+- Read message history from the thread
+- Add emoji reactions to messages
+
+---
+
+## Usage
+
+### Workflow
+
+1. Send a message in your Lark topic group to create a new thread
+2. The bot shows a repo selection card — pick a project or click "Start directly"
+3. The CLI spawns in the selected directory
+4. A live streaming card appears in the thread, showing real-time terminal output with markdown rendering
+5. Each reply creates a new streaming card for that turn; previous cards freeze at their last state
+6. Click "Get Write Link" on the card to receive a write-enabled terminal URL via DM
+7. The CLI replies in the thread via MCP tools
+
+### Slash Commands
 
 | Command | Description |
 |---------|-------------|
-| `botmux setup` | Interactive setup (first-time or add bots) |
-| `botmux start` | Start daemon (PM2 managed) |
-| `botmux stop` | Stop daemon |
-| `botmux restart` | Restart daemon (auto-restores active sessions) |
-| `botmux logs` | View daemon logs (`--lines N` for more) |
-| `botmux status` | Show daemon status |
-| `botmux upgrade` | Upgrade to latest version |
-| `botmux list` | List all active sessions (alias: `ls`) |
-| `botmux delete <id>` | Close a session by ID prefix (alias: `del`/`rm`) |
-| `botmux delete all` | Close all active sessions |
-| `botmux delete stopped` | Clean up zombie sessions with dead processes |
+| `/repo` | Show project selector card |
+| `/repo <N>` | Switch to Nth project from last scan |
+| `/skip` | Skip repo selection, start session directly |
+| `/cd <path>` | Change working directory |
+| `/status` | Show session info (uptime, terminal URL, etc.) |
+| `/cost` | Show token usage and estimated cost |
+| `/restart` | Restart CLI process |
+| `/close` | Close session and terminate CLI |
+| `/clear` | Clear context (new session, same thread) |
+| `/schedule` | Manage scheduled tasks |
+| `/help` | Show available commands |
+
+### Scheduled Task Management
+
+```
+/schedule list
+/schedule remove <id>
+/schedule enable <id>
+/schedule disable <id>
+/schedule run <id>
+```
+
+---
 
 ## Configuration
 
 Configure bots via `~/.botmux/bots.json`. Run `botmux setup` to create it interactively, or edit manually.
-
-Supports running multiple Lark bots on a single machine, each mapped to a different CLI. Multiple bots in the same group chat route messages via @mention; a single bot responds automatically without @.
 
 ```bash
 # Interactive setup
@@ -130,7 +321,7 @@ botmux setup
 | `SESSION_DATA_DIR` | `~/.botmux/data` | Where sessions and queues are stored |
 | `DEBUG` | _(unset)_ | Set to `1` for debug logging |
 
-## File Locations
+### File Locations
 
 | Path | Description |
 |------|-------------|
@@ -138,110 +329,25 @@ botmux setup
 | `~/.botmux/data/` | Session data, message queues |
 | `~/.botmux/logs/` | Daemon logs |
 
-## Usage
+---
 
-### Workflow
-
-1. Send a message in your Lark topic group to create a new thread
-2. The bot shows a repo selection card — pick a project or click "Start directly"
-3. Claude Code spawns in the selected directory
-4. A live streaming card appears in the thread, showing real-time terminal output with markdown rendering
-5. Each reply creates a new streaming card for that turn; previous cards freeze at their last state
-6. Click "🔑 Get Write Link" on the card to receive a write-enabled terminal URL via DM
-7. Claude replies in the thread via MCP tools
-
-### Slash Commands
+## CLI Commands
 
 | Command | Description |
 |---------|-------------|
-| `/repo` | Show project selector card |
-| `/repo <N>` | Switch to Nth project from last scan |
-| `/skip` | Skip repo selection, start session directly |
-| `/cd <path>` | Change working directory |
-| `/status` | Show session info (uptime, terminal URL, etc.) |
-| `/cost` | Show token usage and estimated cost |
-| `/restart` | Restart Claude process |
-| `/close` | Close session and terminate Claude |
-| `/clear` | Clear context (new session, same thread) |
-| `/schedule` | Manage scheduled tasks |
-| `/help` | Show available commands |
+| `botmux setup` | Interactive setup (first-time or add bots) |
+| `botmux start` | Start daemon (PM2 managed) |
+| `botmux stop` | Stop daemon |
+| `botmux restart` | Restart daemon (auto-restores active sessions) |
+| `botmux logs` | View daemon logs (`--lines N` for more) |
+| `botmux status` | Show daemon status |
+| `botmux upgrade` | Upgrade to latest version |
+| `botmux list` | List all active sessions (alias: `ls`) |
+| `botmux delete <id>` | Close a session by ID prefix (alias: `del`/`rm`) |
+| `botmux delete all` | Close all active sessions |
+| `botmux delete stopped` | Clean up zombie sessions with dead processes |
 
-### Scheduled Tasks
-
-Create recurring tasks with natural language:
-
-```
-/schedule every day at 17:50 check AI news
-/schedule weekdays at 9:00 run health check
-/schedule every Monday at 10:00 generate weekly report
-```
-
-Manage tasks:
-
-```
-/schedule list
-/schedule remove <id>
-/schedule enable <id>
-/schedule disable <id>
-/schedule run <id>
-```
-
-### Streaming Cards
-
-Each conversation turn gets a live-updating Feishu card that shows:
-
-- Real-time terminal output (rendered via headless xterm + Feishu Card v2 markdown)
-- Status indicator: 🟡 Starting > 🔵 Working > 🟢 Idle
-- Action buttons: Open Terminal, Get Write Link, Restart Claude, Close Session
-
-The card content is captured from a headless xterm terminal that filters out TUI chrome (logo, status bar, prompts, box-drawing characters) and shows only Claude's actual work output.
-
-### Web Terminal
-
-<p align="center">
-  <img src="gif/web_terminal.gif" alt="Web terminal live output" width="600">
-</p>
-
-Each session exposes a web terminal at `http://<WEB_EXTERNAL_HOST>:<port>`.
-
-- **Read-only link** — shown on the streaming card in the group thread
-- **Write-enabled link** — sent via DM on demand (click "🔑 Get Write Link" on the card)
-
-Features: xterm.js with fit/unicode11/web-links addons, TokyoNight theme, scrollback buffer. On mobile/tablet, a floating shortcut toolbar provides Esc, Ctrl+C, Tab, arrow keys and other control keys missing from virtual keyboards, with automatic keyboard avoidance.
-
-### Tmux Persistent Sessions
-
-<p align="center">
-  <img src="gif/tmux.gif" alt="botmux list — interactive tmux session management" width="600">
-</p>
-
-When tmux is installed, botmux automatically uses the tmux backend. CLI processes run inside tmux sessions while the daemon attaches via node-pty to capture output — streaming cards, idle detection, and web terminal all work unchanged.
-
-**Key benefit: daemon restarts don't interrupt the CLI.** During `botmux restart`, the worker process exits but the tmux session (and the CLI inside it) keeps running. The next incoming message triggers a re-attach — no `--resume` context reload needed.
-
-```bash
-# Recommended: interactive session picker — select and attach to tmux
-npx botmux list
-
-# Or manually attach (session name = bmx-<first 8 chars of session ID>)
-tmux attach -t bmx-<first-8-chars-of-session-id>
-# Ctrl+B, D to detach — CLI keeps running
-
-# Force pure pty mode (disable tmux)
-BACKEND_TYPE=pty botmux start
-```
-
-`botmux list` provides an interactive TUI showing all active sessions with ID, title, working directory, PID, uptime, and status. Use arrow keys to select and Enter to attach. Use `botmux list --plain` for plain-text table output suitable for scripting.
-
-**Session naming:** `bmx-<first 8 chars of session UUID>`
-
-**Lifecycle:**
-
-| Event | tmux session | CLI process |
-|-------|-------------|-------------|
-| `botmux restart` | Survives | Survives (re-attaches on next message) |
-| `/close` or close button | Destroyed | Terminated (SIGHUP) |
-| CLI exits / crashes | Closes with it | Already exited (auto-restart creates new session) |
+---
 
 ## Contributing
 
