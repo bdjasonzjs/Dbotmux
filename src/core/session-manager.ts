@@ -152,11 +152,7 @@ export function buildNewTopicPrompt(
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
   const hints = adapter.systemHints;
 
-  const noteLines = [
-    '- 回复使用 send_to_thread（重要结论、方案确认、最终结果）',
-    '- 对于代码修改任务，先通过 send_to_thread 发送执行方案给用户确认后再执行',
-    ...hints.map(h => `- ${h}`),
-  ];
+  const noteLines = hints.map(h => `- ${h}`);
 
   // Mention metadata section
   let mentionSection = '';
@@ -178,17 +174,15 @@ export function buildNewTopicPrompt(
     botSection = `\n\n当前群聊中的其他机器人：\n${botLines.join('\n')}\n可通过 send_to_thread 的 mentions 参数 @mention 它们协作，也可用 list_bots 工具查询。`;
   }
 
-  return `你已连接到飞书话题，用户发送了：
----
-${userMessage}${formatAttachmentsHint(attachments)}
----
+  const parts = [
+    `用户发送了：\n---\n${userMessage}${formatAttachmentsHint(attachments)}\n---`,
+    `Session ID: ${sessionId}`,
+  ];
+  if (noteLines.length > 0) parts.push(noteLines.join('\n'));
+  if (mentionSection) parts.push(mentionSection.trim());
+  if (botSection) parts.push(botSection.trim());
 
-Session ID: ${sessionId}
-
-请处理用户的请求，通过 send_to_thread 回复用户（session_id: "${sessionId}"）。
-
-注意：
-${noteLines.join('\n')}${mentionSection}${botSection}`;
+  return parts.join('\n\n');
 }
 
 // ─── Session restore ─────────────────────────────────────────────────────────

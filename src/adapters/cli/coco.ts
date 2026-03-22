@@ -2,6 +2,10 @@ import { execSync } from 'node:child_process';
 import { resolveCommand } from './registry.js';
 import type { CliAdapter, PtyHandle, McpServerEntry } from './types.js';
 
+function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 export function createCocoAdapter(pathOverride?: string): CliAdapter {
   const bin = resolveCommand(pathOverride ?? 'coco');
   return {
@@ -21,7 +25,11 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
     },
 
     async writeInput(pty: PtyHandle, content: string) {
-      pty.write(content + '\r');
+      // CoCo is a Claude Code fork but may not enable bracketed paste mode.
+      // Use split-write + delay like Codex/Gemini/OpenCode.
+      pty.write(content);
+      await delay(200);
+      pty.write('\r');
     },
 
     ensureMcpConfig(entry: McpServerEntry) {

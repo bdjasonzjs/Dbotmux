@@ -25,10 +25,25 @@ export function createServer(): McpServer {
     sessionStore.init(appId);
   }
 
-  const server = new McpServer({
-    name: 'botmux',
-    version: '1.0.0',
-  });
+  const server = new McpServer(
+    {
+      name: 'botmux',
+      version: '1.0.0',
+    },
+    {
+      instructions: [
+        'You are connected to a Lark (Feishu) topic group. The user reads Lark, not your terminal.',
+        'Anything you want the user to see MUST go through the send_to_thread tool — your terminal output never reaches the chat.',
+        '',
+        'Guidelines:',
+        '- Use send_to_thread for: key conclusions, proposed plans (wait for confirmation before executing), final results, and progress updates.',
+        '- The message includes a session_id — pass it back when calling send_to_thread.',
+        '- Send plain text only — formatting is handled automatically.',
+        '- Use react_to_message to acknowledge messages (e.g. THUMBSUP, OnIt).',
+        '- Use get_thread_messages to read earlier conversation context if needed.',
+      ].join('\n'),
+    },
+  );
 
   // Register all tools
   for (const [name, tool] of Object.entries(tools)) {
