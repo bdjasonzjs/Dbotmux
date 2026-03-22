@@ -25,13 +25,9 @@
 
 ## 演示
 
-| 飞书流式卡片 | Web 终端 | tmux 会话管理 |
-|:-:|:-:|:-:|
-| <img src="gif/fold&unfold.gif" width="280" /> | <img src="gif/web_terminal.gif" width="280" /> | <img src="gif/tmux.gif" width="280" /> |
-
-| 多机器人协作（赛博斗蛐蛐） |
-|:-:|
-| <img src="docs/setup/multi-bot-collab.png" width="600" /> |
+| 飞书流式卡片 | Web 终端 | tmux 会话管理 | 多机器人协作 |
+|:-:|:-:|:-:|:-:|
+| <img src="gif/fold&unfold.gif" width="220" /> | <img src="gif/web_terminal.gif" width="220" /> | <img src="gif/tmux.gif" width="220" /> | <img src="docs/setup/multi-bot-collab.png" width="220" /> |
 
 <details>
 <summary>完整演示视频</summary>

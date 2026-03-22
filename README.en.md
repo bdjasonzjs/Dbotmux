@@ -23,13 +23,9 @@
 
 **Plug any AI coding CLI into Lark (Feishu) topic groups — one thread per session, streaming cards, web terminal, zero glue code.**
 
-| Lark Streaming Cards | Web Terminal | tmux Session Management |
-|:-:|:-:|:-:|
-| <img src="gif/fold&unfold.gif" width="280" /> | <img src="gif/web_terminal.gif" width="280" /> | <img src="gif/tmux.gif" width="280" /> |
-
-| Multi-Bot Collaboration |
-|:-:|
-| <img src="docs/setup/multi-bot-collab.png" width="600" /> |
+| Lark Streaming Cards | Web Terminal | tmux Session Management | Multi-Bot Collaboration |
+|:-:|:-:|:-:|:-:|
+| <img src="gif/fold&unfold.gif" width="220" /> | <img src="gif/web_terminal.gif" width="220" /> | <img src="gif/tmux.gif" width="220" /> | <img src="docs/setup/multi-bot-collab.png" width="220" /> |
 
 <details>
 <summary>Full demo video</summary>
