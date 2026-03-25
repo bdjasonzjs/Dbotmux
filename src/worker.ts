@@ -119,8 +119,12 @@ function markPromptReady(): void {
     renderer?.markNewTurn();  // exclude history replay from streaming card
   }
   send({ type: 'prompt_ready' });
-  // Send immediate idle snapshot so Lark card reflects idle status
-  if (renderer) {
+  // Send immediate idle snapshot so Lark card reflects idle status.
+  // BUT: skip when messages are pending — flushPending() will immediately
+  // make the CLI busy, so the idle state is transient and shouldn't appear
+  // in the card.  This avoids a false "就绪" flash on daemon restart
+  // (where the initial prompt is queued before the CLI becomes idle).
+  if (renderer && pendingMessages.length === 0) {
     const { content } = renderer.snapshot();
     send({ type: 'screen_update', content, status: 'idle' });
   }
