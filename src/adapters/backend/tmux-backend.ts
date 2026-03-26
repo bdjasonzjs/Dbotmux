@@ -110,20 +110,27 @@ export class TmuxBackend implements SessionBackend {
         cwd: opts.cwd,
         env: opts.env,
       });
-
-      // Configure tmux session for web terminal use:
-      //  - status off: avoid cursor-positioning noise in xterm.js
-      //  - mouse on: let tmux handle scroll wheel → copy mode for scrollback
-      //  - history-limit: large scrollback buffer (tmux default is 2000)
-      setTimeout(() => {
-        try {
-          const t = shellescape(this.sessionName);
-          execSync(`tmux set-option -t ${t} status off`, { stdio: 'ignore' });
-          execSync(`tmux set-option -t ${t} mouse on`, { stdio: 'ignore' });
-          execSync(`tmux set-option -t ${t} history-limit 50000`, { stdio: 'ignore' });
-        } catch { /* session may not be ready yet — benign */ }
-      }, 500);
     }
+
+    // Configure tmux session options.
+    // Runs for BOTH new sessions and reattach — reattach needs this to
+    // backfill options added after the session was originally created.
+    // Setting an already-applied option is idempotent.
+    setTimeout(() => {
+      try {
+        const t = shellescape(this.sessionName);
+        execSync(`tmux set-option -t ${t} status off`, { stdio: 'ignore' });
+        execSync(`tmux set-option -t ${t} mouse on`, { stdio: 'ignore' });
+        execSync(`tmux set-option -t ${t} history-limit 50000`, { stdio: 'ignore' });
+        // Prevent web terminal clients (smaller viewport) from shrinking the
+        // tmux window.  The backend PTY is intentionally wide (300 cols) so
+        // TUI overlays stay outside the snapshot area.  If a web client at
+        // 80×24 causes tmux to resize the window down, reflowed content shifts
+        // buffer positions and the terminal renderer's baseline tracking breaks
+        // — historical output leaks into the streaming card.
+        execSync(`tmux set-option -t ${t} window-size largest`, { stdio: 'ignore' });
+      } catch { /* session may not be ready yet — benign */ }
+    }, 500);
   }
 
   /** Whether the last spawn() re-attached to an existing tmux session. */

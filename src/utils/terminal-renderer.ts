@@ -88,6 +88,20 @@ export class TerminalRenderer {
   private turnBaselineY = 0;
   /** Best content seen this turn — prevents TUI redraws from wiping output. */
   private peakContent = '';
+  /** Whether peakContent was set from Strategy 2 (viewport fallback) rather than
+   *  Strategy 1 (baseline).  When Strategy 1 first returns content, it unconditionally
+   *  replaces a fallback peak — even if shorter — because the fallback may include
+   *  stale content from the previous turn's viewport. */
+  private peakFromFallback = false;
+  /**
+   * When true, the baseline has not yet been established for this turn.
+   * Snapshots return empty until the first write() arrives after markNewTurn(),
+   * which sets the baseline at the exact cursor position before new data flows in.
+   * This prevents old terminal content from leaking into the new turn's card —
+   * regardless of whether the terminal buffer state is accurate (e.g. after
+   * tmux re-attach where the buffer may not match expectations).
+   */
+  private baselineDeferred = true;
 
   constructor(cols: number, rows: number) {
     this.terminal = new Terminal({ cols, rows, allowProposedApi: true });
@@ -95,36 +109,26 @@ export class TerminalRenderer {
 
   /** Feed raw PTY data into the virtual terminal. */
   write(data: string): void {
+    if (this.baselineDeferred) {
+      // Set baseline at the cursor position RIGHT BEFORE new data arrives.
+      // This is the exact boundary between old content and new-turn content.
+      const buffer = this.terminal.buffer.active;
+      this.turnBaselineY = buffer.baseY + buffer.cursorY;
+      this.baselineDeferred = false;
+    }
     this.terminal.write(data);
   }
 
   /**
    * Mark the start of a new conversation turn.
-   * Subsequent snapshots will only include content from after this point.
+   * Subsequent snapshots will return empty until new PTY data arrives,
+   * at which point the baseline is set at the cursor position.
    */
   markNewTurn(): void {
-    const buffer = this.terminal.buffer.active;
-    const baseY = buffer.baseY;
-    const rows = this.terminal.rows;
-    const cursorAbsY = baseY + buffer.cursorY;
-
-    // Find the last non-empty line in the current viewport
-    let lastContentY = baseY;
-    for (let y = rows - 1; y >= 0; y--) {
-      const line = buffer.getLine(baseY + y);
-      if (line && line.translateToString(true).trimEnd()) {
-        lastContentY = baseY + y + 1;
-        break;
-      }
-    }
-
-    // Cap at cursor position — TUI renderers (Ink) place the status bar below
-    // the cursor. Without this cap, the status bar inflates lastContentY past
-    // the actual content boundary, causing Strategy 1 to start reading too late
-    // and miss content that Ink renders above the cursor on the next turn.
-    this.turnBaselineY = Math.min(lastContentY, cursorAbsY + 1);
     this.peakContent = '';
+    this.peakFromFallback = false;
     this.lastHash = '';
+    this.baselineDeferred = true;
   }
 
   /**
@@ -138,11 +142,21 @@ export class TerminalRenderer {
    *      redraws to idle (empty screen), return the saved peak instead.
    */
   snapshot(): { content: string; changed: boolean } {
+    // Baseline not yet established — no new data since markNewTurn().
+    // Return empty to avoid capturing old content.
+    if (this.baselineDeferred) {
+      const hash = createHash('md5').update('').digest('hex');
+      const changed = hash !== this.lastHash;
+      this.lastHash = hash;
+      return { content: '', changed };
+    }
+
     const buffer = this.terminal.buffer.active;
     const baseY = buffer.baseY;
 
     // Strategy 1: baseline read with Phase 1 marker gating (CLI-style output)
     let content = this.extractContent(this.turnBaselineY, false);
+    const fromBaseline = !!content;
 
     // Strategy 2: full viewport without Phase 1 (TUI-style — content anywhere on screen)
     if (!content) {
@@ -151,14 +165,29 @@ export class TerminalRenderer {
 
     // Peak retention — TUI redraws can wipe response from the terminal buffer.
     // Save non-empty content; return saved peak when current screen is empty.
-    // Only update peak when new content is at least as long — prevents Strategy 1's
-    // partial captures (starting from turnBaselineY) from overwriting a more complete
-    // peak that Strategy 2 captured from the full viewport earlier in the turn.
+    //
+    // Strategy-aware: Strategy 2 can read the full viewport which may include
+    // content from the previous turn (before turnBaselineY).  If Strategy 1 later
+    // returns shorter but *correct* content, it must replace the contaminated peak.
     if (content) {
-      if (content.length >= this.peakContent.length) {
+      if (fromBaseline) {
+        // Strategy 1 (authoritative): always use the latest snapshot.
+        // CLI output uses cursor repositioning for temporary content (thinking
+        // animations, spinners) that gets overwritten by shorter final output.
+        // Length-based retention would preserve stale temporary content.
         this.peakContent = content;
+        this.peakFromFallback = false;
       } else {
-        content = this.peakContent;
+        // Strategy 2 (fallback): only grow peak if no baseline peak exists yet.
+        if (!this.peakFromFallback && this.peakContent) {
+          // Baseline peak already set — don't let fallback override it.
+          content = this.peakContent;
+        } else if (content.length >= this.peakContent.length) {
+          this.peakContent = content;
+          this.peakFromFallback = true;
+        } else {
+          content = this.peakContent;
+        }
       }
     } else {
       content = this.peakContent;

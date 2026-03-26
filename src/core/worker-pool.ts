@@ -71,18 +71,23 @@ export const CARD_POSTING_SENTINEL = '__posting__';
  */
 export function scheduleCardPatch(ds: DaemonSession, cardJson: string): void {
   ds.pendingCardJson = cardJson;
+  // Capture the card ID now — by the time flushCardPatch runs, ds.streamCardId
+  // may have been overwritten by a new turn's card (CARD_POSTING_SENTINEL).
+  ds.pendingCardId = ds.streamCardId;
   if (ds.cardPatchInFlight) return;
   flushCardPatch(ds);
 }
 
 function flushCardPatch(ds: DaemonSession): void {
   const json = ds.pendingCardJson;
-  const cardId = ds.streamCardId;
+  const cardId = ds.pendingCardId;
   if (!json || !cardId || cardId === CARD_POSTING_SENTINEL) {
     ds.pendingCardJson = undefined;
+    ds.pendingCardId = undefined;
     return;
   }
   ds.pendingCardJson = undefined;
+  ds.pendingCardId = undefined;
   ds.cardPatchInFlight = true;
   updateMessage(ds.larkAppId, cardId, json)
     .catch(err => {

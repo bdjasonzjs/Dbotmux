@@ -35,9 +35,12 @@ export class IdleDetector {
     const stripped = this.stripAnsi(data);
     this.outputTail = (this.outputTail + stripped).slice(-500);
 
-    // Track when the CLI's input prompt appears
+    // Track when the CLI's input prompt appears.
+    // Check the current chunk too — on a wide PTY (300 cols), a single chunk
+    // can contain the prompt AND a full status-bar redraw (hundreds of chars),
+    // pushing the prompt out of the 500-char outputTail before the check runs.
     if (this.readyPattern && !this.readySeen) {
-      if (this.readyPattern.test(this.outputTail)) {
+      if (this.readyPattern.test(stripped) || this.readyPattern.test(this.outputTail)) {
         this.readySeen = true;
       }
     }

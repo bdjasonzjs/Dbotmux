@@ -218,9 +218,10 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     }
   }
 
-  // On tmux re-attach, CLI is already running — don't suppress first prompt
+  // On tmux re-attach, keep awaitingFirstPrompt = true so screen updates are
+  // suppressed until the idle detector fires markNewTurn() — this prevents the
+  // full tmux scrollback history from leaking into the streaming card.
   if (tmuxBe?.isReattach) {
-    awaitingFirstPrompt = false;
     log('Re-attached to existing tmux session');
   }
 
@@ -238,6 +239,18 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     isPromptReady = false;
     send({ type: 'claude_exit', code, signal });
   });
+
+  // Fallback: if the CLI takes too long to show its prompt (e.g. slow MCP
+  // server init), unblock screen updates so the card doesn't stay at "启动中"
+  // forever.  markNewTurn() sets a clean baseline at the current cursor
+  // position so only content written *after* this point appears in the card.
+  setTimeout(() => {
+    if (awaitingFirstPrompt) {
+      awaitingFirstPrompt = false;
+      renderer?.markNewTurn();
+      log('First prompt timeout — enabling screen updates');
+    }
+  }, 15_000);
 }
 
 function killCli(): void {
