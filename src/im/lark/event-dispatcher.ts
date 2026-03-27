@@ -284,11 +284,13 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
             return;
           }
         } else if (chatType === 'group' && rootId) {
-          // Group thread replies: allow if bot owns the session (no @mention needed),
-          // otherwise require @mention to address a specific bot.
+          // Group thread replies: allow without @mention only when the bot owns the
+          // session AND is the sole bot in the chat. With multiple bots, always require
+          // @mention to disambiguate — even for session owners.
           const ownsSession = handlers.isSessionOwner?.(rootId, larkAppId) ?? false;
-          if (ownsSession && isAllowed) {
-            // Bot owns this thread + sender is in allowlist → process without @mention
+          const botCount = ownsSession ? await getGroupBotCount(larkAppId, chatId) : 0;
+          if (ownsSession && isAllowed && botCount <= 1) {
+            // Sole bot in chat + owns session → process without @mention
           } else {
             const access = await checkGroupMessageAccess(larkAppId, message, chatId, senderOpenId);
             if (access === 'not_allowed') {

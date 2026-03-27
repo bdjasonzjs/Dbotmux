@@ -35,9 +35,10 @@ vi.mock('../src/bot-registry.js', () => ({
   getAllBots: () => mockGetAllBots(),
 }));
 
+const mockListChatBotMembers = vi.fn(async () => [] as Array<{ openId: string; name: string }>);
 vi.mock('../src/im/lark/client.js', () => ({
   getChatInfo: vi.fn(async () => ({ userCount: 1 })),
-  listChatBotMembers: vi.fn(async () => []),
+  listChatBotMembers: (...args: any[]) => mockListChatBotMembers(...args),
   replyMessage: vi.fn(async () => 'msg-id'),
 }));
 
@@ -298,19 +299,61 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
   });
 
-  it('does not interfere with normal user messages', async () => {
+  it('does not interfere with normal user messages (sole bot)', async () => {
     const event = makeUserMessageEvent({
       senderOpenId: USER_OPEN_ID,
       content: JSON.stringify({ text: 'hello' }),
       rootId: 'root-thread-6',
       chatType: 'group',
     });
-    // User message in a thread where bot owns session
+    // User message in a thread where bot owns session, sole bot in chat
     handlers.isSessionOwner.mockReturnValue(true);
+    mockListChatBotMembers.mockResolvedValue([{ openId: MY_OPEN_ID, name: 'BotA' }]);
 
     await capturedHandlers['im.message.receive_v1'](event);
 
     expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, 'root-thread-6', MY_APP_ID);
+  });
+
+  it('requires @mention in multi-bot thread even if bot owns session', async () => {
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'hello everyone' }),
+      rootId: 'root-thread-7',
+      chatId: 'chat-multi-1',  // unique chatId to avoid botCount cache
+      chatType: 'group',
+    });
+    // Bot owns session but there are multiple bots in the chat
+    handlers.isSessionOwner.mockReturnValue(true);
+    mockListChatBotMembers.mockResolvedValue([
+      { openId: MY_OPEN_ID, name: 'BotA' },
+      { openId: OTHER_BOT_OPEN_ID, name: 'BotB' },
+    ]);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+
+    // No @mention → should NOT be routed
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('processes @mentioned message in multi-bot thread', async () => {
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA do this' }),
+      rootId: 'root-thread-8',
+      chatId: 'chat-multi-2',  // unique chatId to avoid botCount cache
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    handlers.isSessionOwner.mockReturnValue(true);
+    mockListChatBotMembers.mockResolvedValue([
+      { openId: MY_OPEN_ID, name: 'BotA' },
+      { openId: OTHER_BOT_OPEN_ID, name: 'BotB' },
+    ]);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, 'root-thread-8', MY_APP_ID);
   });
 });
 
