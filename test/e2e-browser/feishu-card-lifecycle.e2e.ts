@@ -1,11 +1,11 @@
 /**
  * Card lifecycle test (consolidated single test):
- *  1. Card status transitions: 启动中… / 工作中 → 就绪
- *  2. Expand / collapse toggle
- *  3. Card content has no abnormal characters or CLI artifacts
+ *  1. Card status: 启动中… / 工作中 → 就绪
+ *  2. Toggle button exists
+ *  3. Expanded content has no abnormal characters
  *
- * Uses a single test to avoid inter-test state issues with Feishu's
- * threaded chat (old threads can confuse the AI).
+ * All assertions reference the specific test message to avoid
+ * confusion with old test threads in the chat.
  */
 import { describe, it, beforeAll, afterAll } from 'vitest';
 import type { Browser, Page, BrowserContext } from 'playwright';
@@ -56,35 +56,35 @@ describe('feishu card lifecycle', () => {
     await sendMessage(agent, msg);
 
     // --- Step 1: Streaming card appears ---
-    // The streaming card has a colored header like "🖥️ xxx — 工作中"
-    await waitForStreamingCard(agent, { timeoutMs: 90_000 });
+    await waitForStreamingCard(agent, { timeoutMs: 90_000, msgHint: msg });
 
-    // --- Step 2: Verify toggle button exists ---
-    // Streaming card updates every ~2s, so just verify the toggle button is present.
-    // Don't attempt multi-step toggle (collapse then re-expand) — races with updates.
+    // --- Step 2: Verify toggle button exists on this card ---
     await agent.aiAssert(
-      '流式卡片中可以看到"📕 收起输出"或"📖 展开输出"按钮',
+      `在"${msg}"话题中的流式卡片（标题含"🖥️"）里，` +
+        '可以看到"📕 收起输出"或"📖 展开输出"按钮',
     );
 
-    // --- Step 3: Check card content (ensure expanded first) ---
+    // --- Step 3: Ensure expanded and check content ---
     const needExpand = await agent.aiBoolean(
-      '流式卡片中有"📖 展开输出"按钮（说明输出是收起的）',
+      `"${msg}"话题中的流式卡片里有"📖 展开输出"按钮（说明当前是收起的）`,
     );
     if (needExpand) {
-      await agent.aiAct('点击流式卡片中的"📖 展开输出"按钮');
+      await agent.aiAct(
+        `点击"${msg}"话题中流式卡片里的"📖 展开输出"按钮`,
+      );
       await page.waitForTimeout(2000);
     }
 
     await agent.aiAssert(
-      '流式卡片展开的输出内容是可读的正常文本，' +
+      `"${msg}"话题中流式卡片展开的输出内容是可读的正常文本，` +
         '不包含类似 [32m 或 [0m 的 ANSI 转义序列，' +
         '不包含乱码或不可读字符',
     );
 
     // --- Step 4: Wait for idle status ---
     await agent.aiWaitFor(
-      '聊天中有一个流式卡片，其彩色标题栏中包含"就绪"字样（标题格式类似"🖥️ xxx — 就绪"）',
+      `"${msg}"话题中的流式卡片标题中包含"就绪"（格式类似"🖥️ ${msg} — 就绪"）`,
       { timeoutMs: 120_000, checkIntervalMs: 5_000 },
     );
-  }, 300_000); // 5 min total — generous timeout for CLI startup
+  }, 300_000);
 });

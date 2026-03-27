@@ -219,16 +219,23 @@ export async function waitForCardStatus(
  *  1. Wait for any bot card to appear (repo selection OR streaming card)
  *  2. If repo selection card, skip it
  *  3. Confirm streaming card is present
+ *
+ * @param msgHint - The test message text used to identify the correct thread
+ *   among multiple threads in the chat. When provided, the AI will look for
+ *   a card specifically associated with this message.
  */
 export async function waitForStreamingCard(
   agent: PlaywrightAgent,
-  opts?: { timeoutMs?: number },
+  opts?: { timeoutMs?: number; msgHint?: string },
 ): Promise<void> {
   const timeoutMs = opts?.timeoutMs ?? 60_000;
+  const msgRef = opts?.msgHint
+    ? `（与消息"${opts.msgHint}"关联的话题中的）`
+    : '';
 
   // Wait for any bot card response
   await agent.aiWaitFor(
-    '页面上出现了来自机器人的新卡片（可能是"项目仓库管理"卡片，也可能是标题包含"启动中"或"工作中"或"就绪"的流式卡片）',
+    `页面上出现了${msgRef}来自机器人的新卡片（可能是"项目仓库管理"卡片，也可能是标题中包含"启动中"或"工作中"或"就绪"的流式卡片）`,
     { timeoutMs, checkIntervalMs: 3_000 },
   );
 
@@ -240,7 +247,7 @@ export async function waitForStreamingCard(
     await agent.aiAct('点击"▶️ 直接开启会话"按钮');
     // Now wait for the actual streaming card
     await agent.aiWaitFor(
-      '页面上出现了标题包含"启动中"或"工作中"或"就绪"的流式卡片',
+      `页面上出现了${msgRef}标题中包含"启动中"或"工作中"或"就绪"的流式卡片（标题格式类似"🖥️ ... — 状态"）`,
       { timeoutMs, checkIntervalMs: 3_000 },
     );
   }
