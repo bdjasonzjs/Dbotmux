@@ -216,41 +216,57 @@ export async function waitForCardStatus(
 
 /**
  * Full flow after sending a message:
- *  1. Wait for any bot card to appear (repo selection OR streaming card)
- *  2. If repo selection card, skip it
- *  3. Confirm streaming card is present
+ *  1. Wait for bot to respond (any reply in the thread)
+ *  2. Click into the thread to see full card content
+ *  3. Handle repo selection card if present ("直接开启会话")
+ *  4. Wait for streaming card to appear
  *
- * @param msgHint - The test message text used to identify the correct thread
- *   among multiple threads in the chat. When provided, the AI will look for
- *   a card specifically associated with this message.
+ * IMPORTANT: In Feishu's main chat view, thread previews are collapsed.
+ * Card buttons (like "直接开启会话") are only visible when you open
+ * the thread panel. This function handles that navigation.
+ *
+ * @param msgHint - The test message text, used to click into the correct thread
  */
 export async function waitForStreamingCard(
   agent: PlaywrightAgent,
   opts?: { timeoutMs?: number; msgHint?: string },
 ): Promise<void> {
   const timeoutMs = opts?.timeoutMs ?? 60_000;
-  const msgRef = opts?.msgHint
-    ? `（与消息"${opts.msgHint}"关联的话题中的）`
-    : '';
+  const msgText = opts?.msgHint ?? '';
 
-  // Wait for any bot card response
+  // Step 1: Wait for bot to respond to our message
   await agent.aiWaitFor(
-    `页面上出现了${msgRef}来自机器人的新卡片`,
+    msgText
+      ? `聊天中"${msgText}"消息下方出现了机器人的回复`
+      : '聊天中出现了机器人的新回复',
     { timeoutMs, checkIntervalMs: 3_000 },
   );
 
-  // Handle repo selection card if present
+  // Step 2: Click into the thread to see full card content
+  if (msgText) {
+    await agent.aiAct(
+      `点击聊天中"${msgText}"消息区域或其"回复话题"链接，打开话题详情`,
+    );
+  } else {
+    await agent.aiAct('点击最新消息的"回复话题"链接，打开话题详情');
+  }
+  await agent.aiWaitFor('右侧出现了话题详情面板', {
+    timeoutMs: 15_000,
+    checkIntervalMs: 3_000,
+  });
+
+  // Step 3: Handle repo selection card if present
   const hasSkipButton = await agent.aiBoolean(
-    '页面上可以看到"直接开启会话"按钮',
+    '话题面板中可以看到"直接开启会话"按钮',
   );
   if (hasSkipButton) {
-    await agent.aiAct('点击"▶️ 直接开启会话"按钮');
+    await agent.aiAct('点击话题面板中的"▶️ 直接开启会话"按钮');
   }
 
-  // Always verify the streaming card is present (regardless of repo card)
+  // Step 4: Wait for streaming card
   await agent.aiWaitFor(
-    `页面上出现了${msgRef}标题中包含"启动中"或"工作中"或"就绪"的流式卡片（标题格式类似"🖥️ ... — 状态"）`,
-    { timeoutMs, checkIntervalMs: 3_000 },
+    '话题面板中出现了标题包含"启动中"或"工作中"或"就绪"的流式卡片',
+    { timeoutMs, checkIntervalMs: 5_000 },
   );
 }
 

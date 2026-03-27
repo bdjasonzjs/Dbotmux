@@ -43,7 +43,7 @@ describe('feishu card lifecycle', () => {
 
     await navigateToMessenger(page);
     await openChat(agent, 'Claude');
-  }, 60_000);
+  }, 90_000);
 
   afterAll(async () => {
     await agent?.destroy();
@@ -55,22 +55,10 @@ describe('feishu card lifecycle', () => {
     const msg = testMessage('card');
     await sendMessage(agent, msg);
 
-    // Wait for bot to respond (handle repo selection if needed)
+    // Wait for bot to respond, open thread panel, handle repo selection
     await waitForStreamingCard(agent, { timeoutMs: 90_000, msgHint: msg });
 
-    // Click into the thread to isolate from other test threads
-    await agent.aiAct(
-      `点击聊天中包含"${msg}"的消息或话题，打开话题详情面板`,
-    );
-    await page.waitForTimeout(3000);
-
-    // --- Step 1: Verify streaming card with status exists in thread ---
-    await agent.aiWaitFor(
-      '当前话题面板中有标题包含"启动中"或"工作中"或"就绪"的流式卡片',
-      { timeoutMs: 30_000, checkIntervalMs: 3_000 },
-    );
-
-    // --- Step 2: Verify toggle button exists ---
+    // --- Step 1: Verify toggle button exists ---
     await agent.aiAssert(
       '话题面板中的流式卡片里有"📕 收起输出"或"📖 展开输出"按钮',
     );
