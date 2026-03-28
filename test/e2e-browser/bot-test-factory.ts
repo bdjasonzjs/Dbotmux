@@ -57,7 +57,7 @@ export function createBotTest(botName: BotName): void {
     it(`sends hello and receives reply from ${botName}`, async () => {
       // Navigate to bot's private chat
       await navigateToMessenger(page);
-      await openChat(agent, botName);
+      await openChat(page, agent, botName);
 
       const msg = testMessage(botName.toLowerCase());
       await sendMessage(agent, msg);

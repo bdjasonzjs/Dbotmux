@@ -43,8 +43,8 @@ describe('feishu group @mention routing', () => {
 
     // Navigate to group chat once
     await navigateToMessenger(page);
-    await openChat(agent, getGroupChatName());
-  }, 90_000);
+    await openChat(page, agent, getGroupChatName());
+  }, 120_000);
 
   afterAll(async () => {
     await agent?.destroy();

@@ -129,9 +129,10 @@ export async function navigateToMessenger(page: Page): Promise<void> {
 /**
  * Open a specific chat by clicking its entry in the left sidebar.
  * Works for both bot private chats ("Claude") and group chats.
- * Scrolls the sidebar if the chat is not immediately visible.
+ * Falls back to Feishu search (Ctrl+K) if not visible in sidebar.
  */
 export async function openChat(
+  page: Page,
   agent: PlaywrightAgent,
   chatName: string,
 ): Promise<void> {
@@ -141,10 +142,13 @@ export async function openChat(
       `在左侧聊天列表中，点击名称包含"${chatName}"的对话`,
     );
   } catch {
-    // Chat not visible — scroll sidebar down and retry
-    await agent.aiScroll('左侧聊天列表', { direction: 'down', scrollCount: 5 });
+    // Chat not visible in sidebar — use search to find it
+    await page.keyboard.press('Control+k');
+    await page.waitForTimeout(1000);
+    await page.keyboard.type(chatName);
+    await page.waitForTimeout(2000);
     await agent.aiAct(
-      `在左侧聊天列表中，点击名称包含"${chatName}"的对话`,
+      `在搜索结果中，点击名称包含"${chatName}"的对话`,
     );
   }
   // Wait for chat to load

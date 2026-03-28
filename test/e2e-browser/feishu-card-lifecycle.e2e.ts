@@ -42,7 +42,7 @@ describe('feishu card lifecycle', () => {
     agent = createAgent(page);
 
     await navigateToMessenger(page);
-    await openChat(agent, 'Claude');
+    await openChat(page, agent, 'Claude');
   }, 90_000);
 
   afterAll(async () => {

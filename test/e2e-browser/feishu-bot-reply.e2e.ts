@@ -47,7 +47,7 @@ describe('feishu bot reply (smoke test)', () => {
     const msg = testMessage();
 
     await navigateToMessenger(page);
-    await openChat(agent, 'Claude');
+    await openChat(page, agent, 'Claude');
     await sendMessage(agent, msg);
     await waitForStreamingCard(agent);
     await agent.aiAssert('聊天中有来自机器人的回复消息');
