@@ -1,13 +1,14 @@
 /**
  * Shared factory for per-bot E2E tests.
- * Each bot gets its own test file (for parallel execution) that calls this factory.
+ * Each bot gets its own test file (for parallel execution).
  *
  * Test flow per bot:
  *  1. Navigate to messenger → click bot's private chat
  *  2. Send "hello" → bot creates topic and replies
- *  3. Verify card appears with status
- *  4. Verify bot sends a text reply
- *  5. Wait for card to reach "就绪" status
+ *  3. Verify streaming card appears
+ *  4. Wait for card to reach "就绪"
+ *  5. Verify bot sent an actual reply message (with @mention to user)
+ *  6. Close session and verify "会话已关闭"
  */
 import { describe, it, beforeAll, afterAll } from 'vitest';
 import type { Browser, Page, BrowserContext } from 'playwright';
@@ -55,36 +56,33 @@ export function createBotTest(botName: BotName): void {
       await browser?.close();
     }, 60_000);
 
-    it(`sends hello and receives reply from ${botName}`, async () => {
-      // Navigate to bot's private chat
+    it(`sends hello, receives streaming card and actual reply from ${botName}`, async () => {
       await navigateToMessenger(page);
       await openChat(page, agent, botName);
 
       const msg = testMessage(botName.toLowerCase());
       await sendMessage(agent, msg);
 
-      // Handle repo selection if it appears, then wait for streaming card
-      await waitForStreamingCard(agent, {
-        timeoutMs: 90_000,
-        msgHint: msg,
-      });
+      // Wait for streaming card in thread panel
+      await waitForStreamingCard(agent, { timeoutMs: 90_000, msgHint: msg });
 
-      // Verify the bot actually replied (not just repo/status messages).
-      // The real reply is a message with @mention to the user, appearing
-      // after the streaming card — NOT the "工作目录" or repo selection text.
-      await scrollThreadToBottom(agent);
-      await agent.aiAssert(
-        `话题面板底部有来自 ${botName} 的流式卡片（标题含"启动中"或"工作中"或"就绪"）`,
-      );
-    }, 240_000);
-
-    it(`card reaches idle status for ${botName}`, async () => {
-      // Continues from the thread panel opened by previous test
+      // Wait for card to reach idle — means CLI finished processing
       await scrollThreadToBottom(agent);
       await agent.aiWaitFor(
         '话题面板底部的流式卡片标题包含"就绪"',
         { timeoutMs: 120_000, checkIntervalMs: 5_000 },
       );
-    }, 180_000);
+
+      // KEY: Verify bot sent an ACTUAL reply message, not just status.
+      // A real reply is a text message from the bot containing @用户,
+      // visible below or near the streaming card. It must NOT be just
+      // "继续使用当前仓库" or "项目仓库管理" — those are setup messages.
+      await scrollThreadToBottom(agent);
+      await agent.aiAssert(
+        `话题面板中有来自 ${botName} 的文本回复消息（包含"@"某用户的内容），` +
+          '这条消息不是"继续使用当前仓库"或"项目仓库管理"等状态消息，' +
+          '而是机器人对用户问题的实际回答',
+      );
+    }, 300_000);
   });
 }
