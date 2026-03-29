@@ -1,12 +1,12 @@
 /**
  * Group chat topic/thread creation test:
  *
- * Verifies that bots reply using TOPIC REPLIES (话题回复) in regular group chats.
+ * 1. Verifies bot uses TOPIC REPLIES (话题回复) in regular group chats
+ * 2. Verifies only the @mentioned bot responds (not all bots)
  *
- * Feishu UI indicators:
- *  - "查看更早 N 条话题回复" or "N 条话题回复" → topic mode (reply_in_thread=true)
+ * Feishu UI indicators for topic mode:
+ *  - "查看更早 N 条话题回复" or "N 条话题回复" → topic mode
  *  - "N 条回复" (without "话题") → regular inline reply mode
- *  - "回复话题" → thread reply input (present in both modes, not a reliable indicator)
  */
 import { describe, it, beforeAll, afterAll } from 'vitest';
 import type { Browser, Page, BrowserContext } from 'playwright';
@@ -62,16 +62,34 @@ describe('group chat topic reply mode', () => {
       { timeoutMs: 90_000, checkIntervalMs: 5_000 },
     );
 
-    // Wait a few seconds for thread indicator to appear
     await page.waitForTimeout(5000);
 
-    // KEY ASSERTION: check for "话题回复" text in the thread indicator.
-    // Feishu shows "查看更早 N 条话题回复" or "N 条话题回复" when
-    // reply_in_thread=true is used. This is different from "N 条回复"
-    // (without 话题) which indicates regular inline replies.
+    // Verify topic reply mode
     await agent.aiAssert(
       `消息"${msg}"所在区域可以看到包含"话题回复"的文字（例如"查看更早 N 条话题回复"或"N 条话题回复"），` +
         '这说明机器人使用了话题模式回复',
+    );
+  }, 240_000);
+
+  // BUG: getGroupBotCount() doesn't correctly detect other bots in the group,
+  // causing all bots to respond when only one is @mentioned.
+  it.fails('only @mentioned bot responds, others stay silent', async () => {
+    const msg = testMessage('mention-only');
+    await sendMentionMessage(page, agent, 'Claude', msg);
+
+    // Wait for Claude to respond
+    await agent.aiWaitFor(
+      `聊天中"${msg}"消息附近出现了来自 Claude 的回复`,
+      { timeoutMs: 90_000, checkIntervalMs: 5_000 },
+    );
+
+    // Wait extra time to confirm no other bots respond
+    await page.waitForTimeout(15_000);
+
+    // Assert ONLY Claude replied — no other bots should have responded
+    await agent.aiAssert(
+      `在消息"${msg}"的话题回复中，只有 Claude 一个机器人回复了。` +
+        '没有看到 CoCo、Codex、OpenCode 或 Aiden 的回复或卡片。',
     );
   }, 240_000);
 });

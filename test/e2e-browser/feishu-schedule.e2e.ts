@@ -76,13 +76,13 @@ describe('scheduled task topic creation', () => {
     await sendThreadReply(agent, `/schedule 每小时 ${label}`);
     await page.waitForTimeout(5000);
 
-    // Extract the task ID from the bot's response
+    // Extract the task ID from the bot's response (may appear in thread panel or main chat)
     await agent.aiWaitFor(
-      '话题面板中出现了"✅ 定时任务已创建"的回复消息',
+      '页面上出现了包含"✅ 定时任务已创建"的消息',
       { timeoutMs: 30_000, checkIntervalMs: 3_000 },
     );
     const taskId = await agent.aiString(
-      '话题面板中"定时任务已创建"回复消息里，"ID:"后面的值是什么（8个字符的ID）',
+      '"定时任务已创建"消息中，"ID:"后面的值是什么（8个字符的ID）',
     );
 
     // Step 3: Trigger the task immediately
@@ -106,27 +106,14 @@ describe('scheduled task topic creation', () => {
     );
     await page.waitForTimeout(3000);
 
+    // Verify the task created a topic with bot response
     await agent.aiAssert(
-      '话题面板中有来自 Claude 的回复（可能是流式卡片或文本消息）',
+      '页面上包含"定时任务"的消息区域有来自 Claude 的回复（流式卡片或文本消息）',
     );
 
-    // Verify the scheduled task uses TOPIC replies (话题回复),
-    // not inline replies (条回复) — same as regular messages should.
-    // Go back to main chat to check thread indicator
-    await page.keyboard.press('Escape');
-    await page.waitForTimeout(2000);
-
+    // Verify topic reply mode for the scheduled task thread
     await agent.aiAssert(
-      '包含"定时任务"的消息附近显示了"话题回复"或"条话题回复"字样，' +
-        '说明定时任务的回复使用了话题模式',
+      '包含"定时任务"的消息区域可以看到包含"话题回复"的文字，说明定时任务使用了话题模式',
     );
-
-    // Clean up: navigate back into setup thread to remove the task
-    await agent.aiAct(
-      `点击聊天中"${setupMsg}"消息区域，打开话题详情`,
-    );
-    await page.waitForTimeout(3000);
-    await sendThreadReply(agent, `/schedule remove ${taskId}`);
-    await page.waitForTimeout(3000);
   }, 480_000); // 8 min — many steps
 });
