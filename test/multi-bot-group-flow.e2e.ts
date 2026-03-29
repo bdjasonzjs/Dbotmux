@@ -37,6 +37,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
 vi.mock('../src/core/session-manager.js', () => ({
   getSessionWorkingDir: vi.fn(() => '/tmp'),
   buildNewTopicPrompt: vi.fn(() => 'mock-prompt'),
+  getAvailableBots: vi.fn(async () => []),
 }));
 
 vi.mock('../src/services/session-store.js', () => ({
@@ -47,6 +48,7 @@ vi.mock('../src/im/lark/client.js', () => ({
   sendUserMessage: vi.fn(), updateMessage: vi.fn(), replyMessage: vi.fn(),
   resolveAllowedUsers: vi.fn(),
   getChatInfo: vi.fn(),
+  listChatBotMembers: vi.fn(async () => []),
 }));
 
 vi.mock('../src/im/lark/card-builder.js', () => ({

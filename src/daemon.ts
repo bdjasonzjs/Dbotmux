@@ -45,7 +45,7 @@ import {
 } from './core/session-manager.js';
 import { handleCardAction } from './im/lark/card-handler.js';
 import type { CardHandlerDeps } from './im/lark/card-handler.js';
-import { probeBotOpenId, startLarkEventDispatcher, writeBotInfoFile } from './im/lark/event-dispatcher.js';
+import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, writeBotInfoFile } from './im/lark/event-dispatcher.js';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -339,15 +339,16 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
 
   let ds = activeSessions.get(sessionKey(rootId, larkAppId));
 
-  // If this bot doesn't have a session but another bot does, allow coexistence.
-  // Multiple bots can have independent sessions in the same thread — the session
-  // key (rootId::larkAppId) already supports this. No need to kill the other bot.
+  // If another bot already owns this thread, ignore unmentioned replies here as a
+  // second line of defense. Explicit @mentions are still allowed to spin up/take over.
   if (!ds) {
+    const mentionedThisBot = isBotMentioned(larkAppId, data?.message ?? {}, data?.sender?.sender_id?.open_id);
     const hasOtherBot = [...activeSessions.values()].some(
       s => s.session.rootMessageId === rootId && s.larkAppId !== larkAppId
     );
-    if (hasOtherBot) {
-      logger.info(`[${larkAppId}] Joining thread ${rootId} alongside existing bot session(s)`);
+    if (hasOtherBot && !mentionedThisBot) {
+      logger.info(`[${larkAppId}] Ignoring thread ${rootId}; another bot already owns it`);
+      return;
     }
   }
 
@@ -635,13 +636,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       handleThreadReply: (data, rootId, appId) =>
         handleThreadReply(data, rootId, appId),
       isSessionOwner: (rootId, appId) => {
-        if (!activeSessions.has(sessionKey(rootId, appId))) return false;
-        // Only grant shortcut if no other bot also has a session for this rootId
-        for (const s of activeSessions.values()) {
-          if (s.session.rootMessageId === rootId && s.larkAppId !== appId) return false;
-        }
-        return true;
+        return activeSessions.has(sessionKey(rootId, appId));
       },
+      hasThreadOwner: (rootId) =>
+        [...activeSessions.values()].some(s => s.session.rootMessageId === rootId),
     });
   }
 

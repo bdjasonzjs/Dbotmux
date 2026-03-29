@@ -176,23 +176,38 @@ export async function checkGroupMessageAccess(
   const mentioned = isBotMentioned(larkAppId, message, senderOpenId);
   const allowedUsers = getBot(larkAppId).resolvedAllowedUsers;
   const isAllowed = allowedUsers.length === 0 || (!!senderOpenId && allowedUsers.includes(senderOpenId));
+  const allBots = getAllBots();
+  const multipleBotsConfigured = allBots.length > 1;
+  const hasUnknownBotIdentity = allBots.some(bot => !bot.botOpenId);
 
   logger.debug(`Check group message access: ${mentioned}, ${isAllowed}`);
   if (mentioned) {
     return isAllowed ? 'allowed' : 'not_allowed';
   }
 
-  // No @mention — only allow if sender is the sole human in the group
-  // AND this is the only bot in the chat. With multiple bots, require @mention
-  // to disambiguate.
-  // Note: Lark user_count excludes bots. botCount from isInChat includes self.
+  // No @mention:
+  // - Single-bot setup: keep the legacy "solo human in group" shortcut.
+  // - Multi-bot setup: only allow the shortcut when we can positively confirm
+  //   this bot is the only bot in the chat. If bot identities are not ready yet
+  //   (startup race before open_id probe), require @mention to avoid fan-out.
   if (isAllowed) {
-    const [userCount, botCount] = await Promise.all([
-      getGroupUserCount(larkAppId, chatId),
-      getGroupBotCount(larkAppId, chatId),
-    ]);
+    const userCount = await getGroupUserCount(larkAppId, chatId);
+    if (userCount > 1) {
+      return 'ignore';
+    }
+
+    if (!multipleBotsConfigured) {
+      return 'allowed';
+    }
+
+    if (hasUnknownBotIdentity) {
+      logger.debug('Multiple bots configured but bot identity is incomplete, requiring @mention');
+      return 'ignore';
+    }
+
+    const botCount = await getGroupBotCount(larkAppId, chatId);
     logger.debug(`Group user count: ${userCount}, bot count: ${botCount}`);
-    if (userCount <= 1 && botCount <= 1) {
+    if (botCount === 1) {
       return 'allowed';
     }
   }
@@ -208,6 +223,8 @@ export interface EventHandlers {
   handleThreadReply: (data: any, rootId: string, larkAppId: string) => Promise<void>;
   /** Check if this bot owns an active session for the given rootId. */
   isSessionOwner?: (rootId: string, larkAppId: string) => boolean;
+  /** Check if any bot already owns an active session for the given rootId. */
+  hasThreadOwner?: (rootId: string) => boolean;
 }
 
 /**
@@ -284,14 +301,18 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
             return;
           }
         } else if (chatType === 'group' && rootId) {
-          // Group thread replies: allow without @mention only when the bot owns the
-          // session AND is the sole bot in the chat. With multiple bots, always require
-          // @mention to disambiguate — even for session owners.
+          // Group thread replies:
+          // - The owning bot can continue its own thread without repeated @mentions.
+          // - Other bots must be explicitly @mentioned before they can join/take over.
           const ownsSession = handlers.isSessionOwner?.(rootId, larkAppId) ?? false;
-          const botCount = ownsSession ? await getGroupBotCount(larkAppId, chatId) : 0;
-          if (ownsSession && isAllowed && botCount <= 1) {
-            // Sole bot in chat + owns session → process without @mention
+          const hasThreadOwner = handlers.hasThreadOwner?.(rootId) ?? ownsSession;
+          if (ownsSession && isAllowed) {
+            // Existing owner continues the thread.
           } else {
+            if (hasThreadOwner && !isBotMentioned(larkAppId, message, senderOpenId)) {
+              logger.debug(`Ignoring group thread reply for non-owner bot without @mention: ${messageId}`);
+              return;
+            }
             const access = await checkGroupMessageAccess(larkAppId, message, chatId, senderOpenId);
             if (access === 'not_allowed') {
               logger.debug(`Ignoring thread reply from non-allowed user: ${senderOpenId}`);
