@@ -1,5 +1,11 @@
 export interface PtyHandle {
   write(data: string): void;
+  /** Send text literally via tmux send-keys -l (tmux mode only). */
+  sendText?(text: string): void;
+  /** Send special keys via tmux send-keys, e.g. 'Enter', 'Escape', 'C-c' (tmux mode only). */
+  sendSpecialKeys?(...keys: string[]): void;
+  /** Paste text via tmux load-buffer + paste-buffer (auto-brackets if terminal supports it). */
+  pasteText?(text: string): void;
 }
 
 export interface McpServerEntry {

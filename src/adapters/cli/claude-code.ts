@@ -25,17 +25,28 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
     },
 
     async writeInput(pty, content) {
+      const hasImagePath = /\.(jpe?g|png|gif|webp|svg|bmp)\b/i.test(content);
+
       if (content.includes('\n')) {
-        // Use bracketed paste mode so Claude Code reliably detects paste
-        // boundaries instead of relying on timing-based heuristics.
-        pty.write('\x1b[200~' + content + '\x1b[201~');
-        // Image file paths in pasted text trigger Claude Code's async image
-        // attachment, which needs extra time before Enter is accepted.
-        const hasImagePath = /\.(jpe?g|png|gif|webp|svg|bmp)\b/i.test(content);
-        await new Promise(r => setTimeout(r, hasImagePath ? 800 : 500));
-        pty.write('\r');
+        if (pty.pasteText && pty.sendSpecialKeys) {
+          // Tmux mode: paste-buffer auto-handles bracketed paste
+          pty.pasteText(content);
+          await new Promise(r => setTimeout(r, hasImagePath ? 800 : 500));
+          pty.sendSpecialKeys('Enter');
+        } else {
+          // Non-tmux fallback: manual bracketed paste
+          pty.write('\x1b[200~' + content + '\x1b[201~');
+          await new Promise(r => setTimeout(r, hasImagePath ? 800 : 500));
+          pty.write('\r');
+        }
       } else {
-        pty.write(content + '\r');
+        if (pty.sendText && pty.sendSpecialKeys) {
+          // Tmux mode: send-keys -l + Enter
+          pty.sendText(content);
+          pty.sendSpecialKeys('Enter');
+        } else {
+          pty.write(content + '\r');
+        }
       }
     },
 

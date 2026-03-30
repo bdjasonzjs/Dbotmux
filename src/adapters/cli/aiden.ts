@@ -25,12 +25,15 @@ export function createAidenAdapter(pathOverride?: string): CliAdapter {
     },
 
     async writeInput(pty: PtyHandle, content: string) {
-      // Aiden is a Claude Code fork but does NOT enable bracketed paste mode
-      // (\x1b[?2004h) — escape sequences render as literal text.
-      // Use split-write + delay like Codex/Gemini/OpenCode.
-      pty.write(content);
-      await delay(200);
-      pty.write('\r');
+      if (pty.sendText && pty.sendSpecialKeys) {
+        pty.sendText(content);
+        await delay(200);
+        pty.sendSpecialKeys('Enter');
+      } else {
+        pty.write(content);
+        await delay(1000);
+        pty.write('\r');
+      }
     },
 
     ensureMcpConfig(entry: McpServerEntry) {

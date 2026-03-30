@@ -1,5 +1,5 @@
 import * as pty from 'node-pty';
-import { execSync } from 'node:child_process';
+import { execSync, execFileSync } from 'node:child_process';
 import type { SessionBackend, SpawnOpts } from './types.js';
 
 /**
@@ -144,6 +144,43 @@ export class TmuxBackend implements SessionBackend {
 
   write(data: string): void {
     this.process?.write(data);
+  }
+
+  /**
+   * Send text literally to the tmux pane via `tmux send-keys -l`.
+   * Uses execFileSync (no shell) so arbitrary text is safe — no escaping needed.
+   * For multiline text, use pasteText() instead (send-keys -l sends \n as Enter).
+   */
+  sendText(text: string): void {
+    execFileSync('tmux', ['send-keys', '-t', this.sessionName, '-l', '--', text], {
+      stdio: 'ignore',
+      timeout: 5000,
+    });
+  }
+
+  /** Send special keys (Enter, Escape, C-c, etc.) to the tmux pane. */
+  sendSpecialKeys(...keys: string[]): void {
+    execFileSync('tmux', ['send-keys', '-t', this.sessionName, ...keys], {
+      stdio: 'ignore',
+      timeout: 5000,
+    });
+  }
+
+  /**
+   * Paste text into the tmux pane via load-buffer + paste-buffer.
+   * Tmux automatically wraps in bracketed paste if the pane has it enabled.
+   * Safe for multiline content (unlike sendText where \n becomes Enter).
+   */
+  pasteText(text: string): void {
+    execFileSync('tmux', ['load-buffer', '-'], {
+      input: text,
+      stdio: ['pipe', 'ignore', 'ignore'],
+      timeout: 5000,
+    });
+    execFileSync('tmux', ['paste-buffer', '-t', this.sessionName, '-d'], {
+      stdio: 'ignore',
+      timeout: 5000,
+    });
   }
 
   resize(cols: number, rows: number): void {

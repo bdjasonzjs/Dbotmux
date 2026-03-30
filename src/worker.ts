@@ -48,6 +48,8 @@ let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
 const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', gemini: 'Gemini', opencode: 'OpenCode' };
 function cliName(): string { return CLI_DISPLAY_NAMES[lastInitConfig?.cliId ?? ''] ?? 'CLI'; }
 let isPromptReady = false;
+/** Mutex for async flushPending — prevents concurrent flush loops. */
+let isFlushing = false;
 const pendingMessages: string[] = [];
 /** Suppress screen updates until first prompt detected (avoids history replay in card on --resume) */
 let awaitingFirstPrompt = true;
@@ -102,7 +104,11 @@ function onPtyData(data: string): void {
     if (TRUST_DIALOG_PATTERN.test(stripped)) {
       trustHandled = true;
       log('Trust dialog detected, auto-accepting...');
-      backend?.write('\r');
+      if (backend && 'sendSpecialKeys' in backend) {
+        (backend as any).sendSpecialKeys('Enter');
+      } else {
+        backend?.write('\r');
+      }
       return;
     }
   }
@@ -124,35 +130,45 @@ function markPromptReady(): void {
   // make the CLI busy, so the idle state is transient and shouldn't appear
   // in the card.  This avoids a false "就绪" flash on daemon restart
   // (where the initial prompt is queued before the CLI becomes idle).
-  if (renderer && pendingMessages.length === 0) {
+  if (renderer && pendingMessages.length === 0 && !isFlushing) {
     const { content } = renderer.snapshot();
     send({ type: 'screen_update', content, status: 'idle' });
   }
   flushPending();
 }
 
-function flushPending(): void {
-  log(`flushPending: ${pendingMessages.length} pending, promptReady=${isPromptReady}, hasPty=${!!backend}`);
-  while (pendingMessages.length > 0 && isPromptReady && backend && cliAdapter) {
-    const msg = pendingMessages.shift()!;
-    isPromptReady = false;
-    idleDetector?.reset();
-    log(`Writing to PTY (flush): "${msg.substring(0, 80)}"`);
-    // Fire-and-forget: Aiden's delayed writes are internal to the adapter.
-    // Idle detector re-arms on next PTY output, not on write completion.
-    cliAdapter.writeInput(backend, msg);
+/**
+ * Drain the pending message queue sequentially.
+ * Async with isFlushing mutex: awaits each writeInput, then immediately
+ * sends the next message (type-ahead) without waiting for idle detection.
+ * Messages pushed during a flush are picked up by the while loop.
+ */
+async function flushPending(): Promise<void> {
+  if (isFlushing) return;  // while loop in active flush will pick up new messages
+  if (!isPromptReady || !backend || !cliAdapter) return;
+
+  isFlushing = true;
+  isPromptReady = false;
+  idleDetector?.reset();
+
+  try {
+    while (pendingMessages.length > 0 && backend && cliAdapter) {
+      const msg = pendingMessages.shift()!;
+      log(`Writing to PTY (flush): "${msg.substring(0, 80)}"`);
+      await cliAdapter.writeInput(backend, msg);
+    }
+  } finally {
+    isFlushing = false;
   }
 }
 
 function sendToPty(content: string): void {
   if (!backend || !cliAdapter) return;
-  if (isPromptReady) {
-    isPromptReady = false;
-    idleDetector?.reset();
+  pendingMessages.push(content);
+  if (isPromptReady || isFlushing) {
     log(`Writing to PTY: "${content.substring(0, 80)}"`);
-    cliAdapter.writeInput(backend, content);
+    flushPending();  // fire-and-forget async; no-op if already flushing
   } else {
-    pendingMessages.push(content);
     log(`Queued message (${pendingMessages.length} pending): "${content.substring(0, 80)}" — ${cliName()} is busy`);
   }
 }
@@ -659,7 +675,12 @@ process.on('message', async (raw: unknown) => {
       if (lastInitConfig?.adoptMode) {
         // Adopt mode: raw write to PTY (no adapter writeInput)
         if (backend) {
-          backend.write(content + '\r');
+          if ('sendText' in backend && 'sendSpecialKeys' in backend) {
+            (backend as any).sendText(content);
+            (backend as any).sendSpecialKeys('Enter');
+          } else {
+            backend.write(content + '\r');
+          }
           isPromptReady = false;
           idleDetector?.reset();
         }

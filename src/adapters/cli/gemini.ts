@@ -30,11 +30,15 @@ export function createGeminiAdapter(pathOverride?: string): CliAdapter {
     passesInitialPromptViaArgs: true,
 
     async writeInput(pty: PtyHandle, content: string) {
-      // Gemini uses Ink TextInput — multi-line paste needs a delay before Enter
-      // to let the TUI process the pasted content.
-      pty.write(content);
-      await delay(200);
-      pty.write('\r');
+      if (pty.sendText && pty.sendSpecialKeys) {
+        pty.sendText(content);
+        await delay(200);
+        pty.sendSpecialKeys('Enter');
+      } else {
+        pty.write(content);
+        await delay(1000);
+        pty.write('\r');
+      }
     },
 
     ensureMcpConfig(entry: McpServerEntry) {
