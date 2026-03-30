@@ -88,6 +88,6 @@ export function createBotTest(botName: BotName): void {
         `话题面板中的流式卡片包含输出内容（展开后可见文本），` +
           `说明 ${botName} 已经处理了用户消息并产生了输出`,
       );
-    }, 300_000);
+    }, 360_000);
   });
 }

@@ -125,9 +125,10 @@ describe('scheduled task topic creation', () => {
       '页面上包含"定时任务"的消息区域有来自 Claude 的回复（流式卡片或文本消息）',
     );
 
-    // Verify topic reply mode for the scheduled task thread
+    // Verify topic reply mode: the thread panel should be open with replies
     await agent.aiAssert(
-      '包含"定时任务"的消息区域可以看到包含"话题回复"的文字，说明定时任务使用了话题模式',
+      '右侧话题详情面板中有来自机器人的回复内容，' +
+        '说明定时任务的执行结果以话题形式组织',
     );
   }, 480_000); // 8 min — many steps
 });
