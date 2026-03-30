@@ -90,14 +90,12 @@ function makeHandlers(): EventHandlers & {
   handleThreadReply: ReturnType<typeof vi.fn>;
   handleCardAction: ReturnType<typeof vi.fn>;
   isSessionOwner: ReturnType<typeof vi.fn>;
-  hasThreadOwner: ReturnType<typeof vi.fn>;
 } {
   return {
     handleCardAction: vi.fn(async () => undefined),
     handleNewTopic: vi.fn(async () => {}),
     handleThreadReply: vi.fn(async () => {}),
     isSessionOwner: vi.fn(() => false),
-    hasThreadOwner: vi.fn(() => false),
   };
 }
 
@@ -317,7 +315,7 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, 'root-thread-6', MY_APP_ID);
   });
 
-  it('routes thread reply to the owning bot even in a multi-bot chat', async () => {
+  it('requires @mention in multi-bot thread even if bot owns session', async () => {
     const event = makeUserMessageEvent({
       senderOpenId: USER_OPEN_ID,
       content: JSON.stringify({ text: 'hello everyone' }),
@@ -326,7 +324,6 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       chatType: 'group',
     });
     handlers.isSessionOwner.mockReturnValue(true);
-    handlers.hasThreadOwner.mockReturnValue(true);
     mockListChatBotMembers.mockResolvedValue([
       { openId: MY_OPEN_ID, name: 'BotA' },
       { openId: OTHER_BOT_OPEN_ID, name: 'BotB' },
@@ -334,7 +331,8 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
 
     await capturedHandlers['im.message.receive_v1'](event);
 
-    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, 'root-thread-7', MY_APP_ID);
+    // No @mention → should NOT be routed even though bot owns session
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
   });
 
   it('processes @mentioned message in multi-bot thread', async () => {
@@ -347,7 +345,7 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
     });
     handlers.isSessionOwner.mockReturnValue(true);
-    handlers.hasThreadOwner.mockReturnValue(true);
+
     mockListChatBotMembers.mockResolvedValue([
       { openId: MY_OPEN_ID, name: 'BotA' },
       { openId: OTHER_BOT_OPEN_ID, name: 'BotB' },
@@ -367,7 +365,7 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       chatType: 'group',
     });
     handlers.isSessionOwner.mockReturnValue(false);
-    handlers.hasThreadOwner.mockReturnValue(true);
+
     mockListChatBotMembers.mockResolvedValue([
       { openId: MY_OPEN_ID, name: 'BotA' },
       { openId: OTHER_BOT_OPEN_ID, name: 'BotB' },

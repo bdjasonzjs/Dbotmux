@@ -652,8 +652,6 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       isSessionOwner: (rootId, appId) => {
         return activeSessions.has(sessionKey(rootId, appId));
       },
-      hasThreadOwner: (rootId) =>
-        [...activeSessions.values()].some(s => s.session.rootMessageId === rootId),
     });
   }
 

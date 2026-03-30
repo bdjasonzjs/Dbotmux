@@ -209,8 +209,6 @@ export interface EventHandlers {
   handleThreadReply: (data: any, rootId: string, larkAppId: string) => Promise<void>;
   /** Check if this bot owns an active session for the given rootId. */
   isSessionOwner?: (rootId: string, larkAppId: string) => boolean;
-  /** Check if any bot already owns an active session for the given rootId. */
-  hasThreadOwner?: (rootId: string) => boolean;
 }
 
 /**
@@ -288,17 +286,14 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           }
         } else if (chatType === 'group' && rootId) {
           // Group thread replies:
-          // - The owning bot can continue its own thread without repeated @mentions.
-          // - Other bots must be explicitly @mentioned before they can join/take over.
+          // - Sole bot in chat + owns session → respond without @mention
+          // - Multiple bots in chat → always require @mention, even for session owners
+          // - Non-owner bots → require @mention to join/take over
           const ownsSession = handlers.isSessionOwner?.(rootId, larkAppId) ?? false;
-          const hasThreadOwner = handlers.hasThreadOwner?.(rootId) ?? ownsSession;
-          if (ownsSession && isAllowed) {
-            // Existing owner continues the thread.
+          const botCount = ownsSession ? await getGroupBotCount(larkAppId, chatId) : 0;
+          if (ownsSession && isAllowed && botCount <= 1) {
+            // Sole bot in chat + owns session → process without @mention
           } else {
-            if (hasThreadOwner && !isBotMentioned(larkAppId, message, senderOpenId)) {
-              logger.debug(`Ignoring group thread reply for non-owner bot without @mention: ${messageId}`);
-              return;
-            }
             const access = await checkGroupMessageAccess(larkAppId, message, chatId, senderOpenId);
             if (access === 'not_allowed') {
               logger.debug(`Ignoring thread reply from non-allowed user: ${senderOpenId}`);
