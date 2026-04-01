@@ -172,19 +172,20 @@ export function buildNewTopicPrompt(
     }
   }
 
-  const parts = [
-    `用户发送了：\n---\n${userMessage}${formatAttachmentsHint(attachments)}\n---`,
-  ];
+  // CLIs with injectsSessionContext get Lark context via system prompt,
+  // so pass user messages cleanly without wrapper — same format as follow-ups.
+  const attachHint = formatAttachmentsHint(attachments);
+  const parts: string[] = adapter.injectsSessionContext
+    ? [`${userMessage}${attachHint}`]
+    : [`用户发送了：\n---\n${userMessage}${attachHint}\n---`];
 
   // Append follow-up messages buffered during repo selection
   if (followUps && followUps.length > 0) {
     for (const fu of followUps) {
-      parts.push(`用户追加了：\n---\n${fu}\n---`);
+      parts.push(adapter.injectsSessionContext ? fu : `用户追加了：\n---\n${fu}\n---`);
     }
   }
 
-  // CLIs with injectsSessionContext (e.g. Claude Code) get session ID via
-  // --append-system-prompt + MCP auto-detection, so skip per-message injection.
   if (!adapter.injectsSessionContext) {
     parts.push(`Session ID: ${sessionId}`);
   }
