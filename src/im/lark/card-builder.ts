@@ -84,6 +84,31 @@ export function buildSessionCard(
 }
 
 /**
+ * Feishu card API rejects payloads exceeding ~109 KB (error 230025).
+ * Cap markdown content byte size with headroom for card JSON overhead.
+ */
+const MAX_CONTENT_BYTES = 100_000;
+
+/** Truncate content to fit within MAX_CONTENT_BYTES, keeping the tail (most recent output). */
+function truncateContent(content: string): string {
+  if (Buffer.byteLength(content, 'utf-8') <= MAX_CONTENT_BYTES) return content;
+  // Binary search for the longest suffix that fits
+  const lines = content.split('\n');
+  let lo = 0;
+  let hi = lines.length;
+  while (lo < hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    const candidate = lines.slice(mid).join('\n');
+    if (Buffer.byteLength(candidate, 'utf-8') <= MAX_CONTENT_BYTES - 30) {
+      hi = mid;
+    } else {
+      lo = mid + 1;
+    }
+  }
+  return `… (已截断)\n${lines.slice(lo).join('\n')}`;
+}
+
+/**
  * Build a Feishu streaming card that shows live terminal output + controls.
  * This card is PATCHed in-place as the CLI works.
  */
@@ -107,7 +132,7 @@ export function buildStreamingCard(
   const elements: any[] = [];
 
   if (expanded) {
-    const displayContent = screenContent || '(等待输出…)';
+    const displayContent = truncateContent(screenContent) || '(等待输出…)';
     elements.push({ tag: 'markdown', content: displayContent });
     elements.push({ tag: 'hr' });
   }
