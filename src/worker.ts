@@ -145,12 +145,16 @@ function markPromptReady(): void {
  */
 async function flushPending(): Promise<void> {
   if (isFlushing) return;  // while loop in active flush will pick up new messages
-  if (!isPromptReady || !backend || !cliAdapter) return;
+  if (!backend || !cliAdapter) return;
   if (pendingMessages.length === 0) return;  // nothing to flush — keep isPromptReady
+  // Type-ahead adapters flush even while the CLI is busy; others wait for idle.
+  if (!isPromptReady && !cliAdapter.supportsTypeAhead) return;
 
   isFlushing = true;
-  isPromptReady = false;
-  idleDetector?.reset();
+  if (isPromptReady) {
+    isPromptReady = false;
+    idleDetector?.reset();
+  }
 
   try {
     while (pendingMessages.length > 0 && backend && cliAdapter) {
@@ -166,7 +170,7 @@ async function flushPending(): Promise<void> {
 function sendToPty(content: string): void {
   if (!backend || !cliAdapter) return;
   pendingMessages.push(content);
-  if (isPromptReady || isFlushing) {
+  if (isPromptReady || isFlushing || cliAdapter.supportsTypeAhead) {
     log(`Writing to PTY: "${content.substring(0, 80)}"`);
     flushPending();  // fire-and-forget async; no-op if already flushing
   } else {

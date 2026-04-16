@@ -64,6 +64,13 @@ export interface CliAdapter {
    *  manager skips appending "Session ID: ..." to every user message. */
   readonly injectsSessionContext?: boolean;
 
+  /** When true, the CLI accepts input while busy (type-ahead). Worker writes
+   *  queued messages immediately instead of waiting for idle detection.
+   *  Only set for CLIs whose input handling is known to tolerate this —
+   *  Claude Code buffers input internally and processes it after the current
+   *  turn. Others (e.g. CoCo) may drop or garble input while rendering. */
+  readonly supportsTypeAhead?: boolean;
+
   /** Whether CLI uses alternate screen buffer */
   readonly altScreen: boolean;
 }
