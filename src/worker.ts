@@ -313,6 +313,54 @@ async function handleTuiKeys(keys: string[], isFinal: boolean): Promise<void> {
   log(`TUI keys: ${keys.join(' ')}${isFinal ? ' (final)' : ''}`);
 }
 
+/**
+ * Handle atomic text-input: navigate to "Type something" (WITHOUT pressing Enter),
+ * then write text via cliAdapter (which adds its own Enter to submit).
+ *
+ * Why strip Enter: pressing Enter on "Type something" in some TUIs (e.g. Claude Code)
+ * is treated as a "decline" action, not a "enter text mode" action. The TUI
+ * auto-switches to text input mode as soon as a character is typed.
+ */
+async function handleTuiTextInput(keys: string[], text: string): Promise<void> {
+  if (!backend || !cliAdapter) return;
+
+  // Strip trailing Enter from keys — we don't want to press Enter on "Type something"
+  const navKeys = keys[keys.length - 1] === 'Enter' ? keys.slice(0, -1) : keys;
+
+  // Step 1: navigate to "Type something" (no Enter)
+  if ('sendSpecialKeys' in backend) {
+    const b = backend as any;
+    for (const key of navKeys) {
+      b.sendSpecialKeys(key);
+      await new Promise(r => setTimeout(r, 100));
+    }
+  } else {
+    for (const key of navKeys) {
+      backend.write(KEY_TO_ANSI[key] ?? key);
+      await new Promise(r => setTimeout(r, 100));
+    }
+  }
+
+  // Step 2: clear blocking state
+  tuiPromptBlocking = false;
+  if (isPromptReady) {
+    isPromptReady = false;
+    idleDetector?.reset();
+  }
+  screenAnalyzer?.notifySelection('text-input');
+
+  // Wait briefly so the cursor position is stable before pasting
+  await new Promise(r => setTimeout(r, 200));
+
+  // Step 3: write text via cliAdapter (auto-switches to text mode + submits with Enter)
+  log(`TUI text input: writing "${text.substring(0, 80)}" to PTY (after ${navKeys.length} nav keys)`);
+  try {
+    await cliAdapter.writeInput(backend, text);
+  } catch (err: any) {
+    log(`TUI text input write failed: ${err.message}`);
+  }
+}
+
 // ─── Trust Dialog Detection ──────────────────────────────────────────────────
 
 // Claude Code: "Yes, I trust this folder"
@@ -805,7 +853,11 @@ document.getElementById('terminal').addEventListener('contextmenu',function(e){e
 // ── WebSocket ──
 var ws_=null,el=document.getElementById('status');
 term.onData(function(d){
-  if(!hasToken){_showReadonlyToast();return;}
+  if(!hasToken){
+    // Allow mouse events through (scroll/click) — server accepts these in read-only.
+    // Keyboard input triggers the toast instead.
+    if(!/^\\x1b\\[[<M]/.test(d)){_showReadonlyToast();return;}
+  }
   if(ws_&&ws_.readyState===1)ws_.send(JSON.stringify({type:'input',data:d}));
 });
 function sendResize(){if(ws_&&ws_.readyState===1)ws_.send(JSON.stringify({type:'resize',cols:term.cols,rows:term.rows}))}
@@ -997,6 +1049,11 @@ process.on('message', async (raw: unknown) => {
 
     case 'tui_keys': {
       handleTuiKeys(msg.keys, msg.isFinal);
+      break;
+    }
+
+    case 'tui_text_input': {
+      handleTuiTextInput(msg.keys, msg.text);
       break;
     }
 

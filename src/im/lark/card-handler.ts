@@ -289,13 +289,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       let inputKeys: string[] = [];
       try { inputKeys = JSON.parse(value?.input_keys ?? '[]'); } catch { /* bad json */ }
       if (ds.worker && inputText && inputKeys.length > 0) {
-        // First execute the input option's key sequence, then send the text
-        ds.worker.send({ type: 'tui_keys', keys: inputKeys, isFinal: true } as DaemonToWorker);
-        setTimeout(() => {
-          if (ds.worker) {
-            ds.worker.send({ type: 'message', content: inputText } as DaemonToWorker);
-          }
-        }, 500);
+        // Atomic IPC — worker handles keys + text in one flow to avoid race
+        ds.worker.send({ type: 'tui_text_input', keys: inputKeys, text: inputText } as DaemonToWorker);
         logger.info(`[${tag(ds)}] TUI text input: "${inputText}" (keys: ${JSON.stringify(inputKeys)})`);
         if (cardMessageId) {
           const resolvedCard = buildTuiPromptResolvedCard(inputText);
