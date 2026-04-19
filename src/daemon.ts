@@ -537,9 +537,13 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
     persistStreamCardState(ds);
     ds.worker.send({ type: 'message', content: msgContent } as DaemonToWorker);
   } else {
-    // Worker not running — re-fork with resume
+    // Worker not running — re-fork with resume. This is a NEW turn, so drop
+    // any restored streaming-card reference; worker_ready will POST a fresh
+    // card instead of PATCHing the previous turn's card in place.
     logger.info(`[${tag(ds)}] Worker not running, re-forking...`);
     ds.currentTurnTitle = parsed.content.substring(0, 50);
+    ds.streamCardId = undefined;
+    ds.streamCardNonce = undefined;
     persistStreamCardState(ds);
     forkWorker(ds, parsed.content, ds.hasHistory);
   }

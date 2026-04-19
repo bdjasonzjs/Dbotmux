@@ -39,12 +39,18 @@ export interface DaemonSession {
   streamCardPending?: boolean;    // true when a new turn started, next screen_update creates a new card
   streamExpanded?: boolean;       // whether streaming output is visible in card (default: collapsed)
   lastScreenContent?: string;    // last screen_update content — used to freeze card at idle
-  lastScreenStatus?: 'starting' | 'working' | 'idle';  // last screen_update status
+  lastScreenStatus?: 'starting' | 'working' | 'idle' | 'analyzing';  // last screen_update status
   currentTurnTitle?: string;      // title for the current turn's streaming card
   cardPatchInFlight?: boolean;    // true while a card PATCH is in-flight
   pendingCardJson?: string;       // queued card JSON — flushed when in-flight PATCH completes (latest wins)
   pendingCardId?: string;         // card message_id captured at schedule time — prevents stale reads when streamCardId changes between schedule and flush
   frozenCards?: Map<string, FrozenCard>;  // nonce → FrozenCard (historical cards' cached state for toggle)
+  /** message_id of the TUI prompt interactive card (if active) */
+  tuiPromptCardId?: string;
+  /** Cached TUI prompt options — for dedup and for resolving after click */
+  tuiPromptOptions?: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>;
+  tuiPromptMultiSelect?: boolean;
+  tuiToggledIndices?: number[];  // tracks toggled options for multi-select card PATCH
   /** Present when this session was created via /adopt (shared observation mode). */
   adoptedFrom?: {
     tmuxTarget: string;       // e.g. "0:2.0" — user's original tmux pane

@@ -7,7 +7,7 @@ import { execSync } from 'node:child_process';
 import { config } from '../../config.js';
 import { getBot, getAllBots } from '../../bot-registry.js';
 import { sendUserMessage, updateMessage, deleteMessage } from './client.js';
-import { buildSessionCard, buildStreamingCard, getCliDisplayName } from './card-builder.js';
+import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, getCliDisplayName } from './card-builder.js';
 import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
@@ -31,6 +31,7 @@ interface CardActionData {
   action?: {
     value?: Record<string, string>;
     option?: string;
+    form_value?: Record<string, string>;  // V2 form input values
   };
   context?: { open_message_id?: string };
   open_message_id?: string;
@@ -56,7 +57,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   // Use the receiving bot's allowedUsers — the operator open_id in card actions
   // is scoped to the app that received the callback.
   const operatorOpenId = data?.operator?.open_id;
-  const isSensitive = value?.action && ['restart', 'close', 'skip_repo', 'get_write_link', 'toggle_stream', 'takeover', 'disconnect'].includes(value.action);
+  const isSensitive = value?.action && ['restart', 'close', 'skip_repo', 'get_write_link', 'toggle_stream', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     const ds = rootId ? activeSessions.get(rootId) : undefined;
@@ -201,6 +202,109 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
 
       await sessionReply(rootId, '🔄 已接管会话，MCP 已启用');
       logger.info(`[${tag(ds)}] Takeover: resumed session ${originalSessionId} as standard botmux session`);
+    }
+
+    if (actionType === 'tui_keys' && ds) {
+      let keys: string[] = [];
+      try { keys = JSON.parse(value?.keys ?? '[]'); } catch { /* bad json */ }
+      const isFinal = value?.is_final === '1';
+      const optionType = value?.option_type ?? 'select';
+      const selectedIndex = Number(value?.selected_index ?? 0);
+      const selectedText = value?.selected_text ?? `Option ${selectedIndex + 1}`;
+
+      if (optionType === 'toggle') {
+        // Toggle: only update card UI, do NOT send keys to terminal yet.
+        // Keys will be sent in batch when confirm is clicked.
+        if (!ds.tuiToggledIndices) ds.tuiToggledIndices = [];
+        const idx = ds.tuiToggledIndices.indexOf(selectedIndex);
+        if (idx >= 0) ds.tuiToggledIndices.splice(idx, 1);
+        else ds.tuiToggledIndices.push(selectedIndex);
+        logger.info(`[${tag(ds)}] TUI toggle (card only): option ${selectedIndex}, toggled: [${ds.tuiToggledIndices}]`);
+        // PATCH card to update ☐/☑ state
+        if (cardMessageId && ds.tuiPromptOptions) {
+          const updatedCard = buildTuiPromptCard(
+            ds.session.rootMessageId,
+            ds.session.sessionId,
+            ds.currentTurnTitle || 'Select options',
+            ds.tuiPromptOptions,
+            true,
+            ds.tuiToggledIndices,
+          );
+          updateMessage(ds.larkAppId, cardMessageId, updatedCard).catch(err =>
+            logger.debug(`[${tag(ds)}] Failed to update TUI toggle card: ${err}`),
+          );
+          try { return JSON.parse(updatedCard); } catch { /* fall through */ }
+        }
+        return;
+      }
+
+      // For confirm: batch all toggled options' keys first, then confirm keys
+      if (ds.worker) {
+        let allKeys: string[] = [];
+        if (ds.tuiToggledIndices?.length && ds.tuiPromptOptions) {
+          // Send each toggled option's keys in sequence
+          for (const ti of ds.tuiToggledIndices.sort((a, b) => a - b)) {
+            const opt = ds.tuiPromptOptions[ti];
+            if (opt?.keys?.length) {
+              allKeys.push(...opt.keys);
+            }
+          }
+        }
+        // Then the action's own keys (confirm/select)
+        allKeys.push(...keys);
+
+        if (allKeys.length > 0) {
+          ds.worker.send({ type: 'tui_keys', keys: allKeys, isFinal } as DaemonToWorker);
+          logger.info(`[${tag(ds)}] TUI keys: [${allKeys.join(',')}] final=${isFinal} — "${selectedText}"`);
+        }
+
+        if (isFinal) {
+          const resolveText = ds.tuiToggledIndices?.length
+            ? ds.tuiToggledIndices.map(i => ds.tuiPromptOptions?.[i]?.text).filter(Boolean).join(', ')
+            : selectedText;
+          const finalText = resolveText || selectedText;
+          if (cardMessageId) {
+            setTimeout(() => {
+              const resolvedCard = buildTuiPromptResolvedCard(finalText);
+              updateMessage(ds.larkAppId, cardMessageId, resolvedCard).catch(err =>
+                logger.debug(`[${tag(ds)}] Failed to update TUI prompt card: ${err}`),
+              );
+            }, allKeys.length * 100 + 500);
+          }
+          ds.tuiPromptCardId = undefined;
+          ds.tuiPromptOptions = undefined;
+          ds.tuiPromptMultiSelect = undefined;
+          ds.tuiToggledIndices = undefined;
+          try { return JSON.parse(buildTuiPromptProcessingCard(finalText)); } catch { /* fall through */ }
+        }
+      }
+    }
+
+    if (actionType === 'tui_text_input' && ds) {
+      const inputText = action?.form_value?.tui_custom_input ?? '';
+      let inputKeys: string[] = [];
+      try { inputKeys = JSON.parse(value?.input_keys ?? '[]'); } catch { /* bad json */ }
+      if (ds.worker && inputText && inputKeys.length > 0) {
+        // First execute the input option's key sequence, then send the text
+        ds.worker.send({ type: 'tui_keys', keys: inputKeys, isFinal: true } as DaemonToWorker);
+        setTimeout(() => {
+          if (ds.worker) {
+            ds.worker.send({ type: 'message', content: inputText } as DaemonToWorker);
+          }
+        }, 500);
+        logger.info(`[${tag(ds)}] TUI text input: "${inputText}" (keys: ${JSON.stringify(inputKeys)})`);
+        if (cardMessageId) {
+          const resolvedCard = buildTuiPromptResolvedCard(inputText);
+          updateMessage(ds.larkAppId, cardMessageId, resolvedCard).catch(err =>
+            logger.debug(`[${tag(ds)}] Failed to update TUI prompt card: ${err}`),
+          );
+        }
+        ds.tuiPromptCardId = undefined;
+        ds.tuiPromptOptions = undefined;
+      }
+      try {
+        return JSON.parse(buildTuiPromptResolvedCard(inputText || 'Custom input'));
+      } catch { /* fall through */ }
     }
 
     if (actionType === 'get_write_link' && ds && operatorOpenId) {
@@ -409,6 +513,13 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const session = sessionStore.createSession(targetDs.chatId, rootId, displayName, targetDs.chatType);
     targetDs.session = session;
     targetDs.hasHistory = false;
+    // Drop the old turn's streaming-card reference so worker_ready POSTs a
+    // fresh card for the new session instead of PATCHing the previous one.
+    targetDs.streamCardId = undefined;
+    targetDs.streamCardNonce = undefined;
+    targetDs.streamCardPending = undefined;
+    targetDs.lastScreenContent = undefined;
+    targetDs.lastScreenStatus = undefined;
     forkWorker(targetDs, '', false);
     await sessionReply(rootId, `🔄 已切换到 ${displayName}`);
     logger.info(`[${tag(targetDs)}] Repo switched to ${selectedPath}, new session created`);

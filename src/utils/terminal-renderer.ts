@@ -249,6 +249,32 @@ export class TerminalRenderer {
     return filtered.join('\n');
   }
 
+  /**
+   * Raw viewport snapshot — no filtering, no phase gating, no chrome removal.
+   * Used by ScreenAnalyzer which needs the full screen including ❯ cursor lines.
+   */
+  rawSnapshot(): string {
+    const buffer = this.terminal.buffer.active;
+    const baseY = buffer.baseY;
+    const rows = this.terminal.rows;
+    const readCols = Math.min(SNAPSHOT_COLS, this.terminal.cols);
+    const endY = baseY + rows;
+
+    const lines: string[] = [];
+    for (let y = baseY; y < endY; y++) {
+      const line = buffer.getLine(y);
+      if (!line) continue;
+      lines.push(cleanBoxDrawing(line.translateToString(true, 0, readCols)));
+    }
+
+    // Trim trailing blank lines only
+    while (lines.length > 0 && BLANK_RE.test(lines[lines.length - 1])) {
+      lines.pop();
+    }
+
+    return lines.join('\n');
+  }
+
   resize(cols: number, rows: number): void {
     this.terminal.resize(cols, rows);
   }

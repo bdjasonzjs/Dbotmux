@@ -108,13 +108,16 @@ export type DaemonToWorker =
   | { type: 'init'; sessionId: string; chatId: string; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; backendType: 'pty' | 'tmux'; prompt: string; resume?: boolean; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; adoptMode?: boolean; adoptTmuxTarget?: string; adoptPaneCols?: number; adoptPaneRows?: number }
   | { type: 'message'; content: string }
   | { type: 'close' }
-  | { type: 'restart' };
+  | { type: 'restart' }
+  | { type: 'tui_keys'; keys: string[]; isFinal: boolean };
 
 /** Messages sent from Worker to Daemon */
 export type WorkerToDaemon =
   | { type: 'ready'; port: number; token: string }
   | { type: 'claude_exit'; code: number | null; signal: string | null }
   | { type: 'prompt_ready' }
-  | { type: 'screen_update'; content: string; status: 'working' | 'idle' }
-  | { type: 'error'; message: string };
+  | { type: 'screen_update'; content: string; status: 'working' | 'idle' | 'analyzing' }
+  | { type: 'error'; message: string }
+  | { type: 'tui_prompt'; description: string; options: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>; multiSelect?: boolean }
+  | { type: 'tui_prompt_resolved'; selectedText?: string };
 

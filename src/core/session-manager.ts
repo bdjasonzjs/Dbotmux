@@ -232,10 +232,15 @@ export function buildFollowUpContent(
     parts.push(`消息中的 @mention：\n${mentionLines.join('\n')}`);
   }
 
-  // Per-message routing hint — keeps the "use botmux send" instruction
-  // close to the latest attention window, preventing long-context forgetting.
-  // ~8 tokens per message, negligible cost.
-  parts.push('[回复请用 botmux send，终端输出用户看不到]');
+  // Per-message routing hint — only for CLIs without system prompt context.
+  // CLIs with injectsSessionContext (e.g. Claude Code) already have the
+  // "use botmux send" instruction in --append-system-prompt, no need to repeat.
+  const skipHint = opts?.cliId
+    ? createCliAdapterSync(opts.cliId, opts.cliPathOverride).injectsSessionContext
+    : false;
+  if (!skipHint) {
+    parts.push('[回复请用 botmux send，终端输出用户看不到]');
+  }
 
   return parts.join('\n\n');
 }

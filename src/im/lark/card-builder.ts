@@ -118,7 +118,7 @@ export function buildStreamingCard(
   terminalUrl: string,
   title: string,
   screenContent: string,
-  status: 'starting' | 'working' | 'idle',
+  status: 'starting' | 'working' | 'idle' | 'analyzing',
   cliId?: CliId,
   expanded?: boolean,
   cardNonce?: string,
@@ -126,8 +126,8 @@ export function buildStreamingCard(
   showTakeover?: boolean,
 ): string {
   const cliName = getCliDisplayName(cliId ?? 'claude-code');
-  const templateMap = { starting: 'yellow', working: 'blue', idle: 'green' } as const;
-  const statusMap = { starting: '启动中…', working: '工作中', idle: '就绪' } as const;
+  const templateMap = { starting: 'yellow', working: 'blue', idle: 'green', analyzing: 'purple' } as const;
+  const statusMap = { starting: '启动中…', working: '工作中', idle: '等待输入', analyzing: '正在分析…' } as const;
 
   const elements: any[] = [];
 
@@ -264,6 +264,155 @@ export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: strin
     ],
   };
 
+  return JSON.stringify(card);
+}
+
+// ─── TUI Prompt cards ───────────────────────────────────────────────────────
+
+/**
+ * Build a Feishu interactive card for a TUI prompt detected by ScreenAnalyzer.
+ * Select-type options get buttons; input-type options shown in list with a note.
+ */
+export function buildTuiPromptCard(
+  rootId: string,
+  sessionId: string,
+  description: string,
+  options: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>,
+  multiSelect?: boolean,
+  toggledIndices?: number[],
+): string {
+  const hasInputOption = options.some(o => o.type === 'input');
+  const toggled = new Set(toggledIndices ?? []);
+
+  // Build option list — skip confirm-type (shown as button only)
+  const optionLines = options
+    .filter(o => o.type !== 'confirm')
+    .map((opt) => {
+      const i = options.indexOf(opt);
+      const label = opt.label || String(i + 1);
+      if (opt.type === 'toggle') {
+        const check = toggled.has(i) ? '☑' : '☐';
+        return `${check} ${label}. ${escapeMd(opt.text)}`;
+      }
+      return opt.selected
+        ? `**${label}. ${escapeMd(opt.text)}**`
+        : `${label}. ${escapeMd(opt.text)}`;
+    }).join('\n');
+
+  // Build buttons — each carries its AI-provided key sequence
+  const buttons: any[] = [];
+  for (const opt of options) {
+    const originalIndex = options.indexOf(opt);
+    if (opt.type === 'input') continue;
+
+    const isFinal = opt.type === 'select' || opt.type === 'confirm';
+    const btnLabel = opt.type === 'confirm'
+      ? `✅ ${opt.text}`
+      : (opt.label || String(originalIndex + 1));
+
+    buttons.push({
+      tag: 'button' as const,
+      text: { tag: 'plain_text' as const, content: btnLabel },
+      type: ((opt.type === 'confirm' || toggled.has(originalIndex)) ? 'primary' : opt.selected ? 'primary' : 'default') as 'primary' | 'default',
+      value: {
+        action: 'tui_keys',
+        root_id: rootId,
+        session_id: sessionId,
+        keys: JSON.stringify(opt.keys ?? []),
+        is_final: isFinal ? '1' : '0',
+        selected_index: String(originalIndex),
+        selected_text: opt.text,
+        option_type: opt.type ?? 'select',
+      },
+    });
+  }
+
+  const elements: any[] = [
+    {
+      tag: 'div',
+      text: { tag: 'lark_md', content: optionLines },
+    },
+    { tag: 'hr' },
+    { tag: 'action', actions: buttons },
+  ];
+
+  // Form with input field for "Type something" options
+  if (hasInputOption) {
+    const inputOpt = options.find(o => o.type === 'input');
+    elements.push({
+      tag: 'form',
+      name: 'tui_input_form',
+      elements: [
+        {
+          tag: 'input',
+          name: 'tui_custom_input',
+          placeholder: { tag: 'plain_text', content: '输入自定义回复…' },
+        },
+        {
+          tag: 'button',
+          text: { tag: 'plain_text', content: '发送' },
+          type: 'primary',
+          name: 'tui_input_submit',
+          action_type: 'form_submit',
+          value: {
+            action: 'tui_text_input',
+            root_id: rootId,
+            session_id: sessionId,
+            input_keys: JSON.stringify(inputOpt?.keys ?? []),
+          },
+        },
+      ],
+    });
+  }
+
+  const card = {
+    config: { wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: escapeMd(description) },
+      template: 'orange',
+    },
+    elements,
+  };
+  return JSON.stringify(card);
+}
+
+/**
+ * Build a "processing" TUI prompt card — shown immediately when user clicks a button.
+ */
+export function buildTuiPromptProcessingCard(selectedText: string): string {
+  const card = {
+    config: { wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: '正在执行…' },
+      template: 'blue',
+    },
+    elements: [
+      {
+        tag: 'div',
+        text: { tag: 'lark_md', content: `选择: **${escapeMd(selectedText)}**` },
+      },
+    ],
+  };
+  return JSON.stringify(card);
+}
+
+/**
+ * Build a resolved TUI prompt card — shows which option was selected.
+ */
+export function buildTuiPromptResolvedCard(selectedText: string): string {
+  const card = {
+    config: { wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: `已选择` },
+      template: 'green',
+    },
+    elements: [
+      {
+        tag: 'div',
+        text: { tag: 'lark_md', content: `**${escapeMd(selectedText)}**` },
+      },
+    ],
+  };
   return JSON.stringify(card);
 }
 

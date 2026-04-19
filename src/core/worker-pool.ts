@@ -13,7 +13,7 @@ import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
 import { persistStreamCardState } from './session-manager.js';
 import { updateMessage, MessageWithdrawnError } from '../im/lark/client.js';
-import { buildStreamingCard, buildSessionCard, getCliDisplayName } from '../im/lark/card-builder.js';
+import { buildStreamingCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { logger } from '../utils/logger.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
@@ -526,6 +526,48 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             showTakeover,
           );
           scheduleCardPatch(ds, cardJson);
+        }
+        break;
+      }
+
+      case 'tui_prompt': {
+        // AI detected an interactive TUI prompt — post card to thread
+        // Dedup: if a card is already posted for this session, skip
+        if (ds.tuiPromptCardId) {
+          logger.debug(`[${t}] TUI prompt card already posted, skipping duplicate`);
+          break;
+        }
+        logger.info(`[${t}] TUI prompt detected: ${msg.description}${msg.multiSelect ? ' (multi-select)' : ''}`);
+        ds.tuiPromptOptions = msg.options;
+        ds.tuiPromptMultiSelect = msg.multiSelect;
+        ds.tuiToggledIndices = [];
+        ds.currentTurnTitle = msg.description;  // store for card PATCH on toggle
+        try {
+          const cardJson = buildTuiPromptCard(
+            ds.session.rootMessageId,
+            ds.session.sessionId,
+            msg.description,
+            msg.options,
+            msg.multiSelect,
+          );
+          const cardMsgId = await cb.sessionReply(ds.session.rootMessageId, cardJson, 'interactive', ds.larkAppId);
+          ds.tuiPromptCardId = cardMsgId;
+        } catch (err) {
+          logger.warn(`[${t}] Failed to post TUI prompt card: ${err}`);
+        }
+        break;
+      }
+
+      case 'tui_prompt_resolved': {
+        // TUI prompt is no longer showing — update card if it exists
+        logger.info(`[${t}] TUI prompt resolved${msg.selectedText ? `: ${msg.selectedText}` : ''}`);
+        if (ds.tuiPromptCardId) {
+          const resolvedCard = buildTuiPromptResolvedCard(msg.selectedText ?? 'Done');
+          updateMessage(ds.larkAppId, ds.tuiPromptCardId, resolvedCard).catch(err =>
+            logger.debug(`[${t}] Failed to update TUI prompt card: ${err}`),
+          );
+          ds.tuiPromptCardId = undefined;
+          ds.tuiPromptOptions = undefined;
         }
         break;
       }

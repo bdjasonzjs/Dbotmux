@@ -25,6 +25,8 @@ import { PtyBackend } from './adapters/backend/pty-backend.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
 import type { SessionBackend } from './adapters/backend/types.js';
 import { IdleDetector } from './utils/idle-detector.js';
+import { ScreenAnalyzer } from './utils/screen-analyzer.js';
+import { config } from './config.js';
 import * as sessionStore from './services/session-store.js';
 import * as pty from 'node-pty';
 
@@ -71,6 +73,93 @@ const SCREEN_UPDATE_INTERVAL_MS = 2_000;
 
 const MAX_SCROLLBACK = 1_000_000; // chars (~1MB)
 let scrollback = '';
+
+// ─── Screen Analyzer (AI-based TUI prompt detection) ────────────────────────
+
+let screenAnalyzer: ScreenAnalyzer | null = null;
+/** When true, user messages are queued because a TUI prompt is active */
+let tuiPromptBlocking = false;
+
+function startScreenAnalyzer(): void {
+  const sa = config.screenAnalyzer;
+  log(`ScreenAnalyzer config: enabled=${sa.enabled}, baseUrl=${sa.baseUrl ? 'set' : 'empty'}, model=${sa.model || 'empty'}, extraHeaders=${JSON.stringify(sa.extraHeaders)}`);
+  if (!sa.enabled || !sa.baseUrl || !sa.apiKey || !sa.model) return;
+
+  screenAnalyzer = new ScreenAnalyzer(
+    {
+      baseUrl: sa.baseUrl,
+      apiKey: sa.apiKey,
+      model: sa.model,
+      intervalMs: sa.intervalMs,
+      stableCount: sa.stableCount,
+      snapshotMaxChars: sa.snapshotMaxChars,
+      extraHeaders: sa.extraHeaders,
+      extraBody: sa.extraBody,
+    },
+    {
+      getSnapshot: () => renderer?.rawSnapshot() ?? '',
+      onAnalyzing: () => { /* no-op: only block when prompt is actually detected */ },
+      onTuiPrompt: (description, options, multiSelect) => {
+        tuiPromptBlocking = true;
+        send({ type: 'tui_prompt', description, options, multiSelect });
+      },
+      onTuiPromptResolved: (selectedText) => {
+        tuiPromptBlocking = false;
+        send({ type: 'tui_prompt_resolved', selectedText });
+        // Flush any messages that were queued during the prompt
+        flushPending();
+      },
+      log,
+    },
+  );
+  screenAnalyzer.start();
+}
+
+function stopScreenAnalyzer(): void {
+  screenAnalyzer?.dispose();
+  screenAnalyzer = null;
+  tuiPromptBlocking = false;
+}
+
+/** Key name → ANSI escape sequence (for PtyBackend) */
+const KEY_TO_ANSI: Record<string, string> = {
+  Up: '\x1b[A', Down: '\x1b[B', Left: '\x1b[D', Right: '\x1b[C',
+  Enter: '\r', Space: ' ', Tab: '\t', Escape: '\x1b',
+};
+
+/**
+ * Execute an AI-provided key sequence with delays between each key.
+ * @param keys — key names like ["Down","Down","Space","Up","Up"]
+ * @param isFinal — if true, this action ends the prompt (clear blocking state)
+ */
+async function handleTuiKeys(keys: string[], isFinal: boolean): Promise<void> {
+  if (!backend || keys.length === 0) return;
+
+  if ('sendSpecialKeys' in backend) {
+    const b = backend as any;
+    // Send each key individually with 100ms delay for TUI state processing
+    for (const key of keys) {
+      b.sendSpecialKeys(key);
+      await new Promise(r => setTimeout(r, 100));
+    }
+  } else {
+    for (const key of keys) {
+      backend.write(KEY_TO_ANSI[key] ?? key);
+      await new Promise(r => setTimeout(r, 100));
+    }
+  }
+
+  if (isFinal) {
+    tuiPromptBlocking = false;
+    if (isPromptReady) {
+      isPromptReady = false;
+      idleDetector?.reset();
+    }
+    screenAnalyzer?.notifySelection('final');
+  }
+
+  log(`TUI keys: ${keys.join(' ')}${isFinal ? ' (final)' : ''}`);
+}
 
 // ─── Trust Dialog Detection ──────────────────────────────────────────────────
 
@@ -170,6 +259,10 @@ async function flushPending(): Promise<void> {
 function sendToPty(content: string): void {
   if (!backend || !cliAdapter) return;
   pendingMessages.push(content);
+  if (tuiPromptBlocking) {
+    log(`Queued message (${pendingMessages.length} pending): "${content.substring(0, 80)}" — TUI prompt active`);
+    return;
+  }
   if (isPromptReady || isFlushing || cliAdapter.supportsTypeAhead) {
     log(`Writing to PTY: "${content.substring(0, 80)}"`);
     flushPending();  // fire-and-forget async; no-op if already flushing
@@ -182,11 +275,16 @@ function sendToPty(content: string): void {
 
 function startScreenUpdates(): void {
   renderer = new TerminalRenderer(PTY_COLS, PTY_ROWS);
+  let lastSentStatus: string | undefined;
   screenUpdateTimer = setInterval(() => {
     if (!renderer || awaitingFirstPrompt) return;
     const { content, changed } = renderer.snapshot();
-    if (changed) {
-      send({ type: 'screen_update', content, status: isPromptReady ? 'idle' : 'working' });
+    let status: 'working' | 'idle' | 'analyzing' = isPromptReady ? 'idle' : 'working';
+    if (screenAnalyzer?.isAnalyzing) status = 'analyzing';
+    // Send update when content changed OR status changed (e.g. idle → analyzing)
+    if (changed || status !== lastSentStatus) {
+      lastSentStatus = status;
+      send({ type: 'screen_update', content, status });
     }
   }, SCREEN_UPDATE_INTERVAL_MS);
 }
@@ -313,6 +411,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
 function killCli(): void {
   idleDetector?.dispose();
   idleDetector = null;
+  stopScreenAnalyzer();
   stopScreenUpdates();
   backend?.kill();
   backend = null;
@@ -680,6 +779,7 @@ process.on('message', async (raw: unknown) => {
       try {
         const port = await startWebServer('0.0.0.0', msg.webPort);
         startScreenUpdates();
+        startScreenAnalyzer();
         spawnCli(msg);
 
         // Queue the initial prompt — flushed when CLI shows idle.
@@ -731,9 +831,15 @@ process.on('message', async (raw: unknown) => {
       setTimeout(() => {
         if (lastInitConfig) {
           startScreenUpdates();
+          startScreenAnalyzer();
           spawnCli({ ...lastInitConfig, resume: true, prompt: '' });
         }
       }, 500);
+      break;
+    }
+
+    case 'tui_keys': {
+      handleTuiKeys(msg.keys, msg.isFinal);
       break;
     }
 
