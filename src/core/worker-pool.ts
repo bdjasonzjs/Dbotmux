@@ -19,7 +19,7 @@ import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { getBot, getAllBots } from '../bot-registry.js';
 import type { CliId } from '../adapters/cli/types.js';
-import type { DaemonToWorker, WorkerToDaemon, Session } from '../types.js';
+import type { DaemonToWorker, WorkerToDaemon, Session, DisplayMode } from '../types.js';
 import type { DaemonSession } from './types.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -384,13 +384,18 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
               ds.lastScreenContent ?? '',
               'starting',
               botCfg.cliId,
-              ds.streamExpanded,
+              ds.displayMode ?? 'hidden',
               ds.streamCardNonce,
+              ds.currentImageKey,
               isAdopt,
               showTakeover,
             );
             await updateMessage(ds.larkAppId, restoredCardId, streamCardJson);
             persistStreamCardState(ds);
+            // Re-sync worker's display mode (it starts fresh in 'hidden')
+            if (ds.worker && ds.displayMode && ds.displayMode !== 'hidden') {
+              ds.worker.send({ type: 'set_display_mode', mode: ds.displayMode } as DaemonToWorker);
+            }
             logger.info(`[${t}] Reused existing streaming card ${restoredCardId.substring(0, 12)} after worker (re)start`);
             break;
           } catch (err) {
@@ -416,8 +421,9 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             '',
             'starting',
             botCfg.cliId,
-            ds.streamExpanded,
+            ds.displayMode ?? 'hidden',
             ds.streamCardNonce,
+            ds.currentImageKey,
             isAdopt,
             showTakeover,
           );
@@ -465,11 +471,13 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
 
       case 'screen_update': {
         if (!ds.workerPort) break;
+        const prevStatus = ds.lastScreenStatus;
         ds.lastScreenContent = msg.content;
         ds.lastScreenStatus = msg.status;
 
         const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);
+        const mode: DisplayMode = ds.displayMode ?? 'hidden';
 
         if (ds.streamCardPending || !ds.streamCardId) {
           // If a POST is already in-flight, drop this update — it will be
@@ -480,6 +488,8 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           // Generate new nonce so old card buttons are distinguishable.
           const isNewTurn = !!ds.streamCardPending;
           ds.streamCardNonce = randomBytes(4).toString('hex');
+          // New turn → image_key from previous turn no longer valid
+          if (isNewTurn) ds.currentImageKey = undefined;
           const cardJson = buildStreamingCard(
             ds.session.sessionId,
             ds.session.rootMessageId,
@@ -488,8 +498,9 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             isNewTurn ? '' : msg.content,
             msg.status,
             botCfg.cliId,
-            ds.streamExpanded,
+            mode,
             ds.streamCardNonce,
+            ds.currentImageKey,
             isAdopt,
             showTakeover,
           );
@@ -511,7 +522,11 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
               persistStreamCardState(ds);
             });
         } else {
-          // Same turn — queue PATCH (serialized, latest-wins), reuse existing nonce
+          // Same turn — gating:
+          //   text mode: PATCH on every update (markdown content changes)
+          //   screenshot/hidden: PATCH only on status change (image PATCH happens via screenshot_uploaded)
+          const statusChanged = prevStatus !== msg.status;
+          if (mode !== 'text' && !statusChanged) break;
           const cardJson = buildStreamingCard(
             ds.session.sessionId,
             ds.session.rootMessageId,
@@ -520,13 +535,43 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             msg.content,
             msg.status,
             botCfg.cliId,
-            ds.streamExpanded,
+            mode,
             ds.streamCardNonce,
+            ds.currentImageKey,
             isAdopt,
             showTakeover,
           );
           scheduleCardPatch(ds, cardJson);
         }
+        break;
+      }
+
+      case 'screenshot_uploaded': {
+        // Drop uploads that arrived during a new-turn handoff — the image_key may
+        // reflect previous turn's content. Next 10s cycle picks up fresh content.
+        if (ds.streamCardPending) break;
+        ds.currentImageKey = msg.imageKey;
+        ds.lastScreenStatus = msg.status;
+        persistStreamCardState(ds);
+        if ((ds.displayMode ?? 'hidden') !== 'screenshot') break;
+        if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || !ds.workerPort) break;
+        const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
+        const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);
+        const cardJson = buildStreamingCard(
+          ds.session.sessionId,
+          ds.session.rootMessageId,
+          readUrl,
+          turnTitle,
+          ds.lastScreenContent ?? '',
+          msg.status,
+          botCfg.cliId,
+          'screenshot',
+          ds.streamCardNonce,
+          ds.currentImageKey,
+          isAdopt,
+          showTakeover,
+        );
+        scheduleCardPatch(ds, cardJson);
         break;
       }
 
@@ -585,7 +630,8 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);
             const frozenCard = buildStreamingCard(
               ds.session.sessionId, ds.session.rootMessageId, readUrl, turnTitle,
-              ds.lastScreenContent ?? '', 'idle', botCfg.cliId, ds.streamExpanded, ds.streamCardNonce,
+              ds.lastScreenContent ?? '', 'idle', botCfg.cliId,
+              ds.displayMode ?? 'hidden', ds.streamCardNonce, ds.currentImageKey,
               isAdopt, showTakeover,
             );
             scheduleCardPatch(ds, frozenCard);
@@ -614,7 +660,8 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);
             const frozenCard = buildStreamingCard(
               ds.session.sessionId, ds.session.rootMessageId, readUrl, turnTitle,
-              ds.lastScreenContent ?? '', 'idle', botCfg.cliId, ds.streamExpanded, ds.streamCardNonce,
+              ds.lastScreenContent ?? '', 'idle', botCfg.cliId,
+              ds.displayMode ?? 'hidden', ds.streamCardNonce, ds.currentImageKey,
             );
             scheduleCardPatch(ds, frozenCard);
           }

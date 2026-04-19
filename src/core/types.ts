@@ -1,12 +1,23 @@
 import type { ChildProcess } from 'node:child_process';
-import type { Session, DaemonToWorker, LarkAttachment, LarkMention } from '../types.js';
+import type { Session, DaemonToWorker, LarkAttachment, LarkMention, DisplayMode } from '../types.js';
 
 /** Frozen card state — cached content for historical streaming cards that can still be toggled. */
 export interface FrozenCard {
   messageId: string;      // Lark message_id for PATCHing
-  content: string;        // frozen screen content snapshot
+  content: string;        // frozen text snapshot (used in text mode)
   title: string;          // turn title at freeze time
-  expanded: boolean;      // independent expand/collapse state
+  /** Legacy boolean expand/collapse — kept for migrating old persisted cards. */
+  expanded?: boolean;
+  /** Display mode at freeze time. If absent, derived from `expanded`. */
+  displayMode?: DisplayMode;
+  /** Latest uploaded image_key for the frozen card (only when displayMode === 'screenshot'). */
+  imageKey?: string;
+}
+
+/** Resolve effective display mode for a frozen card (with backward-compat). */
+export function frozenDisplayMode(fc: FrozenCard): DisplayMode {
+  if (fc.displayMode) return fc.displayMode;
+  return fc.expanded ? 'text' : 'hidden';
 }
 
 /** Core session state — IM-agnostic.
@@ -37,7 +48,10 @@ export interface DaemonSession {
   streamCardId?: string;         // message_id of the streaming card in group (PATCHed with live output)
   streamCardNonce?: string;       // unique nonce for the current streaming card — embedded in button values to distinguish old vs current card
   streamCardPending?: boolean;    // true when a new turn started, next screen_update creates a new card
-  streamExpanded?: boolean;       // whether streaming output is visible in card (default: collapsed)
+  /** Card body display mode. Default 'hidden'. When user clicks 显示输出, defaults to 'screenshot'. */
+  displayMode?: DisplayMode;
+  /** Latest uploaded screenshot image_key for the streaming card. */
+  currentImageKey?: string;
   lastScreenContent?: string;    // last screen_update content — used to freeze card at idle
   lastScreenStatus?: 'starting' | 'working' | 'idle' | 'analyzing';  // last screen_update status
   currentTurnTitle?: string;      // title for the current turn's streaming card

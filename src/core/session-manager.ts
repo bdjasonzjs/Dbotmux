@@ -262,13 +262,17 @@ export function persistStreamCardState(ds: DaemonSession): void {
   if (
     s.streamCardId === cardId &&
     s.streamCardNonce === ds.streamCardNonce &&
-    s.streamExpanded === ds.streamExpanded &&
+    s.displayMode === ds.displayMode &&
+    s.currentImageKey === ds.currentImageKey &&
     s.currentTurnTitle === ds.currentTurnTitle
   ) return;
   s.streamCardId = cardId;
   s.streamCardNonce = ds.streamCardNonce;
-  s.streamExpanded = ds.streamExpanded;
+  s.displayMode = ds.displayMode;
+  s.currentImageKey = ds.currentImageKey;
   s.currentTurnTitle = ds.currentTurnTitle;
+  // Clear legacy field so it doesn't drift
+  s.streamExpanded = undefined;
   sessionStore.updateSession(s);
 }
 
@@ -316,7 +320,8 @@ export function restoreActiveSessions(activeSessions: Map<string, DaemonSession>
         adoptedFrom: adopted as DaemonSession['adoptedFrom'],
         streamCardId: session.streamCardId,
         streamCardNonce: session.streamCardNonce,
-        streamExpanded: session.streamExpanded,
+        displayMode: session.displayMode ?? (session.streamExpanded ? 'text' : 'hidden'),
+        currentImageKey: session.currentImageKey,
         currentTurnTitle: session.currentTurnTitle,
       };
       activeSessions.set(sessionKey(session.rootMessageId, larkAppId), ds);
@@ -353,7 +358,8 @@ export function restoreActiveSessions(activeSessions: Map<string, DaemonSession>
       // letting the next update create a new card.
       streamCardId: session.streamCardId,
       streamCardNonce: session.streamCardNonce,
-      streamExpanded: session.streamExpanded,
+      displayMode: session.displayMode ?? (session.streamExpanded ? 'text' : 'hidden'),
+      currentImageKey: session.currentImageKey,
       currentTurnTitle: session.currentTurnTitle,
     });
 

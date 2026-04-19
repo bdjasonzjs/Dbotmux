@@ -16,7 +16,12 @@ export interface Session {
    *  (rather than a fresh POST) after daemon restart. */
   streamCardId?: string;
   streamCardNonce?: string;
+  /** Legacy field kept for migrating sessions persisted before displayMode was added. */
   streamExpanded?: boolean;
+  /** Card body display mode — 'hidden' | 'text' | 'screenshot'. */
+  displayMode?: DisplayMode;
+  /** Latest uploaded screenshot image_key, persisted so card can re-render after restart. */
+  currentImageKey?: string;
   currentTurnTitle?: string;
   /** Persisted adopt metadata — allows adopt sessions to survive daemon restarts. */
   adoptedFrom?: {
@@ -103,13 +108,24 @@ export interface ScheduledTask {
 
 // ─── Worker IPC Messages ─────────────────────────────────────────────────────
 
+/** Display modes for the streaming card output. */
+export type DisplayMode = 'hidden' | 'text' | 'screenshot';
+
+/** Quick-action keys sent from card buttons to the worker's PTY/tmux backend. */
+export type TermActionKey =
+  | 'esc' | 'ctrlc' | 'tab' | 'enter' | 'space'
+  | 'up' | 'down' | 'left' | 'right'
+  | 'half_page_up' | 'half_page_down';
+
 /** Messages sent from Daemon to Worker */
 export type DaemonToWorker =
   | { type: 'init'; sessionId: string; chatId: string; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; backendType: 'pty' | 'tmux'; prompt: string; resume?: boolean; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; adoptMode?: boolean; adoptTmuxTarget?: string; adoptPaneCols?: number; adoptPaneRows?: number }
   | { type: 'message'; content: string }
   | { type: 'close' }
   | { type: 'restart' }
-  | { type: 'tui_keys'; keys: string[]; isFinal: boolean };
+  | { type: 'tui_keys'; keys: string[]; isFinal: boolean }
+  | { type: 'set_display_mode'; mode: DisplayMode }
+  | { type: 'term_action'; key: TermActionKey };
 
 /** Messages sent from Worker to Daemon */
 export type WorkerToDaemon =
@@ -119,5 +135,6 @@ export type WorkerToDaemon =
   | { type: 'screen_update'; content: string; status: 'working' | 'idle' | 'analyzing' }
   | { type: 'error'; message: string }
   | { type: 'tui_prompt'; description: string; options: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>; multiSelect?: boolean }
-  | { type: 'tui_prompt_resolved'; selectedText?: string };
+  | { type: 'tui_prompt_resolved'; selectedText?: string }
+  | { type: 'screenshot_uploaded'; imageKey: string; status: 'working' | 'idle' | 'analyzing' };
 

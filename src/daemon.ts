@@ -511,9 +511,11 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
       const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
       const dsBotCfg = getBot(ds.larkAppId).config;
       const prevTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(dsBotCfg.cliId);
+      const prevMode = ds.displayMode ?? 'hidden';
       const frozenCard = buildStreamingCard(
         ds.session.sessionId, ds.session.rootMessageId, readUrl, prevTitle,
-        ds.lastScreenContent ?? '', 'idle', dsBotCfg.cliId, ds.streamExpanded, ds.streamCardNonce,
+        ds.lastScreenContent ?? '', 'idle', dsBotCfg.cliId,
+        prevMode, ds.streamCardNonce, ds.currentImageKey,
       );
       // Freeze through the serialization queue to avoid racing with an in-flight PATCH.
       // scheduleCardPatch replaces any stale pending item (latest-wins).
@@ -526,7 +528,8 @@ async function handleThreadReply(data: any, rootId: string, larkAppId: string): 
           messageId: ds.streamCardId,
           content: ds.lastScreenContent ?? '',
           title: prevTitle,
-          expanded: ds.streamExpanded ?? false,
+          displayMode: prevMode,
+          imageKey: ds.currentImageKey,
         });
         saveFrozenCards(ds.session.sessionId, ds.frozenCards);
       }

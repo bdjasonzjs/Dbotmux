@@ -17,7 +17,7 @@ import { mkdirSync, writeFileSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
-import type { DaemonToWorker, WorkerToDaemon } from './types.js';
+import type { DaemonToWorker, WorkerToDaemon, DisplayMode, TermActionKey } from './types.js';
 import { TerminalRenderer } from './utils/terminal-renderer.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
 import type { CliAdapter } from './adapters/cli/types.js';
@@ -26,9 +26,12 @@ import { TmuxBackend } from './adapters/backend/tmux-backend.js';
 import type { SessionBackend } from './adapters/backend/types.js';
 import { IdleDetector } from './utils/idle-detector.js';
 import { ScreenAnalyzer } from './utils/screen-analyzer.js';
+import { captureToPng } from './utils/screenshot-renderer.js';
+import { uploadImageBuffer } from './utils/lark-upload.js';
 import { config } from './config.js';
 import * as sessionStore from './services/session-store.js';
 import * as pty from 'node-pty';
+import { createHash } from 'node:crypto';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -119,6 +122,127 @@ function stopScreenAnalyzer(): void {
   screenAnalyzer?.dispose();
   screenAnalyzer = null;
   tuiPromptBlocking = false;
+}
+
+// ─── Screenshot Capture (PNG → Feishu image_key) ────────────────────────────
+
+const SCREENSHOT_INTERVAL_MS = 10_000;
+const POST_ACTION_DELAY_MS = 1_000;
+const SHOT_COLS = 160;
+const SHOT_ROWS = 50;
+
+let displayMode: DisplayMode = 'hidden';
+let screenshotTimer: ReturnType<typeof setInterval> | null = null;
+let pendingShotTimer: ReturnType<typeof setTimeout> | null = null;
+let lastShotHash = '';
+/** Lines scrolled up from the live viewport (for half-page pagination). 0 = bottom. */
+let scrollOffset = 0;
+let larkAppIdForUpload = '';
+let larkAppSecretForUpload = '';
+
+function startScreenshotLoop(): void {
+  stopScreenshotLoop();
+  screenshotTimer = setInterval(() => { void captureAndUpload(); }, SCREENSHOT_INTERVAL_MS);
+  // Capture immediately so the user gets a first frame fast
+  void captureAndUpload();
+}
+
+function stopScreenshotLoop(): void {
+  if (screenshotTimer) { clearInterval(screenshotTimer); screenshotTimer = null; }
+  if (pendingShotTimer) { clearTimeout(pendingShotTimer); pendingShotTimer = null; }
+}
+
+/** Schedule a single capture +1s, then resume the regular 10s cadence. */
+function scheduleOneShotAfterAction(): void {
+  if (displayMode !== 'screenshot') return;
+  if (pendingShotTimer) clearTimeout(pendingShotTimer);
+  if (screenshotTimer) { clearInterval(screenshotTimer); screenshotTimer = null; }
+  pendingShotTimer = setTimeout(async () => {
+    pendingShotTimer = null;
+    await captureAndUpload();
+    if (displayMode === 'screenshot') {
+      screenshotTimer = setInterval(() => { void captureAndUpload(); }, SCREENSHOT_INTERVAL_MS);
+    }
+  }, POST_ACTION_DELAY_MS);
+}
+
+async function captureAndUpload(): Promise<void> {
+  if (displayMode !== 'screenshot') return;
+  if (awaitingFirstPrompt) return;
+  if (!renderer) return;
+  if (!larkAppIdForUpload || !larkAppSecretForUpload) return;
+
+  const term = renderer.xterm;
+  const startY = renderer.startYFromOffset(scrollOffset, SHOT_ROWS);
+
+  // Hash dedup — raw snapshot text + scroll offset; identical → skip upload
+  const snap = renderer.rawSnapshot();
+  const hash = createHash('md5').update(snap).update(`|${scrollOffset}`).digest('hex');
+  if (hash === lastShotHash) return;
+  lastShotHash = hash;
+
+  let png: Buffer;
+  try {
+    png = captureToPng(term, { cols: SHOT_COLS, rows: SHOT_ROWS, startY });
+  } catch (err: any) {
+    log(`Screenshot render failed: ${err.message}`);
+    return;
+  }
+
+  let imageKey: string;
+  try {
+    imageKey = await uploadImageBuffer(larkAppIdForUpload, larkAppSecretForUpload, png);
+  } catch (err: any) {
+    log(`Screenshot upload failed: ${err.message}`);
+    return;
+  }
+
+  let status: 'working' | 'idle' | 'analyzing' = isPromptReady ? 'idle' : 'working';
+  if (screenAnalyzer?.isAnalyzing) status = 'analyzing';
+  send({ type: 'screenshot_uploaded', imageKey, status });
+}
+
+function applyDisplayMode(mode: DisplayMode): void {
+  displayMode = mode;
+  scrollOffset = 0;
+  lastShotHash = '';
+  if (mode === 'screenshot') startScreenshotLoop();
+  else stopScreenshotLoop();
+}
+
+const TMUX_KEY_MAP: Record<TermActionKey, string | null> = {
+  esc: 'Escape', ctrlc: 'C-c', tab: 'Tab', enter: 'Enter', space: 'Space',
+  up: 'Up', down: 'Down', left: 'Left', right: 'Right',
+  half_page_up: null, half_page_down: null,
+};
+const PTY_SEQ_MAP: Record<TermActionKey, string | null> = {
+  esc: '\x1b', ctrlc: '\x03', tab: '\t', enter: '\r', space: ' ',
+  up: '\x1b[A', down: '\x1b[B', left: '\x1b[D', right: '\x1b[C',
+  half_page_up: null, half_page_down: null,
+};
+
+function handleTermAction(key: TermActionKey): void {
+  // Pagination: scroll the screenshot viewport, don't touch the backend
+  if (key === 'half_page_up' || key === 'half_page_down') {
+    const half = Math.max(1, Math.floor(SHOT_ROWS / 2));
+    scrollOffset += key === 'half_page_up' ? half : -half;
+    if (scrollOffset < 0) scrollOffset = 0;
+    log(`Scroll offset → ${scrollOffset}`);
+    scheduleOneShotAfterAction();
+    return;
+  }
+
+  if (!backend) return;
+  // Real key input — reset scroll so the user sees live state
+  scrollOffset = 0;
+
+  if ('sendSpecialKeys' in backend && TMUX_KEY_MAP[key]) {
+    (backend as any).sendSpecialKeys(TMUX_KEY_MAP[key]);
+  } else if (PTY_SEQ_MAP[key]) {
+    backend.write(PTY_SEQ_MAP[key]!);
+  }
+  log(`Term action: ${key}`);
+  scheduleOneShotAfterAction();
 }
 
 /** Key name → ANSI escape sequence (for PtyBackend) */
@@ -774,6 +898,9 @@ process.on('message', async (raw: unknown) => {
       if (msg.ownerOpenId) process.env.__OWNER_OPEN_ID = msg.ownerOpenId;
       // Scope session store to this bot's per-bot file
       if (msg.larkAppId) sessionStore.init(msg.larkAppId);
+      // Capture credentials for direct image upload from worker
+      larkAppIdForUpload = msg.larkAppId;
+      larkAppSecretForUpload = msg.larkAppSecret;
       log(`Init: session=${sessionId}, cwd=${msg.workingDir}`);
 
       try {
@@ -843,8 +970,20 @@ process.on('message', async (raw: unknown) => {
       break;
     }
 
+    case 'set_display_mode': {
+      log(`Display mode → ${msg.mode}`);
+      applyDisplayMode(msg.mode);
+      break;
+    }
+
+    case 'term_action': {
+      handleTermAction(msg.key);
+      break;
+    }
+
     case 'close': {
       log('Close requested');
+      stopScreenshotLoop();
       // destroySession kills tmux session permanently; kill() only detaches
       backend?.destroySession?.();
       killCli();
@@ -867,9 +1006,9 @@ function cleanup(): void {
   if (httpServer) { httpServer.close(); httpServer = null; }
 }
 
-process.on('SIGTERM', () => { killCli(); cleanup(); process.exit(0); });
-process.on('SIGINT', () => { killCli(); cleanup(); process.exit(0); });
+process.on('SIGTERM', () => { stopScreenshotLoop(); killCli(); cleanup(); process.exit(0); });
+process.on('SIGINT', () => { stopScreenshotLoop(); killCli(); cleanup(); process.exit(0); });
 // If parent daemon dies, IPC channel closes — clean up
-process.on('disconnect', () => { log('Daemon disconnected'); killCli(); cleanup(); process.exit(0); });
+process.on('disconnect', () => { log('Daemon disconnected'); stopScreenshotLoop(); killCli(); cleanup(); process.exit(0); });
 
 log('Worker started, waiting for init...');

@@ -13,8 +13,8 @@ import * as sessionStore from '../../services/session-store.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
 import { forkWorker, killWorker, scheduleCardPatch } from '../../core/worker-pool.js';
 import { getSessionWorkingDir, buildNewTopicPrompt, getAvailableBots, persistStreamCardState } from '../../core/session-manager.js';
-import type { DaemonToWorker } from '../../types.js';
-import { sessionKey } from '../../core/types.js';
+import type { DaemonToWorker, DisplayMode, TermActionKey } from '../../types.js';
+import { sessionKey, frozenDisplayMode } from '../../core/types.js';
 import type { DaemonSession } from '../../core/types.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 
@@ -57,7 +57,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   // Use the receiving bot's allowedUsers — the operator open_id in card actions
   // is scoped to the app that received the callback.
   const operatorOpenId = data?.operator?.open_id;
-  const isSensitive = value?.action && ['restart', 'close', 'skip_repo', 'get_write_link', 'toggle_stream', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input'].includes(value.action);
+  const isSensitive = value?.action && ['restart', 'close', 'skip_repo', 'get_write_link', 'toggle_stream', 'toggle_display', 'toggle_mode', 'term_action', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     const ds = rootId ? activeSessions.get(rootId) : undefined;
@@ -163,8 +163,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       ds.lastScreenStatus = undefined;
       ds.session.streamCardId = undefined;
       ds.session.streamCardNonce = undefined;
+      ds.session.displayMode = undefined;
+      ds.session.currentImageKey = undefined;
       ds.session.streamExpanded = undefined;
       ds.session.currentTurnTitle = undefined;
+      ds.displayMode = undefined;
+      ds.currentImageKey = undefined;
       sessionStore.updateSession(ds.session);
 
       // Fork standard Botmux worker with resume — BEFORE killing original CLI,
@@ -328,66 +332,123 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       }
     }
 
-    if (actionType === 'toggle_stream' && ds) {
+    // Display & mode toggles (new). 'toggle_stream' is the legacy alias from
+    // pre-screenshot cards and is mapped to toggle_display semantics.
+    if ((actionType === 'toggle_display' || actionType === 'toggle_stream' || actionType === 'toggle_mode') && ds) {
       const clickedNonce: string | undefined = value?.card_nonce;
-      if (clickedNonce && ds.streamCardNonce && clickedNonce !== ds.streamCardNonce) {
-        // Clicked on a historical frozen card — toggle using cached content
-        if (!ds.frozenCards) ds.frozenCards = loadFrozenCards(ds.session.sessionId);
-        const frozen = ds.frozenCards.get(clickedNonce);
-        if (frozen) {
-          frozen.expanded = !frozen.expanded;
-          const botCfg = getBot(ds.larkAppId).config;
-          const readUrl = ds.workerPort
-            ? `http://${config.web.externalHost}:${ds.workerPort}`
-            : '';
-          const cardJson = buildStreamingCard(
-            ds.session.sessionId,
-            ds.session.rootMessageId,
-            readUrl,
-            frozen.title,
-            frozen.content,
-            'idle',
-            botCfg.cliId,
-            frozen.expanded,
-            clickedNonce,
-          );
-          // PATCH the frozen card directly — no serialization needed (no streaming race)
-          updateMessage(ds.larkAppId, frozen.messageId, cardJson).catch(err =>
-            logger.debug(`[${tag(ds)}] Failed to toggle frozen card: ${err}`),
-          );
-          saveFrozenCards(ds.session.sessionId, ds.frozenCards);
-          logger.info(`[${tag(ds)}] Frozen card toggled: ${frozen.expanded ? 'expanded' : 'collapsed'} (nonce=${clickedNonce})`);
-          try { return JSON.parse(cardJson); } catch { /* fall through */ }
-        } else {
-          logger.debug(`[${tag(ds)}] Toggle on unknown old card: nonce=${clickedNonce}, current=${ds.streamCardNonce}`);
+      const isFrozenClick = clickedNonce && ds.streamCardNonce && clickedNonce !== ds.streamCardNonce;
+
+      // Compute next mode for a current vs frozen card
+      function nextMode(current: DisplayMode, hasImage: boolean): DisplayMode {
+        if (actionType === 'toggle_mode') {
+          if (current === 'hidden') return 'screenshot';
+          // Switch text↔screenshot when shown
+          return current === 'text' ? 'screenshot' : 'text';
         }
-      } else {
-        // Current (latest) streaming card — toggle normally
-        const botCfg = getBot(ds.larkAppId).config;
-        ds.streamExpanded = !ds.streamExpanded;
-        persistStreamCardState(ds);
-        if (ds.streamCardId && ds.workerPort) {
-          const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
-          const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);
-          const cardJson = buildStreamingCard(
-            ds.session.sessionId,
-            ds.session.rootMessageId,
-            readUrl,
-            turnTitle,
-            ds.lastScreenContent || '',
-            ds.lastScreenStatus || 'working',
-            botCfg.cliId,
-            ds.streamExpanded,
-            ds.streamCardNonce,
-          );
-          // Queue PATCH as backup — but also return card JSON for instant rendering
-          scheduleCardPatch(ds, cardJson);
-          logger.info(`[${tag(ds)}] Stream display toggled: ${ds.streamExpanded ? 'expanded' : 'collapsed'}`);
-          // Return parsed card so event dispatcher can send it as immediate callback response
-          try { return JSON.parse(cardJson); } catch { /* fall through */ }
-        }
-        logger.info(`[${tag(ds)}] Stream display toggled: ${ds.streamExpanded ? 'expanded' : 'collapsed'}`);
+        // toggle_display / legacy toggle_stream: hidden ↔ shown (default screenshot)
+        if (current === 'hidden') return hasImage || actionType !== 'toggle_stream' ? 'screenshot' : 'text';
+        return 'hidden';
       }
+
+      if (isFrozenClick) {
+        // Historical card — toggle using cached state
+        if (!ds.frozenCards) ds.frozenCards = loadFrozenCards(ds.session.sessionId);
+        const frozen = ds.frozenCards.get(clickedNonce!);
+        if (!frozen) {
+          logger.debug(`[${tag(ds)}] Toggle on unknown frozen card: nonce=${clickedNonce}`);
+          return;
+        }
+        const cur = frozenDisplayMode(frozen);
+        const next = nextMode(cur, !!frozen.imageKey);
+        frozen.displayMode = next;
+        frozen.expanded = next !== 'hidden';
+        const botCfg = getBot(ds.larkAppId).config;
+        const readUrl = ds.workerPort ? `http://${config.web.externalHost}:${ds.workerPort}` : '';
+        const cardJson = buildStreamingCard(
+          ds.session.sessionId,
+          ds.session.rootMessageId,
+          readUrl,
+          frozen.title,
+          frozen.content,
+          'idle',
+          botCfg.cliId,
+          next,
+          clickedNonce,
+          frozen.imageKey,
+        );
+        updateMessage(ds.larkAppId, frozen.messageId, cardJson).catch(err =>
+          logger.debug(`[${tag(ds)}] Failed to toggle frozen card: ${err}`),
+        );
+        saveFrozenCards(ds.session.sessionId, ds.frozenCards);
+        logger.info(`[${tag(ds)}] Frozen card toggled to ${next} (nonce=${clickedNonce})`);
+        try { return JSON.parse(cardJson); } catch { /* fall through */ }
+        return;
+      }
+
+      // Current (latest) card — change displayMode + tell worker
+      const botCfg = getBot(ds.larkAppId).config;
+      const cur: DisplayMode = ds.displayMode ?? 'hidden';
+      const next = nextMode(cur, !!ds.currentImageKey);
+      ds.displayMode = next;
+      persistStreamCardState(ds);
+      if (ds.worker) {
+        ds.worker.send({ type: 'set_display_mode', mode: next } as DaemonToWorker);
+      }
+      if (ds.streamCardId && ds.workerPort) {
+        const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
+        const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);
+        const cardJson = buildStreamingCard(
+          ds.session.sessionId,
+          ds.session.rootMessageId,
+          readUrl,
+          turnTitle,
+          ds.lastScreenContent || '',
+          ds.lastScreenStatus || 'working',
+          botCfg.cliId,
+          next,
+          ds.streamCardNonce,
+          ds.currentImageKey,
+        );
+        scheduleCardPatch(ds, cardJson);
+        logger.info(`[${tag(ds)}] Display mode → ${next}`);
+        try { return JSON.parse(cardJson); } catch { /* fall through */ }
+      }
+      logger.info(`[${tag(ds)}] Display mode → ${next}`);
+      return;
+    }
+
+    // Quick-action keys (Esc, ^C, Tab, Space, Enter, ←↑↓→, ½ page) — forward to worker.
+    if (actionType === 'term_action' && ds) {
+      const key = value?.key as TermActionKey | undefined;
+      if (!key) return;
+      if (ds.worker) {
+        ds.worker.send({ type: 'term_action', key } as DaemonToWorker);
+        logger.info(`[${tag(ds)}] term_action: ${key}`);
+      }
+      // Return the current card JSON so Feishu doesn't revert the displayed
+      // image to the originally-POSTed initial frame while waiting for the
+      // post-action screenshot PATCH (~1s). Keep status unchanged — Feishu's
+      // built-in button spinner already shows that the click registered, and
+      // overriding to 'analyzing' was confusing (AI analysis uses that color).
+      if (ds.streamCardId && ds.streamCardId !== '__posting__' && ds.workerPort) {
+        const botCfg = getBot(ds.larkAppId).config;
+        const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
+        const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(botCfg.cliId);
+        const cardJson = buildStreamingCard(
+          ds.session.sessionId,
+          ds.session.rootMessageId,
+          readUrl,
+          turnTitle,
+          ds.lastScreenContent || '',
+          ds.lastScreenStatus || 'working',
+          botCfg.cliId,
+          ds.displayMode ?? 'screenshot',
+          ds.streamCardNonce,
+          ds.currentImageKey,
+        );
+        try { return JSON.parse(cardJson); } catch { /* fall through */ }
+      }
+      return;
     }
 
     if (actionType === 'skip_repo' && ds) {

@@ -1,6 +1,7 @@
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import type { CliId } from '../../adapters/cli/types.js';
 import type { AdoptableSession } from '../../core/session-discovery.js';
+import type { DisplayMode } from '../../types.js';
 
 const cliDisplayNames: Record<CliId, string> = {
   'claude-code': 'Claude',
@@ -111,6 +112,14 @@ function truncateContent(content: string): string {
 /**
  * Build a Feishu streaming card that shows live terminal output + controls.
  * This card is PATCHed in-place as the CLI works.
+ *
+ * displayMode:
+ *   - 'hidden'     — body collapsed; only header + main controls visible.
+ *   - 'screenshot' — img element (rendered server-side, uploaded for img_key).
+ *   - 'text'       — markdown element with terminal text content.
+ *
+ * Quick-action buttons (Esc, ^C, Tab, Space, Enter, ←↑↓→, ½屏 ↑/↓) appear
+ * whenever displayMode !== 'hidden', regardless of body type.
  */
 export function buildStreamingCard(
   sessionId: string,
@@ -120,78 +129,122 @@ export function buildStreamingCard(
   screenContent: string,
   status: 'starting' | 'working' | 'idle' | 'analyzing',
   cliId?: CliId,
-  expanded?: boolean,
+  displayMode: DisplayMode = 'hidden',
   cardNonce?: string,
+  imageKey?: string,
   adoptMode?: boolean,
   showTakeover?: boolean,
 ): string {
-  const cliName = getCliDisplayName(cliId ?? 'claude-code');
+  void cliId;
   const templateMap = { starting: 'yellow', working: 'blue', idle: 'green', analyzing: 'purple' } as const;
   const statusMap = { starting: '启动中…', working: '工作中', idle: '等待输入', analyzing: '正在分析…' } as const;
 
   const elements: any[] = [];
 
-  if (expanded) {
+  // ── Output body ─────────────────────────────────────────────────────────
+  if (displayMode === 'screenshot') {
+    if (imageKey) {
+      elements.push({
+        tag: 'img',
+        img_key: imageKey,
+        alt: { tag: 'plain_text', content: '' },
+        mode: 'fit_horizontal',
+        preview: true,
+      });
+    } else {
+      elements.push({ tag: 'markdown', content: '_(等待第一张截图…)_' });
+    }
+    elements.push({ tag: 'hr' });
+  } else if (displayMode === 'text') {
     const displayContent = truncateContent(screenContent) || '(等待输出…)';
     elements.push({ tag: 'markdown', content: displayContent });
     elements.push({ tag: 'hr' });
   }
 
-  const toggleBtn = {
-    tag: 'button',
-    text: { tag: 'plain_text', content: expanded ? '📕 收起输出' : '📖 展开输出' },
-    type: 'default' as const,
-    value: { action: 'toggle_stream', root_id: rootId, session_id: sessionId, ...(cardNonce ? { card_nonce: cardNonce } : {}) },
-  };
+  // ── Main control row: display toggle, mode toggle, terminal, manage ─────
+  const headerActions: any[] = [];
 
-  elements.push({
-    tag: 'action',
-    actions: [
-      toggleBtn,
-      {
-        tag: 'button',
-        text: { tag: 'plain_text', content: '🖥️ 打开终端' },
-        type: 'primary',
-        multi_url: {
-          url: terminalUrl,
-          pc_url: terminalUrl,
-          android_url: terminalUrl,
-          ios_url: terminalUrl,
-        },
-      },
-      {
-        tag: 'button',
-        text: { tag: 'plain_text', content: '🔑 获取操作链接' },
-        type: 'default',
-        value: { action: 'get_write_link', root_id: rootId, session_id: sessionId },
-      },
-      ...(adoptMode
-        ? [
-            ...(showTakeover
-              ? [{
-                  tag: 'button' as const,
-                  text: { tag: 'plain_text' as const, content: '🔄 接管' },
-                  type: 'default' as const,
-                  value: { action: 'takeover', root_id: rootId, session_id: sessionId },
-                }]
-              : []),
-            {
-              tag: 'button' as const,
-              text: { tag: 'plain_text' as const, content: '⏏ 断开' },
-              type: 'danger' as const,
-              value: { action: 'disconnect', root_id: rootId, session_id: sessionId },
-            },
-          ]
-        : [
-            {
-              tag: 'button' as const,
-              text: { tag: 'plain_text' as const, content: '❌ 关闭会话' },
-              type: 'danger' as const,
-              value: { action: 'close', root_id: rootId, session_id: sessionId },
-            },
-          ]),
-    ],
+  headerActions.push({
+    tag: 'button',
+    text: { tag: 'plain_text', content: displayMode === 'hidden' ? '📖 显示输出' : '📕 隐藏输出' },
+    type: 'default' as const,
+    value: { action: 'toggle_display', root_id: rootId, session_id: sessionId, ...(cardNonce ? { card_nonce: cardNonce } : {}) },
   });
+  if (displayMode !== 'hidden') {
+    headerActions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: displayMode === 'text' ? '🖼️ 截图' : '📝 文字' },
+      type: 'default' as const,
+      value: { action: 'toggle_mode', root_id: rootId, session_id: sessionId, ...(cardNonce ? { card_nonce: cardNonce } : {}) },
+    });
+  }
+  headerActions.push({
+    tag: 'button',
+    text: { tag: 'plain_text', content: '🖥️ 打开终端' },
+    type: 'primary',
+    multi_url: { url: terminalUrl, pc_url: terminalUrl, android_url: terminalUrl, ios_url: terminalUrl },
+  });
+  headerActions.push({
+    tag: 'button',
+    text: { tag: 'plain_text', content: '🔑 获取操作链接' },
+    type: 'default',
+    value: { action: 'get_write_link', root_id: rootId, session_id: sessionId },
+  });
+  if (adoptMode) {
+    if (showTakeover) {
+      headerActions.push({
+        tag: 'button',
+        text: { tag: 'plain_text', content: '🔄 接管' },
+        type: 'default' as const,
+        value: { action: 'takeover', root_id: rootId, session_id: sessionId },
+      });
+    }
+    headerActions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: '⏏ 断开' },
+      type: 'danger' as const,
+      value: { action: 'disconnect', root_id: rootId, session_id: sessionId },
+    });
+  } else {
+    headerActions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: '❌ 关闭会话' },
+      type: 'danger' as const,
+      value: { action: 'close', root_id: rootId, session_id: sessionId },
+    });
+  }
+  elements.push({ tag: 'action', actions: headerActions });
+
+  // ── Quick-action keys (only when output is shown) ───────────────────────
+  if (displayMode !== 'hidden') {
+    const mkKey = (label: string, key: string) => ({
+      tag: 'button',
+      text: { tag: 'plain_text', content: label },
+      type: 'default' as const,
+      value: { action: 'term_action', root_id: rootId, session_id: sessionId, key },
+    });
+    elements.push({
+      tag: 'action',
+      actions: [
+        mkKey('Esc', 'esc'),
+        mkKey('^C', 'ctrlc'),
+        mkKey('Tab', 'tab'),
+        mkKey('␣ Space', 'space'),
+        mkKey('↵ Enter', 'enter'),
+      ],
+    });
+    elements.push({
+      tag: 'action',
+      actions: [
+        mkKey('←', 'left'),
+        mkKey('↑', 'up'),
+        mkKey('↓', 'down'),
+        mkKey('→', 'right'),
+        mkKey('⇞ 上半屏', 'half_page_up'),
+        mkKey('⇟ 下半屏', 'half_page_down'),
+      ],
+    });
+  }
 
   const card = {
     config: { wide_screen_mode: true },
