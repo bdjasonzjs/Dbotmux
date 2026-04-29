@@ -23,3 +23,21 @@ describe('dashboard IPC server', () => {
     expect(res.status).toBe(404);
   });
 });
+
+describe('GET /api/sessions', () => {
+  it('returns array shape (sessions: Row[])', async () => {
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(Array.isArray(body.sessions)).toBe(true);
+  });
+});
+
+describe('GET /api/sessions/:sessionId', () => {
+  it('returns 404 for unknown sessionId', async () => {
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/nonexistent-id`);
+    expect(res.status).toBe(404);
+  });
+});

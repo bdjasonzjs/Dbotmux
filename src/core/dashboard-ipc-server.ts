@@ -1,6 +1,10 @@
 // src/core/dashboard-ipc-server.ts
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
 import { logger } from '../utils/logger.js';
+import * as sessionStore from '../services/session-store.js';
+import { listActiveSessions, getActiveSessionByKey } from './worker-pool.js';
+import type { DaemonSession } from './types.js';
+import type { Session } from '../types.js';
 
 export interface IpcServerHandle {
   port: number;
@@ -45,6 +49,98 @@ export async function readJsonBody<T = unknown>(req: IncomingMessage): Promise<T
 
 ipcRoute('GET', '/__health', (_req, res) => {
   jsonRes(res, 200, { ok: true });
+});
+
+// ─── Session list / detail ─────────────────────────────────────────────────
+
+export interface SessionRow {
+  sessionId: string;
+  larkAppId: string;
+  botName: string;
+  cliId: 'claude' | 'codex' | 'gemini' | 'opencode' | 'unknown';
+  status: 'starting' | 'working' | 'idle' | 'analyzing' | 'closed';
+  adopt: boolean;
+  spawnedAt: number;
+  lastMessageAt: number;
+  closedAt?: number;
+  workingDir?: string;
+  chatId: string;
+  rootMessageId: string;
+  threadId?: string;
+  title?: string;
+  ownerOpenId?: string;
+  webPort: number | null;
+  cliVersion?: string;
+  hasHistory?: boolean;
+  feishuChatLink: string;
+}
+
+function feishuChatLink(chatId: string): string {
+  return `https://applink.feishu.cn/client/chat/open?openChatId=${encodeURIComponent(chatId)}`;
+}
+
+let cachedBotName = '';
+export function setBotName(name: string): void { cachedBotName = name; }
+
+export function composeRowFromActive(ds: DaemonSession): SessionRow {
+  return {
+    sessionId: ds.session.sessionId,
+    larkAppId: ds.larkAppId,
+    botName: cachedBotName,
+    cliId: (ds.session.cliId as SessionRow['cliId']) ?? 'unknown',
+    status: ds.lastScreenStatus ?? 'starting',
+    adopt: !!ds.adoptedFrom,
+    spawnedAt: ds.spawnedAt,
+    lastMessageAt: ds.lastMessageAt,
+    workingDir: ds.workingDir,
+    chatId: ds.chatId,
+    rootMessageId: ds.session.rootMessageId,
+    title: ds.session.title,
+    ownerOpenId: ds.ownerOpenId,
+    webPort: ds.workerPort ?? null,
+    cliVersion: ds.cliVersion,
+    hasHistory: ds.hasHistory,
+    feishuChatLink: feishuChatLink(ds.chatId),
+  };
+}
+
+export function composeRowFromClosed(s: Session): SessionRow {
+  return {
+    sessionId: s.sessionId,
+    larkAppId: s.larkAppId ?? '',
+    botName: cachedBotName,
+    cliId: (s.cliId as SessionRow['cliId']) ?? 'unknown',
+    status: 'closed',
+    adopt: !!s.adoptedFrom,
+    spawnedAt: Date.parse(s.createdAt),
+    lastMessageAt: s.closedAt ? Date.parse(s.closedAt) : Date.parse(s.createdAt),
+    closedAt: s.closedAt ? Date.parse(s.closedAt) : undefined,
+    workingDir: s.workingDir,
+    chatId: s.chatId,
+    rootMessageId: s.rootMessageId,
+    title: s.title,
+    ownerOpenId: s.ownerOpenId,
+    webPort: s.webPort ?? null,
+    feishuChatLink: feishuChatLink(s.chatId),
+  };
+}
+
+ipcRoute('GET', '/api/sessions', (_req, res) => {
+  // Active first (live state), closed appended (historical)
+  const active = listActiveSessions().map(composeRowFromActive);
+  const activeIds = new Set(active.map(r => r.sessionId));
+  const closed = sessionStore.listSessions()
+    .filter(s => s.status === 'closed' && !activeIds.has(s.sessionId))
+    .map(composeRowFromClosed);
+  jsonRes(res, 200, { sessions: [...active, ...closed] });
+});
+
+ipcRoute('GET', '/api/sessions/:sessionId', (_req, res, params) => {
+  const ds = getActiveSessionByKey(params.sessionId);
+  if (ds) return jsonRes(res, 200, { session: composeRowFromActive(ds) });
+  const closed = sessionStore.listSessions().find(s => s.sessionId === params.sessionId);
+  if (closed) return jsonRes(res, 200, { session: composeRowFromClosed(closed) });
+  jsonRes(res, 404, { error: 'not_found' });
 });
 
 export function startIpcServer(opts: { port: number; host: string }): Promise<IpcServerHandle> {

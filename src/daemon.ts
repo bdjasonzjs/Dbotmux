@@ -26,6 +26,7 @@ import { buildRepoSelectCard, buildStreamingCard, getCliDisplayName } from './im
 import { createCliAdapterSync } from './adapters/cli/registry.js';
 import {
   initWorkerPool,
+  setActiveSessionsRegistry,
   forkWorker,
   killWorker,
   scheduleCardPatch,
@@ -811,6 +812,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       logger.info(`[${ds.session.sessionId.substring(0, 8)}] Session auto-closed (message withdrawn)`);
     },
   });
+  // Expose the activeSessions Map (owned by daemon) to worker-pool readers,
+  // so dashboard IPC and other consumers can list/lookup live sessions.
+  setActiveSessionsRegistry(activeSessions);
 
   // Per-bot initialization
   for (const bot of getAllBots()) {

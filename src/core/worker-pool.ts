@@ -50,6 +50,27 @@ function requireCallbacks(): WorkerPoolCallbacks {
   return callbacks;
 }
 
+// ─── Active session registry (daemon-owned, accessor for IPC) ───────────────
+// The activeSessions Map physically lives in daemon.ts. To let the dashboard
+// IPC server (and other modules) read it without reaching back into daemon, the
+// daemon registers its Map here at boot. Helpers below return a snapshot or
+// linear-scan by sessionId.
+let activeSessionsRegistry: Map<string, DaemonSession> | undefined;
+
+export function setActiveSessionsRegistry(m: Map<string, DaemonSession>): void {
+  activeSessionsRegistry = m;
+}
+
+export function listActiveSessions(): DaemonSession[] {
+  return activeSessionsRegistry ? [...activeSessionsRegistry.values()] : [];
+}
+
+export function getActiveSessionByKey(sessionId: string): DaemonSession | undefined {
+  if (!activeSessionsRegistry) return undefined;
+  for (const s of activeSessionsRegistry.values()) if (s.session.sessionId === sessionId) return s;
+  return undefined;
+}
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 function tag(ds: DaemonSession): string {
