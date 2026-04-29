@@ -90,6 +90,19 @@ function jsonRes(res: ServerResponse, status: number, body: unknown): void {
   res.end(JSON.stringify(body));
 }
 
+async function proxyToDaemon(
+  larkAppId: string, daemonPath: string, init: RequestInit,
+): Promise<Response> {
+  const d = registry.getByAppId(larkAppId);
+  if (!d) {
+    return new Response(JSON.stringify({ ok: false, error: 'daemon_offline' }), {
+      status: 503,
+      headers: { 'content-type': 'application/json' },
+    });
+  }
+  return fetch(`http://127.0.0.1:${d.ipcPort}${daemonPath}`, init);
+}
+
 const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
@@ -130,6 +143,54 @@ const server = createServer(async (req, res) => {
         'location': url.pathname || '/',
       });
       res.end();
+      return;
+    }
+
+    // ─── Public API (cookie/token already validated above) ──────────────────
+
+    if (req.method === 'GET' && url.pathname === '/api/sessions') {
+      return jsonRes(res, 200, { sessions: aggregator.getSessions() });
+    }
+    if (req.method === 'GET' && url.pathname === '/api/schedules') {
+      return jsonRes(res, 200, { schedules: aggregator.getSchedules() });
+    }
+
+    let m: RegExpMatchArray | null;
+    if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/(close|locate)$/))) {
+      const sid = decodeURIComponent(m[1]); const op = m[2];
+      const owner = aggregator.ownerOf(sid);
+      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
+      const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/${op}`, { method: 'POST' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/schedules\/([^/]+)\/(run|pause|resume)$/))) {
+      const id = decodeURIComponent(m[1]); const op = m[2];
+      const owner = aggregator.scheduleOwnerOf(id);
+      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_schedule' });
+      const upstream = await proxyToDaemon(owner, `/api/schedules/${id}/${op}`, { method: 'POST' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // Public SSE — relays aggregator's listener events
+    if (req.method === 'GET' && url.pathname === '/events') {
+      res.writeHead(200, {
+        'content-type': 'text/event-stream',
+        'cache-control': 'no-cache, no-transform',
+        'connection': 'keep-alive',
+      });
+      res.write('retry: 5000\n\n');
+      const off = aggregator.on(ev => {
+        res.write(`event: ${ev.type}\ndata: ${JSON.stringify({ larkAppId: ev.larkAppId, body: ev.body })}\n\n`);
+      });
+      const hb = setInterval(() => {
+        res.write(`event: heartbeat\ndata: ${JSON.stringify({ ts: Date.now() })}\n\n`);
+      }, 15_000);
+      res.on('close', () => { off(); clearInterval(hb); });
       return;
     }
 
