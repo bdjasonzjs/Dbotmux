@@ -1,9 +1,9 @@
 // src/dashboard.ts
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import {
-  readFileSync, writeFileSync, existsSync, chmodSync, mkdirSync,
+  readFileSync, writeFileSync, existsSync, chmodSync, mkdirSync, statSync,
 } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, extname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { logger } from './utils/logger.js';
@@ -77,6 +77,36 @@ async function hydrate(): Promise<void> {
 }
 await hydrate();
 
+// ─── Static frontend ─────────────────────────────────────────────────────────
+
+// Path to the bundled frontend (sibling of dist/dashboard.js)
+const __dirname = dirname(new URL(import.meta.url).pathname);
+const WEB_DIR = join(__dirname, 'dashboard-web');
+
+const MIME: Record<string, string> = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'application/javascript',
+  '.css': 'text/css',
+  '.svg': 'image/svg+xml',
+  '.woff2': 'font/woff2',
+};
+
+function serveStatic(_req: IncomingMessage, res: ServerResponse, pathname: string): boolean {
+  const rel = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
+  const fp = join(WEB_DIR, rel);
+  // Path-traversal guard: resolved path must stay inside WEB_DIR
+  if (!fp.startsWith(WEB_DIR + '/') && fp !== join(WEB_DIR, 'index.html')) return false;
+  try {
+    const st = statSync(fp);
+    if (!st.isFile()) return false;
+    res.writeHead(200, { 'content-type': MIME[extname(fp)] ?? 'application/octet-stream' });
+    res.end(readFileSync(fp));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // ─── HTTP routing ────────────────────────────────────────────────────────────
 
 function authedToken(req: IncomingMessage, url: URL): string | undefined {
@@ -144,6 +174,15 @@ const server = createServer(async (req, res) => {
       });
       res.end();
       return;
+    }
+
+    // ─── Static frontend (index.html + /assets/*) ──────────────────────────
+    if (req.method === 'GET' && (url.pathname === '/' || url.pathname.startsWith('/assets/'))) {
+      // Map /assets/foo.js → WEB_DIR/foo.js
+      const lookupPath = url.pathname.startsWith('/assets/')
+        ? '/' + url.pathname.slice(8)
+        : url.pathname;
+      if (serveStatic(req, res, lookupPath)) return;
     }
 
     // ─── Public API (cookie/token already validated above) ──────────────────
