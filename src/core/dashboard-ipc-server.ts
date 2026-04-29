@@ -7,6 +7,7 @@ import * as scheduler from './scheduler.js';
 import { listActiveSessions, findActiveBySessionId, closeSession } from './worker-pool.js';
 import { replyMessage } from '../im/lark/client.js';
 import { locateLimiter } from './dashboard-locate.js';
+import { dashboardEventBus } from './dashboard-events.js';
 import type { DaemonSession } from './types.js';
 import type { Session, ScheduledTask, ParsedSchedule } from '../types.js';
 import type { CliId } from '../adapters/cli/types.js';
@@ -252,6 +253,28 @@ ipcRoute('GET', '/api/schedules', (_req, res) => {
 ipcRoute('POST', '/api/schedules/:id/run',    (_req, res, p) => jsonRes(res, 200, scheduler.runNow(p.id)));
 ipcRoute('POST', '/api/schedules/:id/pause',  (_req, res, p) => jsonRes(res, 200, scheduler.setEnabled(p.id, false)));
 ipcRoute('POST', '/api/schedules/:id/resume', (_req, res, p) => jsonRes(res, 200, scheduler.setEnabled(p.id, true)));
+
+// ─── SSE event stream ──────────────────────────────────────────────────────
+
+ipcRoute('GET', '/api/events', (_req, res) => {
+  res.writeHead(200, {
+    'content-type': 'text/event-stream',
+    'cache-control': 'no-cache, no-transform',
+    'connection': 'keep-alive',
+  });
+  // Initial flush so the client sees the connection alive immediately.
+  res.write('retry: 5000\n\n');
+
+  const off = dashboardEventBus.subscribe(ev => {
+    res.write(`event: ${ev.type}\ndata: ${JSON.stringify(ev.body)}\n\n`);
+  });
+
+  const hb = setInterval(() => {
+    res.write(`event: heartbeat\ndata: ${JSON.stringify({ ts: Date.now() })}\n\n`);
+  }, 15_000);
+
+  res.on('close', () => { off(); clearInterval(hb); });
+});
 
 export function startIpcServer(opts: { port: number; host: string }): Promise<IpcServerHandle> {
   return new Promise((resolve, reject) => {

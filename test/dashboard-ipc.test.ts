@@ -1,6 +1,7 @@
 // test/dashboard-ipc.test.ts
 import { describe, it, expect, afterEach } from 'vitest';
 import { startIpcServer, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
+import { dashboardEventBus } from '../src/core/dashboard-events.js';
 
 let handle: IpcServerHandle | null = null;
 
@@ -100,4 +101,30 @@ describe('POST /api/schedules/:id/(run|pause|resume)', () => {
     expect(body.ok).toBe(false);
     expect(body.error).toBe('not_found');
   });
+});
+
+describe('SSE /api/events', () => {
+  it('delivers a published event to a connected client', async () => {
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/events`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('text/event-stream');
+
+    const reader = res.body!.getReader();
+    setTimeout(() => dashboardEventBus.publish({ type: 'heartbeat', body: { ts: 42 } }), 50);
+
+    const decoder = new TextDecoder();
+    let buf = '';
+    for (let i = 0; i < 5; i++) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value);
+      if (buf.includes('"ts":42')) break;
+    }
+    expect(buf).toContain('event: heartbeat');
+    expect(buf).toContain('"ts":42');
+
+    reader.releaseLock();
+    await res.body!.cancel();
+  }, 5_000);
 });
