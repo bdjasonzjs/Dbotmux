@@ -2,7 +2,7 @@
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
 import { logger } from '../utils/logger.js';
 import * as sessionStore from '../services/session-store.js';
-import { listActiveSessions, findActiveBySessionId } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession } from './worker-pool.js';
 import type { DaemonSession } from './types.js';
 import type { Session } from '../types.js';
 import type { CliId } from '../adapters/cli/types.js';
@@ -142,6 +142,11 @@ ipcRoute('GET', '/api/sessions/:sessionId', (_req, res, params) => {
   const closed = sessionStore.listSessions().find(s => s.sessionId === params.sessionId);
   if (closed) return jsonRes(res, 200, { session: composeRowFromClosed(closed) });
   jsonRes(res, 404, { error: 'not_found' });
+});
+
+ipcRoute('POST', '/api/sessions/:sessionId/close', async (_req, res, params) => {
+  const r = await closeSession(params.sessionId);
+  jsonRes(res, 200, r);
 });
 
 export function startIpcServer(opts: { port: number; host: string }): Promise<IpcServerHandle> {

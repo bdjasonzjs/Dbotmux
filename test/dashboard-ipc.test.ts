@@ -41,3 +41,13 @@ describe('GET /api/sessions/:sessionId', () => {
     expect(res.status).toBe(404);
   });
 });
+
+describe('POST /api/sessions/:sessionId/close', () => {
+  it('returns 200 with ok=true even when session does not exist (idempotent)', async () => {
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/nonexistent/close`, { method: 'POST' });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+  });
+});

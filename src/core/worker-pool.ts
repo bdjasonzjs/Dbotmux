@@ -19,9 +19,10 @@ import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { claudeJsonlPathForSession } from '../adapters/cli/claude-code.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { getBot, getAllBots } from '../bot-registry.js';
+import { dashboardEventBus } from './dashboard-events.js';
 import type { CliId } from '../adapters/cli/types.js';
 import type { DaemonToWorker, WorkerToDaemon, Session, DisplayMode } from '../types.js';
-import type { DaemonSession } from './types.js';
+import { sessionKey, type DaemonSession } from './types.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -276,6 +277,54 @@ export function killWorker(ds: DaemonSession): void {
   ds.worker = null;
   ds.workerPort = null;
   ds.workerToken = null;
+}
+
+// ─── Idempotent session close (dashboard IPC) ───────────────────────────────
+
+/**
+ * Idempotent close: kill worker if alive, mark Session status='closed' + closedAt,
+ * publish session.exited (if a live worker was killed) and session.update
+ * (if the persistence row transitioned to closed).
+ *
+ * Calling this on an unknown sessionId, an already-closed session, or a session
+ * whose worker died asynchronously must still resolve with `{ ok: true }`.
+ */
+export async function closeSession(
+  sessionId: string,
+): Promise<{ ok: true; alreadyClosed: boolean }> {
+  const ds = findActiveBySessionId(sessionId);
+  let killedLive = false;
+  if (ds) {
+    killWorker(ds);
+    activeSessionsRegistry?.delete(sessionKey(ds.session.rootMessageId, ds.larkAppId));
+    killedLive = true;
+    dashboardEventBus.publish({
+      type: 'session.exited',
+      body: { sessionId, reason: 'dashboard_close' },
+    });
+  }
+
+  // Persistence path — load → mark closed → save (delegated to sessionStore).
+  const stored = sessionStore.getSession(sessionId);
+  const wasOpen = !!stored && stored.status !== 'closed';
+  if (wasOpen) {
+    sessionStore.closeSession(sessionId);
+    const after = sessionStore.getSession(sessionId);
+    dashboardEventBus.publish({
+      type: 'session.update',
+      body: {
+        sessionId,
+        patch: {
+          status: 'closed',
+          closedAt: after?.closedAt ? Date.parse(after.closedAt) : Date.now(),
+        },
+      },
+    });
+  }
+
+  // alreadyClosed = nothing happened on either path.
+  const alreadyClosed = !killedLive && !wasOpen;
+  return { ok: true, alreadyClosed };
 }
 
 // ─── Fork worker ────────────────────────────────────────────────────────────
