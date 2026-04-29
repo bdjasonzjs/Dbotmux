@@ -103,13 +103,29 @@ function ecosystemConfig(): string {
     merge_logs: true,
   };
 
-  const apps = bots.map((_bot: any, i: number) => ({
+  const apps: any[] = bots.map((_bot: any, i: number) => ({
     ...baseApp,
     name: `${PM2_NAME}-${i}`,
     error_file: join(LOG_DIR, `daemon-${i}-error.log`),
     out_file: join(LOG_DIR, `daemon-${i}-out.log`),
     env: { SESSION_DATA_DIR: DATA_DIR, BOTMUX_BOT_INDEX: String(i) },
   }));
+
+  apps.push({
+    name: 'botmux-dashboard',
+    script: join(PKG_ROOT, 'dist', 'dashboard.js'),
+    cwd: PKG_ROOT,
+    autorestart: true,
+    max_restarts: 10,
+    restart_delay: 3000,
+    error_file: join(LOG_DIR, 'dashboard-error.log'),
+    out_file: join(LOG_DIR, 'dashboard-out.log'),
+    merge_logs: true,
+    env: {
+      BOTMUX_DASHBOARD_HOST: process.env.BOTMUX_DASHBOARD_HOST ?? '0.0.0.0',
+      BOTMUX_DASHBOARD_PORT: process.env.BOTMUX_DASHBOARD_PORT ?? '7891',
+    },
+  });
 
   const cfg = { apps };
   const tmpFile = join(CONFIG_DIR, 'ecosystem.config.json');
