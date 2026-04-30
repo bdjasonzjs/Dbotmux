@@ -725,7 +725,16 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           ds.streamCardPending = false;
           ds.streamCardId = CARD_POSTING_SENTINEL;
           cb.sessionReply(ds.session.rootMessageId, cardJson, 'interactive', ds.larkAppId)
-            .then(msgId => { ds.streamCardId = msgId; persistStreamCardState(ds); })
+            .then(msgId => {
+              ds.streamCardId = msgId;
+              persistStreamCardState(ds);
+              // New card live — recall any cards parked by previous turns
+              // (user message, bot @mention, adopt-bridge new turn, etc.).
+              // This is the main turn-to-turn POST path; without recall here,
+              // every long session would leak old streaming cards into the
+              // thread.
+              recallFrozenCards(ds);
+            })
             .catch(err => {
               if (err instanceof MessageWithdrawnError) {
                 logger.warn(`[${t}] Root message withdrawn, closing stale session`);
