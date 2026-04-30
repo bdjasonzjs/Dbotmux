@@ -117,30 +117,36 @@ ipcRoute('POST', '/api/sessions/:sessionId/locate', async (_req, res, params) =>
     res.end(JSON.stringify({ ok: false, error: 'rate_limited', retryAfterMs: acq.retryAfterMs }));
     return;
   }
-  // Resolve owning session (active first, then closed-store fallback)
+  // Resolve owning session (active first, then closed-store fallback). The
+  // locate marker is a bare @-mention of the session's owner — no other text,
+  // no AppLink redirect on the frontend. The notification on the user's
+  // device is enough to navigate them back to the topic.
   const ds = findActiveBySessionId(sid);
   const closed = ds ? null : sessionStore.getSession(sid);
   const ctx = ds
     ? {
         larkAppId: ds.larkAppId,
         rootMessageId: ds.session.rootMessageId,
-        title: ds.session.title || `Dashboard 定位 (${sid.slice(0, 8)})`,
+        ownerOpenId: ds.session.ownerOpenId,
       }
     : closed
       ? {
           larkAppId: closed.larkAppId ?? '',
           rootMessageId: closed.rootMessageId,
-          title: closed.title || `Dashboard 定位 (${sid.slice(0, 8)})`,
+          ownerOpenId: closed.ownerOpenId,
         }
       : null;
   if (!ctx || !ctx.larkAppId) {
     return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
   }
+  if (!ctx.ownerOpenId) {
+    return jsonRes(res, 422, { ok: false, error: 'no_owner' });
+  }
   try {
     const messageId = await replyMessage(
       ctx.larkAppId,
       ctx.rootMessageId,
-      `📍 Dashboard 定位 ${ctx.title}`,
+      `<at user_id="${ctx.ownerOpenId}"></at>`,
       'text',
       true,
     );

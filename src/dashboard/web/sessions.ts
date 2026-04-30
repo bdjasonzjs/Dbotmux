@@ -130,7 +130,10 @@ export function renderSessionsPage(root: HTMLElement) {
           const r = await fetch(`/api/sessions/${encodeURIComponent(s.sessionId)}/locate`, { method: 'POST' });
           const body = await r.json();
           if (body.ok) {
-            window.open(s.feishuChatLink, '_blank');
+            // Daemon posted the @mention into the original thread. The
+            // notification is what the user navigates from — no AppLink
+            // redirect (the previous "open chat in new tab" behavior was
+            // explicitly removed by the user as intrusive).
             let left = 30;
             locateBtn.textContent = `${ICON_PIN} (冷却 ${left}s)`;
             const tick = setInterval(() => {
