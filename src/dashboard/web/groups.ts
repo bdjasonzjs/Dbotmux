@@ -10,6 +10,7 @@ const PAGE_HTML = `
   <input type="search" name="q" placeholder="search chat name / id / owner" />
   <label><input type="checkbox" name="missing"> missing-bot only</label>
   <button type="button" id="g-refresh">Refresh</button>
+  <button type="button" id="g-create">+ Create new group</button>
 </form>
 <table>
   <thead id="g-head"></thead>
@@ -40,7 +41,76 @@ export async function renderGroupsPage(root: HTMLElement) {
     try { await loadGroups(); rerender(); } finally { refreshBtn.disabled = false; }
   };
 
+  const createBtn = root.querySelector<HTMLButtonElement>('#g-create')!;
+  createBtn.onclick = () => openCreateModal();
+
   await loadGroups();
+
+  function openCreateModal() {
+    const allBots = cache.bots;
+    if (allBots.length === 0) {
+      alert('No bots online. Restart the daemon first.');
+      return;
+    }
+    drawer.innerHTML = `
+      <article>
+        <header><h3>Create new group</h3></header>
+        <p>Pick bots to invite. The dashboard auto-selects an online daemon as the chat creator/owner; the rest are added as members in the same call.</p>
+        <form id="g-createform">
+          <label class="form-row">
+            <span>Group name <small>(optional)</small></span>
+            <input type="text" name="name" placeholder="e.g. AI ChangeLog" maxlength="60">
+          </label>
+          <fieldset>
+            <legend>Bots</legend>
+            ${allBots.map((b: any) => `
+              <label class="checkbox-row">
+                <input type="checkbox" name="bot" value="${escapeHtml(b.larkAppId)}">
+                ${escapeHtml(b.botName ?? b.larkAppId)} <small>(${escapeHtml(b.larkAppId)})</small>
+              </label>
+            `).join('')}
+          </fieldset>
+          <div class="actions">
+            <button type="submit">Create</button>
+            <button type="button" id="g-create-cancel">Cancel</button>
+          </div>
+        </form>
+      </article>`;
+    drawer.showModal();
+
+    drawer.querySelector<HTMLButtonElement>('#g-create-cancel')!.onclick = () => drawer.close();
+
+    drawer.querySelector<HTMLFormElement>('#g-createform')!.onsubmit = async ev => {
+      ev.preventDefault();
+      const fd = new FormData(ev.target as HTMLFormElement);
+      const name = ((fd.get('name') as string) ?? '').trim();
+      const ids = fd.getAll('bot') as string[];
+      if (ids.length === 0) { alert('Pick at least one bot.'); return; }
+      const submitBtn = (ev.target as HTMLFormElement).querySelector<HTMLButtonElement>('button[type=submit]');
+      if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = 'Creating...'; }
+      try {
+        const r = await fetch('/api/groups/create', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ name: name || undefined, larkAppIds: ids }),
+        });
+        const respBody = await r.json();
+        if (respBody.ok && respBody.chatId) {
+          const invalid = respBody.invalidBotIds ?? [];
+          const tail = invalid.length ? `\n\nInvalid bot ids: ${invalid.join(', ')}` : '';
+          alert(`Group created.\nchatId: ${respBody.chatId}\ncreator: ${respBody.creator ?? '?'}${tail}`);
+          await loadGroups();
+          rerender();
+        } else {
+          alert(`Failed: ${respBody.error ?? r.status}`);
+        }
+      } catch (e) {
+        alert('Network error: ' + e);
+      } finally {
+        drawer.close();
+      }
+    };
+  }
 
   function renderHead() {
     head.innerHTML = `<tr>
