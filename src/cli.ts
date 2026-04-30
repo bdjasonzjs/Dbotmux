@@ -1405,13 +1405,18 @@ function argFlag(args: string[], flag: string): boolean {
 }
 
 /** Extract positional args, skipping --flag and the value that follows it
- *  (for --flag <value> style).  --flag=value style is self-contained. */
-function positionals(args: string[]): string[] {
+ *  (for --flag <value> style).  --flag=value style is self-contained.
+ *  `booleanFlags` lists flags that take no value — without this hint the
+ *  parser swallows the *next* arg as the flag's value, which silently eats
+ *  positional content (or, worse, a following --flag's value). */
+function positionals(args: string[], booleanFlags: string[] = []): string[] {
   const out: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a.startsWith('--')) {
-      if (!a.includes('=') && i + 1 < args.length) i++; // skip value
+      const flagName = a.includes('=') ? a.slice(0, a.indexOf('=')) : a;
+      const isBoolean = booleanFlags.includes(flagName);
+      if (!a.includes('=') && !isBoolean && i + 1 < args.length) i++; // skip value
       continue;
     }
     out.push(a);
@@ -1797,7 +1802,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (!existsSync(contentFile)) { console.error(`文件不存在: ${contentFile}`); process.exit(1); }
     content = readFileSync(contentFile, 'utf-8');
   } else {
-    const pos = positionals(rest);
+    const pos = positionals(rest, ['--card', '--text', '--top-level']);
     if (pos.length > 0) {
       content = pos.join(' ');
     } else {
