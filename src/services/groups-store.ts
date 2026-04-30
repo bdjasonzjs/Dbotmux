@@ -86,22 +86,27 @@ export async function isInChat(larkAppId: string, chatId: string): Promise<boole
  */
 export async function createChat(
   creatorLarkAppId: string,
-  opts: { name?: string; botIds: string[] },
-): Promise<{ chatId: string; invalidBotIds: string[] }> {
+  opts: { name?: string; botIds: string[]; userIds?: string[] },
+): Promise<{ chatId: string; invalidBotIds: string[]; invalidUserIds: string[] }> {
   const client = getBotClient(creatorLarkAppId);
   // Filter out the creator from bot_id_list — Lark errors if the inviter
   // appears in their own invite list.
   const otherBots = opts.botIds.filter(id => id !== creatorLarkAppId);
+  const userIds = (opts.userIds ?? []).filter(Boolean);
   const data: Record<string, unknown> = {};
   if (opts.name) data.name = opts.name;
   if (otherBots.length > 0) data.bot_id_list = otherBots;
-  const res: any = await (client as any).im.v1.chat.create({ data });
+  if (userIds.length > 0) data.user_id_list = userIds;
+  const params: Record<string, unknown> = {};
+  if (userIds.length > 0) params.user_id_type = 'open_id';
+  const res: any = await (client as any).im.v1.chat.create({ data, params });
   if (res.code !== 0 && res.code !== undefined) {
     throw new Error(`Failed to create chat: ${res.msg ?? 'unknown'} (code: ${res.code})`);
   }
   return {
     chatId: res.data?.chat_id,
     invalidBotIds: res.data?.invalid_bot_id_list ?? [],
+    invalidUserIds: res.data?.invalid_user_id_list ?? [],
   };
 }
 

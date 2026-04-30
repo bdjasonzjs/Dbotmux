@@ -13,6 +13,7 @@ import {
 } from './dashboard/auth.js';
 import { DaemonRegistry } from './dashboard/registry.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
+import { pickOperatorForCreate } from './dashboard/operator-selector.js';
 
 const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 const REGISTRY_DIR = join(homedir(), '.botmux', 'data', 'dashboard-daemons');
@@ -308,14 +309,17 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    // Create a new chat — pick any online daemon as the creator/owner.
+    // Create a new chat — pick a creator daemon and (optionally) auto-invite
+    // the operator into it. Cross-app scoping matters here: Lark `open_id` is
+    // app-scoped, so the operator's open_id and the creator daemon must come
+    // from the SAME bot. See pickOperatorForCreate / operator-selector.ts.
     if (req.method === 'POST' && url.pathname === '/api/groups/create') {
-      let raw: string;
+      let parsed: { name?: unknown; larkAppIds?: unknown; userOpenIds?: unknown };
       try {
         const chunks: Buffer[] = [];
         for await (const c of req) chunks.push(c as Buffer);
-        raw = Buffer.concat(chunks).toString('utf8') || '{}';
-        JSON.parse(raw);
+        const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+        parsed = JSON.parse(raw);
       } catch {
         return jsonRes(res, 400, { ok: false, error: 'bad_json' });
       }
@@ -323,16 +327,61 @@ const server = createServer(async (req, res) => {
       if (online.length === 0) {
         return jsonRes(res, 503, { ok: false, error: 'no_online_daemon' });
       }
-      // First online daemon = creator. The body's larkAppIds list may include
-      // the creator; the daemon-side createChat filters that out before the
-      // Feishu call.
-      const creator = online[0];
+
+      const explicit = Array.isArray(parsed.userOpenIds)
+        ? (parsed.userOpenIds as unknown[]).filter((x): x is string => typeof x === 'string')
+        : [];
+
+      let creator = online[0];   // fallback when auto-detection fails
+      let autoInvited: string | null = null;
+      const merged = new Set<string>(explicit);
+
+      if (explicit.length === 0) {
+        // Auto-detect operator. The selector binds open_id to the daemon that
+        // owns it, so we don't accidentally use bot B's open_id with bot A as
+        // creator (which would silently land in invalid_user_id_list).
+        const op = pickOperatorForCreate(
+          aggregator.getSessions() as any[],
+          (id: string) => !!registry.getByAppId(id),
+        );
+        if (op) {
+          const matched = registry.getByAppId(op.larkAppId);
+          if (matched) {
+            creator = matched;
+            merged.add(op.openId);
+            autoInvited = op.openId;
+          }
+        }
+      }
+
+      const forwardBody = {
+        name: typeof parsed.name === 'string' ? parsed.name : undefined,
+        larkAppIds: parsed.larkAppIds,
+        userOpenIds: [...merged],
+      };
       const upstream = await fetch(
         `http://127.0.0.1:${creator.ipcPort}/api/groups/create`,
-        { method: 'POST', headers: { 'content-type': 'application/json' }, body: raw },
+        { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(forwardBody) },
       );
+      const upstreamText = await upstream.text();
+      let upstreamJson: any = null;
+      try { upstreamJson = JSON.parse(upstreamText); } catch { /* leave null */ }
+      if (upstreamJson && typeof upstreamJson === 'object') {
+        // If Lark rejected the invite (open_id wrong scope, banned user, etc.)
+        // null out autoInvitedOpenId so the frontend doesn't falsely claim
+        // success — the user actually isn't a member of the new chat.
+        const invalidUsers: string[] = Array.isArray(upstreamJson.invalidUserIds)
+          ? upstreamJson.invalidUserIds
+          : [];
+        if (autoInvited && invalidUsers.includes(autoInvited)) {
+          upstreamJson.autoInvitedOpenId = null;
+          upstreamJson.autoInviteRejected = true;
+        } else {
+          upstreamJson.autoInvitedOpenId = autoInvited;
+        }
+      }
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
+      res.end(upstreamJson ? JSON.stringify(upstreamJson) : upstreamText);
       return;
     }
 

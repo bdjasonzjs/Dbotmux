@@ -55,3 +55,6 @@ dialog#g-drawer { border: none; border-radius: 8px; padding: 0; max-width: 600px
 dialog#g-drawer article { padding: 1rem 1.5rem; }
 dialog#g-drawer fieldset { margin: 0.5rem 0; padding: 0.4rem 0.8rem; border: 1px solid var(--border); border-radius: 4px; }
 dialog#g-drawer fieldset legend { padding: 0 0.3rem; color: var(--muted); font-size: 12px; }
+.hint-ok       { background: #ddf4e4; border-left: 3px solid #1a7f37; padding: 0.4rem 0.6rem; border-radius: 3px; margin: 0.5rem 0; font-size: 13px; }
+.hint-warn     { background: #fff8c5; border-left: 3px solid #bf8700; padding: 0.4rem 0.6rem; border-radius: 3px; margin: 0.5rem 0; font-size: 13px; }
+.btn-link.primary { background: #1f6feb; color: white; border-color: #1f6feb; font-weight: 600; }

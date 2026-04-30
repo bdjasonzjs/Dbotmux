@@ -112,4 +112,44 @@ describe('groups-store wrappers', () => {
     const r = await createChat('cli_creator', { botIds: ['cli_creator', 'cli_good', 'cli_bad'] });
     expect(r.invalidBotIds).toEqual(['cli_bad']);
   });
+
+  it('createChat passes userIds as user_id_list with user_id_type=open_id', async () => {
+    chatCreateStub.mockResolvedValueOnce({
+      code: 0,
+      data: { chat_id: 'oc_with_user', invalid_bot_id_list: [], invalid_user_id_list: [] },
+    });
+    const r = await createChat('cli_creator', {
+      botIds: ['cli_creator'],
+      userIds: ['ou_human123'],
+    });
+    expect(r.chatId).toBe('oc_with_user');
+    const callArgs = chatCreateStub.mock.calls[0][0];
+    expect(callArgs.data.user_id_list).toEqual(['ou_human123']);
+    expect(callArgs.params.user_id_type).toBe('open_id');
+    // creator is the only bot in opts.botIds, so bot_id_list should be omitted.
+    expect(callArgs.data.bot_id_list).toBeUndefined();
+  });
+
+  it('createChat surfaces invalid_user_id_list', async () => {
+    chatCreateStub.mockResolvedValueOnce({
+      code: 0,
+      data: { chat_id: 'oc_partial_user', invalid_bot_id_list: [], invalid_user_id_list: ['ou_ghost'] },
+    });
+    const r = await createChat('cli_creator', {
+      botIds: ['cli_creator'],
+      userIds: ['ou_real', 'ou_ghost'],
+    });
+    expect(r.invalidUserIds).toEqual(['ou_ghost']);
+  });
+
+  it('createChat omits user_id_list and user_id_type when no userIds provided', async () => {
+    chatCreateStub.mockResolvedValueOnce({
+      code: 0,
+      data: { chat_id: 'oc_no_user' },
+    });
+    await createChat('cli_creator', { botIds: ['cli_creator', 'cli_other'] });
+    const callArgs = chatCreateStub.mock.calls[0][0];
+    expect(callArgs.data.user_id_list).toBeUndefined();
+    expect(callArgs.params?.user_id_type).toBeUndefined();
+  });
 });

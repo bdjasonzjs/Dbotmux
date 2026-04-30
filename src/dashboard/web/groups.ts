@@ -96,20 +96,62 @@ export async function renderGroupsPage(root: HTMLElement) {
         });
         const respBody = await r.json();
         if (respBody.ok && respBody.chatId) {
-          const invalid = respBody.invalidBotIds ?? [];
-          const tail = invalid.length ? `\n\nInvalid bot ids: ${invalid.join(', ')}` : '';
-          alert(`Group created.\nchatId: ${respBody.chatId}\ncreator: ${respBody.creator ?? '?'}${tail}`);
-          await loadGroups();
-          rerender();
+          renderCreateSuccess(respBody);
+          // Refresh matrix in the background so the new chat eventually shows
+          // up — won't block the success drawer.
+          void loadGroups().then(rerender).catch(() => { /* tolerate */ });
         } else {
           alert(`Failed: ${respBody.error ?? r.status}`);
+          drawer.close();
         }
       } catch (e) {
         alert('Network error: ' + e);
-      } finally {
         drawer.close();
       }
     };
+  }
+
+  function renderCreateSuccess(resp: any) {
+    const chatId = String(resp.chatId);
+    const appLink = `https://applink.feishu.cn/client/chat/open?openChatId=${encodeURIComponent(chatId)}`;
+    const invalidBots = (resp.invalidBotIds ?? []) as string[];
+    const invalidUsers = (resp.invalidUserIds ?? []) as string[];
+    const auto = resp.autoInvitedOpenId as string | null | undefined;
+    const rejected = !!resp.autoInviteRejected;
+    let inviteNote: string;
+    if (auto) {
+      inviteNote = `<p class="hint-ok">已自动邀请你（<code>${escapeHtml(auto)}</code>）作为成员，新群应该会出现在你的飞书侧边栏。</p>`;
+    } else if (rejected) {
+      inviteNote = `<p class="hint-warn">飞书拒绝了自动邀请（你的 open_id 在创建者 bot 的 scope 下不可用）。<strong>你目前不是新群成员</strong>，需要让群里的某个机器人手动把你加进来。</p>`;
+    } else {
+      inviteNote = `<p class="hint-warn">没在 dashboard 缓存里找到 ownerOpenId，<strong>没有自动邀请你</strong>。点开下面链接前，先让群里任一机器人手动把你加进去。</p>`;
+    }
+    const invalidNote = [
+      invalidBots.length ? `<li>无效 bot id: <code>${invalidBots.map(escapeHtml).join(', ')}</code></li>` : '',
+      invalidUsers.length ? `<li>无效用户 open_id: <code>${invalidUsers.map(escapeHtml).join(', ')}</code></li>` : '',
+    ].filter(Boolean).join('');
+
+    drawer.innerHTML = `
+      <article>
+        <header><h3>群创建成功</h3></header>
+        <p><b>chatId:</b> <code>${escapeHtml(chatId)}</code> <button type="button" data-copy="${escapeHtml(chatId)}">copy</button></p>
+        <p><b>创建者:</b> <code>${escapeHtml(resp.creator ?? '?')}</code></p>
+        ${inviteNote}
+        ${invalidNote ? `<ul>${invalidNote}</ul>` : ''}
+        <div class="actions">
+          <a class="btn-link primary" href="${appLink}" target="_blank" rel="noopener">↗ 打开新群</a>
+          <button type="button" id="g-create-close">关闭</button>
+        </div>
+      </article>`;
+
+    drawer.querySelectorAll<HTMLButtonElement>('[data-copy]').forEach(b => {
+      b.onclick = () => {
+        navigator.clipboard.writeText(b.dataset.copy ?? '');
+        b.textContent = 'copied';
+        setTimeout(() => { b.textContent = 'copy'; }, 800);
+      };
+    });
+    drawer.querySelector<HTMLButtonElement>('#g-create-close')!.onclick = () => drawer.close();
   }
 
   function renderHead() {
