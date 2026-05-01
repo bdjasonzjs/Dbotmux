@@ -53,7 +53,12 @@ export function composeRowFromActive(ds: DaemonSession): SessionRow {
     chatId: ds.chatId,
     rootMessageId: ds.session.rootMessageId,
     title: ds.session.title,
-    ownerOpenId: ds.ownerOpenId,
+    // Read from the persisted Session — single source of truth.
+    // ds.ownerOpenId is a parallel in-memory copy that gets cleared on
+    // restoreActiveSessions (which builds a fresh DaemonSession from disk
+    // without copying this field). Reading session.ownerOpenId works for
+    // both fresh and restored sessions.
+    ownerOpenId: ds.session.ownerOpenId,
     webPort: ds.workerPort ?? null,
     cliVersion: ds.cliVersion,
     hasHistory: ds.hasHistory,
