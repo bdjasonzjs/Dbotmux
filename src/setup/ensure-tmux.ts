@@ -36,45 +36,44 @@ function probeTmuxVersion(): string | undefined {
   }
 }
 
-/** Build the install argv for a given package manager. Returns argv[] suitable
- *  for spawnSync; the first element decides whether we wrap with sudo. */
-function buildInstallArgv(pm: PackageManager, pkg: string, info: PlatformInfo): string[] | undefined {
-  const sudoPrefix = (cmd: string[]): string[] => {
-    if (info.isRoot) return cmd;
-    if (info.passwordlessSudo) return ['sudo', '-n', ...cmd];
-    if (info.hasTty) return ['sudo', ...cmd];
-    return []; // can't escalate non-interactively
-  };
+/** Wrap a system command with the appropriate sudo prefix for the current
+ *  platform context, or return undefined if we cannot escalate (no
+ *  passwordless sudo and no TTY to prompt on). */
+function sudoPrefix(cmd: string[], info: PlatformInfo): string[] | undefined {
+  if (info.isRoot) return cmd;
+  if (info.passwordlessSudo) return ['sudo', '-n', ...cmd];
+  if (info.hasTty) return ['sudo', ...cmd];
+  return undefined;
+}
 
+/** Build the install argv for a given package manager. Pure: returns argv[]
+ *  ready for spawnSync, no side effects. Returns undefined if escalation
+ *  isn't possible. */
+function buildInstallArgv(pm: PackageManager, pkg: string, info: PlatformInfo): string[] | undefined {
   switch (pm) {
-    case 'brew':
-      return ['brew', 'install', pkg];
-    case 'conda':
-      return ['conda', 'install', '-y', '-c', 'conda-forge', pkg];
-    case 'apt': {
-      // apt-get update first ensures the package list isn't stale on minimal
-      // images; we only run it once per ensure call. Failure is non-fatal —
-      // the install will fail loudly if a needed package is missing.
-      const update = sudoPrefix(['apt-get', 'update']);
-      if (update.length === 0) return undefined;
-      try { spawnSync(update[0]!, update.slice(1), { stdio: 'inherit', timeout: 120_000 }); } catch { /* best-effort */ }
-      return sudoPrefix(['apt-get', 'install', '-y', pkg]).length === 0
-        ? undefined
-        : sudoPrefix(['apt-get', 'install', '-y', pkg]);
-    }
-    case 'dnf':
-      return sudoPrefix(['dnf', 'install', '-y', pkg]).length === 0 ? undefined : sudoPrefix(['dnf', 'install', '-y', pkg]);
-    case 'yum':
-      return sudoPrefix(['yum', 'install', '-y', pkg]).length === 0 ? undefined : sudoPrefix(['yum', 'install', '-y', pkg]);
-    case 'pacman':
-      return sudoPrefix(['pacman', '-S', '--noconfirm', pkg]).length === 0 ? undefined : sudoPrefix(['pacman', '-S', '--noconfirm', pkg]);
-    case 'apk':
-      return sudoPrefix(['apk', 'add', pkg]).length === 0 ? undefined : sudoPrefix(['apk', 'add', pkg]);
-    case 'zypper':
-      return sudoPrefix(['zypper', 'install', '-y', pkg]).length === 0 ? undefined : sudoPrefix(['zypper', 'install', '-y', pkg]);
-    case 'unknown':
-      return undefined;
+    case 'brew':    return ['brew', 'install', pkg];
+    case 'conda':   return ['conda', 'install', '-y', '-c', 'conda-forge', pkg];
+    case 'apt':     return sudoPrefix(['apt-get', 'install', '-y', pkg], info);
+    case 'dnf':     return sudoPrefix(['dnf', 'install', '-y', pkg], info);
+    case 'yum':     return sudoPrefix(['yum', 'install', '-y', pkg], info);
+    case 'pacman':  return sudoPrefix(['pacman', '-S', '--noconfirm', pkg], info);
+    case 'apk':     return sudoPrefix(['apk', 'add', pkg], info);
+    case 'zypper':  return sudoPrefix(['zypper', 'install', '-y', pkg], info);
+    case 'unknown': return undefined;
   }
+}
+
+/** apt-get specifically needs an updated package list on minimal images
+ *  before the install will find tmux. This is NOT part of buildInstallArgv
+ *  (which is pure) — it runs once just before the apt install attempt.
+ *  Failure here is non-fatal; the actual install will fail loudly if it
+ *  can't find the package. */
+function aptUpdateBeforeInstall(info: PlatformInfo): void {
+  const argv = sudoPrefix(['apt-get', 'update'], info);
+  if (!argv) return;
+  try {
+    spawnSync(argv[0]!, argv.slice(1), { stdio: 'inherit', timeout: 120_000 });
+  } catch { /* best-effort */ }
 }
 
 /** Suggest the manual command we'd have run, for the failure message. */
@@ -120,6 +119,7 @@ export async function ensureTmux(info?: PlatformInfo): Promise<TmuxResult> {
       tried.push(`${pm}（跳过：当前用户无 sudo 且无 TTY）`);
       continue;
     }
+    if (pm === 'apt') aptUpdateBeforeInstall(platform);
     console.log(`   尝试 ${pm}: ${argv.join(' ')}`);
     if (runInstall(argv)) {
       const v = probeTmuxVersion();
@@ -145,6 +145,13 @@ export async function ensureTmux(info?: PlatformInfo): Promise<TmuxResult> {
     '请手动安装后重试：',
     `  ${manual}`,
   ];
+  // macOS without Homebrew → guide the user to install brew first.
+  if (platform.os === 'darwin' && !platform.packageManagers.includes('brew')) {
+    lines.push('');
+    lines.push('macOS 推荐先安装 Homebrew：');
+    lines.push('  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"');
+    lines.push('安装完成后重试 `botmux start`，会走 brew 自动装 tmux。');
+  }
   if (!platform.hasTty && !platform.isRoot && !platform.passwordlessSudo && platform.os === 'linux') {
     lines.push('');
     lines.push('提示：当前不是交互式 TTY 且 sudo 需要密码，systemd/pm2 自启场景下无法弹密码。');

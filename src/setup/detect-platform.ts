@@ -5,7 +5,7 @@
  * to "unknown" so callers can route to a manual-install message.
  */
 import { execSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 
 export type DistroId =
   | 'debian' | 'ubuntu'
@@ -77,8 +77,6 @@ function detectDistro(): DistroId {
     if (c === 'arch' || c === 'manjaro') return c as DistroId;
     if (c === 'alpine') return 'alpine';
     if (c === 'opensuse' || c === 'opensuse-leap' || c === 'opensuse-tumbleweed') return c as DistroId;
-    // ID_LIKE often only has the family name; fold it down.
-    if (c === 'rhel' || c === 'fedora') return c as DistroId;
   }
   return 'unknown';
 }

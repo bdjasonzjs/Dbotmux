@@ -15,7 +15,6 @@ import { existsSync, mkdirSync, createWriteStream, statSync, unlinkSync, renameS
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { get as httpsGet } from 'node:https';
-import { request as httpRequest } from 'node:http';
 import { detectPlatform, type PlatformInfo } from './detect-platform.js';
 
 export interface FontResult {
@@ -127,17 +126,35 @@ function categoryAlreadyOk(spec: FontSpec): boolean {
   });
 }
 
-/** Download a URL to disk, following redirects (GitHub raw → CDN). */
-function downloadFile(url: string, destPath: string): Promise<void> {
+/** Download a URL to disk, following redirects (GitHub raw → CDN).
+ *  All FONT_SPECS URLs are https, so we don't bother with an http fallback.
+ *  Hard timeout (default 60s) covers connect + transfer; on expiry the
+ *  request is destroyed and the partial file is unlinked. */
+function downloadFile(url: string, destPath: string, timeoutMs = 60_000): Promise<void> {
   return new Promise((resolve, reject) => {
+    const tmp = destPath + '.part';
+    let settled = false;
+    let activeReq: ReturnType<typeof httpsGet> | null = null;
+
+    const cleanup = () => {
+      try { unlinkSync(tmp); } catch { /* may not exist */ }
+    };
+    const finish = (err?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (activeReq) try { activeReq.destroy(); } catch { /* ignore */ }
+      if (err) { cleanup(); reject(err); }
+      else resolve();
+    };
+    const timer = setTimeout(() => finish(new Error(`下载超时 (${timeoutMs}ms): ${url}`)), timeoutMs);
+
     const followRedirect = (current: string, hops: number) => {
-      if (hops > 5) {
-        reject(new Error(`太多重定向: ${url}`));
-        return;
-      }
+      if (hops > 5) return finish(new Error(`太多重定向: ${url}`));
       const u = new URL(current);
-      const get = u.protocol === 'http:' ? (httpRequest as any) : httpsGet;
-      const req = get(u, { headers: { 'user-agent': 'botmux-font-installer' } }, (res: any) => {
+      if (u.protocol !== 'https:') return finish(new Error(`仅支持 https://, got ${u.protocol} for ${current}`));
+
+      activeReq = httpsGet(u, { headers: { 'user-agent': 'botmux-font-installer' } }, (res) => {
         if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
           res.resume();
           followRedirect(new URL(res.headers.location, u).toString(), hops + 1);
@@ -145,32 +162,25 @@ function downloadFile(url: string, destPath: string): Promise<void> {
         }
         if (res.statusCode !== 200) {
           res.resume();
-          reject(new Error(`HTTP ${res.statusCode} for ${current}`));
-          return;
+          return finish(new Error(`HTTP ${res.statusCode} for ${current}`));
         }
-        const tmp = destPath + '.part';
         const out = createWriteStream(tmp);
         res.pipe(out);
-        out.on('error', (err: any) => {
-          try { unlinkSync(tmp); } catch { /* ignore */ }
-          reject(err);
-        });
+        out.on('error', (err) => finish(err));
         out.on('finish', () => {
           out.close(() => {
             try {
-              // Atomic rename so a partial file never gets registered.
               renameSync(tmp, destPath);
-              resolve();
-            } catch (err) {
-              reject(err);
+              finish();
+            } catch (err: any) {
+              finish(err);
             }
           });
         });
       });
-      if (typeof req?.on === 'function') {
-        req.on('error', reject);
-      }
+      activeReq.on('error', (err) => finish(err));
     };
+
     followRedirect(url, 0);
   });
 }
