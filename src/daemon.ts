@@ -354,6 +354,25 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
 
   // Oncall group: pin working dir from binding, skip repo selection entirely.
   const oncallEntry = findOncallChat(larkAppId, chatId);
+
+  // Cross-bot inheritance: when a sibling bot already has an active session
+  // anchored here (typical: user @s a second Claude/Aiden in a thread or 普通群
+  // for review), reuse its workingDir and skip the repo card. The same block
+  // exists in handleThreadReply's auto-create branch — both handlers can land
+  // an unowned message after the 4fec43c routing change, so the inheritance
+  // probe has to run in both places.
+  let inheritedFrom: { sessionId: string; larkAppId?: string; workingDir: string } | null = null;
+  if (!oncallEntry) {
+    const peers = scope === 'thread'
+      ? sessionStore.findActiveSessionsByRoot(anchor)
+      : sessionStore.findActiveChatScopeSessionsByChat(chatId);
+    const peer = peers.find(p => p.larkAppId !== larkAppId && !!p.workingDir);
+    if (peer && peer.workingDir) {
+      inheritedFrom = { sessionId: peer.sessionId, larkAppId: peer.larkAppId, workingDir: peer.workingDir };
+    }
+  }
+
+  const pinnedWorkingDir = oncallEntry?.workingDir ?? inheritedFrom?.workingDir;
   const ds: DaemonSession = {
     session,
     worker: null,
@@ -367,26 +386,29 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     cliVersion: cliVersionCache.get(botCfg.cliId)?.version ?? 'unknown',
     lastMessageAt: Date.now(),
     hasHistory: false,
-    pendingRepo: !oncallEntry,
+    pendingRepo: !pinnedWorkingDir,
     pendingPrompt: content,
     pendingAttachments: attachments.length > 0 ? attachments : undefined,
     pendingMentions: parsed.mentions,
     ownerOpenId: senderOpenId,
     currentTurnTitle: content.substring(0, 50),
-    workingDir: oncallEntry?.workingDir,
+    workingDir: pinnedWorkingDir,
   };
-  if (oncallEntry) {
-    ds.session.workingDir = oncallEntry.workingDir;
+  if (pinnedWorkingDir) {
+    ds.session.workingDir = pinnedWorkingDir;
     sessionStore.updateSession(ds.session);
   }
   activeSessions.set(sessionKey(anchor, larkAppId), ds);
 
-  // Oncall-bound chat: spawn CLI immediately with the pinned working dir.
-  if (oncallEntry) {
+  // Pinned (oncall binding or inherited from sibling bot): spawn CLI immediately.
+  if (pinnedWorkingDir) {
     const selfBot = getBot(larkAppId);
     const prompt = buildNewTopicPrompt(content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId });
     forkWorker(ds, prompt);
-    logger.info(`[${tag(ds)}] Oncall-bound chat ${chatId} → workingDir=${oncallEntry.workingDir}, skipped repo select`);
+    const reason = oncallEntry
+      ? `oncall-bound chat ${chatId}`
+      : `inherited from sibling session ${inheritedFrom!.sessionId.substring(0, 8)} (app=${inheritedFrom!.larkAppId ?? 'unknown'})`;
+    logger.info(`[${tag(ds)}] ${reason} → workingDir=${pinnedWorkingDir}, skipped repo select`);
     return;
   }
 
