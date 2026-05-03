@@ -1810,11 +1810,23 @@ async function cmdSend(rest: string[]): Promise<void> {
         ? JSON.parse(readFileSync(crossRefPath, 'utf-8'))
         : {};
       const alreadyMentioned = new Set(mentions.map(m => m.open_id));
-      for (const entry of botEntries) {
+      // Sort by name length desc so longer names ("Claude分身") win over their
+      // prefix ("Claude") when both could match — break-on-first-hit otherwise
+      // routes "@Claude分身" to Claude.
+      const sortedEntries = [...botEntries].sort(
+        (a, b) => (b.botName?.length ?? 0) - (a.botName?.length ?? 0),
+      );
+      for (const entry of sortedEntries) {
         if (!entry.botName || entry.larkAppId === appId) continue;
         const names = [entry.botName, entry.cliId].filter(Boolean) as string[];
         for (const name of names) {
-          const re = new RegExp(`@${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+          const escName = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          // Boundary: lookbehind blocks only ASCII word chars (so `user@Claude`
+          // is rejected but `看看@CoCo` is accepted — CJK prefix is normal in
+          // Chinese text). Lookahead blocks any Unicode letter/digit so
+          // `@Claude2` doesn't match name "Claude" and `@Claude分身好的` doesn't
+          // either-half-match.
+          const re = new RegExp(`(?<![A-Za-z0-9_])@${escName}(?![\\p{L}\\p{N}_])`, 'iu');
           if (!re.test(text)) continue;
           // Prefer sender-scoped open_id from cross-ref (what Lark's sender app
           // has seen for the target bot); fall back to target's own open_id.

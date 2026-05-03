@@ -180,8 +180,8 @@ export function buildNewTopicPrompt(
       '<identity>',
       `  <name>${xmlEscape(botIdentity.name ?? '(未知)')}</name>`,
       `  <open_id>${xmlEscape(botIdentity.openId ?? '(未知)')}</open_id>`,
+      '  <routing_rules>提醒：让别的 bot 接力干活必须 `botmux send --mention <对方 open_id>`，否则对方 bot 不会被触发。</routing_rules>',
       '</identity>',
-      '同一群里可能有多个机器人同时被 @，消息里会以 `@名字` 和 `open_id` 区分。只执行明确分给自己的那部分，整条消息都指派给别的机器人时保持沉默。',
     ].join('\n');
   }
 
@@ -202,7 +202,7 @@ export function buildNewTopicPrompt(
       const items = unmentionedBots.map(
         b => `  <bot name="${xmlEscape(b.displayName)}" open_id="${xmlEscape(b.openId)}" />`,
       );
-      botBlock = `<available_bots hint="可通过 botmux send --mention 参数 @ 它们协作，也可用 botmux bots list 查询">\n${items.join('\n')}\n</available_bots>`;
+      botBlock = `<available_bots hint="让这里的某个 bot 接力干活必须 --mention 它的 open_id（botmux send --mention ou_xxx ...），不 --mention 对方 bot 完全收不到消息">\n${items.join('\n')}\n</available_bots>`;
     }
   }
 
