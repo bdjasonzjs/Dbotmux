@@ -6,39 +6,73 @@
  * path renders identically in the Lark thread — same chrome, same markdown
  * rendering, same table widget.
  *
- * Pure: no I/O, no module-level state. Exported helpers are tested by their
- * call sites' integration tests; no separate unit suite to keep the module
- * dependency-free.
+ * Implementation note: parsing is delegated to `markdown-it` (CommonMark +
+ * GFM tables) instead of hand-rolled regex. The previous regex-based fence
+ * splitter mis-fired on two real cases observed in production:
+ *   1. Code fences directly adjacent to a prose line (no blank line) — Feishu's
+ *      markdown widget needs blank lines around fences, and the old splitter
+ *      didn't enforce them, so fences leaked through as literal `\`\`\`` text.
+ *   2. Nested 3-backtick fences — the non-greedy regex closed the outer fence
+ *      at the first inner one, garbling everything after it.
+ * markdown-it tokenizes correctly per CommonMark and gives us blank-line
+ * normalization for free. For nested fences users should use 4+ backticks for
+ * the outer block (CommonMark spec).
  */
 
-/** Feishu card markdown element doesn't render ATX headings → promote to bold. */
-export function transformHeadings(md: string): string {
-  return md.replace(/^#{1,6}\s+(.+)$/gm, (_m, c: string) => `**${c.trim()}**`);
-}
+import MarkdownIt from 'markdown-it';
+import type Token from 'markdown-it/lib/token.mjs';
 
-/** Parse a contiguous pipe-table block into a Feishu card v2 `table` element. */
-export function parseTableBlock(block: string): any | null {
-  const lines = block.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-  if (lines.length < 2) return null;
-  const rows = lines.map(l => l.replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim()));
-  const sepIdx = rows.findIndex(r => r.length > 0 && r.every(c => /^:?-{2,}:?$/.test(c)));
-  const header = rows[0];
-  const body = sepIdx === 1 ? rows.slice(2) : rows.slice(1);
-  if (header.length === 0) return null;
-  const columns = header.map((h, i) => ({
+const md = new MarkdownIt({ html: false, linkify: false, breaks: false });
+
+/** Build a Feishu native `table` element from a `table_open … table_close` token slice. */
+function buildTableFromTokens(tokens: Token[]): any | null {
+  const headerCells: string[] = [];
+  const bodyRows: string[][] = [];
+  let inHead = false;
+  let inBody = false;
+  let currentRow: string[] | null = null;
+  let inCell = false;
+
+  for (const t of tokens) {
+    switch (t.type) {
+      case 'thead_open': inHead = true; break;
+      case 'thead_close': inHead = false; break;
+      case 'tbody_open': inBody = true; break;
+      case 'tbody_close': inBody = false; break;
+      case 'tr_open': currentRow = []; break;
+      case 'tr_close':
+        if (inBody && currentRow) bodyRows.push(currentRow);
+        currentRow = null;
+        break;
+      case 'th_open':
+      case 'td_open': inCell = true; break;
+      case 'th_close':
+      case 'td_close': inCell = false; break;
+      case 'inline':
+        if (inCell) {
+          if (inHead) headerCells.push(t.content);
+          else if (currentRow) currentRow.push(t.content);
+        }
+        break;
+    }
+  }
+
+  if (headerCells.length === 0) return null;
+
+  const columns = headerCells.map((h, i) => ({
     name: `c${i}`,
     display_name: h || ' ',
     data_type: 'lark_md',
     width: 'auto',
   }));
-  const tableRows = body.map(r => {
+  const rows = bodyRows.map(r => {
     const o: Record<string, string> = {};
-    for (let i = 0; i < header.length; i++) o[`c${i}`] = r[i] ?? '';
+    for (let i = 0; i < headerCells.length; i++) o[`c${i}`] = r[i] ?? '';
     return o;
   });
   return {
     tag: 'table',
-    page_size: Math.min(10, Math.max(1, tableRows.length || 1)),
+    page_size: Math.min(10, Math.max(1, rows.length || 1)),
     row_height: 'low',
     header_style: {
       text_align: 'left',
@@ -49,60 +83,113 @@ export function parseTableBlock(block: string): any | null {
       lines: 1,
     },
     columns,
-    rows: tableRows,
+    rows,
   };
+}
+
+function sliceLines(lines: string[], map: [number, number]): string {
+  return lines.slice(map[0], map[1]).join('\n');
+}
+
+/** Find index of the matching close token at the same nesting depth. */
+function findMatchingClose(tokens: Token[], openIdx: number): number {
+  const open = tokens[openIdx];
+  const close = open.type.replace(/_open$/, '_close');
+  let depth = 1;
+  for (let j = openIdx + 1; j < tokens.length; j++) {
+    if (tokens[j].type === open.type) depth++;
+    else if (tokens[j].type === close) {
+      depth--;
+      if (depth === 0) return j;
+    }
+  }
+  return tokens.length - 1;
 }
 
 /**
  * Split markdown into card v2 body elements:
- *   1. Fenced code blocks are preserved verbatim (shielded from heading/table
- *      transforms so `#` and `|` inside code don't get mis-parsed).
- *   2. Pipe-table blocks in prose become native `table` elements.
- *   3. Everything else becomes a `markdown` element with ATX headings promoted
- *      to bold (Feishu's markdown element doesn't render `#`).
- * Consecutive markdown fragments are merged so the card keeps reasonable
- * element counts.
+ *   1. Pipe tables → native `table` widget (Feishu's markdown widget can't
+ *      render them as a grid).
+ *   2. Headings → bold (Feishu's markdown widget doesn't render ATX `#`).
+ *   3. Code fences → re-emitted with the original backtick run, joined with
+ *      blank lines on either side (Feishu's widget needs them to recognise the
+ *      fence).
+ *   4. Everything else → original source slice, glued by blank lines.
+ *
+ * All non-table blocks are merged into a single `markdown` element to keep
+ * card element counts modest.
  */
-export function buildCardBodyElements(md: string): any[] {
+export function buildCardBodyElements(input: string): any[] {
+  if (!input) return [];
+  const tokens = md.parse(input, {});
+  const lines = input.split('\n');
   const elements: any[] = [];
-  let buffer = '';
-  const flushBuffer = () => {
-    const t = buffer.replace(/^\s+|\s+$/g, '');
-    if (t) elements.push({ tag: 'markdown', content: transformHeadings(t) });
-    buffer = '';
+  const buf: string[] = [];
+
+  const flushBuf = () => {
+    const text = buf.join('\n\n').replace(/\n{3,}/g, '\n\n').trim();
+    if (text) elements.push({ tag: 'markdown', content: text });
+    buf.length = 0;
   };
 
-  // Segment by fenced code blocks (``` ... ```)
-  const fenceRe = /^```[^\n]*\n[\s\S]*?^```[ \t]*$/gm;
-  const segments: Array<{ type: 'prose' | 'code'; text: string }> = [];
-  let fCursor = 0;
-  let fm: RegExpExecArray | null;
-  while ((fm = fenceRe.exec(md)) !== null) {
-    if (fm.index > fCursor) segments.push({ type: 'prose', text: md.slice(fCursor, fm.index) });
-    segments.push({ type: 'code', text: fm[0] });
-    fCursor = fm.index + fm[0].length;
-  }
-  if (fCursor < md.length) segments.push({ type: 'prose', text: md.slice(fCursor) });
+  let i = 0;
+  while (i < tokens.length) {
+    const t = tokens[i];
 
-  for (const seg of segments) {
-    if (seg.type === 'code') {
-      buffer += (buffer && !buffer.endsWith('\n') ? '\n' : '') + seg.text + '\n';
+    if (t.level !== 0) { i++; continue; }
+
+    if (t.type === 'table_open') {
+      flushBuf();
+      const j = findMatchingClose(tokens, i);
+      const tableEl = buildTableFromTokens(tokens.slice(i, j + 1));
+      if (tableEl) elements.push(tableEl);
+      else if (t.map) buf.push(sliceLines(lines, t.map as [number, number]));
+      i = j + 1;
       continue;
     }
-    const tableRe = /(?:^[ \t]*\|.+\|[ \t]*\r?\n?){2,}/gm;
-    let tCursor = 0;
-    let tm: RegExpExecArray | null;
-    while ((tm = tableRe.exec(seg.text)) !== null) {
-      buffer += seg.text.slice(tCursor, tm.index);
-      flushBuffer();
-      const table = parseTableBlock(tm[0]);
-      if (table) elements.push(table);
-      else buffer += tm[0];
-      tCursor = tm.index + tm[0].length;
+
+    if (t.type === 'heading_open') {
+      const inline = tokens[i + 1];
+      const text = (inline?.content ?? '').replace(/^#{1,6}\s+/, '').trim();
+      if (text) buf.push(`**${text}**`);
+      i += 3; // heading_open, inline, heading_close
+      continue;
     }
-    buffer += seg.text.slice(tCursor);
+
+    if (t.type === 'fence' || t.type === 'code_block') {
+      const fence = t.markup || '```';
+      const info = (t.info || '').trim();
+      const content = t.content.replace(/\n+$/, '');
+      buf.push(`${fence}${info}\n${content}\n${fence}`);
+      i++;
+      continue;
+    }
+
+    if (t.type === 'hr') {
+      buf.push('---');
+      i++;
+      continue;
+    }
+
+    if (t.type === 'html_block') {
+      if (t.map) buf.push(sliceLines(lines, t.map as [number, number]));
+      i++;
+      continue;
+    }
+
+    // Generic open token (paragraph_open, bullet_list_open, ordered_list_open,
+    // blockquote_open, …): slice source by the open-token's line map and skip
+    // to the matching close.
+    if (t.type.endsWith('_open') && t.map) {
+      buf.push(sliceLines(lines, t.map as [number, number]));
+      i = findMatchingClose(tokens, i) + 1;
+      continue;
+    }
+
+    i++;
   }
-  flushBuffer();
+
+  flushBuf();
   return elements;
 }
 
