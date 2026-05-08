@@ -216,6 +216,37 @@ describe('Interactive card parsing: edge cases', () => {
 
 // ─── extractResources for interactive cards ───────────────────────────────
 
+describe('Post message parsing', () => {
+  it('renders img tag in post body as [图片] placeholder when no numberer', () => {
+    // Regression: previously dropped to empty string, hiding attached images
+    // from `botmux thread messages` and misleading downstream readers.
+    const post = {
+      zh_cn: {
+        title: '',
+        content: [
+          [{ tag: 'text', text: 'see attached:' }],
+          [{ tag: 'img', image_key: 'img_v3_xxx', width: 100, height: 100 }],
+        ],
+      },
+    };
+    const result = parseApiMessage(makeMsg('post', post));
+    expect(result.content).toBe('see attached:\n[图片]');
+  });
+
+  it('renders file tag in post body as [文件: name] placeholder', () => {
+    const post = {
+      zh_cn: {
+        content: [
+          [{ tag: 'text', text: 'doc:' }],
+          [{ tag: 'file', file_key: 'file_xxx', file_name: 'spec.pdf' }],
+        ],
+      },
+    };
+    const result = parseApiMessage(makeMsg('post', post));
+    expect(result.content).toBe('doc:\n[文件: spec.pdf]');
+  });
+});
+
 describe('extractResources: interactive cards', () => {
   it('should extract image_key from API format elements', () => {
     const card = {

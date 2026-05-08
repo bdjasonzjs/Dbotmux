@@ -353,8 +353,23 @@ function extractTextContent(msgType: string, rawContent: string, mentions?: RawE
               if (node.tag === 'text') return node.text ?? '';
               if (node.tag === 'a') return node.text ?? node.href ?? '';
               if (node.tag === 'at') return `@${node.user_name ?? 'unknown'}`;
-              if (node.tag === 'img' && node.image_key && numberer) {
-                return `[图片 ${numberer.assign(`image:${node.image_key}`).num}]`;
+              // Render img/media tags as a placeholder. Without this fallback,
+              // a post message with images surfaces as text-only — which lets
+              // a reader (e.g. another bot scanning thread history) believe
+              // no image was attached and prompt the sender to retry.
+              if (node.tag === 'img' || node.tag === 'media') {
+                const key = node.image_key ?? node.file_key;
+                if (key && numberer) return `[图片 ${numberer.assign(`image:${key}`).num}]`;
+                return '[图片]';
+              }
+              if (node.tag === 'file') {
+                const key = node.file_key;
+                const name = node.file_name ?? '';
+                if (key && numberer) {
+                  const n = numberer.assign(`file:${key}`).num;
+                  return name ? `[文件 ${n}: ${name}]` : `[文件 ${n}]`;
+                }
+                return name ? `[文件: ${name}]` : '[文件]';
               }
               return '';
             })
