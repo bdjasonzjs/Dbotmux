@@ -107,6 +107,19 @@ Rules for checkAgainWhen:
 
 If needsInteraction is false, omit description and options fields.`;
 
+/**
+ * Patterns identifying optional research/feedback surveys that the CLI shows
+ * but does NOT block on — users can ignore them without breaking the session.
+ * Match against the snapshot OR the AI-returned description.
+ */
+const OPTIONAL_SURVEY_PATTERNS: RegExp[] = [
+  /how is claude doing this session/i,
+];
+
+function isOptionalSurvey(text: string): boolean {
+  return OPTIONAL_SURVEY_PATTERNS.some((re) => re.test(text));
+}
+
 export class ScreenAnalyzer {
   private config: ScreenAnalyzerConfig;
   private callbacks: ScreenAnalyzerCallbacks;
@@ -195,6 +208,15 @@ export class ScreenAnalyzer {
     if (this.waitingForContentChange && truncated === this.lastAnalyzedSnapshot) return;
     if (this.timerCooldownUntil > Date.now()) return;
 
+    // Skip optional research surveys (e.g. Claude session feedback) — they have
+    // a "Dismiss" option and don't actually block the CLI, so no card needed.
+    if (isOptionalSurvey(truncated)) {
+      this.lastAnalyzedSnapshot = truncated;
+      this.waitingForContentChange = true;
+      this.callbacks.log('ScreenAnalyzer: optional survey detected — skipping AI call');
+      return;
+    }
+
     // All layers passed — call AI
     this._analyzing = true;
     this.callbacks.onAnalyzing();
@@ -236,6 +258,12 @@ export class ScreenAnalyzer {
     }
 
     if (analysis.needsInteraction && analysis.options && analysis.options.length > 0) {
+      // Safety net: AI may still flag an optional survey as a prompt — drop it.
+      if (isOptionalSurvey(analysis.description ?? '') || isOptionalSurvey(snapshot)) {
+        this.callbacks.log(`ScreenAnalyzer: dropping optional survey prompt — "${analysis.description}"`);
+        return;
+      }
+
       // Generate keys deterministically in code, using AI-provided index + toggleKey/confirmKey
       const toggleKey = analysis.toggleKey || 'Space';
       const confirmKey = analysis.confirmKey || 'Enter';
