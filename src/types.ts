@@ -14,6 +14,8 @@ export interface Session {
   title: string;
   status: 'active' | 'closed';
   createdAt: string;
+  /** Last user/bot/scheduler input that was routed into this session. */
+  lastMessageAt?: string;
   closedAt?: string;
   pid?: number;
   workingDir?: string;

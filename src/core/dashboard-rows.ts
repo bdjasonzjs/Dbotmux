@@ -39,6 +39,20 @@ let cachedBotName = '';
 export function setBotName(name: string): void { cachedBotName = name; }
 export function getBotName(): string { return cachedBotName; }
 
+function parseSessionTime(iso: string | undefined): number | undefined {
+  if (!iso) return undefined;
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) ? ms : undefined;
+}
+
+function sessionCreatedAtMs(s: Session): number {
+  return parseSessionTime(s.createdAt) ?? 0;
+}
+
+export function sessionLastActivityAtMs(s: Session): number {
+  return parseSessionTime(s.lastMessageAt) ?? sessionCreatedAtMs(s);
+}
+
 export function composeRowFromActive(ds: DaemonSession): SessionRow {
   return {
     sessionId: ds.session.sessionId,
@@ -47,8 +61,8 @@ export function composeRowFromActive(ds: DaemonSession): SessionRow {
     cliId: ds.session.cliId ?? 'unknown',
     status: ds.lastScreenStatus ?? 'starting',
     adopt: !!ds.adoptedFrom,
-    spawnedAt: ds.spawnedAt,
-    lastMessageAt: ds.lastMessageAt,
+    spawnedAt: sessionCreatedAtMs(ds.session) || ds.spawnedAt,
+    lastMessageAt: sessionLastActivityAtMs(ds.session) || ds.lastMessageAt,
     workingDir: ds.workingDir,
     chatId: ds.chatId,
     rootMessageId: ds.session.rootMessageId,
@@ -74,8 +88,8 @@ export function composeRowFromClosed(s: Session): SessionRow {
     cliId: s.cliId ?? 'unknown',
     status: 'closed',
     adopt: !!s.adoptedFrom,
-    spawnedAt: Date.parse(s.createdAt),
-    lastMessageAt: s.closedAt ? Date.parse(s.closedAt) : Date.parse(s.createdAt),
+    spawnedAt: sessionCreatedAtMs(s),
+    lastMessageAt: s.closedAt ? (parseSessionTime(s.closedAt) ?? sessionLastActivityAtMs(s)) : sessionLastActivityAtMs(s),
     closedAt: s.closedAt ? Date.parse(s.closedAt) : undefined,
     workingDir: s.workingDir,
     chatId: s.chatId,

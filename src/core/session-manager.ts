@@ -21,6 +21,15 @@ import type { LarkAttachment, LarkMention, ScheduledTask } from '../types.js';
 import type { MessageResource } from '../im/lark/message-parser.js';
 import { sessionKey, sessionAnchorId } from './types.js';
 import type { DaemonSession } from './types.js';
+import { markSessionActivity } from './session-activity.js';
+
+function sessionCreatedAtMs(session: { createdAt?: string }): number {
+  return session.createdAt ? (Date.parse(session.createdAt) || Date.now()) : Date.now();
+}
+
+function sessionLastMessageAtMs(session: { createdAt?: string; lastMessageAt?: string }): number {
+  return session.lastMessageAt ? (Date.parse(session.lastMessageAt) || sessionCreatedAtMs(session)) : sessionCreatedAtMs(session);
+}
 
 // ─── Path helpers ────────────────────────────────────────────────────────────
 
@@ -425,9 +434,9 @@ export function restoreActiveSessions(activeSessions: Map<string, DaemonSession>
         chatId: session.chatId,
         chatType: session.chatType ?? 'group',
         scope,
-        spawnedAt: Date.now(),
+        spawnedAt: sessionCreatedAtMs(session),
         cliVersion: getCurrentCliVersion(),
-        lastMessageAt: Date.now(),
+        lastMessageAt: sessionLastMessageAtMs(session),
         hasHistory: false,
         workingDir: adopted.cwd,
         adoptedFrom: adopted as DaemonSession['adoptedFrom'],
@@ -463,9 +472,9 @@ export function restoreActiveSessions(activeSessions: Map<string, DaemonSession>
       chatId: session.chatId,
       chatType: session.chatType ?? 'group',
       scope,
-      spawnedAt: Date.now(),
+      spawnedAt: sessionCreatedAtMs(session),
       cliVersion: getCurrentCliVersion(),
-      lastMessageAt: Date.now(),
+      lastMessageAt: sessionLastMessageAtMs(session),
       hasHistory: true,  // restored sessions have prior CLI history
       workingDir: session.workingDir,
       // Restore persisted streaming-card state — next screen_update will PATCH
@@ -612,7 +621,7 @@ export async function executeScheduledTask(
   // Inject into a live session if one already exists at this anchor.
   const existing = activeSessions.get(sessionKey(anchor, larkAppId));
   if (isContinuation && existing?.worker && !existing.worker.killed) {
-    existing.lastMessageAt = Date.now();
+    markSessionActivity(existing);
     try {
       existing.worker.send({ type: 'message', content: task.prompt });
       logger.info(`[scheduler] Task "${task.name}" injected into live session ${existing.session.sessionId}`);
@@ -626,8 +635,10 @@ export async function executeScheduledTask(
   // Thread-scope: rootMessageId = anchor. Chat-scope: rootMessageId stores the
   // chatId-as-seed for audit (sessionAnchorId() returns chatId via scope).
   const session = sessionStore.createSession(task.chatId, anchor, `[定时] ${task.name}`);
+  const now = Date.now();
   session.larkAppId = larkAppId;
   session.scope = scope;
+  session.lastMessageAt = new Date(now).toISOString();
   sessionStore.updateSession(session);
   messageQueue.ensureQueue(anchor);
 
@@ -642,9 +653,9 @@ export async function executeScheduledTask(
     chatId: task.chatId,
     chatType: task.chatType === 'p2p' ? 'p2p' : 'group',
     scope,
-    spawnedAt: Date.now(),
+    spawnedAt: sessionCreatedAtMs(session),
     cliVersion: getCurrentCliVersion(),
-    lastMessageAt: Date.now(),
+    lastMessageAt: now,
     hasHistory: isContinuation,
     workingDir: task.workingDir,
   };

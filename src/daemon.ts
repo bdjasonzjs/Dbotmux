@@ -60,6 +60,7 @@ import { handleCardAction } from './im/lark/card-handler.js';
 import type { CardHandlerDeps } from './im/lark/card-handler.js';
 import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, writeBotInfoFile, canOperate, type RoutingContext } from './im/lark/event-dispatcher.js';
 import { isBotMentionMessageHandled, markBotMentionMessageHandled } from './utils/bot-mention-dedup.js';
+import { markSessionActivity } from './core/session-activity.js';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -360,9 +361,11 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
       // break. Chat-scope keeps the inbound messageId as audit only.
       const cmdRootIdForStore = scope === 'thread' ? anchor : messageId;
       const session = sessionStore.createSession(chatId, cmdRootIdForStore, cmdContent.substring(0, 50), chatType);
+      const now = Date.now();
       session.larkAppId = larkAppId;
       session.ownerOpenId = senderOpenId;
       session.lastCallerOpenId = senderOpenId;
+      session.lastMessageAt = new Date(now).toISOString();
       session.scope = scope;
       sessionStore.updateSession(session);
       activeSessions.set(sessionKey(anchor, larkAppId), {
@@ -374,9 +377,9 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
         chatId,
         chatType,
         scope,
-        spawnedAt: Date.now(),
+        spawnedAt: Date.parse(session.createdAt) || now,
         cliVersion: cliVersionCache.get(botCfg.cliId)?.version ?? 'unknown',
-        lastMessageAt: Date.now(),
+        lastMessageAt: now,
         hasHistory: false,
         ownerOpenId: senderOpenId,
       });
@@ -408,8 +411,10 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // routing keys off chatId via sessionAnchorId(), so any value works.
   const rootIdForStore = scope === 'thread' ? anchor : messageId;
   const session = sessionStore.createSession(chatId, rootIdForStore, parsed.content.substring(0, 50), chatType);
+  const now = Date.now();
   session.larkAppId = larkAppId;
   session.ownerOpenId = senderOpenId;
+  session.lastMessageAt = new Date(now).toISOString();
   session.scope = scope;
   sessionStore.updateSession(session);
   messageQueue.ensureQueue(anchor);
@@ -436,9 +441,9 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     chatId,
     chatType,
     scope,
-    spawnedAt: Date.now(),
+    spawnedAt: Date.parse(session.createdAt) || now,
     cliVersion: cliVersionCache.get(botCfg.cliId)?.version ?? 'unknown',
-    lastMessageAt: Date.now(),
+    lastMessageAt: now,
     hasHistory: false,
     pendingRepo: !pinnedWorkingDir,
     pendingPrompt: content,
@@ -523,7 +528,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       const ds = activeSessions.get(sessionKey(anchor, larkAppId));
       if (ds?.worker && !ds.worker.killed) {
         ds.worker.send({ type: 'raw_input', content: commandContent } as DaemonToWorker);
-        ds.lastMessageAt = Date.now();
+        markSessionActivity(ds);
         logger.info(`[${anchor.substring(0, 12)}] Passthrough ${cmd} → worker`);
       } else {
         sessionReply(anchor, `${cmd} 需要活跃的 CLI 进程，当前话题无运行中的会话。`, 'text', larkAppId);
@@ -580,7 +585,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   // reply cards to whoever triggered this turn — matters in oncall groups
   // where the caller is often not the session owner).
   if (ds) {
-    ds.lastMessageAt = Date.now();
+    markSessionActivity(ds);
     const callerOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
     if (callerOpenId && ds.session.lastCallerOpenId !== callerOpenId) {
       ds.session.lastCallerOpenId = callerOpenId;
@@ -632,9 +637,11 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     //                   (used as audit trail; routing key is chatId).
     const rootIdForStore = scope === 'thread' ? anchor : parsed.messageId;
     const session = sessionStore.createSession(autoCreateChatId, rootIdForStore, parsed.content.substring(0, 50), autoCreateChatType);
+    const now = Date.now();
     session.larkAppId = larkAppId;
     session.ownerOpenId = senderOId;
     session.lastCallerOpenId = senderOId;
+    session.lastMessageAt = new Date(now).toISOString();
     session.scope = scope;
     sessionStore.updateSession(session);
 
@@ -663,9 +670,9 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       chatId: autoCreateChatId,
       chatType: autoCreateChatType,
       scope,
-      spawnedAt: Date.now(),
+      spawnedAt: Date.parse(session.createdAt) || now,
       cliVersion: cliVersionCache.get(botCfg.cliId)?.version ?? 'unknown',
-      lastMessageAt: Date.now(),
+      lastMessageAt: now,
       hasHistory: false,
       pendingRepo: !pinnedWorkingDir,
       pendingPrompt: parsed.content,
@@ -857,7 +864,7 @@ function processBotMentionSignal(signal: BotMentionSignal): void {
       }
     }
     const enrichedContent = enrichedParts.join('\n\n');
-    ds.lastMessageAt = Date.now();
+    markSessionActivity(ds);
     // Park the current streaming card so the new turn's POST can recall it.
     // Without this the bot-to-bot mention path leaves old cards stranded —
     // it bypasses the user-message freeze block in handleThreadReply.

@@ -20,6 +20,8 @@ main { padding: 1rem; }
 table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
 th, td { padding: 0.4rem 0.6rem; text-align: left; border-bottom: 1px solid var(--border); white-space: nowrap; }
 th { background: var(--header-bg); font-weight: 600; }
+th[data-sort] { cursor: pointer; user-select: none; }
+th[data-sort]:hover, th.sorted { background: #eef2f6; }
 tr[data-id]:hover { background: #f6f8fa; cursor: pointer; }
 button { padding: 0.25rem 0.6rem; border: 1px solid var(--border); background: white; border-radius: 4px; cursor: pointer;
   /* iOS Safari renders default <button> with -webkit-appearance: button which

@@ -33,8 +33,8 @@ const PAGE_HTML = `
 <table id="sessions-table">
   <thead><tr>
     <th><input type="checkbox" id="select-all" title="全选当前过滤结果"></th>
-    <th>bot</th><th>cli</th><th>status</th><th>title</th><th>workingDir</th>
-    <th>spawned</th><th>last</th><th>adopt</th><th></th>
+    <th data-sort="botName">bot</th><th data-sort="cliId">cli</th><th data-sort="status">status</th><th data-sort="title">title</th><th data-sort="workingDir">workingDir</th>
+    <th data-sort="spawnedAt">created</th><th data-sort="lastMessageAt">last</th><th data-sort="adopt">adopt</th><th></th>
   </tr></thead>
   <tbody></tbody>
 </table>
@@ -68,11 +68,14 @@ export function renderSessionsPage(root: HTMLElement) {
   const bulkCountSpan = root.querySelector<HTMLElement>('#bulk-count')!;
   const bulkCloseBtn = root.querySelector<HTMLButtonElement>('#bulk-close')!;
   const bulkClearBtn = root.querySelector<HTMLButtonElement>('#bulk-clear')!;
+  const table = root.querySelector<HTMLTableElement>('#sessions-table')!;
 
   // Selection set persists across rerenders (filter changes, SSE updates).
   // Closed/missing sessions get pruned lazily during rerender so the count
   // never overstates active selections.
   const selected = new Set<string>();
+  let sortKey = 'lastMessageAt';
+  let sortDir: 'asc' | 'desc' = 'desc';
 
   function rowHtml(s: any) {
     const closed = s.status === 'closed';
@@ -98,13 +101,41 @@ export function renderSessionsPage(root: HTMLElement) {
     const status = f.get('status') as string;
     const adopt = f.get('adopt') as string;
     const active = !!f.get('active');
-    return [...store.sessions.values()]
+    const rows = [...store.sessions.values()]
       .filter(s => !cli.length || cli.includes(s.cliId ?? 'unknown'))
       .filter(s => !status || s.status === status)
       .filter(s => !adopt || (adopt === 'yes') === !!s.adopt)
       .filter(s => !active || s.status !== 'closed')
-      .filter(s => !q || JSON.stringify(s).toLowerCase().includes(q))
-      .sort((a, b) => (b.lastMessageAt ?? 0) - (a.lastMessageAt ?? 0));
+      .filter(s => !q || JSON.stringify(s).toLowerCase().includes(q));
+    rows.sort(compareRows);
+    return rows;
+  }
+
+  function sortValue(s: any, key: string): string | number | boolean {
+    if (key === 'spawnedAt' || key === 'lastMessageAt') return Number(s[key] ?? 0);
+    if (key === 'adopt') return !!s.adopt;
+    return String(s[key] ?? '').toLowerCase();
+  }
+
+  function compareRows(a: any, b: any): number {
+    const av = sortValue(a, sortKey);
+    const bv = sortValue(b, sortKey);
+    let cmp = 0;
+    if (typeof av === 'number' && typeof bv === 'number') cmp = av - bv;
+    else if (typeof av === 'boolean' && typeof bv === 'boolean') cmp = Number(av) - Number(bv);
+    else cmp = String(av).localeCompare(String(bv));
+    if (cmp === 0) cmp = (Number(a.lastMessageAt ?? 0) - Number(b.lastMessageAt ?? 0));
+    return sortDir === 'asc' ? cmp : -cmp;
+  }
+
+  function paintSortHeaders() {
+    table.querySelectorAll<HTMLTableCellElement>('th[data-sort]').forEach(th => {
+      const active = th.dataset.sort === sortKey;
+      th.classList.toggle('sorted', active);
+      th.setAttribute('aria-sort', active ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none');
+      const label = th.textContent?.replace(/ [▲▼]$/, '').trim() ?? '';
+      th.textContent = active ? `${label} ${sortDir === 'asc' ? '▲' : '▼'}` : label;
+    });
   }
 
   function rerender() {
@@ -117,6 +148,7 @@ export function renderSessionsPage(root: HTMLElement) {
       if (!s || s.status === 'closed') selected.delete(sid);
     }
     tbody.innerHTML = rows.map(rowHtml).join('');
+    paintSortHeaders();
     syncBulkUi(rows);
   }
 
@@ -311,6 +343,18 @@ export function renderSessionsPage(root: HTMLElement) {
       const more = failures.length > 3 ? `\n... +${failures.length - 3} 个` : '';
       alert(`关闭完成：成功 ${ids.length - failed} / 失败 ${failed}\n${head}${more}`);
     }
+  });
+
+  table.querySelectorAll<HTMLTableCellElement>('th[data-sort]').forEach(th => {
+    th.addEventListener('click', () => {
+      const key = th.dataset.sort!;
+      if (sortKey === key) sortDir = sortDir === 'asc' ? 'desc' : 'asc';
+      else {
+        sortKey = key;
+        sortDir = key === 'spawnedAt' || key === 'lastMessageAt' ? 'desc' : 'asc';
+      }
+      rerender();
+    });
   });
 
   filtersForm.addEventListener('input', rerender);
