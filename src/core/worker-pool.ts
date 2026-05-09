@@ -872,9 +872,16 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             scheduleCardPatch(ds, frozenCard);
           }
           killWorker(ds);
-          try {
-            await cb.sessionReply(sessionAnchorId(ds), '\u23cf 已采纳的 CLI 会话已退出', 'text', ds.larkAppId);
-          } catch { /* best effort */ }
+          // Skip the exit notice when the session was already closed via the
+          // ⏏ card button — card-handler already posted "已断开，原 CLI 会话
+          // 不受影响" right before killing us, so another exit message here
+          // is just noise. Natural exits (user typed `exit`, CLI crashed)
+          // leave status='active' and still get the notice.
+          if (ds.session.status !== 'closed') {
+            try {
+              await cb.sessionReply(sessionAnchorId(ds), '\u23cf 已采纳的 CLI 会话已退出', 'text', ds.larkAppId);
+            } catch { /* best effort */ }
+          }
           break;
         }
 
