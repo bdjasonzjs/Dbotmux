@@ -99,32 +99,41 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
     },
 
     async writeInput(pty: PtyHandle, content: string) {
-      // CoCo is a Claude Code fork (Ink TUI) and inherits Claude Code's two
-      // failure modes when content has embedded newlines:
-      //   1. tmux `send-keys -l` treats each \n as Enter, so a raw sendText
-      //      of multi-line content either submits fragments line-by-line or
-      //      paste-burst-coalesces with the *trailing* Enter consumed as part
-      //      of the paste — text just sits in the input box, never submitted.
+      // CoCo / Trae CLI is a Claude Code fork (Ink TUI) with two failure modes
+      // for multi-line input:
+      //   1. tmux `send-keys -l` treats each \n as Enter — multi-line content
+      //      either submits line-by-line or paste-burst-coalesces with the
+      //      trailing Enter consumed as part of the paste (text stays stuck
+      //      in the input box, never submitted).
       //   2. The old adapter had no verification, so the worker never knew
       //      and the user stared at Lark waiting for a reply that never came.
       //
-      // Fix mirrors claude-code.ts:
-      //   - split content by \n, type each line via send-keys -l, insert
-      //     soft-newline (`\` + Enter) between lines — Claude Code's
-      //     documented idiom to add a newline without submitting.
-      //   - throttle each tmux call (~30ms) to stay under the paste-burst
-      //     threshold so soft-newlines aren't silently swallowed as a paste.
-      //   - submitDelay then a single Enter to actually submit.
+      // Fix: use tmux `load-buffer` + `paste-buffer -d` (the `pasteText` path)
+      // which automatically wraps the content in bracketed-paste markers
+      // (`\e[200~...\e[201~`) when the Ink TUI has bracketed paste enabled —
+      // Ink does by default on fresh spawn. CoCo sees an explicit START/END
+      // pair, so embedded `\n` stay as content (no per-line submits) and the
+      // trailing Enter after submitDelay is unambiguously a submit (not part
+      // of an "ongoing paste burst" the way send-keys -l rapid input was).
       //
-      // Verification mirrors codex.ts using ~/.cache/coco/history.jsonl:
-      // write → poll for our content prefix in the delta → retry Enter up
-      // to 3 times → return {submitted:false, recheck} on final miss so the
-      // worker can defer-recheck and otherwise surface a Lark warning.
+      // Why not send-keys -l + `\` + Enter soft-newlines (the claude-code
+      // pattern): on Trae CLI 0.120.31 (May 2026 build), fresh-spawned CoCo
+      // treats the rapid send-keys sequence as an open-ended paste burst and
+      // swallows the final Enter as a soft-newline — message stranded in the
+      // input box with no submit, no error. Manually pressing Enter 30 min
+      // later still works (burst window times out eventually), so the issue
+      // is "burst never terminates from CoCo's POV", which an explicit
+      // bracketed-paste END marker fixes. claude-code.ts keeps its
+      // send-keys-typing path because Claude Code can toggle bracketed paste
+      // OFF after slash commands; CoCo on a fresh-spawn message doesn't have
+      // that concern.
+      //
+      // Verification (unchanged): poll ~/.cache/coco/history.jsonl for the
+      // user-submit line whose decoded `content` starts with our prefix.
+      // Retry Enter up to 3 times, then return {submitted:false, recheck}
+      // for the worker's deferred recheck + Lark warning path.
       const hasImagePath = /\.(jpe?g|png|gif|webp|svg|bmp)\b/i.test(content);
       const submitDelay = hasImagePath ? 800 : 500;
-      const TYPING_THROTTLE_MS = 30;
-
-      const tick = () => new Promise<void>(r => setTimeout(r, TYPING_THROTTLE_MS));
 
       const trySendEnter = (): boolean => {
         try {
@@ -142,24 +151,14 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
       const prefix = submitPrefix(content);
 
       try {
-        if (pty.sendText && pty.sendSpecialKeys) {
-          const lines = content.split('\n');
-          for (let i = 0; i < lines.length; i++) {
-            if (lines[i].length > 0) {
-              pty.sendText(lines[i]);
-              await tick();
-            }
-            if (i < lines.length - 1) {
-              // Soft-newline: `\` + Enter inserts a newline without submitting.
-              pty.sendText('\\');
-              await tick();
-              pty.sendSpecialKeys('Enter');
-              await tick();
-            }
-          }
+        if (pty.pasteText) {
+          // tmux mode: load-buffer + paste-buffer -d. Tmux wraps in bracketed
+          // paste automatically when the pane has it on (Ink default). The
+          // trailing `-d` deletes the buffer after pasting so it doesn't
+          // accumulate across writes.
+          pty.pasteText(content);
         } else {
-          // Non-tmux fallback (raw PTY): bracketed paste is reliable here
-          // since we control the markers directly — no send-keys -l \n quirk.
+          // Non-tmux fallback (raw PTY): wrap markers ourselves.
           pty.write('\x1b[200~' + content + '\x1b[201~');
         }
       } catch {
