@@ -64,7 +64,7 @@ import {
 } from './core/session-manager.js';
 import { handleCardAction } from './im/lark/card-handler.js';
 import type { CardHandlerDeps } from './im/lark/card-handler.js';
-import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, writeBotInfoFile, canOperate, isKnownPeerBot, type RoutingContext } from './im/lark/event-dispatcher.js';
+import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, writeBotInfoFile, canOperate, isKnownPeerBot, checkRequiredScopes, type RoutingContext } from './im/lark/event-dispatcher.js';
 import { markSessionActivity } from './core/session-activity.js';
 
 // ─── State ───────────────────────────────────────────────────────────────────
@@ -560,6 +560,38 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   }
 }
 
+/** Reverse-lookup a foreign bot's display name for a sender open_id observed on
+ *  this app's WS events. Priority:
+ *    1) bot-openids-${larkAppId}.json — per-app cross-ref populated by
+ *       updateBotOpenIdCrossRef when @mentions go through us. Open_id is
+ *       per-app scoped, so this is the authoritative map for this larkAppId.
+ *    2) bots-info.json — fallback for bots not yet in our cross-ref but
+ *       registered as botmux peers (matches by their self-reported open_id;
+ *       only works when the peer's app id space coincides with ours).
+ *  Returns "Bot" if neither lookup hits — keeps the prefix readable rather
+ *  than blocking the message.
+ */
+function lookupForeignBotName(senderOpenId: string, larkAppId: string): string {
+  try {
+    const fp = join(config.session.dataDir, `bot-openids-${larkAppId}.json`);
+    if (existsSync(fp)) {
+      const data: Record<string, string> = JSON.parse(readFileSync(fp, 'utf-8'));
+      for (const [name, openId] of Object.entries(data)) {
+        if (openId === senderOpenId) return name;
+      }
+    }
+  } catch { /* fall through */ }
+  try {
+    const infoPath = join(config.session.dataDir, 'bots-info.json');
+    if (existsSync(infoPath)) {
+      const entries: Array<{ larkAppId: string; botOpenId: string | null; botName: string | null; cliId: string }> = JSON.parse(readFileSync(infoPath, 'utf-8'));
+      const hit = entries.find(e => e.botOpenId === senderOpenId);
+      if (hit) return hit.botName ?? getCliDisplayName(hit.cliId as CliId);
+    }
+  } catch { /* */ }
+  return 'Bot';
+}
+
 async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> {
   const { chatId: ctxChatId, chatType: ctxChatType, scope, anchor, larkAppId } = ctx;
   await resolveNonsupportMessage(data, larkAppId);
@@ -570,6 +602,22 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     const { extraResources } = await expandMergeForward(larkAppId, parsed.messageId, parsed);
     resources.push(...extraResources);
   }
+
+  // Foreign bot @mention prefix: when sender is another bot (sender_type='app'
+  // 且不是本机），把内容包成 [来自 X 的 @mention]\n<原文> 喂给 worker，让 CLI
+  // 知道这是另一个 bot 发的——不是用户直接发的——后续不需要按"对话用户"的
+  // 方式处理。signal-file 路径删掉之前由 processBotMentionSignal 拼，现在
+  // 统一在这里拼。仅影响发给 worker 的 prompt 内容，title / 命令解析 / 日志
+  // 还是用原 parsed.content。
+  const senderOpenIdForPrefix = parsed.senderId || data?.sender?.sender_id?.open_id;
+  const isForeignBot =
+    parsed.senderType === 'app' &&
+    !!senderOpenIdForPrefix &&
+    senderOpenIdForPrefix !== getBot(larkAppId).botOpenId;
+  const botSenderPrefix = isForeignBot
+    ? `[来自 ${lookupForeignBotName(senderOpenIdForPrefix!, larkAppId)} 的 @mention]\n`
+    : '';
+  const promptContent = botSenderPrefix + parsed.content;
 
   const content = parsed.content.trim();
   // Strip leading @<bot> mentions so "@bot /restart" is recognized as a command.
@@ -664,8 +712,8 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   if (ds?.pendingRepo) {
     // Enrich content with attachment hints and mention metadata (same as normal send)
     let enriched = attachments.length > 0
-      ? `${parsed.content}${formatAttachmentsHint(attachments)}`
-      : parsed.content;
+      ? `${promptContent}${formatAttachmentsHint(attachments)}`
+      : promptContent;
     if (parsed.mentions && parsed.mentions.length > 0) {
       const mentionLines = parsed.mentions.map(m => {
         const idPart = m.openId ? ` → open_id: ${m.openId}` : '';
@@ -748,7 +796,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       lastMessageAt: now,
       hasHistory: false,
       pendingRepo: !pinnedWorkingDir,
-      pendingPrompt: parsed.content,
+      pendingPrompt: promptContent,
       pendingAttachments: attachments.length > 0 ? attachments : undefined,
       pendingMentions: parsed.mentions,
       ownerOpenId: senderOId,
@@ -765,7 +813,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     // spawn CLI immediately, skip repo selection.
     if (pinnedWorkingDir) {
       const selfBot = getBot(larkAppId);
-      const prompt = buildNewTopicPrompt(parsed.content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId });
+      const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId });
       forkWorker(newDs, prompt);
       const reason = oncallEntry
         ? `oncall-bound chat ${autoCreateChatId}`
@@ -790,7 +838,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       // No projects found — skip repo selection, spawn directly
       newDs.pendingRepo = false;
       const selfBot = getBot(larkAppId);
-      const prompt = buildNewTopicPrompt(parsed.content, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId });
+      const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId });
       forkWorker(newDs, prompt);
     }
 
@@ -811,12 +859,12 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     const isBridge = !!ds.adoptedFrom;
     const selfBot = getBot(ds.larkAppId);
     const msgContent = isBridge
-      ? buildBridgeInputContent(parsed.content, {
+      ? buildBridgeInputContent(promptContent, {
           attachments,
           mentions: parsed.mentions,
           selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
         })
-      : buildFollowUpContent(parsed.content, ds.session.sessionId, {
+      : buildFollowUpContent(promptContent, ds.session.sessionId, {
           attachments,
           mentions: parsed.mentions,
           isAdoptMode: false,
@@ -881,7 +929,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     // because worker=null at that point.
     const dsBotCfgForFork = getBot(ds.larkAppId).config;
     const selfBot = getBot(ds.larkAppId);
-    const wrappedPrompt = buildReforkPrompt(ds, parsed.content, {
+    const wrappedPrompt = buildReforkPrompt(ds, promptContent, {
       attachments,
       mentions: parsed.mentions,
       cliId: dsBotCfgForFork.cliId,
@@ -1013,6 +1061,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       // Probe runs in background and is retried by the periodic heartbeat;
       // a single failure here is not actionable. Surface as debug only.
       logger.debug(`[${cfg.larkAppId}] Bot open_id probe failed (will retry): ${err.message}`);
+    });
+
+    // Required-scope check: 启动后 best-effort 校验
+    // im:message.group_at_msg.include_bot:readonly。缺失会 logger.error +
+    // 私信 allowedUsers[0]。校验异步，跑失败不影响 daemon。
+    checkRequiredScopes(cfg.larkAppId).catch(err => {
+      logger.debug(`[${cfg.larkAppId}] required-scope check failed: ${err?.message ?? err}`);
     });
 
     // Start event dispatcher for this bot
