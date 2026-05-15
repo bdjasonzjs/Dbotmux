@@ -66,10 +66,17 @@ describe('claude-code buildArgs', () => {
     expect(args).not.toContain('--resume');
   });
 
-  it('resume session passes --resume', () => {
+  it('resume without observed Claude session id starts with --session-id', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-1', resume: true });
-    expect(args).toContain('--resume');
+    expect(args).toContain('--session-id');
     expect(args).toContain('sess-1');
+    expect(args).not.toContain('--resume');
+  });
+
+  it('resume with observed Claude session id passes --resume', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-1', resume: true, resumeSessionId: 'claude-sess-1' });
+    expect(args).toContain('--resume');
+    expect(args).toContain('claude-sess-1');
     expect(args).not.toContain('--session-id');
   });
 

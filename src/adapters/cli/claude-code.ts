@@ -210,11 +210,15 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
     buildArgs({ sessionId, resume, resumeSessionId, botName, botOpenId }) {
       const args: string[] = [];
       if (resume) {
-        // Prefer Claude's most recently observed internal session id when we
-        // have one — `--resume` reads `<id>.jsonl`, and after a previous run
-        // rotated the id (which we now persist via the pid-file resolver) the
-        // botmux sessionId no longer matches Claude's actual transcript file.
-        args.push('--resume', resumeSessionId ?? sessionId);
+        // Only resume when we have an observed Claude-native session id. A
+        // botmux session id is not proof that Claude ever created a matching
+        // transcript: if the first Claude process exits before the initial
+        // prompt lands, `claude --resume <botmux-id>` exits cleanly with
+        // "No conversation found with session ID" and the daemon crash-loops.
+        // Starting fresh with `--session-id` is idempotent for this case and
+        // gives the queued Lark message another chance to create the transcript.
+        if (resumeSessionId) args.push('--resume', resumeSessionId);
+        else args.push('--session-id', sessionId);
       } else {
         args.push('--session-id', sessionId);
       }
