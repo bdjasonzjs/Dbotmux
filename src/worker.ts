@@ -65,6 +65,12 @@ import { createHash } from 'node:crypto';
 
 let cliAdapter: CliAdapter | null = null;
 let backend: SessionBackend | null = null;
+/** Monotonic token for the currently-attached backend lifecycle.
+ *  Async writeInput() can outlive the CLI it started writing to (Claude exits,
+ *  daemon asks this worker to restart, tmux session is destroyed, then the
+ *  delayed final Enter/retry path fires). Capture this epoch before awaiting
+ *  writeInput so stale tmux send-keys failures don't crash the worker. */
+let backendEpoch = 0;
 let cliPidMarker: string | null = null;  // path to .botmux-cli-pids/<pid>
 let idleDetector: IdleDetector | null = null;
 let isTmuxMode = false;
@@ -2007,7 +2013,31 @@ async function flushPending(): Promise<void> {
         codexBridgeMarkPendingTurn(msg);
       }
       log(`Writing to PTY (flush): "${msg.substring(0, 80)}"`);
-      const result = await cliAdapter.writeInput(backend, msg);
+      const writeBackend: SessionBackend = backend;
+      const writeEpoch = backendEpoch;
+      let result: Awaited<ReturnType<CliAdapter['writeInput']>>;
+      try {
+        result = await cliAdapter.writeInput(writeBackend, msg);
+      } catch (err: any) {
+        const staleBackend = backend !== writeBackend || backendEpoch !== writeEpoch;
+        const preview = msg.length > 60 ? msg.slice(0, 60) + '…' : msg;
+        log(`writeInput failed${staleBackend ? ' after backend restart/exit' : ''}: ${err?.message ?? err}; preview="${preview}"`);
+        if (!staleBackend) {
+          send({
+            type: 'user_notify',
+            message: `⚠️ 发给 ${cliName()} 的消息写入终端失败，可能卡在输入框或 tmux pane 已消失。请去 Web 终端看一下，或重发这条消息。\n开头：${preview}`,
+          });
+        }
+        // Do not let a backend write error take down the worker process. If
+        // the CLI just exited, daemon-side auto-restart will bring it back;
+        // if this was a live-backend failure, stop this drain so later queued
+        // messages are not written into a broken pane.
+        break;
+      }
+      if (backend !== writeBackend || backendEpoch !== writeEpoch) {
+        log(`writeInput completed after backend restart/exit; ignoring stale result. preview="${msg.substring(0, 80)}"`);
+        break;
+      }
       // Persist any sessionId the adapter observed via authoritative sources
       // (Claude's pid file, Codex's history). Done independently of submit
       // outcome — the rotation is real even when the current Enter didn't
@@ -2099,6 +2129,7 @@ function stopScreenUpdates(): void {
 // ─── PTY Management ──────────────────────────────────────────────────────────
 
 function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
+  backendEpoch++;
   // ── Adopt mode: pipe-pane the user's existing tmux pane (no attach) ──
   if (cfg.adoptMode && cfg.adoptTmuxTarget) {
     // We mark BOTH isTmuxMode and isPipeMode: the former keeps idle/spawn
@@ -2432,6 +2463,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
 }
 
 function killCli(): void {
+  backendEpoch++;
   idleDetector?.dispose();
   idleDetector = null;
   stopScreenAnalyzer();
