@@ -50,6 +50,7 @@ import type { CliAdapter, PtyHandle } from './adapters/cli/types.js';
 import { PtyBackend } from './adapters/backend/pty-backend.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
 import { TmuxPipeBackend } from './adapters/backend/tmux-pipe-backend.js';
+import { selectSessionBackend } from './adapters/backend/session-backend-selector.js';
 import type { SessionBackend } from './adapters/backend/types.js';
 import { tmuxEnv } from './setup/ensure-tmux.js';
 import { IdleDetector } from './utils/idle-detector.js';
@@ -2300,9 +2301,10 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     log('tmux backend requested but functional probe failed — falling back to PTY backend');
     useTmux = false;
   }
-  isTmuxMode = useTmux;
-  const tmuxBe = useTmux ? new TmuxBackend(TmuxBackend.sessionName(cfg.sessionId)) : null;
-  backend = tmuxBe ?? new PtyBackend();
+  const selectedBackend = selectSessionBackend({ sessionId: cfg.sessionId, useTmux });
+  isTmuxMode = selectedBackend.isTmuxMode;
+  isPipeMode = selectedBackend.isPipeMode;
+  backend = selectedBackend.backend;
 
   // Claude Code appends a line to ~/.claude/projects/<cwd-hash>/<sid>.jsonl each
   // time the user submits. The adapter uses this file to verify paste+Enter
@@ -2383,10 +2385,6 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // On tmux re-attach, keep awaitingFirstPrompt = true so screen updates are
   // suppressed until the idle detector fires markNewTurn() — this prevents the
   // full tmux scrollback history from leaking into the streaming card.
-  if (tmuxBe?.isReattach) {
-    log('Re-attached to existing tmux session');
-  }
-
   // Bridge fallback: claude-code only. Tail Claude's transcript JSONL so a
   // turn the model finishes WITHOUT calling `botmux send` still gets its
   // assistant text forwarded to Lark (the gate in emitReadyTurns suppresses
@@ -2451,6 +2449,16 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     isPromptReady = false;
     send({ type: 'claude_exit', code, signal });
   });
+
+  if (isPipeMode && backend instanceof TmuxPipeBackend && (backend as any).isReattach) {
+    log(`Re-attached to existing tmux session via pipe-pane: ${TmuxBackend.sessionName(cfg.sessionId)}`);
+    try {
+      const initial = backend.captureCurrentScreen();
+      if (initial.length > 0) onPtyData(initial);
+    } catch (err: any) {
+      log(`captureCurrentScreen failed: ${err.message}`);
+    }
+  }
 
   // Fallback: if the CLI takes too long to show its prompt (e.g. slow
   // plugin init), unblock screen updates so the card doesn't stay at

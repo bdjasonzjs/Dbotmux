@@ -30,6 +30,7 @@ import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import type { SessionBackend, SpawnOpts } from './types.js';
 import { tmuxEnv } from '../../setup/ensure-tmux.js';
+import { buildBotmuxEnvAssignments, resolveUserShell, SHELL_WRAPPER_SCRIPT, TmuxBackend } from './tmux-backend.js';
 
 function shellescape(s: string): string {
   // Single-quote-escape, replacing internal ' with '\''
@@ -44,32 +45,42 @@ export function normaliseCaptureLineEndings(s: string): string {
 }
 
 export class TmuxPipeBackend implements SessionBackend {
-  /** Real tmux pane address (e.g. "0:2.0"). */
+  /** Real tmux pane address (e.g. "0:2.0") or botmux session name (bmx-*). */
   private readonly paneTarget: string;
   private readonly fifoPath: string;
   private readStream: fs.ReadStream | null = null;
   private readonly dataCbs: Array<(d: string) => void> = [];
   private readonly exitCbs: Array<(code: number | null, signal: string | null) => void> = [];
+  private lifecycleTimer: NodeJS.Timeout | null = null;
   private cols = 200;
   private rows = 50;
   private exited = false;
   /** Set after pipe-pane subscription is active so kill() knows to cancel it. */
   private pipeAttached = false;
+  private readonly createSession: boolean;
+  private readonly ownsSession: boolean;
+  private readonly isReattach: boolean;
 
-  constructor(paneTarget: string) {
+  constructor(paneTarget: string, opts?: { createSession?: boolean; ownsSession?: boolean; isReattach?: boolean }) {
     this.paneTarget = paneTarget;
+    this.createSession = opts?.createSession ?? false;
+    this.ownsSession = opts?.ownsSession ?? false;
+    this.isReattach = opts?.isReattach ?? false;
     // Per-instance fifo so concurrent adopt sessions don't collide.
     this.fifoPath = join(tmpdir(), `botmux-pipe-${randomBytes(8).toString('hex')}.fifo`);
   }
 
   // ─── SessionBackend implementation ────────────────────────────────────────
 
-  /** spawn() in this backend doesn't actually spawn a process; it sets up
-   *  the pipe-pane subscription + fifo reader. The bin/args params are
-   *  ignored (the CLI is already running in the user's pane). */
-  spawn(_bin: string, _args: string[], opts: SpawnOpts): void {
+  /** spawn() sets up the pipe-pane subscription + fifo reader. In managed
+   *  mode it first creates a detached bmx-* tmux session that runs the CLI. */
+  spawn(bin: string, args: string[], opts: SpawnOpts): void {
     this.cols = opts.cols;
     this.rows = opts.rows;
+
+    if (this.createSession) {
+      this.createDetachedSession(bin, args, opts);
+    }
 
     // Step 1: create the fifo. mkfifo is POSIX; linux/darwin both have it.
     spawnSync('mkfifo', [this.fifoPath], { stdio: 'ignore' });
@@ -113,6 +124,7 @@ export class TmuxPipeBackend implements SessionBackend {
         { stdio: 'ignore', timeout: 5000, env: tmuxEnv() },
       );
       this.pipeAttached = true;
+      this.startLifecycleWatcher();
     } catch (err: any) {
       this.fireExit(1, null);
       throw err;
@@ -202,11 +214,15 @@ export class TmuxPipeBackend implements SessionBackend {
   }
 
   resize(cols: number, rows: number): void {
-    // Don't resize the user's tmux pane on every web client resize — that
-    // would visibly snap the user's own client around. We just remember the
-    // requested size for getAttachInfo / capture sizing.
     this.cols = cols;
     this.rows = rows;
+    if (this.ownsSession) {
+      execFileSync('tmux', ['resize-window', '-t', this.paneTarget, '-x', String(cols), '-y', String(rows)], {
+        stdio: 'ignore',
+        timeout: 5000,
+        env: tmuxEnv(),
+      });
+    }
   }
 
   onData(cb: (data: string) => void): void {
@@ -220,6 +236,7 @@ export class TmuxPipeBackend implements SessionBackend {
   kill(): void {
     if (this.exited) return;
     this.exited = true;
+    this.stopLifecycleWatcher();
     // Cancel tmux's pipe subscription. Calling pipe-pane without a command
     // turns it off for the target pane.
     if (this.pipeAttached) {
@@ -233,12 +250,13 @@ export class TmuxPipeBackend implements SessionBackend {
       this.readStream = null;
     }
     try { fs.unlinkSync(this.fifoPath); } catch { /* already gone */ }
-    this.fireExit(0, null);
   }
 
   destroySession(): void {
-    // Adopt mode never owns the source session — kill() is enough.
     this.kill();
+    if (this.ownsSession) {
+      TmuxBackend.killSession(this.paneTarget);
+    }
   }
 
   getChildPid(): number | null {
@@ -264,6 +282,76 @@ export class TmuxPipeBackend implements SessionBackend {
   }
 
   // ─── Pipe-specific helpers ────────────────────────────────────────────────
+
+  private startLifecycleWatcher(): void {
+    this.stopLifecycleWatcher();
+    this.lifecycleTimer = setInterval(() => {
+      if (this.exited) return;
+      try {
+        const paneId = execSync(
+          `tmux display-message -p -t ${shellescape(this.paneTarget)} '#{pane_id}'`,
+          { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 2000, env: tmuxEnv() },
+        ).trim();
+        if (!paneId) this.handlePaneExit();
+      } catch {
+        this.handlePaneExit();
+      }
+    }, 1000);
+  }
+
+  private stopLifecycleWatcher(): void {
+    if (this.lifecycleTimer) {
+      clearInterval(this.lifecycleTimer);
+      this.lifecycleTimer = null;
+    }
+  }
+
+  private handlePaneExit(): void {
+    if (this.exited) return;
+    this.exited = true;
+    this.stopLifecycleWatcher();
+    if (this.readStream) {
+      try { this.readStream.destroy(); } catch { /* already closed */ }
+      this.readStream = null;
+    }
+    try { fs.unlinkSync(this.fifoPath); } catch { /* already gone */ }
+    this.fireExit(1, null);
+  }
+
+  private createDetachedSession(bin: string, args: string[], opts: SpawnOpts): void {
+    const shellSpec = resolveUserShell();
+    const envAssignments = buildBotmuxEnvAssignments(opts.env);
+    execFileSync('tmux', [
+      'new-session',
+      '-d',
+      '-s', this.paneTarget,
+      '-x', String(opts.cols),
+      '-y', String(opts.rows),
+      '--',
+      shellSpec.shell, ...shellSpec.flags, '-c', SHELL_WRAPPER_SCRIPT, '_',
+      opts.cwd,
+      ...envAssignments,
+      bin, ...args,
+    ], {
+      cwd: opts.cwd,
+      stdio: 'ignore',
+      timeout: 5000,
+      env: tmuxEnv(opts.env),
+    });
+    this.applySessionOptions();
+  }
+
+  private applySessionOptions(): void {
+    const t = shellescape(this.paneTarget);
+    const env = tmuxEnv();
+    try {
+      execSync(`tmux set-option -t ${t} status off`, { stdio: 'ignore', env });
+      execSync(`tmux set-option -t ${t} mouse on`, { stdio: 'ignore', env });
+      execSync(`tmux set-option -s set-clipboard on`, { stdio: 'ignore', env });
+      execSync(`tmux set-option -t ${t} history-limit 50000`, { stdio: 'ignore', env });
+      execSync(`tmux set-option -t ${t} window-size largest`, { stdio: 'ignore', env });
+    } catch { /* session may not be ready yet — benign */ }
+  }
 
   /** Snapshot the current screen of the adopted pane WITH ANSI escapes,
    *  including history (-S - = start of scrollback). New web-terminal
