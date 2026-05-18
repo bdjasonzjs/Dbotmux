@@ -71,7 +71,7 @@ Compared to OpenClaw-style approaches built on Agent SDKs:
 
 ## 5-Minute Setup
 
-> 💡 **TL;DR**: run `botmux setup` and pick "scan-to-create" to finish Steps 1+2 in one shot (the official `@larksuiteoapi/node-sdk` device flow gives you the AppID/AppSecret). Steps 3–6 (permissions, event subscription, publish) still need clicks in the Open Platform console — Lark hasn't exposed write APIs for those. The setup wizard prints deep-links to each remaining step.
+> 💡 **TL;DR**: run `botmux setup` and pick "scan-to-create" to finish Steps 1+2 in one shot (the official `@larksuiteoapi/node-sdk` device flow gives you the AppID/AppSecret). PersonalAgent apps come with event subscriptions and bot capability pre-configured, so only Step 4 (permissions) + Step 5 (optional redirect URL) + Step 6 (publish) require browser clicks; the setup wizard writes a JSON file with a one-line clipboard copy command and prints deep-links to each remaining step.
 
 ### Step 1: Create a Lark App
 
@@ -104,7 +104,7 @@ npm install -g botmux
 botmux setup
 
 # Start (must be running before configuring WebSocket subscription — Lark checks for an active connection)
-# Re-validates credentials before forking workers; missing scopes/events only WARN, do not block the daemon.
+# Re-validates credentials before forking workers; missing scopes only WARN, do not block the daemon.
 botmux start
 ```
 

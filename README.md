@@ -173,7 +173,7 @@ CLI 进入 botmux 会话时自动获得 `~/.botmux/bin` 在 PATH 中，以及一
 
 ## 5 分钟快速接入
 
-> 💡 **TL;DR**：跑 `botmux setup` 选「扫码建应用」一步完成 Step 1+2（拿 AppID/AppSecret）；Step 3-6（权限、事件订阅、发版）飞书开放平台没开放写 API，仍需手动在浏览器里点。setup 完成后会自动打印剩余步骤的深链。
+> 💡 **TL;DR**：跑 `botmux setup` 选「扫码建应用」一步完成 Step 1+2（拿 AppID/AppSecret）。PersonalAgent 应用建出来时事件订阅和 bot 能力都已默认配好，只剩 Step 4 权限申请 + Step 5（按需）重定向 URL + Step 6 发版三步要在浏览器手动点；setup 完成后会自动写 JSON 文件 + 打印一键复制命令 + 各步骤的深链。
 
 ### Step 1: 创建飞书应用
 
@@ -205,7 +205,7 @@ npm install -g botmux
 botmux setup
 
 # 启动（飞书后台配置长连接订阅前需要先启动，否则无法检测到连接）
-# start 前再校验一次凭证；权限/事件订阅未配齐不会阻塞 daemon，只 WARN
+# start 前再校验一次凭证；权限未配齐不会阻塞 daemon，只 WARN
 botmux start
 ```
 
