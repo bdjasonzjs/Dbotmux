@@ -160,6 +160,14 @@ function writeBotsJsonAtomic(bots: any[]): void {
   writeBotsAtomic(BOTS_JSON_FILE, bots);
 }
 
+/**
+ * 从 bot 配置里取 brand. 旧的 bots.json (1.0 之前) 没这个字段, default 到 feishu
+ * 保留向后兼容. cmdStart 凭证校验 + printRemainingSteps 深链都靠它选 host.
+ */
+function botBrand(b: any): 'feishu' | 'lark' {
+  return b?.brand === 'lark' ? 'lark' : 'feishu';
+}
+
 function printRemainingSteps(appId: string, brand: 'feishu' | 'lark'): void {
   // verify-permissions.ts 的 buildRemainingSteps 是数据源, 这里只负责打印
   // 为了避免在 cli.ts 启动时同步导入 Lark SDK (registerApp/verify-permissions
@@ -259,7 +267,15 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
   const workingDir = await ask(rl, '默认工作目录 [~]: ');
   const allowedUsers = await ask(rl, '允许的用户 (邮箱或 open_id，逗号分隔，留空=不限制): ');
 
-  const bot: Record<string, any> = { larkAppId: creds.appId, larkAppSecret: creds.appSecret, cliId };
+  // brand 必须持久化: cmdStart 的 validate / event-dispatcher 走的 deep link
+  // 都看这个字段; 不写就只能硬编码 feishu, lark 租户用户会被打成凭证无效.
+  // 为了向后兼容 (旧 bots.json 没 brand 字段), reader 应当 default 到 'feishu'.
+  const bot: Record<string, any> = {
+    larkAppId: creds.appId,
+    larkAppSecret: creds.appSecret,
+    brand: creds.brand,
+    cliId,
+  };
   if (workingDir) bot.workingDir = workingDir;
   if (allowedUsers) bot.allowedUsers = allowedUsers.split(',').map((s: string) => s.trim()).filter(Boolean);
 
@@ -307,7 +323,7 @@ async function writeSingleBotConfig(): Promise<boolean> {
 
   writeBotsJsonAtomic([bot]);
   console.log(`\n✅ 配置已写入: ${BOTS_JSON_FILE}`);
-  printRemainingSteps(bot.larkAppId, 'feishu');
+  printRemainingSteps(bot.larkAppId, botBrand(bot));
   console.log(`下一步:`);
   console.log(`  1. botmux start              启动 daemon`);
   console.log(`  2. botmux autostart enable   注册开机自启（推荐：${process.platform === 'darwin' ? 'mac launchd' : process.platform === 'linux' ? 'linux user systemd' : '当前平台暂不支持'}，无需 sudo）`);
@@ -351,7 +367,7 @@ async function cmdSetup(): Promise<void> {
       console.log(`旧配置已备份: ${BOTS_JSON_FILE}.bak`);
       writeBotsJsonAtomic([newBot]);
       console.log(`✅ 配置已写入: ${BOTS_JSON_FILE}`);
-      printRemainingSteps(newBot.larkAppId, 'feishu');
+      printRemainingSteps(newBot.larkAppId, botBrand(newBot));
       console.log(`下一步: botmux restart\n`);
       return;
     }
@@ -366,7 +382,7 @@ async function cmdSetup(): Promise<void> {
     writeBotsJsonAtomic([...bots, newBot]);
     console.log(`\n✅ 已添加机器人 ${newBot.larkAppId}，共 ${bots.length + 1} 个`);
     console.log(`   配置文件: ${BOTS_JSON_FILE}`);
-    printRemainingSteps(newBot.larkAppId, 'feishu');
+    printRemainingSteps(newBot.larkAppId, botBrand(newBot));
     console.log(`下一步: botmux restart\n`);
 
   } else if (hasEnv) {
@@ -408,7 +424,7 @@ async function cmdSetup(): Promise<void> {
     console.log(`\n✅ 已迁移到多机器人配置`);
     console.log(`   配置文件: ${BOTS_JSON_FILE}`);
     console.log(`   旧配置已备份: ${ENV_FILE}.bak`);
-    printRemainingSteps(newBot.larkAppId, 'feishu');
+    printRemainingSteps(newBot.larkAppId, botBrand(newBot));
     console.log(`下一步: botmux restart\n`);
 
   } else {
@@ -507,7 +523,7 @@ async function cmdStart(): Promise<void> {
         invalid.push({ appId: b.larkAppId || '(空 appId)', reason: 'larkAppId/larkAppSecret 缺失' });
         continue;
       }
-      const v = await validateCredentials(b.larkAppId, b.larkAppSecret, 'feishu');
+      const v = await validateCredentials(b.larkAppId, b.larkAppSecret, botBrand(b));
       if (!v.ok) {
         if (v.error === 'invalid_credentials') {
           invalid.push({ appId: b.larkAppId, reason: v.message });

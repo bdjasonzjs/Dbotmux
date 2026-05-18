@@ -32,6 +32,12 @@ describe('writeBotsJsonAtomic', () => {
     expect(parsed[0].larkAppId).toBe('cli_1');
   });
 
+  it('persists the brand field so subsequent start/verify reads it back', () => {
+    writeBotsJsonAtomic(botsPath, [{ larkAppId: 'cli_lark', larkAppSecret: 's', brand: 'lark' }]);
+    const parsed = readBotsJsonOrEmpty(botsPath);
+    expect(parsed[0].brand).toBe('lark');
+  });
+
   it('cleans up the tmp file after rename (only bots.json remains)', () => {
     writeBotsJsonAtomic(botsPath, [{ larkAppId: 'cli_2' }]);
     expect(existsSync(botsPath + '.tmp')).toBe(false);
