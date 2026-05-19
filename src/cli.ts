@@ -2413,6 +2413,21 @@ function buildFooterAddressing(
 }
 
 async function cmdSend(rest: string[]): Promise<void> {
+  // Safety gate: a CLI agent running inside a workflow subagent (Slice F)
+  // must not chat-post directly — chat-facing side effects are reserved
+  // for `hostExecutor` activities so they can be tracked via
+  // `effectAttempted` + reconciled across retries / resumes.  Refuse loud
+  // so the agent (and any human reviewing logs) sees the boundary.
+  if (process.env.BOTMUX_WORKFLOW === '1') {
+    const runId = process.env.BOTMUX_WORKFLOW_RUN_ID ?? '?';
+    const nodeId = process.env.BOTMUX_WORKFLOW_NODE_ID ?? '?';
+    console.error(
+      `botmux send refused inside workflow subagent (run=${runId} node=${nodeId}).\n` +
+      `Workflow subagents must return structured output via the WORKFLOW_OUTPUT marker;\n` +
+      `chat-facing side effects belong in a hostExecutor activity, not a subagent.`,
+    );
+    process.exit(2);
+  }
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
   const sessionIdArg = argValue(rest, '--session-id');
   const images = argValues(rest, '--image', '--images');
@@ -3062,6 +3077,40 @@ function getVersion(): string {
 }
 
 const command = process.argv[2];
+
+// Workflow safety gate (Slice C0): a CLI invoked inside a workflow
+// subagent worker (BOTMUX_WORKFLOW=1, set by daemon-spawn) must not
+// trigger chat-facing or schedule-mutation side effects.  Those belong
+// in `hostExecutor` activities so they get `effectAttempted` tracking +
+// reconcile.  Read-only commands (history, quoted, bots list, etc.)
+// stay allowed because they're useful for agents to introspect.
+if (process.env.BOTMUX_WORKFLOW === '1') {
+  const blockedRoot = new Set(['send', 'create-group', 'setup']);
+  const isSchedule = command === 'schedule';
+  const scheduleSub = isSchedule ? (process.argv[3] ?? '') : '';
+  const blockedScheduleSub = new Set([
+    'add',
+    'rm',
+    'remove',
+    'del',
+    'delete',
+    'pause',
+    'disable',
+    'resume',
+    'enable',
+    'run',
+  ]);
+  if (blockedRoot.has(command) || (isSchedule && blockedScheduleSub.has(scheduleSub))) {
+    const runId = process.env.BOTMUX_WORKFLOW_RUN_ID ?? '?';
+    const nodeId = process.env.BOTMUX_WORKFLOW_NODE_ID ?? '?';
+    console.error(
+      `botmux ${command}${isSchedule ? ` ${scheduleSub}` : ''} refused inside workflow ` +
+      `subagent (run=${runId} node=${nodeId}).  Chat-facing or schedule-mutating ` +
+      `effects belong in a hostExecutor activity, not a subagent.`,
+    );
+    process.exit(2);
+  }
+}
 
 switch (command) {
   case '--version':

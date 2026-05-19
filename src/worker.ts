@@ -3016,8 +3016,14 @@ process.on('message', async (raw: unknown) => {
         const { setDefaultLocale } = await import('./i18n/index.js');
         setDefaultLocale(msg.locale);
       }
-      // Scope session store to this bot's per-bot file
-      if (msg.larkAppId) sessionStore.init(msg.larkAppId);
+      // Scope session store to this bot's per-bot file.
+      // Slice C0: workflow-spawned workers (BOTMUX_WORKFLOW=1) skip this —
+      // their `sessionId` is synthetic (`wf-<runId>-<activityId>-...`) and
+      // must not be appended to the bot's chat-session registry.  The
+      // workflow's own event log is the source of truth for run state.
+      if (msg.larkAppId && process.env.BOTMUX_WORKFLOW !== '1') {
+        sessionStore.init(msg.larkAppId);
+      }
       // Capture credentials for direct image upload from worker
       larkAppIdForUpload = msg.larkAppId;
       larkAppSecretForUpload = msg.larkAppSecret;
