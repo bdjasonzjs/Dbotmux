@@ -10,13 +10,16 @@
  * keeps the CLI route the simplest possible smoke test.
  */
 
+import { promises as fs } from 'node:fs';
+import { join } from 'node:path';
+
 import { EventLog } from '../workflows/events/append.js';
 import { parseWorkflowDefinition } from '../workflows/definition.js';
 import { loadWorkflowDefinition } from '../workflows/loader.js';
 import { runLoop } from '../workflows/loop.js';
 import { mintWorkflowRunId } from '../workflows/run-id.js';
 import { createRun, type BotResolver } from '../workflows/run-init.js';
-import { getRunsDir } from '../workflows/runs-dir.js';
+import { getRunsDir, runDir } from '../workflows/runs-dir.js';
 import {
   createDefaultHostExecutorRegistry,
   createDefaultProviderReconcilers,
@@ -26,7 +29,10 @@ import {
   createStubSpawnFn,
   type StubSpawnHandler,
 } from '../workflows/spawn-bot.js';
-import type { WorkflowRuntimeContext } from '../workflows/runtime.js';
+import type {
+  WorkerSpawnFn,
+  WorkflowRuntimeContext,
+} from '../workflows/runtime.js';
 
 // Local arg parsers — mirror cli.ts shape; deliberately not exported.
 function argValue(args: string[], ...flags: string[]): string | undefined {
@@ -58,6 +64,9 @@ export async function cmdWorkflow(sub: string, rest: string[]): Promise<void> {
     case 'run':
       await cmdWorkflowRun(rest);
       return;
+    case 'resume':
+      await cmdWorkflowResume(rest);
+      return;
     case 'show':
       await cmdWorkflowShow(rest);
       return;
@@ -74,12 +83,19 @@ export async function cmdWorkflow(sub: string, rest: string[]): Promise<void> {
 }
 
 function printHelp(): void {
-  console.log(`用法: botmux workflow <run|show> [...]
+  console.log(`用法: botmux workflow <run|resume|show> [...]
 
 子命令:
   run <id> [--param key=value ...] [--run-id <id>] [--bot-resolver echo]
       离线驱动 workflow（stub spawn）。事件 / 状态打到 stdout。
       humanGate 节点跑到 'awaiting-wait' 即退出（CLI 离线场景下没有审批入口）。
+
+  resume <runId>
+      从磁盘 runDir 冷恢复一个已有 run。R0 recovery 先收 dangling effect，
+      之后 orchestrator 继续推进；遇到 humanGate 只输出 awaiting-wait，
+      不伪造审批；run 已 terminal 则直接打摘要，零事件写入。
+      CLI 不会 spawn 新 subagent —— 现有 in-flight subagent 会被标记
+      WorkerCrashed/manual 并由 orchestrator 终结 run。
 
   show <runId>
       replay 当前 run 的事件，打印 Snapshot 摘要。
@@ -158,6 +174,159 @@ const echoHandler: StubSpawnHandler = (input) => ({
   bot: input.botName,
   activityId: input.activityId,
 });
+
+// ─── resume ───────────────────────────────────────────────────────────────
+
+/**
+ * R1 cold resume — pick up an existing run from its on-disk runDir.
+ *
+ * Contract (codex-loopy review 2026-05-20):
+ *   - Replay first.  If the run is already terminal, print summary and
+ *     write zero events.
+ *   - Do NOT call `createRun` / write `runStarted` — those are mint-time
+ *     events.  Resume just attaches a fresh ctx to the existing log.
+ *   - `spawnSubagent` is a no-throw failure stub: returns
+ *     `WorkerCrashed/manual` so any subagent dispatch the orchestrator
+ *     decides to do during resume lands as a recorded `activityFailed`
+ *     (NOT a thrown JS error that would crash the CLI).  manual class
+ *     prevents R0 from auto-retrying.
+ *   - hostExecutors / reconcilers / loadEffectInput are wired so the
+ *     recovery phase can settle dangling side-effects via reconciler.
+ *
+ * Out of scope for R1: daemon-startup scan, watcher rebuild, real worker
+ * reattach, dashboard surface.
+ */
+async function cmdWorkflowResume(rest: string[]): Promise<void> {
+  const runId = positionals(rest)[0];
+  if (!runId) {
+    console.error('用法: botmux workflow resume <runId>');
+    process.exit(1);
+  }
+
+  const runsDir = getRunsDir();
+  const dir = runDir(runId, runsDir);
+  const workflowJsonPath = join(dir, 'workflow.json');
+
+  let defRaw: string;
+  try {
+    defRaw = await fs.readFile(workflowJsonPath, 'utf-8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      console.error(`找不到 runDir 的 workflow.json：${workflowJsonPath}`);
+      console.error(`(runsDir=${runsDir}；用 BOTMUX_WORKFLOW_RUNS_DIR 覆盖)`);
+    } else {
+      console.error(`读取 ${workflowJsonPath} 失败：${(err as Error).message}`);
+    }
+    process.exit(1);
+  }
+
+  let def;
+  try {
+    def = parseWorkflowDefinition(JSON.parse(defRaw!));
+  } catch (err) {
+    console.error(`解析 ${workflowJsonPath} 失败：${(err as Error).message}`);
+    process.exit(1);
+    return;
+  }
+
+  // Same as run: load bots so feishu host executors can resolve larkAppId.
+  try {
+    const { registerBot, loadBotConfigs } = await import('../bot-registry.js');
+    for (const cfg of loadBotConfigs()) registerBot(cfg);
+  } catch {
+    // bots.json missing/invalid is fine — workflows that don't touch IM
+    // still resume; IM-touching steps will surface a clear error.
+  }
+
+  const log = new EventLog(runId, runsDir);
+  const events = await log.readAll();
+  if (events.length === 0) {
+    console.error(`runId=${runId} 没找到任何事件 (runsDir=${runsDir})`);
+    process.exit(1);
+  }
+
+  const { replay } = await import('../workflows/events/replay.js');
+  const initialSnap = replay(events);
+
+  console.log(`workflow=${def!.workflowId} runId=${runId}`);
+  console.log(`runsDir=${runsDir}`);
+
+  // ── Terminal short-circuit ────────────────────────────────────────────
+  // Per codex review: replay first; if the run already finished, print
+  // summary and DON'T enter runLoop (no new events written).
+  if (
+    initialSnap.run.status === 'succeeded' ||
+    initialSnap.run.status === 'failed' ||
+    initialSnap.run.status === 'cancelled'
+  ) {
+    console.log(`\nrun.status=${initialSnap.run.status} (terminal — nothing to resume)`);
+    console.log(`events: ${initialSnap.lastSeq}`);
+    if (initialSnap.run.output) {
+      console.log(`output: ${initialSnap.run.output.outputHash}`);
+    }
+    if (initialSnap.run.status !== 'succeeded') {
+      process.exit(1);
+    }
+    return;
+  }
+
+  const spawnSubagent: WorkerSpawnFn = async (input) => ({
+    kind: 'failure',
+    errorCode: 'WorkerCrashed',
+    errorClass: 'manual',
+    errorMessage:
+      `subagent '${input.botName}' (node=${input.nodeId}, activity=${input.activityId}) ` +
+      `is not resumable via 'botmux workflow resume' — CLI does not spawn workers. ` +
+      `Use IM /workflow run for full execution, or restart the run.`,
+  });
+
+  const ctx: WorkflowRuntimeContext = {
+    log,
+    def: def!,
+    spawnSubagent,
+    hostExecutors: createDefaultHostExecutorRegistry(),
+    reconcilers: createDefaultProviderReconcilers(),
+    loadEffectInput: (activityId, attemptId) =>
+      loadEffectInputSidecar(log, activityId, attemptId),
+  };
+
+  const result = await runLoop(ctx, { maxTicks: 200 });
+
+  console.log(`\nloop stopped: ${result.reason} after ${result.ticks} tick(s)`);
+  console.log(`run.status=${result.lastSnapshot.run.status}`);
+  console.log(`events: ${result.lastSnapshot.lastSeq}`);
+  if (result.reason === 'awaiting-wait') {
+    console.log(`awaiting-wait on: ${result.lastSnapshot.danglingWaits.join(', ')}`);
+    console.log(`(CLI resume 不发卡；从 IM 用 /workflow run 进的话审批入口在那边)`);
+  }
+  if (result.reason === 'no-progress') {
+    if (result.lastSnapshot.danglingEffectAttempted.length > 0) {
+      console.log(
+        `dangling effects: ${result.lastSnapshot.danglingEffectAttempted.join(', ')}`,
+      );
+    }
+    const danglingNonEffect = result.lastSnapshot.danglingActivities.filter(
+      (a) => !result.lastSnapshot.danglingEffectAttempted.includes(a),
+    );
+    if (danglingNonEffect.length > 0) {
+      console.log(`dangling activities (non-effect): ${danglingNonEffect.join(', ')}`);
+    }
+  }
+  if (result.reason === 'terminal' && result.lastSnapshot.run.output) {
+    console.log(`output: ${result.lastSnapshot.run.output.outputHash}`);
+  }
+
+  // Non-zero exit when the run did not resolve to a clean terminal/awaiting.
+  if (
+    result.reason !== 'terminal' &&
+    result.reason !== 'awaiting-wait'
+  ) {
+    process.exit(1);
+  }
+  if (result.reason === 'terminal' && result.lastSnapshot.run.status !== 'succeeded') {
+    process.exit(1);
+  }
+}
 
 function collectParams(rest: string[]): Record<string, unknown> {
   const out: Record<string, unknown> = {};
