@@ -1277,3 +1277,202 @@ describe('resume — Step 8: dangling wait resolutions', () => {
     expect(second.waitRecoveryOutcomes).toEqual([]);
   });
 });
+
+// ─── Step 9: cancel recovery ────────────────────────────────────────────────
+
+describe('resume — Step 9: dangling cancel recovery', () => {
+  it('cancelRequested + no terminal → activityCanceled recovery', async () => {
+    await bootstrapWith(
+      attemptCreated('a-cancel', 'at-1'),
+      {
+        runId: RUN_ID,
+        type: 'cancelRequested',
+        actor: 'human',
+        payload: {
+          target: { kind: 'activity', activityId: 'a-cancel' },
+          reason: 'user stop',
+          by: 'ou_alice',
+        },
+      },
+    );
+    const events = await log.readAll();
+    const cancelReq = events.find((e) => e.type === 'cancelRequested')!;
+
+    const r = await resume({
+      log,
+      runId: RUN_ID,
+      daemonId: 'd-1',
+      reconcilers: emptyReconcilers(),
+    });
+    expect(r.cancelRecoveryOutcomes).toHaveLength(1);
+    const c = r.cancelRecoveryOutcomes[0];
+    expect(c.activityId).toBe('a-cancel');
+    expect(c.delivered).toBe(false);
+    expect(c.cancelOriginEventId).toBe(cancelReq.eventId);
+    expect(c.terminalEvent.type).toBe('activityCanceled');
+    const p = c.terminalEvent.payload as { cancelOriginEventId: string };
+    expect(p.cancelOriginEventId).toBe(cancelReq.eventId);
+    expect(r.workerCrashedOutcomes).toEqual([]);
+  });
+
+  it('cancelRequested + cancelDelivered + no terminal → activityCanceled + delivered=true', async () => {
+    await bootstrapWith(
+      attemptCreated('a-cancel', 'at-1'),
+      {
+        runId: RUN_ID,
+        type: 'cancelRequested',
+        actor: 'human',
+        payload: {
+          target: { kind: 'activity', activityId: 'a-cancel' },
+          reason: 'r',
+          by: 'b',
+        },
+      },
+      {
+        runId: RUN_ID,
+        type: 'cancelDelivered',
+        actor: 'worker',
+        payload: {
+          target: { kind: 'activity', activityId: 'a-cancel' },
+          activityId: 'a-cancel',
+        },
+      },
+    );
+    const r = await resume({
+      log,
+      runId: RUN_ID,
+      daemonId: 'd-1',
+      reconcilers: emptyReconcilers(),
+    });
+    expect(r.cancelRecoveryOutcomes[0].delivered).toBe(true);
+  });
+
+  it('cancel preempts reconcile: effectAttempted + cancelRequested → activityCanceled, NO reconcile', async () => {
+    // The most important Step 9 invariant: cancel is authoritative
+    // even when reconcile recovery would have completed the effect.
+    await bootstrapWith(
+      attemptCreated('a-1', 'at-1'),
+      effectAttempted('a-1', 'at-1', 'botmux-schedule', 'wf_x', 1, Number.MAX_SAFE_INTEGER),
+      {
+        runId: RUN_ID,
+        type: 'cancelRequested',
+        actor: 'human',
+        payload: {
+          target: { kind: 'activity', activityId: 'a-1' },
+          reason: 'preempt',
+          by: 'ou_a',
+        },
+      },
+    );
+    let providerCalled = false;
+    const reconciler: ProviderReconciler = {
+      provider: 'botmux-schedule',
+      async readOnlyLookup() {
+        providerCalled = true;
+        return { found: true, externalRefs: { taskId: 'wf_x' } };
+      },
+    };
+    const r = await resume({
+      log,
+      runId: RUN_ID,
+      daemonId: 'd-1',
+      reconcilers: new Map([['botmux-schedule', reconciler]]),
+    });
+    expect(providerCalled).toBe(false);
+    expect(r.cancelRecoveryOutcomes).toHaveLength(1);
+    expect(r.reconcileOutcomes).toEqual([]);
+  });
+
+  it('cancel preempts wait recovery: waitResolved + cancelRequested → activityCanceled', async () => {
+    await bootstrapWith(
+      attemptCreated('a-1', 'at-1'),
+      {
+        runId: RUN_ID,
+        type: 'waitCreated',
+        actor: 'scheduler',
+        payload: { activityId: 'a-1', nodeId: 'n-1', waitKind: 'human-gate' },
+      },
+      {
+        runId: RUN_ID,
+        type: 'waitResolved',
+        actor: 'human',
+        payload: { activityId: 'a-1', resolution: 'approved', by: 'x' },
+      },
+      {
+        runId: RUN_ID,
+        type: 'cancelRequested',
+        actor: 'human',
+        payload: {
+          target: { kind: 'activity', activityId: 'a-1' },
+          reason: 'preempt',
+          by: 'ou_a',
+        },
+      },
+    );
+    const r = await resume({
+      log,
+      runId: RUN_ID,
+      daemonId: 'd-1',
+      reconcilers: emptyReconcilers(),
+    });
+    expect(r.cancelRecoveryOutcomes).toHaveLength(1);
+    expect(r.waitRecoveryOutcomes).toEqual([]);
+    expect(r.workerCrashedOutcomes).toEqual([]);
+  });
+
+  it('second resume after cancel recovery is a no-op', async () => {
+    await bootstrapWith(
+      attemptCreated('a-1', 'at-1'),
+      {
+        runId: RUN_ID,
+        type: 'cancelRequested',
+        actor: 'human',
+        payload: {
+          target: { kind: 'activity', activityId: 'a-1' },
+          reason: 'r',
+          by: 'b',
+        },
+      },
+    );
+    const first = await resume({
+      log,
+      runId: RUN_ID,
+      daemonId: 'd-1',
+      reconcilers: emptyReconcilers(),
+    });
+    expect(first.cancelRecoveryOutcomes).toHaveLength(1);
+    const second = await resume({
+      log,
+      runId: RUN_ID,
+      daemonId: 'd-1',
+      reconcilers: emptyReconcilers(),
+    });
+    expect(second.cancelRecoveryOutcomes).toEqual([]);
+  });
+
+  it('node/run-target cancel does NOT trigger activity recovery in v0 (Step 10 scheduler concern)', async () => {
+    await bootstrapWith(
+      attemptCreated('a-1', 'at-1'),
+      {
+        runId: RUN_ID,
+        type: 'cancelRequested',
+        actor: 'human',
+        payload: {
+          target: { kind: 'node', nodeId: 'n-1' },
+          reason: 'abort node',
+          by: 'b',
+        },
+      },
+    );
+    const r = await resume({
+      log,
+      runId: RUN_ID,
+      daemonId: 'd-1',
+      reconcilers: emptyReconcilers(),
+    });
+    expect(r.cancelRecoveryOutcomes).toEqual([]);
+    // The activity is still dangling; gets WorkerCrashed because there
+    // was no fan-out from node→activity in v0.  Step 10 will refine.
+    expect(r.workerCrashedOutcomes).toHaveLength(1);
+  });
+});

@@ -102,6 +102,24 @@ export type AttemptState = {
     eventId: string;
   };
   /**
+   * Cancel-in-flight marker (Step 9).  Populated when a `cancelRequested`
+   * targets this activity (directly via `kind=activity`, or — Step 10
+   * scheduler concern — fan-out from node/run cancel).  Resume reads
+   * this to detect dangling cancels (cancelRequested written, terminal
+   * missing) and complete them with `activityCanceled`.
+   *
+   * Cleared / superseded once `activityCanceled` writes a terminal —
+   * but we keep `cancelOriginEventId` recoverable from the request
+   * event itself, so resume doesn't need an in-flight pointer post-
+   * terminal.
+   */
+  cancelRequest?: {
+    cancelOriginEventId: string;
+    requestedBy: string;
+    reason: string;
+    delivered: boolean;
+  };
+  /**
    * Wait state for human-gate / time / condition activities (Step 8).
    * Populated by `waitCreated` and updated by `waitResolved` /
    * `waitDeadlineExceeded`.  Resume reads this to recover dangling
@@ -207,6 +225,14 @@ export type Snapshot = {
    * recorded resolution.  Disjoint from `danglingWaits`.
    */
   danglingWaitResolutions: string[];
+  /**
+   * activityIds with a `cancelRequested` targeting them (directly or
+   * via fan-out — Step 10 scheduler concern), but no `activityCanceled`
+   * terminal yet.  Resume materializes the terminal during recovery.
+   * Disjoint from `danglingEffectAttempted` / `danglingWaitResolutions`
+   * to keep the recovery routing unambiguous.
+   */
+  danglingCancels: string[];
 };
 
 // ─── Replay ─────────────────────────────────────────────────────────────────
@@ -617,13 +643,41 @@ export function replay(events: WorkflowEvent[]): Snapshot {
       }
 
       // ─── Control ────────────────────────────────────────────────────
-      case 'cancelRequested':
+      case 'cancelRequested': {
+        // Step 9: project the request onto the targeted activity (or
+        // every activity, for run-level cancel).  Step 10 will refine
+        // the node→activity fan-out; for now we only project the
+        // direct activity-target form, which is what the host API
+        // emits in v0.  Node/run targets are recorded but do not
+        // automatically fan out into per-activity dangling state.
+        const p = (e as CancelRequestedEvent).payload as CancelRequestedEvent['payload'];
+        if (!('ref' in p)) {
+          if (p.target.kind === 'activity') {
+            const act = getActivity(p.target.activityId);
+            const at = currentAttempt(act);
+            if (at) {
+              at.cancelRequest = {
+                cancelOriginEventId: e.eventId,
+                requestedBy: p.by,
+                reason: p.reason,
+                delivered: at.cancelRequest?.delivered ?? false,
+              };
+            }
+          }
+          // node/run targets: recorded for audit; scheduler (Step 10)
+          // owns the fan-out decision.
+        }
+        break;
+      }
       case 'cancelDelivered': {
-        // No direct state mutation — terminal node/activity/run cancel
-        // events (activityCanceled / nodeCanceled / runCanceled) carry
-        // the projection.  These two are causal links recorded for audit
-        // and to drive scheduler-side broadcast logic.
-        void (e as CancelRequestedEvent | CancelDeliveredEvent);
+        const p = (e as CancelDeliveredEvent).payload as CancelDeliveredEvent['payload'];
+        if (!('ref' in p)) {
+          const act = getActivity(p.activityId);
+          const at = currentAttempt(act);
+          if (at?.cancelRequest) {
+            at.cancelRequest.delivered = true;
+          }
+        }
         break;
       }
 
@@ -677,6 +731,7 @@ export function replay(events: WorkflowEvent[]): Snapshot {
   const danglingActivities: string[] = [];
   const danglingEffectAttempted: string[] = [];
   const danglingWaitResolutions: string[] = [];
+  const danglingCancels: string[] = [];
   for (const a of activities.values()) {
     const latest = a.attempts.length > 0 ? a.attempts[a.attempts.length - 1] : undefined;
     if (!latest) continue;
@@ -696,6 +751,12 @@ export function replay(events: WorkflowEvent[]): Snapshot {
       if (latest.wait?.resolution) {
         danglingWaitResolutions.push(a.activityId);
       }
+      // Cancel requested but no terminal yet — resume completes by
+      // writing activityCanceled.  Cancel takes precedence over other
+      // recovery paths (see resume routing).
+      if (latest.cancelRequest) {
+        danglingCancels.push(a.activityId);
+      }
     }
   }
 
@@ -710,6 +771,7 @@ export function replay(events: WorkflowEvent[]): Snapshot {
     danglingActivities,
     danglingEffectAttempted,
     danglingWaitResolutions,
+    danglingCancels,
     danglingWaits,
   };
 }

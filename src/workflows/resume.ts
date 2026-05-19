@@ -36,6 +36,7 @@
 import type { EventLog } from './events/append.js';
 import { replay, type Snapshot, type AttemptState } from './events/replay.js';
 import type {
+  ActivityCanceledEvent,
   ActivityFailedEvent,
   ActivitySucceededEvent,
   ReconcileResultEvent,
@@ -177,6 +178,24 @@ export type WaitRecoveryOutcome = {
 };
 
 /**
+ * Recovery of a cancel whose request landed but whose activity
+ * terminal was never written (crash between `cancelRequested` /
+ * `cancelDelivered` and `activityCanceled`).  Step 9: replay surfaces
+ * these as `Snapshot.danglingCancels`; resume writes activityCanceled
+ * with the original cancelRequested.eventId on the terminal.
+ */
+export type CancelRecoveryOutcome = {
+  activityId: string;
+  attemptId: string;
+  cancelOriginEventId: string;
+  /** True if cancelDelivered was already written; false means we
+   *  short-circuited a never-delivered cancel.  Both still terminate
+   *  the activity (cancel intent is authoritative). */
+  delivered: boolean;
+  terminalEvent: ActivityCanceledEvent;
+};
+
+/**
  * Reconcile failures that resume DELIBERATELY does not terminate (codex
  * F3): a retryable provider failure during idempotentSubmit might mean
  * "request landed, response lost", and writing a manual terminal there
@@ -203,6 +222,7 @@ export type ResumeResult = {
   workerCrashedOutcomes: WorkerCrashedOutcome[];
   transientFailures: TransientReconcileFailure[];
   waitRecoveryOutcomes: WaitRecoveryOutcome[];
+  cancelRecoveryOutcomes: CancelRecoveryOutcome[];
 };
 
 // ─── Resume orchestrator ────────────────────────────────────────────────────
@@ -254,9 +274,23 @@ export async function resume(ctx: ResumeContext): Promise<ResumeResult> {
   const allEvents = await ctx.log.readAll();
   const snapshot = replay(allEvents);
 
+  // Step 9: cancel recovery — cancelRequested landed but no terminal.
+  // Cancel preempts other recovery paths (spec §2.5: cancel is the
+  // authoritative terminal reason; once requested, the activity ends
+  // canceled regardless of whether reconcile/wait paths would have
+  // resolved differently).  Run cancel first so the subsequent loops
+  // can skip its activities.
+  const cancelRecoveryOutcomes: CancelRecoveryOutcome[] = [];
+  for (const activityId of snapshot.danglingCancels) {
+    const cancellation = await recoverCancel(ctx, snapshot, activityId);
+    if (cancellation) cancelRecoveryOutcomes.push(cancellation);
+  }
+  const cancelled = new Set(snapshot.danglingCancels);
+
   const reconcileOutcomes: ReconcileOutcome[] = [];
   const transientFailures: TransientReconcileFailure[] = [];
   for (const activityId of snapshot.danglingEffectAttempted) {
+    if (cancelled.has(activityId)) continue; // already terminated by cancel
     const result = await reconcileOne(ctx, snapshot, activityId, now());
     if (result.kind === 'outcome') reconcileOutcomes.push(result.outcome);
     else if (result.kind === 'transient') transientFailures.push(result.failure);
@@ -268,6 +302,7 @@ export async function resume(ctx: ResumeContext): Promise<ResumeResult> {
   // terminal state.
   const waitRecoveryOutcomes: WaitRecoveryOutcome[] = [];
   for (const activityId of snapshot.danglingWaitResolutions) {
+    if (cancelled.has(activityId)) continue;
     const recovery = await recoverWaitResolution(ctx, snapshot, activityId);
     if (recovery) waitRecoveryOutcomes.push(recovery);
   }
@@ -279,6 +314,7 @@ export async function resume(ctx: ResumeContext): Promise<ResumeResult> {
   const waitingActivities = new Set(snapshot.danglingWaits);
   const waitRecovered = new Set(snapshot.danglingWaitResolutions);
   for (const activityId of snapshot.danglingActivities) {
+    if (cancelled.has(activityId)) continue;
     if (reconciled.has(activityId)) continue;
     if (waitingActivities.has(activityId)) continue;
     if (waitRecovered.has(activityId)) continue;
@@ -310,6 +346,38 @@ export async function resume(ctx: ResumeContext): Promise<ResumeResult> {
     workerCrashedOutcomes,
     transientFailures,
     waitRecoveryOutcomes,
+    cancelRecoveryOutcomes,
+  };
+}
+
+// ─── Cancel recovery (Step 9) ──────────────────────────────────────────────
+
+async function recoverCancel(
+  ctx: ResumeContext,
+  snapshot: Snapshot,
+  activityId: string,
+): Promise<CancelRecoveryOutcome | null> {
+  const activity = snapshot.activities.get(activityId);
+  if (!activity) return null;
+  const latest = activity.attempts[activity.attempts.length - 1];
+  if (!latest?.cancelRequest) return null;
+  const cr = latest.cancelRequest;
+  const terminalEvent = (await ctx.log.append({
+    runId: ctx.runId,
+    type: 'activityCanceled',
+    actor: 'system',
+    payload: {
+      activityId,
+      attemptId: latest.attemptId,
+      cancelOriginEventId: cr.cancelOriginEventId,
+    },
+  })) as ActivityCanceledEvent;
+  return {
+    activityId,
+    attemptId: latest.attemptId,
+    cancelOriginEventId: cr.cancelOriginEventId,
+    delivered: cr.delivered,
+    terminalEvent,
   };
 }
 
