@@ -1347,9 +1347,13 @@ describe('resume — Step 9: dangling cancel recovery', () => {
     expect(r.cancelRecoveryOutcomes[0].delivered).toBe(true);
   });
 
-  it('cancel preempts reconcile: effectAttempted + cancelRequested → activityCanceled, NO reconcile', async () => {
-    // The most important Step 9 invariant: cancel is authoritative
-    // even when reconcile recovery would have completed the effect.
+  it('cancel + effectAttempted: reconciles FIRST (captures evidence), then writes activityCanceled (codex Step 9 round 1 finding 1)', async () => {
+    // New Step 9 semantics: when an activity has BOTH a dangling
+    // effectAttempted AND a cancelRequested, resume MUST run reconcile
+    // first so the provider's actual state is recorded in
+    // reconcileResult.evidence — even though the terminal will be
+    // `activityCanceled` (cancel wins as terminal reason).  Skipping
+    // reconcile loses the audit of whether the side effect happened.
     await bootstrapWith(
       attemptCreated('a-1', 'at-1'),
       effectAttempted('a-1', 'at-1', 'botmux-schedule', 'wf_x', 1, Number.MAX_SAFE_INTEGER),
@@ -1378,9 +1382,177 @@ describe('resume — Step 9: dangling cancel recovery', () => {
       daemonId: 'd-1',
       reconcilers: new Map([['botmux-schedule', reconciler]]),
     });
-    expect(providerCalled).toBe(false);
+    // Provider WAS called — evidence capture is mandatory for cancel + effect.
+    expect(providerCalled).toBe(true);
     expect(r.cancelRecoveryOutcomes).toHaveLength(1);
+    const c = r.cancelRecoveryOutcomes[0];
+    // Terminal is `activityCanceled` (cancel wins), not activitySucceeded.
+    expect(c.kind).toBe('cancelled');
+    expect(c.terminalEvent.type).toBe('activityCanceled');
+    // Evidence was preserved in the reconcileResult written alongside.
+    expect(c.reconcileEvent?.type).toBe('reconcileResult');
+    expect(c.reconcileDecision).toBe('completedByIdempotentSubmit');
+    // The reconcile branch produces NO ReconcileOutcome — cancel branch
+    // owns the activity entirely.
     expect(r.reconcileOutcomes).toEqual([]);
+    // Reconcile evidence carries the provider's externalRefs for forensics.
+    const ep = c.reconcileEvent?.payload as {
+      evidence: {
+        externalRefs?: unknown;
+        cancelOriginEventId?: string;
+        cancelReason?: string;
+        cancelRequestedBy?: string;
+      };
+    };
+    expect(ep.evidence.externalRefs).toEqual({ taskId: 'wf_x' });
+    // Codex Step 9 round 2 finding 1: cancel chain is preserved
+    // STRUCTURALLY on reconcileResult.evidence so dashboards / forensics
+    // can correlate cancel × reconcile without parsing errorMessage.
+    expect(ep.evidence.cancelOriginEventId).toBe(c.cancelOriginEventId);
+    expect(ep.evidence.cancelReason).toBe('preempt');
+    expect(ep.evidence.cancelRequestedBy).toBe('ou_a');
+  });
+
+  it('cancel + effect with readOnlyLookup found=false → freshRetry evidence + activityCanceled', async () => {
+    await bootstrapWith(
+      attemptCreated('a-1', 'at-1'),
+      effectAttempted('a-1', 'at-1', 'botmux-schedule', 'wf_x', 1, Number.MAX_SAFE_INTEGER),
+      {
+        runId: RUN_ID,
+        type: 'cancelRequested',
+        actor: 'human',
+        payload: {
+          target: { kind: 'activity', activityId: 'a-1' },
+          reason: 'preempt',
+          by: 'b',
+        },
+      },
+    );
+    const reconciler: ProviderReconciler = {
+      provider: 'botmux-schedule',
+      async readOnlyLookup() {
+        return { found: false };
+      },
+    };
+    const r = await resume({
+      log,
+      runId: RUN_ID,
+      daemonId: 'd-1',
+      reconcilers: new Map([['botmux-schedule', reconciler]]),
+    });
+    expect(r.cancelRecoveryOutcomes).toHaveLength(1);
+    const c = r.cancelRecoveryOutcomes[0];
+    expect(c.kind).toBe('cancelled');
+    expect(c.terminalEvent.type).toBe('activityCanceled');
+    expect(c.reconcileDecision).toBe('freshRetry');
+    // Cancel chain preserved on the reconcileResult evidence.
+    const ep = c.reconcileEvent?.payload as {
+      evidence: { cancelOriginEventId?: string };
+    };
+    expect(ep.evidence.cancelOriginEventId).toBe(c.cancelOriginEventId);
+  });
+
+  it('cancel + effect with TTL expired → manual evidence + activityFailed{manual} (NOT activityCanceled)', async () => {
+    // When reconcile reports manual (e.g. TTL expired, provider state unknown),
+    // writing activityCanceled would fabricate a clean cancel terminal we
+    // can't substantiate.  Step 9 escalates to activityFailed{manual}.
+    await bootstrapWith(
+      attemptCreated('a-1', 'at-1'),
+      effectAttempted('a-1', 'at-1', 'botmux-schedule', 'wf_x', 1, 1), // ttl=1ms
+      {
+        runId: RUN_ID,
+        type: 'cancelRequested',
+        actor: 'human',
+        payload: {
+          target: { kind: 'activity', activityId: 'a-1' },
+          reason: 'preempt',
+          by: 'b',
+        },
+      },
+    );
+    const reconciler: ProviderReconciler = {
+      provider: 'botmux-schedule',
+      async readOnlyLookup() {
+        return { found: true, externalRefs: { taskId: 'wf_x' } };
+      },
+    };
+    const r = await resume({
+      log,
+      runId: RUN_ID,
+      daemonId: 'd-1',
+      reconcilers: new Map([['botmux-schedule', reconciler]]),
+      now: () => Number.MAX_SAFE_INTEGER, // TTL definitely expired
+    });
+    expect(r.cancelRecoveryOutcomes).toHaveLength(1);
+    const c = r.cancelRecoveryOutcomes[0];
+    expect(c.kind).toBe('failed');
+    expect(c.terminalEvent.type).toBe('activityFailed');
+    expect(c.reconcileDecision).toBe('manual');
+    const tp = c.terminalEvent.payload as { error: { errorCode: string; errorClass: string } };
+    expect(tp.error.errorCode).toBe('TtlExpired');
+    expect(tp.error.errorClass).toBe('manual');
+    // Codex Step 9 round 2 finding 1: cancel chain is preserved
+    // structurally on reconcileResult.evidence (TTL+cancel is the key
+    // case where errorMessage parsing would otherwise be required).
+    const ep = c.reconcileEvent?.payload as {
+      evidence: {
+        cancelOriginEventId?: string;
+        cancelReason?: string;
+        cancelRequestedBy?: string;
+        reason?: string;
+      };
+    };
+    expect(ep.evidence.cancelOriginEventId).toBe(c.cancelOriginEventId);
+    expect(ep.evidence.cancelReason).toBe('preempt');
+    expect(ep.evidence.cancelRequestedBy).toBe('b');
+    // TTL-specific keys are still present alongside cancel keys.
+    expect(ep.evidence.reason).toBe('ttl_expired');
+  });
+
+  it('cancel + effect with transient retryable failure → activity stays dangling, transientFailure surfaced', async () => {
+    await bootstrapWith(
+      attemptCreated('a-1', 'at-1'),
+      effectAttempted('a-1', 'at-1', 'feishu-im', 'fhash', 1, Number.MAX_SAFE_INTEGER),
+      {
+        runId: RUN_ID,
+        type: 'cancelRequested',
+        actor: 'human',
+        payload: {
+          target: { kind: 'activity', activityId: 'a-1' },
+          reason: 'preempt',
+          by: 'b',
+        },
+      },
+    );
+    const reconciler: ProviderReconciler = {
+      provider: 'feishu-im',
+      requiresEffectInput: false,
+      async idempotentSubmit() {
+        return {
+          ok: false as const,
+          errorCode: 'NetworkError',
+          errorClass: 'retryable' as const,
+          errorMessage: 'temporary network blip',
+        };
+      },
+    };
+    const r = await resume({
+      log,
+      runId: RUN_ID,
+      daemonId: 'd-1',
+      reconcilers: new Map([['feishu-im', reconciler]]),
+    });
+    expect(r.cancelRecoveryOutcomes).toEqual([]);
+    expect(r.transientFailures).toHaveLength(1);
+    expect(r.transientFailures[0].activityId).toBe('a-1');
+    // No terminal events written for the cancel-pending activity.
+    const events = await log.readAll();
+    const aTerm = events.find(
+      (e) =>
+        (e.type === 'activityCanceled' || e.type === 'activityFailed' || e.type === 'activitySucceeded') &&
+        (e.payload as { activityId?: string }).activityId === 'a-1',
+    );
+    expect(aTerm).toBeUndefined();
   });
 
   it('cancel preempts wait recovery: waitResolved + cancelRequested → activityCanceled', async () => {

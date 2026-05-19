@@ -180,9 +180,31 @@ export type WaitRecoveryOutcome = {
 /**
  * Recovery of a cancel whose request landed but whose activity
  * terminal was never written (crash between `cancelRequested` /
- * `cancelDelivered` and `activityCanceled`).  Step 9: replay surfaces
- * these as `Snapshot.danglingCancels`; resume writes activityCanceled
- * with the original cancelRequested.eventId on the terminal.
+ * `cancelDelivered` and the terminal).  Step 9: replay surfaces these
+ * as `Snapshot.danglingCancels`.
+ *
+ * The terminal resume writes depends on whether the cancelled
+ * attempt also had a dangling `effectAttempted` (Step 9 round 1
+ * finding 1):
+ *
+ *   - **No effectAttempted** (plain cancel): resume writes
+ *     `activityCanceled` directly, with `cancelOriginEventId`
+ *     pointing at the originating `cancelRequested`.
+ *   - **effectAttempted present** (cancel + effect): resume FIRST
+ *     runs reconcile to capture provider evidence (writes
+ *     `reconcileResult` with cancel-coupled keys — see
+ *     payloads.ts `ReconcileResultPayload` doc), THEN decides:
+ *       - `completedByIdempotentSubmit` / `freshRetry` →
+ *         `activityCanceled` (cancel wins as terminal reason; the
+ *         provider's outcome is preserved in reconcileResult evidence)
+ *       - `manual` (TTL expired / unknown provider / submit errored
+ *         fatally) → `activityFailed{manual}` — we deliberately do
+ *         NOT write `activityCanceled` because provider state is
+ *         unknown and pretending the cancel cleanly succeeded would
+ *         lie to forensics
+ *       - `transient` → NO terminal; the activity stays dangling and
+ *         the next resume cycle retries (surfaces as a
+ *         `TransientReconcileFailure` on `ResumeResult.transientFailures`)
  */
 export type CancelRecoveryOutcome = {
   activityId: string;
@@ -192,7 +214,25 @@ export type CancelRecoveryOutcome = {
    *  short-circuited a never-delivered cancel.  Both still terminate
    *  the activity (cancel intent is authoritative). */
   delivered: boolean;
-  terminalEvent: ActivityCanceledEvent;
+  /**
+   * What terminal we ended up writing.  `cancelled` is the regular
+   * cancel terminal; `failed` is the "manual escalation" path when
+   * reconcile evidence is non-conclusive (Step 9 finding 1).
+   */
+  kind: 'cancelled' | 'failed';
+  /** Present when reconcile ran alongside cancel — i.e. the activity
+   *  had a dangling effectAttempted.  Pure cancels (no effect) leave
+   *  this undefined. */
+  reconcileEvent?: ReconcileResultEvent;
+  /**
+   * The reconcile decision that informed the cancel terminal (only
+   * populated when the activity had a dangling effectAttempted).
+   * - For `completedByIdempotentSubmit` and `freshRetry`, terminal is
+   *   `activityCanceled`.
+   * - For `manual`, terminal is `activityFailed{manual}`.
+   */
+  reconcileDecision?: ReconcileDecision;
+  terminalEvent: ActivityCanceledEvent | ActivityFailedEvent;
 };
 
 /**
@@ -275,26 +315,53 @@ export async function resume(ctx: ResumeContext): Promise<ResumeResult> {
   const snapshot = replay(allEvents);
 
   // Step 9: cancel recovery — cancelRequested landed but no terminal.
-  // Cancel preempts other recovery paths (spec §2.5: cancel is the
-  // authoritative terminal reason; once requested, the activity ends
-  // canceled regardless of whether reconcile/wait paths would have
-  // resolved differently).  Run cancel first so the subsequent loops
-  // can skip its activities.
+  // Spec §2.5: cancel is the authoritative terminal REASON, but when
+  // the cancelled attempt also has a dangling `effectAttempted` we
+  // must FIRST run reconcile to capture provider evidence (codex Step 9
+  // round 1 finding 1).  Skipping reconcile would write activityCanceled
+  // without ever observing whether the provider actually performed the
+  // side effect — which is the difference between "we cancelled a no-op"
+  // and "we cancelled a successful submit", and recovery can't replay
+  // that distinction later.  We still write `activityCanceled` for the
+  // common cases (completedByIdempotentSubmit / freshRetry) so cancel
+  // remains the terminal reason; only `manual` reconcile decisions
+  // escalate to `activityFailed{manual}` because the provider state is
+  // unknown and pretending otherwise would lie about the cancel outcome.
+  //
+  // Cancel runs first so the subsequent loops can skip its activities.
   const cancelRecoveryOutcomes: CancelRecoveryOutcome[] = [];
+  const transientFailures: TransientReconcileFailure[] = [];
+  const effectAttemptedSet = new Set(snapshot.danglingEffectAttempted);
   for (const activityId of snapshot.danglingCancels) {
-    const cancellation = await recoverCancel(ctx, snapshot, activityId);
-    if (cancellation) cancelRecoveryOutcomes.push(cancellation);
+    if (effectAttemptedSet.has(activityId)) {
+      const result = await recoverCancelWithReconcile(ctx, snapshot, activityId, now());
+      if (result.kind === 'outcome') cancelRecoveryOutcomes.push(result.outcome);
+      else if (result.kind === 'transient') transientFailures.push(result.failure);
+      // 'skipped' = missing activity; ignore.
+    } else {
+      const cancellation = await recoverCancel(ctx, snapshot, activityId);
+      if (cancellation) cancelRecoveryOutcomes.push(cancellation);
+    }
   }
-  const cancelled = new Set(snapshot.danglingCancels);
+  // Activities the cancel branch ALREADY terminated (succeeded or escalated
+  // to failed) — distinct from activities the cancel branch left dangling
+  // because reconcile reported transient.
+  const cancelTerminated = new Set(cancelRecoveryOutcomes.map((o) => o.activityId));
 
   const reconcileOutcomes: ReconcileOutcome[] = [];
-  const transientFailures: TransientReconcileFailure[] = [];
   for (const activityId of snapshot.danglingEffectAttempted) {
-    if (cancelled.has(activityId)) continue; // already terminated by cancel
+    if (cancelTerminated.has(activityId)) continue; // already handled by cancel branch
+    // Skip activities that the cancel branch tried but got transient on:
+    // we already recorded the transient failure there; running another
+    // reconcileOne for the same idempotencyKey would double-write.
+    if (snapshot.danglingCancels.includes(activityId)) {
+      continue;
+    }
     const result = await reconcileOne(ctx, snapshot, activityId, now());
     if (result.kind === 'outcome') reconcileOutcomes.push(result.outcome);
     else if (result.kind === 'transient') transientFailures.push(result.failure);
   }
+  const cancelled = new Set(snapshot.danglingCancels);
 
   // Step 8: wait recovery — `waitResolved` / `waitDeadlineExceeded`
   // landed but the activity terminal didn't.  Materialize the terminal
@@ -352,6 +419,10 @@ export async function resume(ctx: ResumeContext): Promise<ResumeResult> {
 
 // ─── Cancel recovery (Step 9) ──────────────────────────────────────────────
 
+/**
+ * Plain cancel recovery for activities WITHOUT a dangling effectAttempted.
+ * Writes `activityCanceled` directly — no provider state to reconcile.
+ */
 async function recoverCancel(
   ctx: ResumeContext,
   snapshot: Snapshot,
@@ -377,7 +448,117 @@ async function recoverCancel(
     attemptId: latest.attemptId,
     cancelOriginEventId: cr.cancelOriginEventId,
     delivered: cr.delivered,
+    kind: 'cancelled',
     terminalEvent,
+  };
+}
+
+/**
+ * Cancel recovery for activities WITH a dangling effectAttempted.
+ * Step 9 codex round 1 finding 1: reconcile evidence FIRST (captures
+ * provider state into a `reconcileResult`), then write the cancel
+ * terminal based on the decision:
+ *   - completedByIdempotentSubmit / freshRetry → activityCanceled
+ *     (cancel wins; provider state preserved in evidence)
+ *   - manual → activityFailed{manual} (state unknown, don't fabricate
+ *     a cancel terminal we can't substantiate)
+ *   - transient → no terminal; surface to caller and leave dangling
+ *     so the next resume can retry the reconcile
+ */
+type CancelReconcileStepResult =
+  | { kind: 'outcome'; outcome: CancelRecoveryOutcome }
+  | { kind: 'transient'; failure: TransientReconcileFailure }
+  | { kind: 'skipped' };
+
+async function recoverCancelWithReconcile(
+  ctx: ResumeContext,
+  snapshot: Snapshot,
+  activityId: string,
+  nowMs: number,
+): Promise<CancelReconcileStepResult> {
+  const activity = snapshot.activities.get(activityId);
+  if (!activity) return { kind: 'skipped' };
+  const latest = activity.attempts[activity.attempts.length - 1];
+  if (!latest?.cancelRequest || !latest.effectAttempted) return { kind: 'skipped' };
+  const cr = latest.cancelRequest;
+
+  const evidence = await captureEvidence(ctx, snapshot, activityId, nowMs, {
+    cancelContext: {
+      cancelOriginEventId: cr.cancelOriginEventId,
+      reason: cr.reason,
+      requestedBy: cr.requestedBy,
+    },
+  });
+  if (evidence.kind === 'skipped') return { kind: 'skipped' };
+  if (evidence.kind === 'transient') {
+    return { kind: 'transient', failure: evidence.failure };
+  }
+
+  const ea = latest.effectAttempted;
+  // Decision → terminal mapping for cancel branch.
+  if (evidence.kind === 'manual') {
+    // Provider state unknown — escalate to activityFailed{manual}.  We
+    // intentionally do NOT write activityCanceled here: it would
+    // misrepresent the cancel as a clean abort even though we can't
+    // verify whether the provider performed the side effect.  The
+    // cancelOriginEventId is preserved in the reconcile evidence for
+    // forensics.
+    const terminalEvent = (await ctx.log.append({
+      runId: ctx.runId,
+      type: 'activityFailed',
+      actor: 'system',
+      payload: {
+        activityId,
+        attemptId: latest.attemptId,
+        error: {
+          errorCode: evidence.errorCode,
+          errorClass: 'manual',
+          errorMessage: `Cancel + reconcile: ${evidence.errorMessage} (cancelOriginEventId=${cr.cancelOriginEventId})`,
+        },
+      },
+    })) as ActivityFailedEvent;
+    return {
+      kind: 'outcome',
+      outcome: {
+        activityId,
+        attemptId: latest.attemptId,
+        cancelOriginEventId: cr.cancelOriginEventId,
+        delivered: cr.delivered,
+        kind: 'failed',
+        reconcileEvent: evidence.reconcileEvent ?? undefined,
+        reconcileDecision: 'manual',
+        terminalEvent,
+      },
+    };
+  }
+
+  // completedByIdempotentSubmit OR freshRetry: cancel wins as terminal
+  // reason.  Evidence is preserved in the reconcileResult written by
+  // captureEvidence (or referenced via the prior reconcileResult eventId
+  // when recovered=true).
+  const terminalEvent = (await ctx.log.append({
+    runId: ctx.runId,
+    type: 'activityCanceled',
+    actor: 'system',
+    payload: {
+      activityId,
+      attemptId: latest.attemptId,
+      cancelOriginEventId: cr.cancelOriginEventId,
+    },
+  })) as ActivityCanceledEvent;
+  void ea;
+  return {
+    kind: 'outcome',
+    outcome: {
+      activityId,
+      attemptId: latest.attemptId,
+      cancelOriginEventId: cr.cancelOriginEventId,
+      delivered: cr.delivered,
+      kind: 'cancelled',
+      reconcileEvent: evidence.reconcileEvent ?? undefined,
+      reconcileDecision: evidence.kind,
+      terminalEvent,
+    },
   };
 }
 
@@ -517,6 +698,53 @@ type ReconcileStepResult =
   | { kind: 'transient'; failure: TransientReconcileFailure }
   | { kind: 'skipped' };
 
+/**
+ * Result of capturing reconcile evidence.  Carries enough metadata for
+ * either the regular path (`reconcileOne`) or the cancel path
+ * (`recoverCancelWithReconcile`) to write an appropriate terminal.
+ *
+ * Invariant: `reconcileResult` is either freshly written (recovered=false,
+ * reconcileEvent populated) or reused from a prior crashed cycle
+ * (recovered=true, reconcileEvent=null — see F1).  Either way, the
+ * reconcile state has been audited; only the activity terminal remains
+ * for the caller to write.
+ */
+type EvidenceResult =
+  | {
+      kind: 'completedByIdempotentSubmit';
+      capability: ReconcileCapability;
+      externalRefs: Record<string, unknown>;
+      evidence: Record<string, unknown>;
+      reconcileEvent: ReconcileResultEvent | null;
+      recovered: boolean;
+    }
+  | {
+      kind: 'freshRetry';
+      capability: ReconcileCapability;
+      evidence: Record<string, unknown>;
+      reconcileEvent: ReconcileResultEvent | null;
+      recovered: boolean;
+    }
+  | {
+      kind: 'manual';
+      capability: ReconcileCapability;
+      errorCode: string;
+      errorMessage: string;
+      evidence: Record<string, unknown>;
+      reconcileEvent: ReconcileResultEvent | null;
+      recovered: boolean;
+    }
+  | {
+      kind: 'transient';
+      failure: TransientReconcileFailure;
+    }
+  | {
+      kind: 'skipped';
+    };
+
+/** Convenience for code that only cares about reconcile decision identity. */
+type EvidenceDecision = Exclude<EvidenceResult['kind'], 'transient' | 'skipped'>;
+
 async function reconcileOne(
   ctx: ResumeContext,
   snapshot: Snapshot,
@@ -526,9 +754,58 @@ async function reconcileOne(
   const activity = snapshot.activities.get(activityId);
   if (!activity) return { kind: 'skipped' };
   const latest = activity.attempts[activity.attempts.length - 1];
-  if (!latest || !latest.effectAttempted) return { kind: 'skipped' };
+  if (!latest?.effectAttempted) return { kind: 'skipped' };
 
   const ea = latest.effectAttempted;
+  const evidence = await captureEvidence(ctx, snapshot, activityId, nowMs);
+  if (evidence.kind === 'skipped') return { kind: 'skipped' };
+  if (evidence.kind === 'transient') return { kind: 'transient', failure: evidence.failure };
+
+  return { kind: 'outcome', outcome: await writeRegularTerminal(ctx, latest.attemptId, activityId, ea, evidence) };
+}
+
+/**
+ * Optional extras that the caller wants merged into every freshly
+ * written `reconcileResult.evidence` (does NOT apply to F1 recovery —
+ * the prior reconcileResult is immutable).  Currently used by the
+ * cancel branch to embed `cancelOriginEventId` / `cancelReason` /
+ * `cancelRequestedBy` so dashboards / forensics can correlate
+ * cancel × reconcile structurally rather than via errorMessage parsing
+ * (codex Step 9 round 2 finding 1).
+ */
+type EvidenceCaptureOptions = {
+  cancelContext?: {
+    cancelOriginEventId: string;
+    reason: string;
+    requestedBy: string;
+  };
+};
+
+/**
+ * Capture reconcile evidence WITHOUT writing the activity terminal.
+ * Writes `reconcileResult` (or reuses a prior one — F1 recovery) and
+ * returns the decision + auxiliary data the caller needs to write the
+ * appropriate terminal.
+ *
+ * Splitting evidence capture from terminal write lets the cancel path
+ * (`recoverCancelWithReconcile`) reuse the decision tree without
+ * accidentally fabricating activitySucceeded — codex Step 9 round 1
+ * finding 1.
+ */
+async function captureEvidence(
+  ctx: ResumeContext,
+  snapshot: Snapshot,
+  activityId: string,
+  nowMs: number,
+  options?: EvidenceCaptureOptions,
+): Promise<EvidenceResult> {
+  const activity = snapshot.activities.get(activityId);
+  if (!activity) return { kind: 'skipped' };
+  const latest = activity.attempts[activity.attempts.length - 1];
+  if (!latest?.effectAttempted) return { kind: 'skipped' };
+
+  const ea = latest.effectAttempted;
+  const extra = controlExtra(options);
 
   // F1: recovery path — if a previous resume already wrote a
   // reconcileResult for this attempt but crashed before the terminal,
@@ -536,25 +813,21 @@ async function reconcileOne(
   // Re-running risks a DIFFERENT decision (TTL crosses, provider state
   // changes), so we honor the recorded choice.
   if (latest.latestReconcileResult) {
-    return recoverFromReconcileResult(ctx, activityId, latest, ea);
+    return evidenceFromPriorReconcileResult(latest, ea);
   }
 
   const reconciler = ctx.reconcilers.get(ea.provider);
 
   // Case A — unknown provider.  No way to confirm; manual/UnknownProvider.
   if (!reconciler) {
-    return outcome(
-      await writeManual(
-        ctx,
-        activityId,
-        latest.attemptId,
-        ea.idempotencyKey,
-        ea.provider,
-        'none',
-        'UnknownProviderError',
-        `No reconciler registered for provider "${ea.provider}".`,
-        { reason: 'no_reconciler' },
-      ),
+    return await writeReconcileResultManual(
+      ctx,
+      activityId,
+      ea,
+      'none',
+      'UnknownProviderError',
+      `No reconciler registered for provider "${ea.provider}".`,
+      { reason: 'no_reconciler', ...extra },
     );
   }
 
@@ -564,23 +837,20 @@ async function reconcileOne(
   // force at attempt time is what matters.
   const ttlExpired = nowMs - ea.attemptedAtMs > ea.idempotencyTtlMs;
   if (ttlExpired) {
-    return outcome(
-      await writeManual(
-        ctx,
-        activityId,
-        latest.attemptId,
-        ea.idempotencyKey,
-        ea.provider,
-        'none',
-        'TtlExpired',
-        `Provider TTL (${ea.idempotencyTtlMs}ms) elapsed before resume could reconcile.`,
-        {
-          reason: 'ttl_expired',
-          attemptedAtMs: ea.attemptedAtMs,
-          nowMs,
-          idempotencyTtlMs: ea.idempotencyTtlMs,
-        },
-      ),
+    return await writeReconcileResultManual(
+      ctx,
+      activityId,
+      ea,
+      'none',
+      'TtlExpired',
+      `Provider TTL (${ea.idempotencyTtlMs}ms) elapsed before resume could reconcile.`,
+      {
+        reason: 'ttl_expired',
+        attemptedAtMs: ea.attemptedAtMs,
+        nowMs,
+        idempotencyTtlMs: ea.idempotencyTtlMs,
+        ...extra,
+      },
     );
   }
 
@@ -600,20 +870,16 @@ async function reconcileOne(
     reconciler.requiresEffectInput &&
     (inputLoadError !== null || effectInput === undefined)
   ) {
-    return outcome(
-      await writeManual(
-        ctx,
-        activityId,
-        latest.attemptId,
-        ea.idempotencyKey,
-        ea.provider,
-        'none',
-        'InputUnrecoverable',
-        inputLoadError
-          ? `Failed to load effect input for reconcile: ${inputLoadError.message}`
-          : `Reconciler "${ea.provider}" requires effect input, but ctx.loadEffectInput returned undefined / was not provided.`,
-        { reason: 'input_unrecoverable', hadLoader: !!ctx.loadEffectInput },
-      ),
+    return await writeReconcileResultManual(
+      ctx,
+      activityId,
+      ea,
+      'none',
+      'InputUnrecoverable',
+      inputLoadError
+        ? `Failed to load effect input for reconcile: ${inputLoadError.message}`
+        : `Reconciler "${ea.provider}" requires effect input, but ctx.loadEffectInput returned undefined / was not provided.`,
+      { reason: 'input_unrecoverable', hadLoader: !!ctx.loadEffectInput, ...extra },
     );
   }
 
@@ -622,29 +888,21 @@ async function reconcileOne(
   if (reconciler.readOnlyLookup) {
     const lookup = await reconciler.readOnlyLookup(ea.idempotencyKey, effectInput);
     if (lookup.found) {
-      return outcome(
-        await writeCompletedByIdempotentSubmit(
-          ctx,
-          activityId,
-          latest.attemptId,
-          ea.idempotencyKey,
-          ea.provider,
-          'readOnlyLookup',
-          lookup.externalRefs,
-          lookup.evidence ?? {},
-        ),
-      );
-    }
-    return outcome(
-      await writeFreshRetry(
+      return await writeReconcileResultCompleted(
         ctx,
         activityId,
-        latest.attemptId,
-        ea.idempotencyKey,
-        ea.provider,
+        ea,
         'readOnlyLookup',
-        lookup.evidence ?? { found: false },
-      ),
+        lookup.externalRefs,
+        { ...(lookup.evidence ?? {}), ...extra },
+      );
+    }
+    return await writeReconcileResultFreshRetry(
+      ctx,
+      activityId,
+      ea,
+      'readOnlyLookup',
+      { ...(lookup.evidence ?? { found: false }), ...extra },
     );
   }
 
@@ -652,24 +910,18 @@ async function reconcileOne(
   if (reconciler.idempotentSubmit) {
     const submit = await reconciler.idempotentSubmit(ea.idempotencyKey, effectInput);
     if (submit.ok) {
-      return outcome(
-        await writeCompletedByIdempotentSubmit(
-          ctx,
-          activityId,
-          latest.attemptId,
-          ea.idempotencyKey,
-          ea.provider,
-          'idempotentSubmit',
-          submit.externalRefs,
-          submit.evidence ?? {},
-        ),
+      return await writeReconcileResultCompleted(
+        ctx,
+        activityId,
+        ea,
+        'idempotentSubmit',
+        submit.externalRefs,
+        { ...(submit.evidence ?? {}), ...extra },
       );
     }
-    // F3: retryable failures stay dangling.  Provider may have received
-    // the request and dropped the response; writing manual terminal
-    // would freeze the activity in a wrong state and short-circuit the
-    // next resume from retrying.  We log to the caller as a transient
-    // failure and let the activity remain dangling.
+    // F3: retryable failures stay dangling — no reconcileResult is
+    // written here because the provider's state is in flux.  The next
+    // resume cycle re-enters the decision tree from scratch.
     if (submit.errorClass === 'retryable') {
       return {
         kind: 'transient',
@@ -684,108 +936,55 @@ async function reconcileOne(
         },
       };
     }
-    // fatal / userFault / manual — these are decisive; write manual
-    // terminal so a human inspects.  Note the manual escalation here is
-    // intentional and bounded to non-retryable cases.
-    return outcome(
-      await writeManual(
-        ctx,
-        activityId,
-        latest.attemptId,
-        ea.idempotencyKey,
-        ea.provider,
-        'idempotentSubmit',
-        submit.errorCode,
-        submit.errorMessage,
-        submit.evidence ?? { errorClass: submit.errorClass },
-      ),
+    return await writeReconcileResultManual(
+      ctx,
+      activityId,
+      ea,
+      'idempotentSubmit',
+      submit.errorCode,
+      submit.errorMessage,
+      { ...(submit.evidence ?? { errorClass: submit.errorClass }), ...extra },
     );
   }
 
   // Case E — reconciler exists but exposes no capability.  Manual.
-  return outcome(
-    await writeManual(
-      ctx,
-      activityId,
-      latest.attemptId,
-      ea.idempotencyKey,
-      ea.provider,
-      'none',
-      'UnknownProviderError',
-      `Reconciler for "${ea.provider}" exposes neither readOnlyLookup nor idempotentSubmit.`,
-      { reason: 'no_capability' },
-    ),
+  return await writeReconcileResultManual(
+    ctx,
+    activityId,
+    ea,
+    'none',
+    'UnknownProviderError',
+    `Reconciler for "${ea.provider}" exposes neither readOnlyLookup nor idempotentSubmit.`,
+    { reason: 'no_capability', ...extra },
   );
 }
 
-function outcome(o: ReconcileOutcome): ReconcileStepResult {
-  return { kind: 'outcome', outcome: o };
+function controlExtra(options?: EvidenceCaptureOptions): Record<string, unknown> {
+  if (!options?.cancelContext) return {};
+  const { cancelOriginEventId, reason, requestedBy } = options.cancelContext;
+  return {
+    cancelOriginEventId,
+    cancelReason: reason,
+    cancelRequestedBy: requestedBy,
+  };
 }
 
-// ─── F1 recovery: a prior reconcileResult exists, terminal does not ─────────
-
-async function recoverFromReconcileResult(
+/**
+ * Write the regular (non-cancel) activity terminal that corresponds to
+ * an EvidenceResult.  Returns a ReconcileOutcome for the orchestrator.
+ *
+ * Caller must filter out `transient` and `skipped` before invoking.
+ */
+async function writeRegularTerminal(
   ctx: ResumeContext,
+  attemptId: string,
   activityId: string,
-  latest: AttemptState,
   ea: NonNullable<AttemptState['effectAttempted']>,
-): Promise<ReconcileStepResult> {
-  const rr = latest.latestReconcileResult!;
-  switch (rr.decision) {
+  evidence: Extract<EvidenceResult, { kind: EvidenceDecision }>,
+): Promise<ReconcileOutcome> {
+  switch (evidence.kind) {
     case 'completedByIdempotentSubmit': {
-      // Re-derive externalRefs from the recorded evidence.  We wrote it
-      // there during the first resume so this recovery is decoupled
-      // from the provider being reachable now.
-      //
-      // STRICT validation (codex round 2 of Step 7): if evidence
-      // doesn't carry a usable externalRefs object, this is a corrupt
-      // reconcileResult — falling back to `{}` would silently materialize
-      // a fake activitySucceeded with an empty external ref, turning log
-      // corruption into a fake success.  Treat as CorruptLog manual
-      // instead so the inconsistency surfaces.
-      const evidence = rr.evidence;
-      const candidate = (evidence as { externalRefs?: unknown }).externalRefs;
-      if (
-        candidate === undefined ||
-        candidate === null ||
-        typeof candidate !== 'object' ||
-        Array.isArray(candidate)
-      ) {
-        const terminalEvent = (await ctx.log.append({
-          runId: ctx.runId,
-          type: 'activityFailed',
-          actor: 'system',
-          payload: {
-            activityId,
-            attemptId: latest.attemptId,
-            error: {
-              errorCode: 'CorruptLog',
-              errorClass: 'manual',
-              errorMessage:
-                'Prior reconcileResult{decision=completedByIdempotentSubmit} is missing evidence.externalRefs (or it is not an object) — refusing to fabricate an activitySucceeded from empty refs.',
-            },
-          },
-        })) as ActivityFailedEvent;
-        return outcome({
-          activityId,
-          attemptId: latest.attemptId,
-          idempotencyKey: ea.idempotencyKey,
-          provider: ea.provider,
-          capability: rr.capability,
-          decision: 'manual',
-          evidence: {
-            ...rr.evidence,
-            corruptReason: 'missing_external_refs',
-            originalDecision: 'completedByIdempotentSubmit',
-            reconcileEventId: rr.eventId,
-          },
-          terminalEvent,
-          reconcileEvent: null,
-          recovered: true,
-        });
-      }
-      const externalRefs = candidate as Record<string, unknown>;
-      const outputBuf = Buffer.from(JSON.stringify(externalRefs), 'utf-8');
+      const outputBuf = Buffer.from(JSON.stringify(evidence.externalRefs), 'utf-8');
       const outputHash = await sha256Hex(outputBuf);
       const terminalEvent = (await ctx.log.append({
         runId: ctx.runId,
@@ -793,256 +992,257 @@ async function recoverFromReconcileResult(
         actor: 'system',
         payload: {
           activityId,
-          attemptId: latest.attemptId,
+          attemptId,
           outputRef: {
             outputHash: `sha256:${outputHash}`,
             outputBytes: outputBuf.length,
             outputSchemaVersion: 1,
             contentType: 'application/json',
           },
-          externalRefs,
+          externalRefs: evidence.externalRefs,
         },
       })) as ActivitySucceededEvent;
-      return outcome({
+      return {
         activityId,
-        attemptId: latest.attemptId,
+        attemptId,
         idempotencyKey: ea.idempotencyKey,
         provider: ea.provider,
-        capability: rr.capability,
+        capability: evidence.capability,
         decision: 'completedByIdempotentSubmit',
-        evidence: rr.evidence,
+        evidence: evidence.evidence,
         terminalEvent,
-        reconcileEvent: null,
-        recovered: true,
-      });
+        reconcileEvent: evidence.reconcileEvent,
+        recovered: evidence.recovered,
+      };
+    }
+    case 'freshRetry': {
+      return {
+        activityId,
+        attemptId,
+        idempotencyKey: ea.idempotencyKey,
+        provider: ea.provider,
+        capability: evidence.capability,
+        decision: 'freshRetry',
+        evidence: evidence.evidence,
+        terminalEvent: null,
+        reconcileEvent: evidence.reconcileEvent,
+        recovered: evidence.recovered,
+      };
     }
     case 'manual': {
-      const evidence = rr.evidence;
-      const errorCode =
-        (evidence as { errorCode?: string }).errorCode ?? 'UnknownProviderError';
       const terminalEvent = (await ctx.log.append({
         runId: ctx.runId,
         type: 'activityFailed',
         actor: 'system',
         payload: {
           activityId,
-          attemptId: latest.attemptId,
+          attemptId,
           error: {
-            errorCode,
+            errorCode: evidence.errorCode,
             errorClass: 'manual',
-            errorMessage: `Recovered from prior crashed reconcile cycle (decision=manual, errorCode=${errorCode}).`,
+            errorMessage: evidence.errorMessage,
           },
         },
       })) as ActivityFailedEvent;
-      return outcome({
+      return {
         activityId,
-        attemptId: latest.attemptId,
+        attemptId,
         idempotencyKey: ea.idempotencyKey,
         provider: ea.provider,
-        capability: rr.capability,
+        capability: evidence.capability,
         decision: 'manual',
-        evidence: rr.evidence,
+        evidence: evidence.evidence,
         terminalEvent,
+        reconcileEvent: evidence.reconcileEvent,
+        recovered: evidence.recovered,
+      };
+    }
+  }
+}
+
+// ─── F1 recovery: a prior reconcileResult exists, terminal does not ─────────
+
+/**
+ * Re-shape a prior crashed reconcile cycle's reconcileResult into an
+ * EvidenceResult so the caller's terminal-write path matches what would
+ * have happened originally.
+ *
+ * Codex Step 7 round 2: corrupt prior decisions (replayed without
+ * terminal, or completedByIdempotentSubmit with missing externalRefs)
+ * escalate to `manual` with diagnostic evidence rather than fabricate
+ * a fake activitySucceeded.
+ */
+function evidenceFromPriorReconcileResult(
+  latest: AttemptState,
+  _ea: NonNullable<AttemptState['effectAttempted']>,
+): EvidenceResult {
+  void _ea;
+  const rr = latest.latestReconcileResult!;
+  switch (rr.decision) {
+    case 'completedByIdempotentSubmit': {
+      const candidate = (rr.evidence as { externalRefs?: unknown }).externalRefs;
+      if (
+        candidate === undefined ||
+        candidate === null ||
+        typeof candidate !== 'object' ||
+        Array.isArray(candidate)
+      ) {
+        return {
+          kind: 'manual',
+          capability: rr.capability,
+          errorCode: 'CorruptLog',
+          errorMessage:
+            'Prior reconcileResult{decision=completedByIdempotentSubmit} is missing evidence.externalRefs (or it is not an object) — refusing to fabricate an activitySucceeded from empty refs.',
+          evidence: {
+            ...rr.evidence,
+            corruptReason: 'missing_external_refs',
+            originalDecision: 'completedByIdempotentSubmit',
+            reconcileEventId: rr.eventId,
+          },
+          reconcileEvent: null,
+          recovered: true,
+        };
+      }
+      return {
+        kind: 'completedByIdempotentSubmit',
+        capability: rr.capability,
+        externalRefs: candidate as Record<string, unknown>,
+        evidence: rr.evidence,
         reconcileEvent: null,
         recovered: true,
-      });
+      };
+    }
+    case 'manual': {
+      const errorCode =
+        (rr.evidence as { errorCode?: string }).errorCode ?? 'UnknownProviderError';
+      return {
+        kind: 'manual',
+        capability: rr.capability,
+        errorCode,
+        errorMessage: `Recovered from prior crashed reconcile cycle (decision=manual, errorCode=${errorCode}).`,
+        evidence: rr.evidence,
+        reconcileEvent: null,
+        recovered: true,
+      };
     }
     case 'freshRetry': {
-      // No terminal to write — scheduler picks up the dangling attempt
-      // (the prior reconcileResult survived the crash and is the
-      // authoritative decision).
-      return outcome({
-        activityId,
-        attemptId: latest.attemptId,
-        idempotencyKey: ea.idempotencyKey,
-        provider: ea.provider,
+      return {
+        kind: 'freshRetry',
         capability: rr.capability,
-        decision: 'freshRetry',
         evidence: rr.evidence,
-        terminalEvent: null,
         reconcileEvent: null,
         recovered: true,
-      });
+      };
     }
     case 'replayed': {
       // Replayed means a terminal already existed when reconcileResult
-      // was written.  If we landed here, that terminal got lost — which
-      // is a corrupt-log scenario, not a recoverable one.  Surface as
-      // manual to flag the inconsistency.
-      const terminalEvent = (await ctx.log.append({
-        runId: ctx.runId,
-        type: 'activityFailed',
-        actor: 'system',
-        payload: {
-          activityId,
-          attemptId: latest.attemptId,
-          error: {
-            errorCode: 'CorruptLog',
-            errorClass: 'manual',
-            errorMessage:
-              'Prior reconcileResult decision=replayed but no terminal event present — log inconsistency.',
-          },
-        },
-      })) as ActivityFailedEvent;
-      return outcome({
-        activityId,
-        attemptId: latest.attemptId,
-        idempotencyKey: ea.idempotencyKey,
-        provider: ea.provider,
+      // was written.  If we landed here, that terminal got lost — log
+      // corruption.  Surface as manual to flag the inconsistency.
+      return {
+        kind: 'manual',
         capability: rr.capability,
-        decision: 'manual',
+        errorCode: 'CorruptLog',
+        errorMessage:
+          'Prior reconcileResult decision=replayed but no terminal event present — log inconsistency.',
         evidence: {
           ...rr.evidence,
           originalDecision: 'replayed',
           reconcileEventId: rr.eventId,
         },
-        terminalEvent,
         reconcileEvent: null,
         recovered: true,
-      });
+      };
     }
   }
 }
 
-// ─── Event writers (one per terminal decision) ──────────────────────────────
+// ─── reconcileResult writers (decision-shaped EvidenceResult builders) ──────
 
-async function writeCompletedByIdempotentSubmit(
+async function writeReconcileResultCompleted(
   ctx: ResumeContext,
   activityId: string,
-  attemptId: string,
-  idempotencyKey: string,
-  provider: string,
+  ea: NonNullable<AttemptState['effectAttempted']>,
   capability: ReconcileCapability,
   externalRefs: Record<string, unknown>,
   evidence: Record<string, unknown>,
-): Promise<ReconcileOutcome> {
+): Promise<EvidenceResult> {
   const reconcileEvent = (await ctx.log.append({
     runId: ctx.runId,
     type: 'reconcileResult',
     actor: 'system',
     payload: {
       activityId,
-      idempotencyKey,
+      idempotencyKey: ea.idempotencyKey,
       capability,
       decision: 'completedByIdempotentSubmit',
       evidence: { ...evidence, externalRefs },
     },
   })) as ReconcileResultEvent;
-
-  const outputBuf = Buffer.from(JSON.stringify(externalRefs), 'utf-8');
-  const outputHash = await sha256Hex(outputBuf);
-  const terminalEvent = (await ctx.log.append({
-    runId: ctx.runId,
-    type: 'activitySucceeded',
-    actor: 'system',
-    payload: {
-      activityId,
-      attemptId,
-      outputRef: {
-        outputHash: `sha256:${outputHash}`,
-        outputBytes: outputBuf.length,
-        outputSchemaVersion: 1,
-        contentType: 'application/json',
-      },
-      externalRefs,
-    },
-  })) as ActivitySucceededEvent;
-
   return {
-    activityId,
-    attemptId,
-    idempotencyKey,
-    provider,
+    kind: 'completedByIdempotentSubmit',
     capability,
-    decision: 'completedByIdempotentSubmit',
+    externalRefs,
     evidence,
-    terminalEvent,
     reconcileEvent,
     recovered: false,
   };
 }
 
-async function writeFreshRetry(
+async function writeReconcileResultFreshRetry(
   ctx: ResumeContext,
   activityId: string,
-  attemptId: string,
-  idempotencyKey: string,
-  provider: string,
+  ea: NonNullable<AttemptState['effectAttempted']>,
   capability: ReconcileCapability,
   evidence: Record<string, unknown>,
-): Promise<ReconcileOutcome> {
+): Promise<EvidenceResult> {
   const reconcileEvent = (await ctx.log.append({
     runId: ctx.runId,
     type: 'reconcileResult',
     actor: 'system',
     payload: {
       activityId,
-      idempotencyKey,
+      idempotencyKey: ea.idempotencyKey,
       capability,
       decision: 'freshRetry',
       evidence,
     },
   })) as ReconcileResultEvent;
   return {
-    activityId,
-    attemptId,
-    idempotencyKey,
-    provider,
+    kind: 'freshRetry',
     capability,
-    decision: 'freshRetry',
     evidence,
-    terminalEvent: null,
     reconcileEvent,
     recovered: false,
   };
 }
 
-async function writeManual(
+async function writeReconcileResultManual(
   ctx: ResumeContext,
   activityId: string,
-  attemptId: string,
-  idempotencyKey: string,
-  provider: string,
+  ea: NonNullable<AttemptState['effectAttempted']>,
   capability: ReconcileCapability,
   errorCode: string,
   errorMessage: string,
   evidence: Record<string, unknown>,
-): Promise<ReconcileOutcome> {
+): Promise<EvidenceResult> {
   const reconcileEvent = (await ctx.log.append({
     runId: ctx.runId,
     type: 'reconcileResult',
     actor: 'system',
     payload: {
       activityId,
-      idempotencyKey,
+      idempotencyKey: ea.idempotencyKey,
       capability,
       decision: 'manual',
       evidence: { ...evidence, errorCode },
     },
   })) as ReconcileResultEvent;
-  const terminalEvent = (await ctx.log.append({
-    runId: ctx.runId,
-    type: 'activityFailed',
-    actor: 'system',
-    payload: {
-      activityId,
-      attemptId,
-      error: {
-        errorCode,
-        errorClass: 'manual',
-        errorMessage,
-      },
-    },
-  })) as ActivityFailedEvent;
   return {
-    activityId,
-    attemptId,
-    idempotencyKey,
-    provider,
+    kind: 'manual',
     capability,
-    decision: 'manual',
+    errorCode,
+    errorMessage,
     evidence,
-    terminalEvent,
     reconcileEvent,
     recovered: false,
   };

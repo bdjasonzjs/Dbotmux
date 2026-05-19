@@ -323,6 +323,20 @@ export const ResumeStartedPayload = z.object({
  *   - `reconcileEventId`?: string
  *       eventId of the originating reconcileResult (recovery cross-ref).
  *
+ * Cancel-coupled keys (Step 9 round 2 — when reconcile fires under
+ * cancel, any decision):
+ *   - `cancelOriginEventId`?: string  — eventId of the originating
+ *     `cancelRequested` so dashboard / forensics can correlate the
+ *     cancel × reconcile pair structurally instead of parsing
+ *     `activityFailed.errorMessage`.
+ *   - `cancelReason`?: string         — `cancelRequested.payload.reason`
+ *   - `cancelRequestedBy`?: string    — `cancelRequested.payload.by`
+ *
+ * These keys are written ONLY by `recoverCancelWithReconcile`'s fresh
+ * reconcile cycle; they are absent on regular reconciles and on F1
+ * recovery (the prior reconcileResult was written before cancel
+ * landed and is immutable).
+ *
  * `freshRetry` evidence is provider-specific; v0 puts whatever the
  * reconciler returned from `readOnlyLookup({ found: false })` here.
  *

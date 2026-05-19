@@ -40,6 +40,8 @@ import type {
   ActivityCanceledEvent,
   CancelDeliveredEvent,
   CancelRequestedEvent,
+  NodeCanceledEvent,
+  RunCanceledEvent,
 } from './events/types.js';
 
 // ─── Public types ──────────────────────────────────────────────────────────
@@ -73,8 +75,18 @@ export type CompleteActivityCancelInput = {
   cancelOriginEventId: string;
 };
 
+export type CompleteNodeCancelInput = {
+  nodeId: string;
+  cancelOriginEventId: string;
+};
+
+export type CompleteRunCancelInput = {
+  cancelOriginEventId: string;
+};
+
 export type RequestCancelActor = 'human' | 'supervisor' | 'system';
 export type DeliverCancelActor = 'worker' | 'system';
+export type CompleteCancelActor = 'scheduler' | 'worker' | 'system';
 
 // ─── Host API ─────────────────────────────────────────────────────────────
 
@@ -128,7 +140,7 @@ export async function deliverCancel(
 export async function completeActivityCancel(
   log: EventLog,
   input: CompleteActivityCancelInput,
-  actor: 'scheduler' | 'worker' | 'system' = 'scheduler',
+  actor: CompleteCancelActor = 'scheduler',
 ): Promise<ActivityCanceledEvent> {
   return (await log.append({
     runId: log.runId,
@@ -140,4 +152,47 @@ export async function completeActivityCancel(
       cancelOriginEventId: input.cancelOriginEventId,
     },
   })) as ActivityCanceledEvent;
+}
+
+/**
+ * Node terminal in the cancel branch.  Spec §2.5: nodeCanceled fires
+ * only after ALL of the node's activities have reached terminal — the
+ * caller (scheduler / supervisor) is responsible for verifying that
+ * precondition before invoking.  This helper merely writes the event.
+ */
+export async function completeNodeCancel(
+  log: EventLog,
+  input: CompleteNodeCancelInput,
+  actor: CompleteCancelActor = 'scheduler',
+): Promise<NodeCanceledEvent> {
+  return (await log.append({
+    runId: log.runId,
+    type: 'nodeCanceled',
+    actor,
+    payload: {
+      nodeId: input.nodeId,
+      cancelOriginEventId: input.cancelOriginEventId,
+    },
+  })) as NodeCanceledEvent;
+}
+
+/**
+ * Run terminal in the cancel branch.  Spec §2.5: runCanceled fires
+ * only after ALL of the run's nodes have reached terminal.  Same
+ * precondition responsibility as `completeNodeCancel` — this helper
+ * writes the event but doesn't enforce dependencies.
+ */
+export async function completeRunCancel(
+  log: EventLog,
+  input: CompleteRunCancelInput,
+  actor: CompleteCancelActor = 'scheduler',
+): Promise<RunCanceledEvent> {
+  return (await log.append({
+    runId: log.runId,
+    type: 'runCanceled',
+    actor,
+    payload: {
+      cancelOriginEventId: input.cancelOriginEventId,
+    },
+  })) as RunCanceledEvent;
 }

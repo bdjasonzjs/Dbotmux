@@ -8,6 +8,8 @@ import {
   requestCancel,
   deliverCancel,
   completeActivityCancel,
+  completeNodeCancel,
+  completeRunCancel,
 } from '../src/workflows/cancel.js';
 
 const RUN_ID = 'run-cancel-test-01';
@@ -306,5 +308,156 @@ describe('cancel — completeActivityCancel', () => {
     });
     const snap = replay(await log.readAll());
     expect(snap.activities.get('a-1')?.status).toBe('cancelled');
+  });
+});
+
+// ─── completeNodeCancel / completeRunCancel (Step 9 round 1 finding 2) ─────
+
+describe('cancel — completeNodeCancel', () => {
+  it('writes nodeCanceled and replay marks node cancelled', async () => {
+    await bootstrap('a-1', 'at-1');
+    const req = await requestCancel(log, {
+      target: { kind: 'node', nodeId: 'n-1' },
+      reason: 'r',
+      by: 'b',
+    });
+    const e = await completeNodeCancel(log, {
+      nodeId: 'n-1',
+      cancelOriginEventId: req.eventId,
+    });
+    expect(e.type).toBe('nodeCanceled');
+    expect(e.actor).toBe('scheduler');
+    const p = e.payload as { nodeId: string; cancelOriginEventId: string };
+    expect(p.nodeId).toBe('n-1');
+    expect(p.cancelOriginEventId).toBe(req.eventId);
+    const snap = replay(await log.readAll());
+    expect(snap.nodes.get('n-1')?.status).toBe('cancelled');
+    expect(snap.nodes.get('n-1')?.cancelOriginEventId).toBe(req.eventId);
+    // Intent marker cleared once the terminal is written.
+    expect(snap.cancelledNodeIntents.has('n-1')).toBe(false);
+  });
+
+  it('actor override is honored', async () => {
+    await bootstrap('a-1', 'at-1');
+    const req = await requestCancel(log, {
+      target: { kind: 'node', nodeId: 'n-1' },
+      reason: 'r',
+      by: 'b',
+    });
+    const e = await completeNodeCancel(
+      log,
+      { nodeId: 'n-1', cancelOriginEventId: req.eventId },
+      'system',
+    );
+    expect(e.actor).toBe('system');
+  });
+});
+
+describe('cancel — completeRunCancel', () => {
+  it('writes runCanceled and replay marks run cancelled', async () => {
+    await bootstrap('a-1', 'at-1');
+    const req = await requestCancel(log, {
+      target: { kind: 'run', runId: RUN_ID },
+      reason: 'r',
+      by: 'b',
+    });
+    const e = await completeRunCancel(log, {
+      cancelOriginEventId: req.eventId,
+    });
+    expect(e.type).toBe('runCanceled');
+    expect(e.actor).toBe('scheduler');
+    const p = e.payload as { cancelOriginEventId: string };
+    expect(p.cancelOriginEventId).toBe(req.eventId);
+    const snap = replay(await log.readAll());
+    expect(snap.run.status).toBe('cancelled');
+    expect(snap.run.cancelOriginEventId).toBe(req.eventId);
+    expect(snap.cancelledRunIntent).toBeUndefined();
+  });
+});
+
+// ─── Snapshot intent markers (Step 9 round 1 finding 3) ────────────────────
+
+describe('replay — cancel intents on snapshot', () => {
+  it('cancelRequested{run} sets snapshot.cancelledRunIntent (first-cancel-wins)', async () => {
+    await bootstrap('a-1', 'at-1');
+    const first = await requestCancel(log, {
+      target: { kind: 'run', runId: RUN_ID },
+      reason: 'first',
+      by: 'alice',
+    });
+    await requestCancel(log, {
+      target: { kind: 'run', runId: RUN_ID },
+      reason: 'second',
+      by: 'bob',
+    });
+    const snap = replay(await log.readAll());
+    expect(snap.cancelledRunIntent).toEqual({
+      cancelOriginEventId: first.eventId,
+      requestedBy: 'alice',
+      reason: 'first',
+    });
+  });
+
+  it('cancelRequested{node} sets snapshot.cancelledNodeIntents map keyed by nodeId', async () => {
+    await bootstrap('a-1', 'at-1');
+    const req = await requestCancel(log, {
+      target: { kind: 'node', nodeId: 'n-7' },
+      reason: 'abort n-7',
+      by: 'alice',
+    });
+    const snap = replay(await log.readAll());
+    expect(snap.cancelledNodeIntents.get('n-7')).toEqual({
+      cancelOriginEventId: req.eventId,
+      requestedBy: 'alice',
+      reason: 'abort n-7',
+    });
+  });
+
+  it('multiple node intents coexist independently', async () => {
+    await log.append(runCreated);
+    await log.append(attemptCreated('a-1', 'at-1', 'n-1'));
+    await log.append(attemptCreated('a-2', 'at-2', 'n-2'));
+    const r1 = await requestCancel(log, {
+      target: { kind: 'node', nodeId: 'n-1' },
+      reason: 'r1',
+      by: 'a',
+    });
+    const r2 = await requestCancel(log, {
+      target: { kind: 'node', nodeId: 'n-2' },
+      reason: 'r2',
+      by: 'b',
+    });
+    const snap = replay(await log.readAll());
+    expect(snap.cancelledNodeIntents.size).toBe(2);
+    expect(snap.cancelledNodeIntents.get('n-1')?.cancelOriginEventId).toBe(r1.eventId);
+    expect(snap.cancelledNodeIntents.get('n-2')?.cancelOriginEventId).toBe(r2.eventId);
+  });
+
+  it('runCanceled clears the cancelledRunIntent marker', async () => {
+    await bootstrap('a-1', 'at-1');
+    const req = await requestCancel(log, {
+      target: { kind: 'run', runId: RUN_ID },
+      reason: 'r',
+      by: 'b',
+    });
+    // Before runCanceled: intent is set
+    let snap = replay(await log.readAll());
+    expect(snap.cancelledRunIntent?.cancelOriginEventId).toBe(req.eventId);
+    // After runCanceled: intent cleared
+    await completeRunCancel(log, { cancelOriginEventId: req.eventId });
+    snap = replay(await log.readAll());
+    expect(snap.cancelledRunIntent).toBeUndefined();
+  });
+
+  it('activity-target cancel does NOT populate intent markers', async () => {
+    await bootstrap('a-1', 'at-1');
+    await requestCancel(log, {
+      target: { kind: 'activity', activityId: 'a-1' },
+      reason: 'r',
+      by: 'b',
+    });
+    const snap = replay(await log.readAll());
+    expect(snap.cancelledRunIntent).toBeUndefined();
+    expect(snap.cancelledNodeIntents.size).toBe(0);
   });
 });

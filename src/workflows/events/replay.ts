@@ -227,12 +227,48 @@ export type Snapshot = {
   danglingWaitResolutions: string[];
   /**
    * activityIds with a `cancelRequested` targeting them (directly or
-   * via fan-out — Step 10 scheduler concern), but no `activityCanceled`
-   * terminal yet.  Resume materializes the terminal during recovery.
-   * Disjoint from `danglingEffectAttempted` / `danglingWaitResolutions`
-   * to keep the recovery routing unambiguous.
+   * via fan-out — Step 10 scheduler concern), but no terminal yet.
+   *
+   * NOT disjoint from `danglingEffectAttempted` (Step 9 round 1
+   * finding 1):  cancel + effectAttempted is the central case that
+   * `recoverCancelWithReconcile` handles — reconcile fires FIRST to
+   * capture provider evidence, then writes the cancel-flavored
+   * terminal (`activityCanceled` for completedByIdempotentSubmit /
+   * freshRetry; `activityFailed{manual}` when reconcile is
+   * inconclusive).  The orchestrator routes the intersection through
+   * the cancel-with-reconcile path; remaining cancels (no effect)
+   * go through plain `recoverCancel`.
+   *
+   * Disjoint from `danglingWaitResolutions` is still upheld — cancel
+   * + wait combinations are skipped by wait recovery; cancel wins.
    */
   danglingCancels: string[];
+  /**
+   * Run-level cancel intent (Step 9 codex round 1 finding 3).  Set when
+   * a `cancelRequested{kind:run}` lands and not yet `runCanceled`.  Replay
+   * surfaces it so schedulers / dashboards can see "this run is being
+   * cancelled" without re-scanning the event list.  Cleared when
+   * `runCanceled` lands (run.status === 'cancelled').
+   */
+  cancelledRunIntent?: {
+    cancelOriginEventId: string;
+    requestedBy: string;
+    reason: string;
+  };
+  /**
+   * Per-node cancel intents.  Same shape and role as `cancelledRunIntent`
+   * but scoped to a node — set when `cancelRequested{kind:node}` lands
+   * and the node hasn't yet reached `nodeCanceled`.  First request wins
+   * on overlap (consistent with the activity-level fan-out semantics).
+   */
+  cancelledNodeIntents: Map<
+    string,
+    {
+      cancelOriginEventId: string;
+      requestedBy: string;
+      reason: string;
+    }
+  >;
 };
 
 // ─── Replay ─────────────────────────────────────────────────────────────────
@@ -269,6 +305,14 @@ export function replay(events: WorkflowEvent[]): Snapshot {
   const outputs = new Map<string, OutputRef>();
   // Wait tracking: activityId -> resolved (true if waitResolved/Deadline seen)
   const waitsOpen = new Set<string>();
+  // Step 9 finding 3: cancel intents — first request wins.
+  let runCancelIntent:
+    | { cancelOriginEventId: string; requestedBy: string; reason: string }
+    | undefined;
+  const nodeCancelIntents = new Map<
+    string,
+    { cancelOriginEventId: string; requestedBy: string; reason: string }
+  >();
 
   let lastSeq = 0;
 
@@ -686,12 +730,30 @@ export function replay(events: WorkflowEvent[]): Snapshot {
             }
             case 'node': {
               const nodeId = p.target.nodeId;
+              // Record node intent (first cancel wins) regardless of
+              // whether any activities are currently mapped to the node
+              // — the intent stands even if fan-out finds nothing yet.
+              if (!nodeCancelIntents.has(nodeId)) {
+                nodeCancelIntents.set(nodeId, {
+                  cancelOriginEventId: e.eventId,
+                  requestedBy: p.by,
+                  reason: p.reason,
+                });
+              }
               for (const act of activities.values()) {
                 if (act.ownerNodeId === nodeId) markActivity(act);
               }
               break;
             }
             case 'run': {
+              // Record run intent (first cancel wins).
+              if (!runCancelIntent) {
+                runCancelIntent = {
+                  cancelOriginEventId: e.eventId,
+                  requestedBy: p.by,
+                  reason: p.reason,
+                };
+              }
               for (const act of activities.values()) markActivity(act);
               break;
             }
@@ -714,9 +776,17 @@ export function replay(events: WorkflowEvent[]): Snapshot {
       // ─── System / Recovery ──────────────────────────────────────────
       case 'workerLost':
       case 'resumeStarted': {
-        // No deterministic state projection during replay.  Resume logic
-        // (Step 7) reads these events directly to drive recovery; replay
-        // just preserves them in the event order for downstream use.
+        // No state projection: these are audit-only.
+        //   - `workerLost` (Step 10) is informational — the runtime emits
+        //     it when a worker disappears with in-flight activityIds, and
+        //     the lost activities surface through the normal dangling
+        //     paths (no terminals, so they show up in danglingActivities
+        //     and feed reconcile / WorkerCrashed recovery).  Replay
+        //     doesn't need to mutate state to make that work.
+        //   - `resumeStarted` (Step 7) is written BY resume itself as the
+        //     first event of a recovery cycle; downstream consumers may
+        //     read it for audit/forensics, but replay just preserves it
+        //     in the event order.
         void (e as WorkerLostEvent | ResumeStartedEvent);
         break;
       }
@@ -792,6 +862,21 @@ export function replay(events: WorkflowEvent[]): Snapshot {
 
   const danglingWaits = Array.from(waitsOpen);
 
+  // Drop intents that already reached their terminal.  Spec §2.5:
+  // run/nodeCanceled writes the cancel terminal; once present the intent
+  // is no longer in-flight.  The intent stays set when the terminal
+  // hasn't been written (caller / scheduler still needs to complete it).
+  const cancelledRunIntent = run.status === 'cancelled' ? undefined : runCancelIntent;
+  const cancelledNodeIntents = new Map<
+    string,
+    { cancelOriginEventId: string; requestedBy: string; reason: string }
+  >();
+  for (const [nodeId, intent] of nodeCancelIntents) {
+    const node = nodes.get(nodeId);
+    if (node?.status === 'cancelled') continue;
+    cancelledNodeIntents.set(nodeId, intent);
+  }
+
   return {
     run,
     nodes,
@@ -803,5 +888,7 @@ export function replay(events: WorkflowEvent[]): Snapshot {
     danglingWaitResolutions,
     danglingCancels,
     danglingWaits,
+    cancelledRunIntent,
+    cancelledNodeIntents,
   };
 }
