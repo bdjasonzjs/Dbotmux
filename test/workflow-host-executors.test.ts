@@ -1,0 +1,464 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { tmpdir } from 'node:os';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { EventLog, type EventDraft } from '../src/workflows/events/append.js';
+import {
+  executeSideEffect,
+  type HostExecutorContext,
+  type SideEffectingExecutor,
+} from '../src/workflows/hostExecutors/index.js';
+import { deriveIdempotencyKey } from '../src/workflows/events/idempotency.js';
+
+// ─── Test fixtures ──────────────────────────────────────────────────────────
+
+const RUN_ID = 'run-host-exec-01';
+const SHA64 = 'a'.repeat(64);
+
+let baseDir: string;
+let log: EventLog;
+
+beforeEach(() => {
+  baseDir = mkdtempSync(join(tmpdir(), 'wf-host-exec-'));
+  log = new EventLog(RUN_ID, baseDir);
+});
+afterEach(() => {
+  rmSync(baseDir, { recursive: true, force: true });
+});
+
+function context(overrides: Partial<HostExecutorContext> = {}): HostExecutorContext {
+  return {
+    log,
+    runId: RUN_ID,
+    workflowId: 'wf-demo',
+    revisionId: 'rev-001',
+    nodeId: 'n1',
+    activityId: 'a1',
+    attemptId: 'at1',
+    ...overrides,
+  };
+}
+
+async function seedRun(): Promise<void> {
+  // Replay needs runCreated as the first event.  Any test reading events
+  // back must call this first; otherwise readAll is just the protocol
+  // events and replay() will reject.
+  await log.append({
+    runId: RUN_ID,
+    type: 'runCreated',
+    actor: 'scheduler',
+    payload: {
+      workflowId: 'wf-demo',
+      revisionId: 'rev-001',
+      inputRef: { outputHash: `sha256:${SHA64}`, outputBytes: 1, outputSchemaVersion: 1 },
+      initiator: 'tests',
+    },
+  } as EventDraft);
+}
+
+// ─── Mock executor: tracks invoke calls + can be configured to throw ────────
+
+function makeMockExecutor(opts: {
+  output?: unknown;
+  externalRefs?: Record<string, unknown>;
+  throws?: Error;
+  classifier?: SideEffectingExecutor<any, any>['classifyError'];
+} = {}): SideEffectingExecutor<{ x: string }, { y: string }> & {
+  calls: Array<{ input: { x: string }; idempotencyKey: string }>;
+} {
+  const calls: Array<{ input: { x: string }; idempotencyKey: string }> = [];
+  return {
+    provider: 'mock-provider',
+    idempotencyTtlMs: 60000,
+    canonicalInput(input) {
+      return { x: input.x };
+    },
+    async invoke(input, idempotencyKey) {
+      calls.push({ input, idempotencyKey });
+      if (opts.throws) throw opts.throws;
+      return {
+        output: (opts.output ?? { y: 'ok' }) as { y: string },
+        externalRefs: opts.externalRefs ?? { mockId: 'mock-123' },
+      };
+    },
+    classifyError: opts.classifier,
+    calls,
+  };
+}
+
+// ─── executeSideEffect — happy path ─────────────────────────────────────────
+
+describe('executeSideEffect — happy path event sequence', () => {
+  it('writes effectAttempted then activitySucceeded in order', async () => {
+    await seedRun();
+    const exec = makeMockExecutor();
+    const result = await executeSideEffect(context(), { x: 'hi' }, exec);
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.output).toEqual({ y: 'ok' });
+    expect(result.externalRefs).toEqual({ mockId: 'mock-123' });
+
+    const events = await log.readAll();
+    expect(events.map((e) => e.type)).toEqual([
+      'runCreated',
+      'effectAttempted',
+      'activitySucceeded',
+    ]);
+
+    const effectAttempted = events[1] as any;
+    const succeeded = events[2] as any;
+    expect(effectAttempted.payload.activityId).toBe('a1');
+    expect(effectAttempted.payload.attemptId).toBe('at1');
+    expect(effectAttempted.payload.provider).toBe('mock-provider');
+    expect(effectAttempted.payload.idempotencyTtlMs).toBe(60000);
+    expect(succeeded.payload.activityId).toBe('a1');
+    expect(succeeded.payload.attemptId).toBe('at1');
+    expect(succeeded.payload.externalRefs).toEqual({ mockId: 'mock-123' });
+  });
+
+  it('forwards a deterministic idempotencyKey to executor.invoke', async () => {
+    await seedRun();
+    const exec = makeMockExecutor();
+    await executeSideEffect(context(), { x: 'hi' }, exec);
+    expect(exec.calls).toHaveLength(1);
+    expect(exec.calls[0].idempotencyKey).toBe(
+      deriveIdempotencyKey({
+        workflowId: 'wf-demo',
+        revisionId: 'rev-001',
+        runId: RUN_ID,
+        nodeId: 'n1',
+        attemptId: 'at1',
+      }),
+    );
+    expect(exec.calls[0].idempotencyKey.length).toBeLessThanOrEqual(50);
+  });
+
+  it('records canonical inputHash on effectAttempted', async () => {
+    await seedRun();
+    const exec = makeMockExecutor();
+    await executeSideEffect(context(), { x: 'frozen-input' }, exec);
+    const events = await log.readAll();
+    const effectAttempted = events[1] as any;
+    expect(effectAttempted.payload.inputHash).toMatch(/^sha256:[0-9a-f]{64}$/);
+  });
+
+  it('activitySucceeded carries an outputRef with hash of externalRefs', async () => {
+    await seedRun();
+    const exec = makeMockExecutor({ externalRefs: { messageId: 'om_abc' } });
+    await executeSideEffect(context(), { x: 'y' }, exec);
+    const events = await log.readAll();
+    const succeeded = events[2] as any;
+    expect(succeeded.payload.outputRef.outputHash).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(succeeded.payload.outputRef.contentType).toBe('application/json');
+  });
+});
+
+// ─── executeSideEffect — failure paths ──────────────────────────────────────
+
+describe('executeSideEffect — failure paths', () => {
+  it('writes activityFailed with classifier output', async () => {
+    await seedRun();
+    const exec = makeMockExecutor({
+      throws: new Error('boom'),
+      classifier: () => ({
+        errorCode: 'NetworkError',
+        errorClass: 'retryable',
+        errorMessage: 'network down',
+      }),
+    });
+    const result = await executeSideEffect(context(), { x: 'y' }, exec);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error.errorCode).toBe('NetworkError');
+    expect(result.error.errorClass).toBe('retryable');
+
+    const events = await log.readAll();
+    expect(events.map((e) => e.type)).toEqual([
+      'runCreated',
+      'effectAttempted', // still written before invoke
+      'activityFailed',
+    ]);
+    const failed = events[2] as any;
+    expect(failed.payload.error.errorCode).toBe('NetworkError');
+    expect(failed.payload.error.errorClass).toBe('retryable');
+    expect(failed.payload.error.errorMessage).toBe('network down');
+  });
+
+  it('falls back to UnknownProviderError/manual when no classifier', async () => {
+    await seedRun();
+    const exec = makeMockExecutor({ throws: new Error('huh?') });
+    const result = await executeSideEffect(context(), { x: 'y' }, exec);
+    if (result.ok) throw new Error('expected failure');
+    expect(result.error.errorCode).toBe('UnknownProviderError');
+    expect(result.error.errorClass).toBe('manual');
+    expect(result.error.errorMessage).toBe('huh?');
+  });
+
+  it('falls back to UnknownProviderError/manual when classifier returns null', async () => {
+    await seedRun();
+    const exec = makeMockExecutor({
+      throws: new Error('weird'),
+      classifier: () => null,
+    });
+    const result = await executeSideEffect(context(), { x: 'y' }, exec);
+    if (result.ok) throw new Error('expected failure');
+    expect(result.error.errorCode).toBe('UnknownProviderError');
+    expect(result.error.errorClass).toBe('manual');
+  });
+
+  it('truncates long error messages to fit the envelope payload cap', async () => {
+    // Truncation budget is 2048 chars — schema allows 4096 but envelope
+    // payload cap is also 4096 bytes, so we leave headroom for the rest
+    // of the JSON envelope (activityId/attemptId/errorCode/etc).
+    await seedRun();
+    const longMsg = 'x'.repeat(5000);
+    const exec = makeMockExecutor({ throws: new Error(longMsg) });
+    const result = await executeSideEffect(context(), { x: 'y' }, exec);
+    if (result.ok) throw new Error('expected failure');
+    expect(result.error.errorMessage.length).toBeLessThanOrEqual(2048);
+    expect(result.error.errorMessage.endsWith('...')).toBe(true);
+  });
+
+  it('truncates classifier-returned long messages too', async () => {
+    await seedRun();
+    const longMsg = 'y'.repeat(5000);
+    const exec = makeMockExecutor({
+      throws: new Error('boom'),
+      classifier: () => ({
+        errorCode: 'NetworkError',
+        errorClass: 'retryable',
+        errorMessage: longMsg,
+      }),
+    });
+    const result = await executeSideEffect(context(), { x: 'y' }, exec);
+    if (result.ok) throw new Error('expected failure');
+    expect(result.error.errorMessage.length).toBeLessThanOrEqual(2048);
+  });
+});
+
+// ─── feishu-send + feishu-reply: canonicalInput shape ──────────────────────
+
+describe('feishuSendExecutor.canonicalInput', () => {
+  it('covers receive_id + msg_type + content + larkAppId (spike §1.5)', async () => {
+    const { feishuSendExecutor } = await import(
+      '../src/workflows/hostExecutors/feishu-send.js'
+    );
+    const canonical = feishuSendExecutor.canonicalInput({
+      larkAppId: 'cli_x',
+      chatId: 'oc_y',
+      content: 'hello',
+    });
+    expect(canonical).toEqual({
+      receive_id: 'oc_y',
+      receive_id_type: 'chat_id',
+      msg_type: 'text',
+      content: 'hello',
+      larkAppId: 'cli_x',
+    });
+  });
+
+  it('respects custom msgType', async () => {
+    const { feishuSendExecutor } = await import(
+      '../src/workflows/hostExecutors/feishu-send.js'
+    );
+    const canonical = feishuSendExecutor.canonicalInput({
+      larkAppId: 'cli_x',
+      chatId: 'oc_y',
+      content: '{"text":"hi"}',
+      msgType: 'interactive',
+    });
+    expect((canonical as any).msg_type).toBe('interactive');
+  });
+});
+
+describe('feishuReplyExecutor.canonicalInput', () => {
+  it('pins root_message_id (spike test 3c: parent ignored by Feishu uuid)', async () => {
+    const { feishuReplyExecutor } = await import(
+      '../src/workflows/hostExecutors/feishu-reply.js'
+    );
+    const canonical = feishuReplyExecutor.canonicalInput({
+      larkAppId: 'cli_x',
+      rootMessageId: 'om_parent',
+      content: 'reply',
+    });
+    expect(canonical).toEqual({
+      root_message_id: 'om_parent',
+      msg_type: 'text',
+      content: 'reply',
+      reply_in_thread: false,
+      larkAppId: 'cli_x',
+    });
+  });
+
+  it('different rootMessageId → different canonicalInput → different inputHash', async () => {
+    const { feishuReplyExecutor } = await import(
+      '../src/workflows/hostExecutors/feishu-reply.js'
+    );
+    const { computeInputHash } = await import('../src/workflows/events/idempotency.js');
+    const a = computeInputHash(
+      feishuReplyExecutor.canonicalInput({
+        larkAppId: 'cli_x',
+        rootMessageId: 'om_A',
+        content: 'reply',
+      }),
+    );
+    const b = computeInputHash(
+      feishuReplyExecutor.canonicalInput({
+        larkAppId: 'cli_x',
+        rootMessageId: 'om_B',
+        content: 'reply',
+      }),
+    );
+    expect(a).not.toBe(b);
+  });
+});
+
+// ─── botmux-schedule: integration with schedule-store ──────────────────────
+
+describe('botmuxScheduleExecutor invoke()', () => {
+  // We can't easily mock schedule-store because it pulls a side-effecting
+  // singleton tree (config, logger, dashboard events).  Use a freshImport
+  // pattern like the other schedule tests and verify behaviour end-to-end.
+  let tempDataDir: string;
+
+  beforeEach(() => {
+    tempDataDir = mkdtempSync(join(tmpdir(), 'wf-host-exec-sched-'));
+  });
+  afterEach(() => {
+    rmSync(tempDataDir, { recursive: true, force: true });
+  });
+
+  it('creates a task with id=idempotencyKey, returns externalRefs.taskId', async () => {
+    // We need to mock config + logger BEFORE importing botmux-schedule
+    // because it transitively imports schedule-store.
+    vi.resetModules();
+    vi.doMock('../src/config.js', () => ({
+      config: {
+        session: {
+          get dataDir() {
+            return tempDataDir;
+          },
+        },
+      },
+    }));
+    vi.doMock('../src/utils/logger.js', () => ({
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    }));
+
+    const { botmuxScheduleExecutor } = await import(
+      '../src/workflows/hostExecutors/botmux-schedule.js'
+    );
+    const { getTask } = await import('../src/services/schedule-store.js');
+
+    const idemKey = 'wf_test_schedule_idem';
+    const result = await botmuxScheduleExecutor.invoke(
+      {
+        name: 'Daily',
+        schedule: '0 9 * * *',
+        parsed: { kind: 'cron', expr: '0 9 * * *', display: '0 9 * * *' },
+        prompt: 'do the thing',
+        workingDir: '/wd',
+        chatId: 'oc_x',
+      },
+      idemKey,
+    );
+
+    expect(result.output.taskId).toBe(idemKey);
+    expect(result.externalRefs).toEqual({ taskId: idemKey });
+    expect(getTask(idemKey)?.name).toBe('Daily');
+  });
+
+  it('re-invoke with same input idempotent (returns same taskId)', async () => {
+    vi.resetModules();
+    vi.doMock('../src/config.js', () => ({
+      config: { session: { get dataDir() { return tempDataDir; } } },
+    }));
+    vi.doMock('../src/utils/logger.js', () => ({
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    }));
+
+    const { botmuxScheduleExecutor } = await import(
+      '../src/workflows/hostExecutors/botmux-schedule.js'
+    );
+
+    const idemKey = 'wf_test_schedule_rerun';
+    const input = {
+      name: 'Daily',
+      schedule: '0 9 * * *',
+      parsed: { kind: 'cron' as const, expr: '0 9 * * *', display: '0 9 * * *' },
+      prompt: 'do',
+      workingDir: '/wd',
+      chatId: 'oc_x',
+    };
+    const a = await botmuxScheduleExecutor.invoke(input, idemKey);
+    const b = await botmuxScheduleExecutor.invoke(input, idemKey);
+    expect(b.output.taskId).toBe(a.output.taskId);
+  });
+
+  it('classifies IdempotencyConflictError as fatal/IdempotencyConflict', async () => {
+    vi.resetModules();
+    vi.doMock('../src/config.js', () => ({
+      config: { session: { get dataDir() { return tempDataDir; } } },
+    }));
+    vi.doMock('../src/utils/logger.js', () => ({
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    }));
+    const { botmuxScheduleExecutor } = await import(
+      '../src/workflows/hostExecutors/botmux-schedule.js'
+    );
+    const { IdempotencyConflictError } = await import(
+      '../src/services/schedule-store.js'
+    );
+    const conflict = new IdempotencyConflictError({
+      taskId: 't',
+      existingInputHash: 'sha256:' + '1'.repeat(64),
+      incomingInputHash: 'sha256:' + '2'.repeat(64),
+    });
+    const cls = botmuxScheduleExecutor.classifyError!(conflict);
+    expect(cls?.errorCode).toBe('IdempotencyConflict');
+    expect(cls?.errorClass).toBe('fatal');
+  });
+});
+
+// ─── feishuSendExecutor error classifier ────────────────────────────────────
+
+describe('classifyFeishuError', () => {
+  it('classifies MessageWithdrawnError as manual', async () => {
+    const { classifyFeishuError } = await import(
+      '../src/workflows/hostExecutors/feishu-send.js'
+    );
+    const { MessageWithdrawnError } = await import('../src/im/lark/client.js');
+    const cls = classifyFeishuError(new MessageWithdrawnError('om_x'));
+    expect(cls?.errorCode).toBe('UnknownProviderError');
+    expect(cls?.errorClass).toBe('manual');
+  });
+
+  it('classifies HTTP 429 as ProviderRateLimited/retryable', async () => {
+    const { classifyFeishuError } = await import(
+      '../src/workflows/hostExecutors/feishu-send.js'
+    );
+    const err = Object.assign(new Error('rate limited'), {
+      response: { status: 429 },
+    });
+    const cls = classifyFeishuError(err);
+    expect(cls?.errorCode).toBe('ProviderRateLimited');
+    expect(cls?.errorClass).toBe('retryable');
+  });
+
+  it('classifies ECONNREFUSED as NetworkError/retryable', async () => {
+    const { classifyFeishuError } = await import(
+      '../src/workflows/hostExecutors/feishu-send.js'
+    );
+    const cls = classifyFeishuError(new Error('connect ECONNREFUSED 127.0.0.1'));
+    expect(cls?.errorCode).toBe('NetworkError');
+    expect(cls?.errorClass).toBe('retryable');
+  });
+
+  it('returns null for unknown errors (falls back to protocol default)', async () => {
+    const { classifyFeishuError } = await import(
+      '../src/workflows/hostExecutors/feishu-send.js'
+    );
+    expect(classifyFeishuError(new Error('something else'))).toBeNull();
+  });
+});
