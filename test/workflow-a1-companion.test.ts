@@ -102,9 +102,21 @@ describe('schedule-demo workflow — A1 dogfood', () => {
     expect(effect.payload.inputHash).toMatch(/^sha256:[0-9a-f]{64}$/);
 
     const succeeded = events.find((e) => e.type === 'activitySucceeded')! as {
-      payload: { externalRefs: { taskId: string } };
+      payload: {
+        externalRefs: { taskId: string };
+        outputRef: { outputPath: string; outputHash: string; contentType?: string };
+      };
     };
     expect(succeeded.payload.externalRefs.taskId).toBe(effect.payload.idempotencyKey);
+    expect(succeeded.payload.outputRef.contentType).toBe('application/json');
+
+    // B-output: outputRef points at a readable JSON blob containing
+    // both `output` (executor's typed return) and `externalRefs`.
+    const blob = JSON.parse(await fs.readFile(succeeded.payload.outputRef.outputPath, 'utf-8'));
+    expect(blob).toEqual({
+      output: { taskId: effect.payload.idempotencyKey },
+      externalRefs: { taskId: effect.payload.idempotencyKey },
+    });
 
     const task = getTask(effect.payload.idempotencyKey);
     expect(task?.name).toBe('schedule-demo daily 9am');

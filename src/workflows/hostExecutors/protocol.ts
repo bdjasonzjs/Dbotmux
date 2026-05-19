@@ -1,3 +1,4 @@
+import { writeJsonBlob } from '../blob.js';
 import { computeInputHash, deriveIdempotencyKey } from '../events/idempotency.js';
 import type {
   ActivityFailedEvent,
@@ -76,14 +77,20 @@ export async function executeSideEffect<I, O>(
   try {
     const { output, externalRefs } = await executor.invoke(input, idempotencyKey);
 
-    // 3a. activitySucceeded.  outputRef is a content-addressed reference
-    //     to the output — for v0 we hash the externalRefs as a stand-in
-    //     "output" since the side-effect activities don't produce
-    //     standalone output beyond the provider's returned identifiers.
-    //     Step 7+ may add richer output (full provider response blob ref)
-    //     but the externalRefs are the source of truth for resume.
-    const outputBuf = Buffer.from(JSON.stringify(externalRefs), 'utf-8');
-    const outputHash = await sha256Hex(outputBuf);
+    // 3a. activitySucceeded.  outputRef points at a real JSON blob
+    //     `{ output, externalRefs }` so dashboard / CLI show / reconcile
+    //     evidence can inspect the full provider response without
+    //     replaying events.  We keep `externalRefs` on the event payload
+    //     too — replay/reconciler reads it without touching disk.
+    //
+    //     Non-plain-JSON outputs (Date, Map, Set, Buffer, BigInt,
+    //     function) are rejected here so they fall through the same
+    //     classifier path as a provider crash.  Executors must return
+    //     plain JSON-serializable values; silently coercing a Date to
+    //     `{}` would corrupt the audit trail.
+    assertJsonPlain(output, 'output');
+    assertJsonPlain(externalRefs, 'externalRefs');
+    const outputRef = await writeJsonBlob(ctx.log, { output, externalRefs });
 
     const successEvent = (await ctx.log.append({
       runId: ctx.runId,
@@ -92,12 +99,7 @@ export async function executeSideEffect<I, O>(
       payload: {
         activityId: ctx.activityId,
         attemptId: ctx.attemptId,
-        outputRef: {
-          outputHash: `sha256:${outputHash}`,
-          outputBytes: outputBuf.length,
-          outputSchemaVersion: 1,
-          contentType: 'application/json',
-        },
+        outputRef,
         externalRefs,
       },
     } as Omit<ActivitySucceededEvent, 'eventId' | 'schemaVersion'>)) as ActivitySucceededEvent;
@@ -161,9 +163,48 @@ function defaultClassification(err: unknown): ExecutorErrorClassification {
   };
 }
 
-async function sha256Hex(buf: Buffer): Promise<string> {
-  // Imported lazily to avoid bundling crypto unnecessarily at module init
-  // and to keep this file small for review.
-  const { createHash } = await import('node:crypto');
-  return createHash('sha256').update(buf).digest('hex');
+/**
+ * Reject non-plain-JSON values before they reach `writeJsonBlob`, where
+ * `canonicalJsonStringify` would silently coerce a Date / Map / Set into
+ * `{}`.  Path-prefixed error messages so the classifier can surface
+ * which field tripped it.
+ */
+function assertJsonPlain(value: unknown, path: string): void {
+  if (value === null) return;
+  const t = typeof value;
+  if (t === 'string' || t === 'number' || t === 'boolean' || t === 'undefined') {
+    // `undefined` is JSON-omitted, not a serialization failure — only
+    // reject the explicitly hostile types below.
+    return;
+  }
+  if (t === 'bigint') {
+    throw new Error(`hostExecutor output not JSON-serializable at ${path}: BigInt`);
+  }
+  if (t === 'function' || t === 'symbol') {
+    throw new Error(`hostExecutor output not JSON-serializable at ${path}: ${t}`);
+  }
+  if (value instanceof Date) {
+    throw new Error(`hostExecutor output not JSON-serializable at ${path}: Date (use .toISOString() string)`);
+  }
+  if (value instanceof Map || value instanceof Set) {
+    throw new Error(`hostExecutor output not JSON-serializable at ${path}: ${value.constructor.name}`);
+  }
+  if (Buffer.isBuffer(value) || ArrayBuffer.isView(value) || value instanceof ArrayBuffer) {
+    throw new Error(`hostExecutor output not JSON-serializable at ${path}: binary buffer`);
+  }
+  if (Array.isArray(value)) {
+    value.forEach((v, i) => assertJsonPlain(v, `${path}[${i}]`));
+    return;
+  }
+  const obj = value as object;
+  const proto = Object.getPrototypeOf(obj);
+  if (proto !== Object.prototype && proto !== null) {
+    const ctorName = (obj as { constructor?: { name?: string } }).constructor?.name ?? 'unknown';
+    throw new Error(
+      `hostExecutor output not JSON-serializable at ${path}: non-plain object (${ctorName})`,
+    );
+  }
+  for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
+    assertJsonPlain(v, `${path}.${k}`);
+  }
 }

@@ -152,6 +152,37 @@ describe('executeSideEffect — happy path event sequence', () => {
     expect(succeeded.payload.outputRef.outputHash).toMatch(/^sha256:[0-9a-f]{64}$/);
     expect(succeeded.payload.outputRef.contentType).toBe('application/json');
   });
+
+  it('outputRef points at a JSON blob containing {output, externalRefs}', async () => {
+    const { readFileSync } = await import('node:fs');
+    await seedRun();
+    const exec = makeMockExecutor({
+      output: { y: 'detail' },
+      externalRefs: { messageId: 'om_xyz' },
+    });
+    await executeSideEffect(context(), { x: 'y' }, exec);
+    const events = await log.readAll();
+    const succeeded = events[2] as any;
+    const outputPath = succeeded.payload.outputRef.outputPath;
+    expect(typeof outputPath).toBe('string');
+    const blob = JSON.parse(readFileSync(outputPath, 'utf-8'));
+    expect(blob).toEqual({
+      output: { y: 'detail' },
+      externalRefs: { messageId: 'om_xyz' },
+    });
+  });
+
+  it('outputRef.outputBytes matches the actual blob size', async () => {
+    const { statSync } = await import('node:fs');
+    await seedRun();
+    const exec = makeMockExecutor({ externalRefs: { id: 'abc' } });
+    await executeSideEffect(context(), { x: 'y' }, exec);
+    const events = await log.readAll();
+    const succeeded = events[2] as any;
+    expect(statSync(succeeded.payload.outputRef.outputPath).size).toBe(
+      succeeded.payload.outputRef.outputBytes,
+    );
+  });
 });
 
 // ─── executeSideEffect — failure paths ──────────────────────────────────────
@@ -234,6 +265,54 @@ describe('executeSideEffect — failure paths', () => {
     const result = await executeSideEffect(context(), { x: 'y' }, exec);
     if (result.ok) throw new Error('expected failure');
     expect(result.error.errorMessage.length).toBeLessThanOrEqual(2048);
+  });
+
+  it('rejects non-plain-JSON output (Date) via activityFailed instead of silent coerce', async () => {
+    await seedRun();
+    const exec: SideEffectingExecutor<{ x: string }, any> = {
+      provider: 'mock-provider',
+      idempotencyTtlMs: 60000,
+      canonicalInput(input) {
+        return { x: input.x };
+      },
+      async invoke() {
+        return {
+          output: { when: new Date('2026-05-19T00:00:00Z') },
+          externalRefs: { mockId: 'm1' },
+        };
+      },
+    };
+    const result = await executeSideEffect(context(), { x: 'y' }, exec);
+    if (result.ok) throw new Error('expected failure');
+    expect(result.error.errorCode).toBe('UnknownProviderError');
+    expect(result.error.errorClass).toBe('manual');
+    expect(result.error.errorMessage).toMatch(/JSON-serializable.*Date/);
+    const events = await log.readAll();
+    expect(events.map((e) => e.type)).toEqual([
+      'runCreated',
+      'effectAttempted',
+      'activityFailed',
+    ]);
+  });
+
+  it('rejects non-plain-JSON externalRefs (Map) the same way', async () => {
+    await seedRun();
+    const exec: SideEffectingExecutor<{ x: string }, any> = {
+      provider: 'mock-provider',
+      idempotencyTtlMs: 60000,
+      canonicalInput(input) {
+        return { x: input.x };
+      },
+      async invoke() {
+        return {
+          output: { ok: true },
+          externalRefs: { tags: new Map([['k', 'v']]) } as any,
+        };
+      },
+    };
+    const result = await executeSideEffect(context(), { x: 'y' }, exec);
+    if (result.ok) throw new Error('expected failure');
+    expect(result.error.errorMessage).toMatch(/JSON-serializable.*Map/);
   });
 });
 
