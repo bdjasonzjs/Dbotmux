@@ -1,5 +1,8 @@
+import { z } from 'zod';
+
 import { sendMessage, MessageWithdrawnError } from '../../im/lark/client.js';
 import { PROVIDER_TTL_MS } from '../events/schema.js';
+import type { ProviderReconciler } from '../resume.js';
 import type {
   ExecutorErrorClassification,
   SideEffectingExecutor,
@@ -22,6 +25,17 @@ export type FeishuSendInput = {
 export type FeishuSendOutput = {
   messageId: string;
 };
+
+const FeishuSendInputSchema = z.object({
+  larkAppId: z.string().min(1),
+  chatId: z.string().min(1),
+  content: z.string(),
+  msgType: z.string().min(1).optional(),
+});
+
+export function parseFeishuSendInput(input: unknown): FeishuSendInput {
+  return FeishuSendInputSchema.parse(input);
+}
 
 export const feishuSendExecutor: SideEffectingExecutor<FeishuSendInput, FeishuSendOutput> = {
   provider: 'feishu-im',
@@ -59,6 +73,42 @@ export const feishuSendExecutor: SideEffectingExecutor<FeishuSendInput, FeishuSe
 
   classifyError(err) {
     return classifyFeishuError(err);
+  },
+};
+
+export const feishuSendReconciler: ProviderReconciler = {
+  provider: 'feishu-im',
+  requiresEffectInput: true,
+
+  async idempotentSubmit(idempotencyKey, input) {
+    let parsed: FeishuSendInput;
+    try {
+      parsed = parseFeishuSendInput(input);
+    } catch (err) {
+      return {
+        ok: false,
+        errorCode: 'InputValidationFailed',
+        errorClass: 'manual',
+        errorMessage: err instanceof Error ? err.message : String(err),
+        evidence: { source: 'idempotentSubmit', reason: 'invalid_effect_input' },
+      };
+    }
+
+    try {
+      const { externalRefs } = await feishuSendExecutor.invoke(parsed, idempotencyKey);
+      return {
+        ok: true,
+        externalRefs,
+        evidence: { source: 'idempotentSubmit', externalRefs },
+      };
+    } catch (err) {
+      const classification = classifyFeishuError(err) ?? defaultFeishuClassification(err);
+      return {
+        ok: false,
+        ...classification,
+        evidence: { source: 'idempotentSubmit' },
+      };
+    }
   },
 };
 
@@ -103,4 +153,12 @@ export function classifyFeishuError(err: unknown): ExecutorErrorClassification |
   // Unknown — fall through to protocol default (UnknownProviderError /
   // manual) by returning null.
   return null;
+}
+
+function defaultFeishuClassification(err: unknown): ExecutorErrorClassification {
+  return {
+    errorCode: 'UnknownProviderError',
+    errorClass: 'manual',
+    errorMessage: err instanceof Error ? err.message : String(err),
+  };
 }

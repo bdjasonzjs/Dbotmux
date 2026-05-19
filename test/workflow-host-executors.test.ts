@@ -319,6 +319,11 @@ describe('executeSideEffect — failure paths', () => {
 // ─── feishu-send + feishu-reply: canonicalInput shape ──────────────────────
 
 describe('feishuSendExecutor.canonicalInput', () => {
+  afterEach(() => {
+    vi.doUnmock('../src/im/lark/client.js');
+    vi.resetModules();
+  });
+
   it('covers receive_id + msg_type + content + larkAppId (spike §1.5)', async () => {
     const { feishuSendExecutor } = await import(
       '../src/workflows/hostExecutors/feishu-send.js'
@@ -348,6 +353,117 @@ describe('feishuSendExecutor.canonicalInput', () => {
       msgType: 'interactive',
     });
     expect((canonical as any).msg_type).toBe('interactive');
+  });
+
+  it('parseFeishuSendInput validates the workflow input shape', async () => {
+    const { parseFeishuSendInput } = await import(
+      '../src/workflows/hostExecutors/feishu-send.js'
+    );
+    expect(parseFeishuSendInput({
+      larkAppId: 'cli_x',
+      chatId: 'oc_y',
+      content: 'hello',
+    })).toEqual({
+      larkAppId: 'cli_x',
+      chatId: 'oc_y',
+      content: 'hello',
+    });
+    expect(() => parseFeishuSendInput({ chatId: 'oc_y', content: 'hello' })).toThrow();
+  });
+
+  it('invoke forwards the runtime idempotencyKey to sendMessage uuid', async () => {
+    vi.resetModules();
+    const sendMessage = vi.fn(async () => 'om_sent_1');
+    vi.doMock('../src/im/lark/client.js', () => ({
+      sendMessage,
+      MessageWithdrawnError: class MessageWithdrawnError extends Error {},
+    }));
+    const { feishuSendExecutor } = await import(
+      '../src/workflows/hostExecutors/feishu-send.js'
+    );
+
+    const result = await feishuSendExecutor.invoke(
+      {
+        larkAppId: 'cli_x',
+        chatId: 'oc_y',
+        content: 'hello',
+      },
+      'wf_idem_key',
+    );
+
+    expect(sendMessage).toHaveBeenCalledWith('cli_x', 'oc_y', 'hello', 'text', 'wf_idem_key');
+    expect(result).toEqual({
+      output: { messageId: 'om_sent_1' },
+      externalRefs: { messageId: 'om_sent_1' },
+    });
+  });
+
+  it('reconciler idempotentSubmit reuses the same Feishu uuid', async () => {
+    vi.resetModules();
+    const sendMessage = vi.fn(async () => 'om_replayed');
+    vi.doMock('../src/im/lark/client.js', () => ({
+      sendMessage,
+      MessageWithdrawnError: class MessageWithdrawnError extends Error {},
+    }));
+    const { feishuSendReconciler } = await import(
+      '../src/workflows/hostExecutors/feishu-send.js'
+    );
+
+    const result = await feishuSendReconciler.idempotentSubmit!('wf_retry_key', {
+      larkAppId: 'cli_x',
+      chatId: 'oc_y',
+      content: 'hello',
+      msgType: 'text',
+    });
+
+    expect(feishuSendReconciler.requiresEffectInput).toBe(true);
+    expect(sendMessage).toHaveBeenCalledWith('cli_x', 'oc_y', 'hello', 'text', 'wf_retry_key');
+    expect(result).toMatchObject({
+      ok: true,
+      externalRefs: { messageId: 'om_replayed' },
+      evidence: { source: 'idempotentSubmit', externalRefs: { messageId: 'om_replayed' } },
+    });
+  });
+
+  it('reconciler maps transient Feishu submit failures to retryable', async () => {
+    vi.resetModules();
+    const sendMessage = vi.fn(async () => {
+      const err = Object.assign(new Error('rate limited'), { response: { status: 429 } });
+      throw err;
+    });
+    vi.doMock('../src/im/lark/client.js', () => ({
+      sendMessage,
+      MessageWithdrawnError: class MessageWithdrawnError extends Error {},
+    }));
+    const { feishuSendReconciler } = await import(
+      '../src/workflows/hostExecutors/feishu-send.js'
+    );
+
+    const result = await feishuSendReconciler.idempotentSubmit!('wf_retry_key', {
+      larkAppId: 'cli_x',
+      chatId: 'oc_y',
+      content: 'hello',
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      errorCode: 'ProviderRateLimited',
+      errorClass: 'retryable',
+    });
+  });
+});
+
+describe('default hostExecutor registry', () => {
+  it('registers botmux-schedule and feishu-send executors/reconcilers', async () => {
+    const {
+      createDefaultHostExecutorRegistry,
+      createDefaultProviderReconcilers,
+    } = await import('../src/workflows/hostExecutors/registry.js');
+
+    expect(createDefaultHostExecutorRegistry().has('botmux-schedule')).toBe(true);
+    expect(createDefaultHostExecutorRegistry().has('feishu-send')).toBe(true);
+    expect(createDefaultProviderReconcilers().has('botmux-schedule')).toBe(true);
+    expect(createDefaultProviderReconcilers().has('feishu-im')).toBe(true);
   });
 });
 
