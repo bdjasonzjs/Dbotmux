@@ -36,11 +36,53 @@ export const RetryPolicySchema = z.object({
 });
 export type RetryPolicy = z.infer<typeof RetryPolicySchema>;
 
+/**
+ * Output binding — `{ "$ref": "<nodeId>.output.<path>" }` references the
+ * `output` of another node's most recent successful work activity.
+ *
+ * Hard constraints (all enforced at parse time):
+ *   - Object MUST be exactly one key (`$ref`), strict — no extra fields.
+ *     Half-parsed mixed objects are a footgun: callers might forget the
+ *     `$ref` key and silently get a literal object instead of resolved data.
+ *   - `$ref` must be a non-empty string; runtime `resolveRef` then enforces
+ *     the `.output.` separator + path-segment safety (no `__proto__` etc).
+ */
+export const OutputRefSpecSchema = z.object({
+  $ref: z.string().min(1),
+}).strict();
+export type OutputRefSpec = z.infer<typeof OutputRefSpecSchema>;
+
+/** A string field that may either be a literal or a single `$ref`. */
+export const BoundStringSchema = z.union([z.string(), OutputRefSpecSchema]);
+export type BoundString = z.infer<typeof BoundStringSchema>;
+
+/**
+ * Recursive JSON allowing `OutputRefSpec` to appear at any leaf or sub-tree.
+ *
+ * Refusal rule for non-strict `$ref`-bearing objects: an object that has a
+ * `$ref` key MUST be an exact strict `OutputRefSpec`.  Mixing `$ref` with
+ * other keys is rejected at parse time to keep `$ref` a reserved form.
+ */
+export const BoundJsonValueSchema: z.ZodType<unknown> = z.lazy(() =>
+  z.union([
+    z.string(),
+    z.number(),
+    z.boolean(),
+    z.null(),
+    OutputRefSpecSchema,
+    z.array(BoundJsonValueSchema),
+    z.record(BoundJsonValueSchema).refine(
+      (obj) => !Object.prototype.hasOwnProperty.call(obj, '$ref'),
+      { message: '`$ref` must appear in an exact `{ "$ref": <string> }` object — no extra keys allowed' },
+    ),
+  ]),
+);
+
 export const HumanGateSchema = z.object({
   // v0 only supports 'before'.  after-step gate would need a different
   // dispatch model (suspend post-success); deferred to v1+.
   stage: z.literal('before'),
-  prompt: z.string(),
+  prompt: BoundStringSchema,
   approvers: z.array(z.string()).optional(),
   deadlineMs: z.number().int().positive().optional(),
   onTimeout: z.enum(['fail', 'success']).optional(),
@@ -64,7 +106,7 @@ export const SubagentNodeSchema = z.object({
   ...NodeBaseShape,
   type: z.literal('subagent'),
   bot: z.string().min(1),
-  prompt: z.string(),
+  prompt: BoundStringSchema,
   workingDir: z.string().optional(),
   modelOverrides: z
     .object({
@@ -85,7 +127,7 @@ export const HostExecutorNodeSchema = z.object({
   ...NodeBaseShape,
   type: z.literal('hostExecutor'),
   executor: z.string().min(1),
-  input: z.unknown(),
+  input: BoundJsonValueSchema,
 });
 export type HostExecutorNode = z.infer<typeof HostExecutorNodeSchema>;
 

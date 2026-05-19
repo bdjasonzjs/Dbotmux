@@ -23,6 +23,11 @@ import { writeEffectInputSidecar } from './effect-input.js';
 import { writeJsonBlob } from './blob.js';
 import type { WorkflowDefinition } from './definition.js';
 import type { EventLog } from './events/append.js';
+import {
+  BindingError,
+  resolveBindings,
+  resolveBoundString,
+} from './output-binding.js';
 import type { BotSnapshot, ErrorClass, ErrorCode, OutputRef } from './events/payloads.js';
 import { replay, type Snapshot } from './events/replay.js';
 import type {
@@ -220,19 +225,36 @@ function executeRegisteredHostExecutor<I, O>(
 /**
  * Open a humanGate.stage='before' wait.  Writes:
  *   1. `attemptCreated{nodeId, activityId=gate, attemptId, attemptNumber=1}`
- *   2. `waitCreated{waitKind='human-gate', deadlineAt?, prompt, onTimeout}`
+ *      — `inputRef` carries the RAW (pre-binding) humanGate spec so an
+ *      operator can still see what the workflow author wrote.
+ *   2. Resolve `humanGate.prompt` against the snapshot (output bindings).
+ *      Binding failure → `activityFailed{InputBindingFailed/userFault}`,
+ *      no waitCreated written.  The orchestrator picks the failure up on
+ *      its next tick and emits `completeNodeFailed`.
+ *   3. On success: `waitCreated{prompt: <resolved>, ...}`.
  *
  * The caller (Slice C / Slice D) is responsible for actually rendering
  * the approval card to the IM channel after this returns.
  */
+export type DispatchGateResult =
+  | {
+      kind: 'wait';
+      attemptId: string;
+      attemptCreated: AttemptCreatedEvent;
+      waitCreated: WaitCreatedEvent;
+    }
+  | {
+      kind: 'failed';
+      attemptId: string;
+      attemptCreated: AttemptCreatedEvent;
+      activityFailed: ActivityFailedEvent;
+    };
+
 export async function dispatchGate(
   ctx: WorkflowRuntimeContext,
   action: DispatchGateAction,
-): Promise<{
-  attemptId: string;
-  attemptCreated: AttemptCreatedEvent;
-  waitCreated: WaitCreatedEvent;
-}> {
+  options: { snapshot?: Snapshot } = {},
+): Promise<DispatchGateResult> {
   const attemptId = gateAttemptId(action.activityId);
   const inputRef = await writeJsonBlob(ctx.log, {
     kind: 'human-gate',
@@ -253,6 +275,26 @@ export async function dispatchGate(
     },
   })) as AttemptCreatedEvent;
 
+  let resolvedPrompt: string;
+  try {
+    resolvedPrompt = await resolveBoundString(action.humanGate.prompt, {
+      snapshot: options.snapshot ?? replay(await ctx.log.readAll()),
+      def: ctx.def,
+      log: ctx.log,
+    });
+  } catch (err) {
+    if (err instanceof BindingError) {
+      const activityFailed = await writeBindingFailure(
+        ctx,
+        action.activityId,
+        attemptId,
+        err.message,
+      );
+      return { kind: 'failed', attemptId, attemptCreated, activityFailed };
+    }
+    throw err;
+  }
+
   const deadlineAt = action.humanGate.deadlineMs
     ? nowMs(ctx) + action.humanGate.deadlineMs
     : undefined;
@@ -263,11 +305,33 @@ export async function dispatchGate(
     nodeId: action.nodeId,
     waitKind: 'human-gate',
     deadlineAt,
-    prompt: action.humanGate.prompt,
+    prompt: resolvedPrompt,
     onTimeout: action.humanGate.onTimeout,
   });
 
-  return { attemptId, attemptCreated, waitCreated };
+  return { kind: 'wait', attemptId, attemptCreated, waitCreated };
+}
+
+async function writeBindingFailure(
+  ctx: WorkflowRuntimeContext,
+  activityId: string,
+  attemptId: string,
+  message: string,
+): Promise<ActivityFailedEvent> {
+  return (await ctx.log.append({
+    runId: ctx.log.runId,
+    type: 'activityFailed',
+    actor: 'scheduler',
+    payload: {
+      activityId,
+      attemptId,
+      error: {
+        errorCode: 'InputBindingFailed',
+        errorClass: 'userFault',
+        errorMessage: truncateRuntimeErrorMessage(message),
+      },
+    },
+  })) as ActivityFailedEvent;
 }
 
 // ─── dispatchWork ─────────────────────────────────────────────────────────
@@ -305,7 +369,16 @@ export async function dispatchWork(
   const attemptId = workAttemptId(action.activityId, attemptNumber);
   const node = action.node;
 
+  const bindingCtx = {
+    snapshot: options.snapshot ?? replay(await ctx.log.readAll()),
+    def: ctx.def,
+    log: ctx.log,
+  };
+
   if (node.type === 'hostExecutor') {
+    // attemptCreated carries the RAW (pre-binding) input.  Operator-side
+    // debug can see the literal `$ref` the author wrote, while the
+    // effect-input sidecar (below) holds the resolved+parsed form.
     const inputRef = await writeJsonBlob(ctx.log, {
       kind: 'hostExecutor',
       executor: node.executor,
@@ -333,9 +406,23 @@ export async function dispatchWork(
       });
     }
 
+    let resolvedInput: unknown;
+    try {
+      resolvedInput = await resolveBindings(node.input, bindingCtx);
+    } catch (err) {
+      if (err instanceof BindingError) {
+        return failHostExecutor(ctx, action.activityId, attemptId, {
+          errorCode: 'InputBindingFailed',
+          errorClass: 'userFault',
+          errorMessage: truncateRuntimeErrorMessage(err.message),
+        });
+      }
+      throw err;
+    }
+
     let parsedInput: unknown;
     try {
-      parsedInput = registered.parseInput(node.input);
+      parsedInput = registered.parseInput(resolvedInput);
     } catch (err) {
       return failHostExecutor(ctx, action.activityId, attemptId, {
         errorCode: 'InputValidationFailed',
@@ -384,7 +471,9 @@ export async function dispatchWork(
     };
   }
 
-  // Subagent path: serialize prompt as the input blob.
+  // Subagent path: serialize the RAW (pre-binding) prompt as the input
+  // blob so audit can see the literal `$ref` the author wrote.  The
+  // resolved prompt is what we actually hand to the worker.
   const inputRef = await writeJsonBlob(ctx.log, {
     kind: 'subagent',
     bot: node.bot,
@@ -404,6 +493,30 @@ export async function dispatchWork(
     },
   });
 
+  let resolvedPrompt: string;
+  try {
+    resolvedPrompt = await resolveBoundString(node.prompt, bindingCtx);
+  } catch (err) {
+    if (err instanceof BindingError) {
+      const activityFailed = await writeBindingFailure(
+        ctx,
+        action.activityId,
+        attemptId,
+        err.message,
+      );
+      return {
+        kind: 'failed',
+        attemptId,
+        errorClass: 'userFault',
+        errorCode: 'InputBindingFailed',
+        errorMessage: activityFailed.payload && !('ref' in activityFailed.payload)
+          ? activityFailed.payload.error.errorMessage
+          : err.message,
+      };
+    }
+    throw err;
+  }
+
   // NB: skipping `leaseSigned` + `activityRunning` in v0 — those are
   // tied to the lease-timeout enforcement path (Step 6) which we
   // don't engage when the spawn callback runs inline and synchronously
@@ -419,7 +532,7 @@ export async function dispatchWork(
     // override still wins — author intent on a specific step beats the
     // run-wide bot default.
     workingDir: node.workingDir ?? botSnapshot?.workingDir,
-    prompt: node.prompt,
+    prompt: resolvedPrompt,
     modelOverrides: node.modelOverrides,
     toolPolicy: node.toolPolicy,
     activityId: action.activityId,

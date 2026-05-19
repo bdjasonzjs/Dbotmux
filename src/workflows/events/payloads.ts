@@ -26,6 +26,11 @@ export const ErrorCodeEnum = z.enum([
   'IdempotencyInputMismatch',
   'IdempotencyConflict',
   'InputValidationFailed',
+  // Author wrote a `{ "$ref": ... }` that couldn't be resolved against
+  // upstream output at dispatch time — missing node, not-yet-succeeded,
+  // path-not-found, missing output blob.  Always userFault: it's a
+  // workflow definition / authoring mistake, not a provider issue.
+  'InputBindingFailed',
   'OutputSchemaViolation',
   'WaitDeadlineExceeded',
   'TtlExpired',
