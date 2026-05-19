@@ -790,6 +790,121 @@ describe('resume — F1: crash between reconcileResult and terminal', () => {
     const sp = o.terminalEvent!.payload as { externalRefs: { messageId: string } };
     expect(sp.externalRefs).toEqual({ messageId: 'om_late' });
   });
+
+  it('completedByIdempotentSubmit without evidence.externalRefs → CorruptLog/manual (codex round 2 blocker)', async () => {
+    // Strict validation: a reconcileResult{decision=completedByIdempotentSubmit}
+    // whose evidence has no externalRefs is corruption (someone wrote a
+    // partial event).  Recovery MUST NOT fabricate an activitySucceeded
+    // with `{}` externalRefs — that would convert log corruption into a
+    // fake success.
+    await bootstrapWith(
+      attemptCreated('a-1', 'at-1'),
+      effectAttempted('a-1', 'at-1', 'feishu-im', 'wf_corrupt', 1000, PROVIDER_TTL_MS['feishu-im']),
+      {
+        runId: RUN_ID,
+        type: 'reconcileResult',
+        actor: 'system',
+        payload: {
+          activityId: 'a-1',
+          idempotencyKey: 'wf_corrupt',
+          capability: 'idempotentSubmit',
+          decision: 'completedByIdempotentSubmit',
+          evidence: { reason: 'missing on purpose' }, // NO externalRefs
+        },
+      },
+    );
+    const r = await resume({
+      log,
+      runId: RUN_ID,
+      daemonId: 'd-1',
+      reconcilers: new Map(),
+      now: () => 1001,
+    });
+    const o = r.reconcileOutcomes[0];
+    expect(o.recovered).toBe(true);
+    expect(o.decision).toBe('manual'); // escalated from completedByIdempotentSubmit
+    expect(o.terminalEvent?.type).toBe('activityFailed');
+    const ep = o.terminalEvent!.payload as { error: { errorCode: string; errorMessage: string } };
+    expect(ep.error.errorCode).toBe('CorruptLog');
+    expect(ep.error.errorMessage).toMatch(/externalRefs/);
+    expect(o.evidence).toMatchObject({
+      corruptReason: 'missing_external_refs',
+      originalDecision: 'completedByIdempotentSubmit',
+    });
+    // No activitySucceeded landed in the log.
+    const events = await log.readAll();
+    const succeeded = events.filter((e) => e.type === 'activitySucceeded');
+    expect(succeeded).toEqual([]);
+  });
+
+  it('completedByIdempotentSubmit where evidence.externalRefs is not an object → CorruptLog', async () => {
+    // Same blocker, different malformed shape: externalRefs is a
+    // string/number/array instead of an object.  Recovery still refuses.
+    await bootstrapWith(
+      attemptCreated('a-1', 'at-1'),
+      effectAttempted('a-1', 'at-1', 'feishu-im', 'wf_bad_shape', 1000, PROVIDER_TTL_MS['feishu-im']),
+      {
+        runId: RUN_ID,
+        type: 'reconcileResult',
+        actor: 'system',
+        payload: {
+          activityId: 'a-1',
+          idempotencyKey: 'wf_bad_shape',
+          capability: 'idempotentSubmit',
+          decision: 'completedByIdempotentSubmit',
+          evidence: { externalRefs: ['not', 'an', 'object'] },
+        },
+      },
+    );
+    const r = await resume({
+      log,
+      runId: RUN_ID,
+      daemonId: 'd-1',
+      reconcilers: new Map(),
+      now: () => 1001,
+    });
+    const o = r.reconcileOutcomes[0];
+    expect(o.decision).toBe('manual');
+    const ep = o.terminalEvent!.payload as { error: { errorCode: string } };
+    expect(ep.error.errorCode).toBe('CorruptLog');
+  });
+
+  it('replayed fallback includes reconcileEventId in evidence (codex round 2 suggestion)', async () => {
+    await bootstrapWith(
+      attemptCreated('a-1', 'at-1'),
+      effectAttempted('a-1', 'at-1', 'botmux-schedule', 'wf_replayed', 1, Number.MAX_SAFE_INTEGER),
+      {
+        runId: RUN_ID,
+        type: 'reconcileResult',
+        actor: 'system',
+        payload: {
+          activityId: 'a-1',
+          idempotencyKey: 'wf_replayed',
+          capability: 'none',
+          decision: 'replayed',
+          evidence: { source: 'first-resume' },
+        },
+      },
+    );
+    // Find the reconcileResult event so we know its expected eventId.
+    const eventsBefore = await log.readAll();
+    const recEvent = eventsBefore.find((e) => e.type === 'reconcileResult');
+    expect(recEvent).toBeDefined();
+    const expectedEventId = recEvent!.eventId;
+
+    const r = await resume({
+      log,
+      runId: RUN_ID,
+      daemonId: 'd-1',
+      reconcilers: new Map(),
+    });
+    const o = r.reconcileOutcomes[0];
+    expect(o.decision).toBe('manual');
+    expect(o.evidence).toMatchObject({
+      originalDecision: 'replayed',
+      reconcileEventId: expectedEventId,
+    });
+  });
 });
 
 // ─── F2 — reconciler input passthrough ─────────────────────────────────────

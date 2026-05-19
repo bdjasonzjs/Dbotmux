@@ -509,10 +509,55 @@ async function recoverFromReconcileResult(
       // Re-derive externalRefs from the recorded evidence.  We wrote it
       // there during the first resume so this recovery is decoupled
       // from the provider being reachable now.
+      //
+      // STRICT validation (codex round 2 of Step 7): if evidence
+      // doesn't carry a usable externalRefs object, this is a corrupt
+      // reconcileResult — falling back to `{}` would silently materialize
+      // a fake activitySucceeded with an empty external ref, turning log
+      // corruption into a fake success.  Treat as CorruptLog manual
+      // instead so the inconsistency surfaces.
       const evidence = rr.evidence;
-      const externalRefs =
-        (evidence as { externalRefs?: Record<string, unknown> }).externalRefs ??
-        {};
+      const candidate = (evidence as { externalRefs?: unknown }).externalRefs;
+      if (
+        candidate === undefined ||
+        candidate === null ||
+        typeof candidate !== 'object' ||
+        Array.isArray(candidate)
+      ) {
+        const terminalEvent = (await ctx.log.append({
+          runId: ctx.runId,
+          type: 'activityFailed',
+          actor: 'system',
+          payload: {
+            activityId,
+            attemptId: latest.attemptId,
+            error: {
+              errorCode: 'CorruptLog',
+              errorClass: 'manual',
+              errorMessage:
+                'Prior reconcileResult{decision=completedByIdempotentSubmit} is missing evidence.externalRefs (or it is not an object) — refusing to fabricate an activitySucceeded from empty refs.',
+            },
+          },
+        })) as ActivityFailedEvent;
+        return outcome({
+          activityId,
+          attemptId: latest.attemptId,
+          idempotencyKey: ea.idempotencyKey,
+          provider: ea.provider,
+          capability: rr.capability,
+          decision: 'manual',
+          evidence: {
+            ...rr.evidence,
+            corruptReason: 'missing_external_refs',
+            originalDecision: 'completedByIdempotentSubmit',
+            reconcileEventId: rr.eventId,
+          },
+          terminalEvent,
+          reconcileEvent: null,
+          recovered: true,
+        });
+      }
+      const externalRefs = candidate as Record<string, unknown>;
       const outputBuf = Buffer.from(JSON.stringify(externalRefs), 'utf-8');
       const outputHash = await sha256Hex(outputBuf);
       const terminalEvent = (await ctx.log.append({
@@ -619,7 +664,11 @@ async function recoverFromReconcileResult(
         provider: ea.provider,
         capability: rr.capability,
         decision: 'manual',
-        evidence: { ...rr.evidence, originalDecision: 'replayed' },
+        evidence: {
+          ...rr.evidence,
+          originalDecision: 'replayed',
+          reconcileEventId: rr.eventId,
+        },
         terminalEvent,
         reconcileEvent: null,
         recovered: true,
