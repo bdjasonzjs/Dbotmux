@@ -50,11 +50,13 @@ export class TmuxPipeBackend implements SessionBackend {
   private readonly fifoPath: string;
   private readStream: fs.ReadStream | null = null;
   private readonly dataCbs: Array<(d: string) => void> = [];
-  /** Bounded tail of the most recent bytes tmux replicated from the pane.
-   *  Crash diagnostic: when a send fails because the pane vanished,
-   *  capture-pane can no longer read the (now-gone) screen — but these bytes
-   *  were already received over the pipe and are the CLI's actual final
-   *  stdout/stderr (e.g. a gateway/API error) right before it exited. */
+  /** Bounded tail of the decoded output tmux most recently replicated from the
+   *  pane (kept to the last RECENT_OUTPUT_MAX UTF-16 code units, not an exact
+   *  byte count — fine for a diagnostic). Crash diagnostic: when a send fails
+   *  because the pane vanished, capture-pane can no longer read the (now-gone)
+   *  screen — but this text was already received over the pipe and is the
+   *  CLI's actual final stdout/stderr (e.g. a gateway/API error) right before
+   *  it exited. */
   private recentOutput = '';
   private static readonly RECENT_OUTPUT_MAX = 4096;
   private readonly exitCbs: Array<(code: number | null, signal: string | null) => void> = [];
