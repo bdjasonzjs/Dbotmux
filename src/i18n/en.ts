@@ -67,6 +67,7 @@ export const messages: Record<string, string> = {
   'cmd.repo.switched_to': '🔄 Switched to {name}',
   'cmd.repo.warning_running': '⚠️ A session is already running. Switching repos will close it and start a new one.\nIf that\'s what you want, pick the new repo from the card below.',
   'cmd.repo.scan_dir_not_exist': 'Scan dirs do not exist: {dirs}\nCheck that workingDir in bots.json points to a valid directory.',
+  'cmd.repo.working_dir_not_exist': '❌ Configured working directory does not exist or is not a directory: {dirs}\nCheck workingDir / workingDirs in ~/.botmux/bots.json, or run `botmux setup` and choose an existing directory.',
   'cmd.repo.no_git_repos': 'No git repositories found under {dirs}.',
   'cmd.skip.opened': '▶️ Session started (working dir: {cwd})',
   'cmd.skip.no_pending': 'No pending repo selection.',

@@ -19,6 +19,7 @@ import { validateWorkingDir } from './working-dir.js';
 import { discoverAdoptableSessions, validateAdoptTarget, type AdoptableSession } from './session-discovery.js';
 import { generateAuthUrl, getTokenStatus } from '../utils/user-token.js';
 import { bindOncall, unbindOncall, getOncallStatus } from '../services/oncall-store.js';
+import { invalidWorkingDirs } from '../utils/working-dir.js';
 import type { LarkMessage, DaemonToWorker } from '../types.js';
 import { sessionKey, sessionAnchorId } from './types.js';
 import type { DaemonSession } from './types.js';
@@ -113,6 +114,21 @@ function formatUptime(ms: number): string {
   if (m < 60) return `${m}m${s % 60}s`;
   const h = Math.floor(m / 60);
   return `${h}h${m % 60}m`;
+}
+
+function invalidConfiguredWorkingDirs(ds: DaemonSession | undefined, larkAppId: string | undefined): string[] {
+  if (ds?.workingDir) return invalidWorkingDirs({ workingDir: ds.workingDir });
+  if (larkAppId) {
+    const bot = getBot(larkAppId);
+    return invalidWorkingDirs({
+      workingDir: bot.config.workingDir ?? '~',
+      workingDirs: bot.config.workingDirs,
+    });
+  }
+  return invalidWorkingDirs({
+    workingDir: config.daemon.workingDir ?? '~',
+    workingDirs: config.daemon.workingDirs,
+  });
 }
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -418,6 +434,11 @@ export async function handleCommand(
         }
 
         const scanDirs = getProjectScanDirs(ds);
+        const invalidDirs = invalidConfiguredWorkingDirs(ds, ds?.larkAppId ?? larkAppId);
+        if (invalidDirs.length > 0) {
+          await sessionReply(rootId, t('cmd.repo.working_dir_not_exist', { dirs: invalidDirs.map(d => `\`${d}\``).join(', ') }, loc));
+          break;
+        }
         const validDirs = scanDirs.filter(d => existsSync(d));
         if (validDirs.length === 0) {
           await sessionReply(rootId, t('cmd.repo.scan_dir_not_exist', { dirs: scanDirs.join(', ') }, loc));

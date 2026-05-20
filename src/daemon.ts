@@ -20,6 +20,7 @@ import { expandMergeForward } from './im/lark/merge-forward.js';
 import { buildQuoteHint } from './im/lark/quote-hint.js';
 import { logger } from './utils/logger.js';
 import { ensureCjkFontsInstalled } from './utils/font-installer.js';
+import { invalidWorkingDirs } from './utils/working-dir.js';
 import type { DaemonToWorker, LarkMessage } from './types.js';
 export type { DaemonSession } from './core/types.js';
 import type { DaemonSession } from './core/types.js';
@@ -397,6 +398,29 @@ async function maybeAutoBindDefaultOncall(
   return r.entry;
 }
 
+async function replyInvalidWorkingDirs(
+  anchor: string,
+  larkAppId: string,
+  ds: DaemonSession,
+): Promise<boolean> {
+  const bot = getBot(larkAppId);
+  const invalid = invalidWorkingDirs({
+    workingDir: ds.workingDir ?? bot.config.workingDir ?? '~',
+    workingDirs: ds.workingDir ? undefined : bot.config.workingDirs,
+  });
+  if (invalid.length === 0) return false;
+
+  ds.pendingRepo = false;
+  activeSessions.delete(sessionKey(anchor, larkAppId));
+  sessionStore.closeSession(ds.session.sessionId);
+  const msg = tr('cmd.repo.working_dir_not_exist', {
+    dirs: invalid.map(d => `\`${d}\``).join(', '),
+  }, localeForBot(larkAppId));
+  await sessionReply(anchor, msg, 'text', larkAppId);
+  logger.warn(`[${tag(ds)}] configured workingDir missing: ${invalid.join(', ')}`);
+  return true;
+}
+
 async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const { chatId, messageId, chatType, larkAppId } = ctx;
   // scope/anchor are mutable here: `/t` / `/topic` may flip a 普通群 chat-scope
@@ -592,6 +616,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
 
   // Pinned (oncall binding or inherited from sibling bot): spawn CLI immediately.
   if (pinnedWorkingDir) {
+    if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
     const selfBot = getBot(larkAppId);
     const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender);
     forkWorker(ds, prompt);
@@ -603,6 +628,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   }
 
   // Show repo selection card
+  if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
   const scanDirs = getProjectScanDirs(ds).filter(d => existsSync(d));
   let projects: import('./services/project-scanner.js').ProjectInfo[] = [];
   if (scanDirs.length > 0) {
@@ -938,6 +964,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     // Pinned (oncall binding or inherited from peer bot in same thread):
     // spawn CLI immediately, skip repo selection.
     if (pinnedWorkingDir) {
+      if (await replyInvalidWorkingDirs(anchor, larkAppId, newDs)) return;
       const selfBot = getBot(larkAppId);
       const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender);
       forkWorker(newDs, prompt);
@@ -949,6 +976,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     }
 
     // Show repo selection card (same as handleNewTopic)
+    if (await replyInvalidWorkingDirs(anchor, larkAppId, newDs)) return;
     const scanDirs2 = getProjectScanDirs(newDs).filter(d => existsSync(d));
     let projects: import('./services/project-scanner.js').ProjectInfo[] = [];
     if (scanDirs2.length > 0) {

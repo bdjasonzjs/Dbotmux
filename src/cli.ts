@@ -41,6 +41,7 @@ import {
 } from './setup/bot-config-editor.js';
 import type { CliId } from './adapters/cli/types.js';
 import { logger } from './utils/logger.js';
+import { invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional } from './cli/arg-utils.js';
 import { isLocale, setDefaultLocale, SUPPORTED_LOCALES, type Locale } from './i18n/index.js';
 import { readGlobalConfig, setGlobalLocale, globalConfigPath } from './global-config.js';
@@ -178,6 +179,15 @@ function loadBotsJson(): any[] {
     }
   }
   return [];
+}
+
+function ensureBotWorkingDirsExist(bot: Record<string, any>, context = 'workingDir'): boolean {
+  const invalid = invalidWorkingDirs(bot);
+  if (invalid.length === 0) return true;
+  console.log(`\n❌ ${context} 指向的目录不存在或不是目录:`);
+  for (const dir of invalid) console.log(`   - ${dir}`);
+  console.log('   请先创建目录，或重新填写一个已存在的工作目录。');
+  return false;
 }
 
 function ensureUniqueBotProcessNames(bots: any[]): void {
@@ -477,6 +487,8 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
   // 字段即可. 手动 fallback 场景没 open_id, 字段直接不写 (== 不限制).
   if (creds.userOpenId) bot.allowedUsers = [creds.userOpenId];
 
+  if (!ensureBotWorkingDirsExist(bot, '默认工作目录')) return null;
+
   return normalizeBotConfig(bot);
 }
 
@@ -684,6 +696,11 @@ async function cmdSetup(): Promise<void> {
       } catch (err: any) {
         rl.close();
         console.log(`\n❌ 编辑失败: ${err?.message ?? String(err)}`);
+        return;
+      }
+      if (!ensureBotWorkingDirsExist(edited, '默认工作目录')) {
+        rl.close();
+        console.log('   配置未修改。');
         return;
       }
 
