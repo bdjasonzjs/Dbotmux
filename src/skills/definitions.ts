@@ -400,9 +400,9 @@ description: 根据用户自然语言描述生成 botmux workflow JSON 定义文
 ## 硬规则
 
 1. 不要在用户确认设计稿前写文件。
-2. 必须先跑 \`botmux bots list\`，按输出里的 \`name\` 填 \`subagent.bot\`，不要猜 bot 名。
-3. 写到 \`workflows/<workflowId>.workflow.json\`；\`workflowId\` 推荐 kebab-case。
-4. 写完必须跑 \`botmux workflow validate <path>\`，失败就按错误修到通过。
+2. 必须先跑 \`botmux bots list\`，按输出里的 **\`larkAppId\`**（形如 \`cli_xxxxxxxxxxxxxxxx\`）填 \`subagent.bot\`。**不要填 \`name\`**——\`name\` 是 Lark 群里的 displayName（admin 可改、可能带后缀），跨 daemon 必然解析失败。larkAppId 是 bot 的全局唯一 ID。
+3. 写到 \`$HOME/.botmux/workflows/<workflowId>.workflow.json\`（**绝对路径**，daemon 的全局位置）。不要写到当前 cwd 的 \`./workflows/\`——CLI agent 和 daemon 进程的 cwd 不一定一致。\`workflowId\` 推荐 kebab-case。
+4. 写完必须跑 \`botmux workflow validate $HOME/.botmux/workflows/<workflowId>.workflow.json\`，失败就按错误修到通过。
 5. 高风险节点主动建议 \`humanGate\`：发消息、写文件、外部 API、git push、删除/覆盖。纯读、草稿、纯计算通常不加 gate。
 6. 当前没有字符串模板语言：不要写 \`{{params.name}}\` 或 \`{{draft.output}}\` 期望 runtime 展开。
 7. \`$ref\` 只支持整值替换，**不能拼接字符串**。两种合法形式：
@@ -421,15 +421,15 @@ description: 根据用户自然语言描述生成 botmux workflow JSON 定义文
 botmux bots list
 \`\`\`
 
-记住每个 bot 的 \`name\`。后续 \`subagent.bot\` 必须使用这些 name。
+输出每个 bot 的 \`name\`（人类可读 displayName，仅供你判断哪个 bot 适合做什么）和 \`larkAppId\`（形如 \`cli_xxxxxxxxxxxxxxxx\`，**这是真正要填进 workflow.subagent.bot 的值**）。
 
 ### Step 3 — 给用户确认设计草案
 
-用表格展示节点设计：
+用表格展示节点设计（"bot" 列用人类可读名字给用户看，但实际写进 JSON 是 larkAppId）：
 
 | 节点 id | 类型 | bot/executor | 做什么 | 依赖 | humanGate |
 |---|---|---|---|---|---|
-| draft | subagent | claude-loopy | 写草稿 | - | - |
+| draft | subagent | claude-loopy (cli_a930…) | 写草稿 | - | - |
 | send | hostExecutor | feishu-send | 发到群里 | draft | 审批草稿 |
 
 同时说明：
@@ -441,15 +441,15 @@ botmux bots list
 
 ### Step 4 — 生成 JSON
 
-创建 \`workflows/<workflowId>.workflow.json\`。每个 node 建议写 \`description\`，记录设计理由或 bot 选择理由。
+创建 \`$HOME/.botmux/workflows/<workflowId>.workflow.json\`（**绝对路径**，不要写相对路径）。每个 subagent 节点的 \`bot\` 字段必须填 larkAppId（\`cli_xxx...\`），不是 displayName。每个 node 建议写 \`description\`，记录设计理由或 bot 选择理由。
 
 ### Step 5 — 校验
 
 \`\`\`bash
-botmux workflow validate workflows/<workflowId>.workflow.json
+botmux workflow validate $HOME/.botmux/workflows/<workflowId>.workflow.json
 \`\`\`
 
-validate 能抓 JSON/schema/graph 错误；但它不会检查 bot 是否真的存在，也不会检查 \`$ref\` 指向的 output 字段是否运行时一定存在，所以你仍要人工核对 bots list 和 outputSchema。
+validate 能抓 JSON/schema/graph 错误；但它**不会**检查 bot 是否真的存在，也不会检查 \`$ref\` 指向的 output 字段是否运行时一定存在——所以你仍要人工核对 bots list（larkAppId 一定要逐字符匹配）和 outputSchema。
 
 ### Step 6 — 交付
 
@@ -488,7 +488,7 @@ subagent node：
 \`\`\`json
 {
   "type": "subagent",
-  "bot": "claude-loopy",
+  "bot": "cli_xxxxxxxxxxxxxxxx",
   "prompt": "Static prompt string, or a whole-field { \\"$ref\\": \\"draft.output.text\\" }",
   "depends": ["draft"],
   "humanGate": { "stage": "before", "prompt": { "$ref": "draft.output.preview" } },
@@ -579,7 +579,7 @@ humanGate：
   "nodes": {
     "draft": {
       "type": "subagent",
-      "bot": "claude-loopy",
+      "bot": "cli_xxxxxxxxxxxxxxxx",
       "prompt": "Write a short greeting. Return JSON: {\\"preview\\": string, \\"text\\": string}.",
       "outputSchema": {
         "type": "object",
@@ -593,7 +593,7 @@ humanGate：
     },
     "finalize": {
       "type": "subagent",
-      "bot": "claude-loopy",
+      "bot": "cli_xxxxxxxxxxxxxxxx",
       "depends": ["draft"],
       "humanGate": {
         "stage": "before",
@@ -633,7 +633,7 @@ humanGate：
   "nodes": {
     "draft": {
       "type": "subagent",
-      "bot": "claude-loopy",
+      "bot": "cli_xxxxxxxxxxxxxxxx",
       "prompt": "Draft a weekly report covering this week's PRs, decisions, and blockers. Return JSON: {\\"preview\\": string, \\"text\\": string}.",
       "outputSchema": {
         "type": "object",
@@ -671,6 +671,8 @@ humanGate：
 
 ## 常见错误
 
+- **\`subagent.bot\` 填了 displayName（如 \`claude-loopy\` 或 \`aiden-oncall(d2)\`）而不是 larkAppId**：跨 daemon 必 fail，runtime 报 "Bot 'X' not found in registry"。一定填 \`cli_xxxxxxxxxxxxxxxx\`。
+- **workflow 文件写到当前 cwd 的 \`./workflows/\` 而不是 \`$HOME/.botmux/workflows/\`**：CLI agent cwd 和 daemon cwd 不一致时 daemon 找不到文件。一定用绝对路径 \`$HOME/.botmux/workflows/<id>.workflow.json\`。
 - 写 \`{{...}}\` 模板：当前 runtime 不展开，改成整字段 \`$ref\` 或让上游输出完整字符串。
 - \`$ref\` 字符串里没有 \`.output.\` 也不是 \`params.*\` 开头：parse 会报错。
 - \`$ref\` 引用的 node 没写进 \`depends\`：validate 可能过，运行时顺序不可靠。

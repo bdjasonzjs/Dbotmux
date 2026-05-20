@@ -55,5 +55,11 @@ describe('built-in botmux-workflow-create skill', () => {
     expect(skill!.content).toContain('"$ref": "params.<path>"');
     expect(skill!.content).toContain('语法支持两种形式');
     expect(skill!.content).not.toContain('语法只能是 `<nodeId>.output.<path>`');
+    // workflow.subagent.bot must be larkAppId (cross-daemon stable identifier), not displayName
+    expect(skill!.content).toContain('larkAppId');
+    expect(skill!.content).toContain('cli_xxxxxxxxxxxxxxxx');
+    expect(skill!.content).not.toContain('"bot": "claude-loopy"');
+    // workflow file must live at $HOME/.botmux/workflows/, not in arbitrary cwd
+    expect(skill!.content).toContain('$HOME/.botmux/workflows/');
   });
 });
