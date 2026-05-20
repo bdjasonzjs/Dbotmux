@@ -355,6 +355,39 @@ botmux autostart enable
 | `botmux autostart status` | 查看自启状态 |
 | `botmux dashboard` | 输出一次 Web Dashboard URL（每次刷 token，旧链接立即失效） |
 
+### Workflow 子命令（实验性运维）
+
+`botmux workflow` 把工作流 run 的状态当一等公民暴露出来——查看哪些 run 在跑、读事件流、从崩溃 / awaiting 恢复或取消。所有命令读写 `BOTMUX_WORKFLOW_RUNS_DIR`（默认 `~/.botmux/workflow-runs`），不需要 daemon 在线。
+
+| 命令 | 说明 |
+|------|------|
+| `botmux workflow run <id> [--param k=v ...]` | 离线驱动 workflow（stub spawn）；humanGate 节点跑到 awaiting-wait 退出 |
+| `botmux workflow resume <runId>` | 从磁盘 runDir 冷恢复一个已有 run；R0 recovery 先收 dangling effect，再走 orchestrator |
+| `botmux workflow cancel <runId> [--reason <text>]` | 写 run-level cancelRequested 并驱动 cancel recovery；terminal run 直接 no-op |
+| `botmux workflow ls [--all] [--status running,failed] [--wide] [--json]` | 列 runsDir 下所有 run；默认仅 non-terminal；`dEf/dAct/dWait` 三列分别是 dangling effects / non-effect activities / waits |
+| `botmux workflow tail <runId> [--from N] [--follow] [--json]` | 打印事件简表；默认 history-only，`--follow` 才轮询 events.ndjson 增量 |
+| `botmux workflow show <runId>` | replay 当前 run 的事件，打 Snapshot 摘要 JSON |
+
+典型运维流程：
+
+```bash
+# 看哪些 run 在跑
+botmux workflow ls
+
+# 进一个 run 看事件
+botmux workflow tail wf-abc-123
+
+# run 卡住或 daemon 重启过 → 冷恢复
+botmux workflow resume wf-abc-123
+
+# 实在跑不动 → 取消
+botmux workflow cancel wf-abc-123 --reason '依赖外部超时'
+```
+
+完整端到端 dogfood（run → ls → tail → resume → cancel）参见 `scripts/dogfood-o1.sh`，跑在临时 runsDir 里，不碰真实环境。
+
+---
+
 ### 开机自启
 
 `botmux autostart enable` 把 daemon 注册到当前用户的 init 系统，重启机器后自动起来：

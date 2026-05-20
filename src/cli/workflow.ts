@@ -76,6 +76,13 @@ export async function cmdWorkflow(sub: string, rest: string[]): Promise<void> {
     case 'cancel':
       await cmdWorkflowCancel(rest);
       return;
+    case 'ls':
+    case 'list':
+      await cmdWorkflowLs(rest);
+      return;
+    case 'tail':
+      await cmdWorkflowTail(rest);
+      return;
     case 'show':
       await cmdWorkflowShow(rest);
       return;
@@ -92,7 +99,7 @@ export async function cmdWorkflow(sub: string, rest: string[]): Promise<void> {
 }
 
 function printHelp(): void {
-  console.log(`用法: botmux workflow <run|resume|cancel|show> [...]
+  console.log(`用法: botmux workflow <run|resume|cancel|ls|tail|show> [...]
 
 子命令:
   run <id> [--param key=value ...] [--run-id <id>] [--bot-resolver echo]
@@ -110,8 +117,17 @@ function printHelp(): void {
       写入 run-level cancelRequested 并驱动 cancel recovery。terminal run
       直接 no-op；不会发 IM 通知或重发审批卡。
 
+  ls [--all] [--status running,failed,...] [--wide] [--json]
+      列出 runsDir 下所有 run。默认仅 non-terminal；--all 全列；--status
+      支持逗号多选；--wide 增加 failedNodeId/chatId/larkAppId；--json
+      输出完整 JSON 行。
+
+  tail <runId> [--from <seq>] [--follow] [--json]
+      打印 run 的事件简表（seq / type / node / activity / errorCode）。
+      默认 history-only；--follow 才轮询 events.ndjson 增量。--from 默认 1。
+
   show <runId>
-      replay 当前 run 的事件，打印 Snapshot 摘要。
+      replay 当前 run 的事件，打印 Snapshot 摘要 JSON（含 nodes/dangling 等）。
 
 环境变量:
   BOTMUX_WORKFLOW_RUNS_DIR=<path>  覆盖 runs 根目录（默认 ~/.botmux/workflow-runs）
@@ -584,6 +600,315 @@ function validateParams(
       process.exit(1);
     }
   }
+}
+
+// ─── ls ───────────────────────────────────────────────────────────────────
+
+/**
+ * `botmux workflow ls` — operator surface for "what's running on disk?"
+ *
+ * Read-only: walks runsDir/<runId>/events.ndjson, replays each, projects a
+ * row.  By default lists only non-terminal runs (the typical operator
+ * question: "what's still hot?").  Terminal runs are useful for triage
+ * and stay one `--all` flag away.
+ *
+ * Output:
+ *   - default: aligned table on stdout.  Column set tuned to fit ~120
+ *     cols: runId | workflowId | status | lastSeq | dEf/dAct/dWait | updatedAt
+ *   - `--wide`: appends failedNodeId / chatId / larkAppId.
+ *   - `--json`: one JSON object per line (machine-parseable).
+ *
+ * Filters:
+ *   - `--all`: include terminal (succeeded/failed/cancelled).
+ *   - `--status running,failed`: comma-separated set; overrides `--all`.
+ */
+async function cmdWorkflowLs(rest: string[]): Promise<void> {
+  const all = rest.includes('--all');
+  const wide = rest.includes('--wide');
+  const json = rest.includes('--json');
+  const statusFilter = argValue(rest, '--status');
+  const wantStatuses = statusFilter
+    ? new Set(statusFilter.split(',').map((s) => s.trim()).filter(Boolean))
+    : undefined;
+
+  const runsDir = getRunsDir();
+  let entries: Array<{ name: string; isDirectory(): boolean }>;
+  try {
+    entries = await fs.readdir(runsDir, { withFileTypes: true });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      if (json) return;
+      console.log(`(空 runsDir：${runsDir})`);
+      return;
+    }
+    console.error(`读取 ${runsDir} 失败：${(err as Error).message}`);
+    process.exit(1);
+  }
+
+  const { replay } = await import('../workflows/events/replay.js');
+  const { readRunChatBinding } = await import('../workflows/loader.js');
+
+  type Row = {
+    runId: string;
+    workflowId: string;
+    status: string;
+    lastSeq: number;
+    dEf: number;
+    dAct: number;
+    dWait: number;
+    updatedAt: number;
+    failedNodeId?: string;
+    chatId?: string;
+    larkAppId?: string;
+  };
+
+  const rows: Row[] = [];
+  for (const entry of entries!) {
+    if (!entry.isDirectory()) continue;
+    const runId = entry.name;
+    const log = new EventLog(runId, runsDir);
+    let events;
+    try {
+      events = await log.readAll();
+    } catch {
+      continue;
+    }
+    if (events.length === 0) continue;
+    let snap;
+    try {
+      snap = replay(events);
+    } catch {
+      continue;
+    }
+    const status = snap.run.status;
+    const terminalStatuses = new Set(['succeeded', 'failed', 'cancelled']);
+
+    if (wantStatuses) {
+      if (!wantStatuses.has(status)) continue;
+    } else if (!all && terminalStatuses.has(status)) {
+      continue;
+    }
+
+    // dAct = non-wait, non-effect dangling activities (the "worker-style"
+    // bucket; gates show up in dWait, effects in dEf).
+    const effectSet = new Set(snap.danglingEffectAttempted);
+    const waitSet = new Set(snap.danglingWaits);
+    const dAct = snap.danglingActivities.filter(
+      (a) => !effectSet.has(a) && !waitSet.has(a),
+    ).length;
+
+    const row: Row = {
+      runId,
+      workflowId: snap.run.workflowId ?? '?',
+      status,
+      lastSeq: snap.lastSeq,
+      dEf: snap.danglingEffectAttempted.length,
+      dAct,
+      dWait: snap.danglingWaits.length,
+      updatedAt: events[events.length - 1]!.timestamp,
+      failedNodeId: snap.run.failedNodeId,
+    };
+
+    if (wide || json) {
+      try {
+        const binding = await readRunChatBinding(runId, {
+          runDir: join(runsDir, runId),
+        });
+        row.chatId = binding.chatId;
+        row.larkAppId = binding.larkAppId;
+      } catch {
+        // CLI-only run — no chat binding on disk.  Leave fields undefined.
+      }
+    }
+
+    rows.push(row);
+  }
+
+  // Most recently updated first — typical operator scan pattern.
+  rows.sort((a, b) => b.updatedAt - a.updatedAt);
+
+  if (json) {
+    for (const r of rows) console.log(JSON.stringify(r));
+    return;
+  }
+
+  if (rows.length === 0) {
+    console.log('(no runs match)');
+    return;
+  }
+
+  const headers = wide
+    ? ['RUN_ID', 'WORKFLOW', 'STATUS', 'LAST_SEQ', 'dEf/dAct/dWait', 'UPDATED', 'FAILED_NODE', 'CHAT_ID', 'LARK_APP']
+    : ['RUN_ID', 'WORKFLOW', 'STATUS', 'LAST_SEQ', 'dEf/dAct/dWait', 'UPDATED'];
+
+  const rowCells = rows.map((r) => {
+    const dangling = `${r.dEf}/${r.dAct}/${r.dWait}`;
+    const updated = new Date(r.updatedAt).toISOString().slice(0, 19).replace('T', ' ');
+    const base = [r.runId, r.workflowId, r.status, String(r.lastSeq), dangling, updated];
+    if (!wide) return base;
+    return [...base, r.failedNodeId ?? '-', r.chatId ?? '-', r.larkAppId ?? '-'];
+  });
+
+  const widths = headers.map((h, i) =>
+    Math.max(h.length, ...rowCells.map((row) => row[i]!.length)),
+  );
+  const pad = (s: string, w: number) => s + ' '.repeat(w - s.length);
+  console.log(headers.map((h, i) => pad(h, widths[i]!)).join('  '));
+  for (const cells of rowCells) {
+    console.log(cells.map((c, i) => pad(c, widths[i]!)).join('  '));
+  }
+}
+
+// ─── tail ─────────────────────────────────────────────────────────────────
+
+/**
+ * `botmux workflow tail <runId>` — operator surface for "show me the
+ * event stream of this run".
+ *
+ * Default mode is history-only (codex review 2026-05-20): print every
+ * event from `--from` (default 1) and exit.  CLI defaults that hang are
+ * a footgun for scripts and tests — `--follow` is the opt-in that turns
+ * on the watch loop.
+ *
+ * Follow strategy: poll `fs.stat` on the events.ndjson file at 200ms
+ * cadence and incrementally read new bytes from the recorded offset.
+ * NDJSON makes the boundary handling trivial — we only emit on `\n`.
+ * Truncation / rotation isn't supported here (events.ndjson is
+ * append-only by design); if the file shrinks we surface a warning.
+ */
+async function cmdWorkflowTail(rest: string[]): Promise<void> {
+  const runId = positionals(rest)[0];
+  if (!runId) {
+    console.error('用法: botmux workflow tail <runId> [--from <seq>] [--follow] [--json]');
+    process.exit(1);
+  }
+  const fromArg = argValue(rest, '--from');
+  const fromSeq = fromArg ? Number(fromArg) : 1;
+  if (!Number.isFinite(fromSeq) || fromSeq < 1) {
+    console.error(`--from 必须是 >=1 的整数，收到 "${fromArg}"`);
+    process.exit(1);
+  }
+  const follow = rest.includes('--follow') || rest.includes('-f');
+  const json = rest.includes('--json');
+
+  const runsDir = getRunsDir();
+  const eventsPath = join(runsDir, runId, 'events.ndjson');
+  const log = new EventLog(runId, runsDir);
+
+  let initial;
+  try {
+    initial = await log.readAll();
+  } catch (err) {
+    console.error(`读取 ${eventsPath} 失败：${(err as Error).message}`);
+    process.exit(1);
+  }
+  if (initial!.length === 0) {
+    console.error(`runId=${runId} 没找到任何事件 (runsDir=${runsDir})`);
+    process.exit(1);
+  }
+
+  for (const ev of initial!) {
+    const seq = eventSeqFromId(ev.eventId);
+    if (seq < fromSeq) continue;
+    printEventLine(ev, json);
+  }
+
+  if (!follow) return;
+
+  // Watch loop.  Cache file size so we only re-read new bytes; parse
+  // incrementally by line.  Stop on Ctrl-C; until then we never resolve.
+  let offset = (await fs.stat(eventsPath)).size;
+  let lastSeq = eventSeqFromId(initial![initial!.length - 1]!.eventId);
+  let buffer = '';
+
+  process.on('SIGINT', () => process.exit(0));
+
+  while (true) {
+    await new Promise((r) => setTimeout(r, 200));
+    const stat = await fs.stat(eventsPath).catch(() => null);
+    if (!stat) continue;
+    if (stat.size < offset) {
+      console.error(`(events.ndjson 大小回退 ${offset} → ${stat.size}，停止 tail)`);
+      return;
+    }
+    if (stat.size === offset) continue;
+    const fd = await fs.open(eventsPath, 'r');
+    try {
+      const chunk = Buffer.alloc(stat.size - offset);
+      await fd.read(chunk, 0, chunk.length, offset);
+      offset = stat.size;
+      buffer += chunk.toString('utf-8');
+    } finally {
+      await fd.close();
+    }
+    let nl;
+    while ((nl = buffer.indexOf('\n')) >= 0) {
+      const line = buffer.slice(0, nl);
+      buffer = buffer.slice(nl + 1);
+      if (!line.trim()) continue;
+      let ev: { eventId?: unknown } | undefined;
+      try {
+        ev = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (typeof ev?.eventId !== 'string') continue;
+      const seq = eventSeqFromId(ev.eventId);
+      if (seq <= lastSeq) continue;
+      lastSeq = seq;
+      if (seq < fromSeq) continue;
+      printEventLine(ev, json);
+    }
+  }
+}
+
+/**
+ * Recover the monotonic seq from `<runId>-<seq>`.  Events embed seq into
+ * eventId (events doc v0.1.2 §3.1) and do not expose it as a top-level
+ * field — operator surfaces have to parse it out themselves.
+ */
+function eventSeqFromId(eventId: string): number {
+  const dash = eventId.lastIndexOf('-');
+  if (dash < 0) return 0;
+  const n = Number(eventId.slice(dash + 1));
+  return Number.isFinite(n) ? n : 0;
+}
+
+function printEventLine(ev: unknown, json: boolean): void {
+  if (json) {
+    console.log(JSON.stringify(ev));
+    return;
+  }
+  const e = ev as {
+    eventId: string;
+    type: string;
+    payload?: Record<string, unknown> | { ref: string };
+  };
+  const seq = String(eventSeqFromId(e.eventId)).padStart(4);
+  const type = e.type.padEnd(22);
+  const ctx = extractEventContext(e.payload);
+  const parts: string[] = [];
+  if (ctx.nodeId) parts.push('node=' + ctx.nodeId);
+  if (ctx.activityId) parts.push('act=' + ctx.activityId);
+  const where = parts.join(' ');
+  const err = ctx.errorCode ? ' err=' + ctx.errorCode : '';
+  console.log(seq + '  ' + type + '  ' + where + err);
+}
+
+function extractEventContext(
+  payload: unknown,
+): { nodeId?: string; activityId?: string; errorCode?: string } {
+  if (!payload || typeof payload !== 'object' || 'ref' in payload) return {};
+  const p = payload as Record<string, unknown>;
+  const out: { nodeId?: string; activityId?: string; errorCode?: string } = {};
+  if (typeof p.nodeId === 'string') out.nodeId = p.nodeId;
+  if (typeof p.activityId === 'string') out.activityId = p.activityId;
+  if (typeof p.failedNodeId === 'string') out.nodeId = p.failedNodeId;
+  const err = p.error;
+  if (err && typeof err === 'object' && 'errorCode' in err) {
+    out.errorCode = String((err as { errorCode: unknown }).errorCode);
+  }
+  return out;
 }
 
 // ─── show ─────────────────────────────────────────────────────────────────
