@@ -3,6 +3,7 @@
 // Polls /api/workflows/runs every 5s while visible.  Each row links to
 // #/workflows/<runId> — the Run Detail page (B path) hooks into the
 // same hash route.
+import { t, type MessageKey } from './i18n.js';
 
 type RunRow = {
   runId: string;
@@ -151,30 +152,35 @@ type ResolveWaitResponse = {
   pending?: boolean;
 };
 
-const PAGE_HTML = `
+function pageHtml(): string {
+  const statusOptions: Array<[string, string]> = [
+    ['', t('workflow.filter.nonTerminal')],
+    ['all', t('workflow.filter.all')],
+    ['pending', statusLabel('pending')],
+    ['running', statusLabel('running')],
+    ['waiting', statusLabel('waiting')],
+    ['succeeded', statusLabel('succeeded')],
+    ['failed', statusLabel('failed')],
+    ['cancelled', statusLabel('cancelled')],
+  ];
+  return `
 <form id="wf-filters" class="filters">
-  <input type="search" name="q" placeholder="search runId / workflowId / chatId" />
+  <input type="search" name="q" placeholder="${escapeHtml(t('workflow.searchPlaceholder'))}" />
   <select name="status">
-    <option value="">non-terminal</option>
-    <option value="all">all</option>
-    <option value="pending">pending</option>
-    <option value="running">running</option>
-    <option value="waiting">waiting</option>
-    <option value="succeeded">succeeded</option>
-    <option value="failed">failed</option>
-    <option value="cancelled">cancelled</option>
+    ${statusOptions.map(([value, label]) => `<option value="${escapeHtml(value)}">${escapeHtml(label)}</option>`).join('')}
   </select>
   <span id="wf-last-load" class="muted"></span>
 </form>
 <table>
   <thead><tr>
-    <th>run</th><th>workflow</th><th>status</th>
-    <th>lastSeq</th><th>dEf/dAct/dWait</th><th>updated</th>
-    <th>chat / app</th>
+    <th>${escapeHtml(t('workflow.table.run'))}</th><th>${escapeHtml(t('workflow.table.workflow'))}</th><th>${escapeHtml(t('workflow.table.status'))}</th>
+    <th>${escapeHtml(t('workflow.table.lastSeq'))}</th><th>${escapeHtml(t('workflow.table.dangling'))}</th><th>${escapeHtml(t('workflow.table.updated'))}</th>
+    <th>${escapeHtml(t('workflow.table.chatApp'))}</th>
   </tr></thead>
   <tbody id="wf-tbody"></tbody>
 </table>
 `;
+}
 
 const POLL_MS = 5000;
 const DETAIL_POLL_MS = 2000;
@@ -190,15 +196,21 @@ function fmtUpdated(ms: number): string {
   const d = new Date(ms);
   const now = Date.now();
   const diff = now - ms;
-  if (diff < 60_000) return `${Math.max(1, Math.floor(diff / 1000))}s ago`;
-  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
-  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`;
+  if (diff < 60_000) return t('time.secondsAgo', { value: Math.max(1, Math.floor(diff / 1000)) });
+  if (diff < 3_600_000) return t('time.minutesAgo', { value: Math.floor(diff / 60_000) });
+  if (diff < 86_400_000) return t('time.hoursAgo', { value: Math.floor(diff / 3_600_000) });
   return d.toISOString().slice(0, 19).replace('T', ' ');
 }
 
 function statusBadge(status: string): string {
   const cls = TERMINAL.has(status) ? 'wf-status terminal' : 'wf-status live';
-  return `<span class="${cls} wf-status-${escapeHtml(status)}">${escapeHtml(status)}</span>`;
+  return `<span class="${cls} wf-status-${escapeHtml(status)}">${escapeHtml(statusLabel(status))}</span>`;
+}
+
+function statusLabel(status: string): string {
+  const key = `workflow.status.${status}` as MessageKey;
+  const label = t(key);
+  return label === key ? status : label;
 }
 
 export function renderWorkflowsPage(root: HTMLElement): () => void {
@@ -210,7 +222,7 @@ export function renderWorkflowsPage(root: HTMLElement): () => void {
 }
 
 function renderWorkflowListPage(root: HTMLElement): () => void {
-  root.innerHTML = PAGE_HTML;
+  root.innerHTML = pageHtml();
   const tbody = root.querySelector<HTMLElement>('#wf-tbody')!;
   const form = root.querySelector<HTMLFormElement>('#wf-filters')!;
   const lastLoadEl = root.querySelector<HTMLElement>('#wf-last-load')!;
@@ -238,10 +250,10 @@ function renderWorkflowListPage(root: HTMLElement): () => void {
     if (rows.length === 0) {
       tbody.innerHTML = `<tr><td colspan="7" class="empty">${
         lastErr
-          ? `Failed to load: ${escapeHtml(lastErr)}`
+          ? escapeHtml(t('workflow.list.failedLoad', { error: lastErr }))
           : cache.length === 0
-            ? 'No runs match.'
-            : 'No runs match this filter.'
+            ? escapeHtml(t('workflow.list.noRuns'))
+            : escapeHtml(t('workflow.list.noFilterMatch'))
       }</td></tr>`;
       return;
     }
@@ -271,10 +283,13 @@ function renderWorkflowListPage(root: HTMLElement): () => void {
 
   function setStatusLine(): void {
     if (lastErr) {
-      lastLoadEl.textContent = `error: ${lastErr}`;
+      lastLoadEl.textContent = t('workflow.list.error', { error: lastErr });
       lastLoadEl.classList.add('error');
     } else {
-      lastLoadEl.textContent = `${cache.length} runs · refreshed ${new Date().toLocaleTimeString()}`;
+      lastLoadEl.textContent = t('workflow.list.loaded', {
+        count: cache.length,
+        time: new Date().toLocaleTimeString(),
+      });
       lastLoadEl.classList.remove('error');
     }
   }
@@ -351,12 +366,12 @@ function renderWorkflowListPage(root: HTMLElement): () => void {
 function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void {
   root.innerHTML = `
     <div class="wf-detail-head">
-      <a class="btn-link" href="#/workflows">Back</a>
+      <a class="btn-link" href="#/workflows">${escapeHtml(t('workflow.detail.back'))}</a>
       <div>
         <h2><code>${escapeHtml(runId)}</code></h2>
-        <div id="wf-detail-subtitle" class="muted">Loading...</div>
+        <div id="wf-detail-subtitle" class="muted">${escapeHtml(t('workflow.detail.loading'))}</div>
       </div>
-      <button id="wf-cancel-run" type="button" class="contrast" hidden>Cancel</button>
+      <button id="wf-cancel-run" type="button" class="contrast" hidden>${escapeHtml(t('workflow.detail.cancel'))}</button>
       <span id="wf-detail-refresh" class="muted"></span>
     </div>
     <section id="wf-detail-error" class="hint-warn" hidden></section>
@@ -365,13 +380,13 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
     <section id="wf-dangling-panel"></section>
     <section class="wf-panel">
       <div class="wf-panel-title">
-        <h3>Nodes / Activities</h3>
+        <h3>${escapeHtml(t('workflow.detail.nodes'))}</h3>
       </div>
       <div class="wf-table-scroll">
         <table>
           <thead><tr>
-            <th>node</th><th>node status</th><th>activity</th><th>activity status</th>
-            <th>attempts</th><th>current</th><th>detail</th>
+            <th>${escapeHtml(t('workflow.detail.node'))}</th><th>${escapeHtml(t('workflow.detail.nodeStatus'))}</th><th>${escapeHtml(t('workflow.detail.activity'))}</th><th>${escapeHtml(t('workflow.detail.activityStatus'))}</th>
+            <th>${escapeHtml(t('workflow.detail.attempts'))}</th><th>${escapeHtml(t('workflow.detail.current'))}</th><th>${escapeHtml(t('workflow.detail.detail'))}</th>
           </tr></thead>
           <tbody id="wf-node-tbody"></tbody>
         </table>
@@ -379,19 +394,19 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
     </section>
     <section class="wf-panel">
       <div class="wf-panel-title">
-        <h3>Node I/O</h3>
+        <h3>${escapeHtml(t('workflow.detail.nodeIO'))}</h3>
       </div>
       <div id="wf-io-list" class="wf-io-list"></div>
     </section>
     <section class="wf-panel">
       <div class="wf-panel-title">
-        <h3>Timeline</h3>
-        <button id="wf-load-older" type="button" hidden>Load older</button>
+        <h3>${escapeHtml(t('workflow.detail.timeline'))}</h3>
+        <button id="wf-load-older" type="button" hidden>${escapeHtml(t('workflow.detail.loadOlder'))}</button>
       </div>
       <div class="wf-table-scroll wf-timeline-scroll">
         <table>
           <thead><tr>
-            <th>seq</th><th>event</th><th>actor</th><th>node</th><th>activity</th><th>error</th><th>time</th>
+            <th>${escapeHtml(t('workflow.detail.seq'))}</th><th>${escapeHtml(t('workflow.detail.event'))}</th><th>${escapeHtml(t('workflow.detail.actor'))}</th><th>${escapeHtml(t('workflow.detail.node'))}</th><th>${escapeHtml(t('workflow.detail.activity'))}</th><th>${escapeHtml(t('workflow.detail.error'))}</th><th>${escapeHtml(t('workflow.detail.time'))}</th>
           </tr></thead>
           <tbody id="wf-event-tbody"></tbody>
         </table>
@@ -455,16 +470,16 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
   async function fetchSnapshot(): Promise<void> {
     const res = await fetch(`/api/workflows/runs/${encodeURIComponent(runId)}/snapshot`);
     if (res.status === 404) {
-      throw new Error('unknown run');
+      throw new Error(t('workflow.detail.unknownRun'));
     }
-    if (!res.ok) throw new Error(`snapshot HTTP ${res.status}`);
+    if (!res.ok) throw new Error(t('workflow.detail.snapshotHttp', { status: res.status }));
     snapshot = (await res.json()) as RunSnapshot;
   }
 
   async function fetchEvents(params: URLSearchParams): Promise<EventWindow> {
     const res = await fetch(`/api/workflows/runs/${encodeURIComponent(runId)}/events?${params}`);
-    if (res.status === 404) throw new Error('unknown run');
-    if (!res.ok) throw new Error(`events HTTP ${res.status}`);
+    if (res.status === 404) throw new Error(t('workflow.detail.unknownRun'));
+    if (!res.ok) throw new Error(t('workflow.detail.eventsHttp', { status: res.status }));
     return (await res.json()) as EventWindow;
   }
 
@@ -541,13 +556,11 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
   async function cancelRun(): Promise<void> {
     if (!snapshot || TERMINAL.has(snapshot.run.status) || canceling) return;
     if (!snapshot.chatBinding?.larkAppId) {
-      setError(`cancel unavailable: use botmux workflow cancel ${runId}`);
+      setError(t('workflow.detail.cancelUnavailable', { runId }));
       return;
     }
     const dangling = danglingSummary(snapshot);
-    const message = `Cancel workflow run ${runId}?\n\n` +
-      `${dangling.total} dangling item(s) will be handled by cancel-driven recovery.\n` +
-      `effects=${dangling.effects}, activities=${dangling.activities}, waits=${dangling.waits}, cancels=${dangling.cancels}`;
+    const message = t('workflow.detail.cancelConfirm', { runId, ...dangling });
     if (!window.confirm(message)) return;
     canceling = true;
     cancelBtn.disabled = true;
@@ -558,13 +571,13 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
         body: JSON.stringify({ reason: 'cancelled via dashboard' }),
       });
       if (res.status === 401) {
-        throw new Error('write access required: run `botmux dashboard` in the terminal to get a one-time URL, open it once to set the cookie, then come back and click cancel again.');
+        throw new Error(t('workflow.detail.writeAccessCancel'));
       }
       const body = (await res.json().catch(() => ({}))) as CancelRunResponse;
       if (!res.ok || !body.ok) {
-        throw new Error(body.hint ?? body.error ?? `cancel HTTP ${res.status}`);
+        throw new Error(body.hint ?? body.error ?? t('workflow.detail.cancelHttp', { status: res.status }));
       }
-      setCancelStatus(body.pending ? 'cancel pending; waiting for running activity to drain' : null);
+      setCancelStatus(body.pending ? t('workflow.detail.cancelPending') : null);
       setError(null);
       await poll();
     } catch (err: any) {
@@ -592,20 +605,22 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
         body: JSON.stringify({ comment }),
       });
       if (res.status === 401) {
-        throw new Error('write access required: run `botmux dashboard` in the terminal to get a one-time URL, open it once to set the cookie, then come back and approve/reject again.');
+        throw new Error(t('workflow.detail.writeAccessApproval'));
       }
       const body = (await res.json().catch(() => ({}))) as ResolveWaitResponse;
       if (!res.ok || !body.ok) {
-        throw new Error(body.hint ?? body.message ?? body.error ?? `${action} HTTP ${res.status}`);
+        throw new Error(
+          body.hint ?? body.message ?? body.error ?? t('workflow.detail.actionHttp', { action, status: res.status }),
+        );
       }
-      const label = action === 'approve' ? 'approved' : 'rejected';
+      const label = action === 'approve' ? t('workflow.detail.approved') : t('workflow.detail.rejected');
       approvalStatuses.set(attemptId, {
         kind: 'ok',
         text: body.alreadyTerminal
-          ? `Run already terminal; ${label} was not applied.`
+          ? t('workflow.detail.alreadyTerminal', { label })
           : body.pending
-            ? `${label}; waiting for workflow to continue.`
-            : `${label}; refreshing workflow state.`,
+            ? t('workflow.detail.workflowContinue', { label })
+            : t('workflow.detail.workflowRefreshing', { label }),
       });
       setError(null);
       await poll();
@@ -625,13 +640,15 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
     const run = snapshot.run;
     if (TERMINAL.has(run.status)) setCancelStatus(null);
     subtitle.innerHTML = `${escapeHtml(run.workflowId ?? '?')} · ${statusBadge(run.status)} · lastSeq ${snapshot.lastSeq}`;
-    refresh.textContent = `refreshed ${new Date().toLocaleTimeString()}`;
+    refresh.textContent = t('workflow.detail.refreshed', { time: new Date().toLocaleTimeString() });
     cancelBtn.hidden = TERMINAL.has(run.status);
     cancelBtn.disabled = canceling || !snapshot.chatBinding?.larkAppId;
-    cancelBtn.textContent = snapshot.chatBinding?.larkAppId ? 'Cancel' : 'CLI cancel only';
+    cancelBtn.textContent = snapshot.chatBinding?.larkAppId
+      ? t('workflow.detail.cancel')
+      : t('workflow.detail.cliCancelOnly');
     cancelBtn.title = snapshot.chatBinding?.larkAppId
-      ? 'Cancel this workflow run'
-      : `Cancel unavailable: use botmux workflow cancel ${runId}`;
+      ? t('workflow.detail.cancelTitle')
+      : t('workflow.detail.cliCancelTitle', { runId });
     renderSummary(summaryEl, snapshot);
     renderDangling(danglingEl, snapshot);
     renderNodeActivityRows(nodeTbody, snapshot);
@@ -644,7 +661,7 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
     renderEvents(eventTbody, events);
     timelineScroll.scrollTop = timelineScrollTop;
     loadOlder.hidden = !hasOlder;
-    eventMeta.textContent = `${events.length}/${totalCount} events loaded`;
+    eventMeta.textContent = t('workflow.detail.eventsLoaded', { loaded: events.length, total: totalCount });
   }
 
   function scheduleNext(): void {
@@ -677,7 +694,7 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
     })
     .catch((err: any) => {
       setError(err?.message ?? String(err));
-      subtitle.textContent = 'Load failed';
+      subtitle.textContent = t('workflow.detail.loadFailed');
     });
 
   return () => {
@@ -690,18 +707,18 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
 function renderSummary(el: HTMLElement, snap: RunSnapshot): void {
   const r = snap.run;
   const items: Array<[string, string]> = [
-    ['workflow', escapeHtml(r.workflowId ?? '?')],
-    ['status', statusBadge(r.status)],
-    ['lastSeq', String(snap.lastSeq)],
-    ['updated', escapeHtml(new Date(snap.updatedAt).toLocaleString())],
-    ['revision', escapeHtml(short(r.revisionId))],
-    ['initiator', escapeHtml(r.initiator ?? '-')],
+    [t('workflow.summary.workflow'), escapeHtml(r.workflowId ?? '?')],
+    [t('workflow.summary.status'), statusBadge(r.status)],
+    [t('workflow.summary.lastSeq'), String(snap.lastSeq)],
+    [t('workflow.summary.updated'), escapeHtml(new Date(snap.updatedAt).toLocaleString())],
+    [t('workflow.summary.revision'), escapeHtml(short(r.revisionId))],
+    [t('workflow.summary.initiator'), escapeHtml(r.initiator ?? '-')],
   ];
-  if (r.failedNodeId) items.push(['failedNode', escapeHtml(r.failedNodeId)]);
-  if (r.cancelOriginEventId) items.push(['cancelOrigin', escapeHtml(r.cancelOriginEventId)]);
+  if (r.failedNodeId) items.push([t('workflow.summary.failedNode'), escapeHtml(r.failedNodeId)]);
+  if (r.cancelOriginEventId) items.push([t('workflow.summary.cancelOrigin'), escapeHtml(r.cancelOriginEventId)]);
   if (snap.chatBinding) {
-    items.push(['chat', `<code>${escapeHtml(snap.chatBinding.chatId)}</code>`]);
-    items.push(['app', `<code>${escapeHtml(snap.chatBinding.larkAppId)}</code>`]);
+    items.push([t('workflow.summary.chat'), `<code>${escapeHtml(snap.chatBinding.chatId)}</code>`]);
+    items.push([t('workflow.summary.app'), `<code>${escapeHtml(snap.chatBinding.larkAppId)}</code>`]);
   }
   el.innerHTML = items
     .map(([label, value]) => `<div class="wf-summary-item"><span>${label}</span><strong>${value}</strong></div>`)
@@ -741,24 +758,24 @@ function danglingSummary(snap: RunSnapshot): {
 function renderDangling(el: HTMLElement, snap: RunSnapshot): void {
   const d = snap.dangling;
   const groups: Array<[string, string[]]> = [
-    ['activities', d.activities],
-    ['effects', d.effectAttempted],
-    ['waits', d.waits],
-    ['cancels', d.cancels],
+    [t('workflow.dangling.activities'), d.activities],
+    [t('workflow.dangling.effects'), d.effectAttempted],
+    [t('workflow.dangling.waits'), d.waits],
+    [t('workflow.dangling.cancels'), d.cancels],
   ];
   const total = new Set(groups.flatMap(([, xs]) => xs)).size;
   el.className = total > 0 ? 'wf-panel wf-dangling-panel has' : 'wf-panel wf-dangling-panel';
   if (total === 0) {
-    el.innerHTML = `<div class="wf-panel-title"><h3>Dangling</h3></div><div class="muted">No dangling work.</div>`;
+    el.innerHTML = `<div class="wf-panel-title"><h3>${escapeHtml(t('workflow.detail.dangling'))}</h3></div><div class="muted">${escapeHtml(t('workflow.detail.noDangling'))}</div>`;
     return;
   }
-  el.innerHTML = `<div class="wf-panel-title"><h3>Dangling</h3><span class="wf-dangling has">${total}</span></div>
+  el.innerHTML = `<div class="wf-panel-title"><h3>${escapeHtml(t('workflow.detail.dangling'))}</h3><span class="wf-dangling has">${total}</span></div>
     <div class="wf-dangling-grid">
       ${groups
         .map(
           ([name, xs]) => `<div><strong>${name}</strong>${
             xs.length === 0
-              ? '<div class="muted">none</div>'
+              ? `<div class="muted">${escapeHtml(t('workflow.detail.none'))}</div>`
               : `<ul>${xs.map((x) => `<li><code>${escapeHtml(x)}</code></li>`).join('')}</ul>`
           }</div>`,
         )
@@ -784,7 +801,9 @@ function renderNodeActivityRows(tbody: HTMLElement, snap: RunSnapshot): void {
     rows.push(renderNodeActivityRow(undefined, activity));
   }
 
-  tbody.innerHTML = rows.length > 0 ? rows.join('') : '<tr><td colspan="7" class="empty">No nodes yet.</td></tr>';
+  tbody.innerHTML = rows.length > 0
+    ? rows.join('')
+    : `<tr><td colspan="7" class="empty">${escapeHtml(t('workflow.detail.noNodes'))}</td></tr>`;
 }
 
 function renderNodeActivityRow(node?: NodeState, activity?: ActivityState): string {
@@ -796,7 +815,7 @@ function renderNodeActivityRow(node?: NodeState, activity?: ActivityState): stri
     <td>${activity ? statusBadge(activity.status) : '<span class="muted">-</span>'}</td>
     <td>${activity?.attempts.length ?? 0}</td>
     <td>${latest ? `<code>${escapeHtml(latest.attemptId)}</code>` : '<span class="muted">-</span>'}</td>
-    <td>${latest ? renderAttemptDetail(latest) : '<span class="muted">idle</span>'}</td>
+    <td>${latest ? renderAttemptDetail(latest) : `<span class="muted">${escapeHtml(t('workflow.detail.idle'))}</span>`}</td>
   </tr>`;
 }
 
@@ -842,7 +861,9 @@ function renderNodeIO(
     ));
   }
 
-  el.innerHTML = cards.length > 0 ? cards.join('') : '<div class="empty">No node I/O yet.</div>';
+  el.innerHTML = cards.length > 0
+    ? cards.join('')
+    : `<div class="empty">${escapeHtml(t('workflow.detail.noNodeIO'))}</div>`;
   restoreIOBlockScroll(el, scrollTops);
   attachIOBlockToggleTracking(el, openBlocks);
   attachIOBlockScrollTracking(el, scrollTops);
@@ -875,20 +896,20 @@ function renderIOCard(
     <header>
       <div>
         <strong><code>${escapeHtml(title)}</code></strong>
-        <span class="muted">${activity ? escapeHtml(activity.activityId) : 'not dispatched'}</span>
+        <span class="muted">${activity ? escapeHtml(activity.activityId) : escapeHtml(t('workflow.detail.notDispatched'))}</span>
       </div>
       <div>${node ? statusBadge(node.status) : ''} ${activity ? statusBadge(activity.status) : ''}</div>
     </header>
     <div class="wf-io-meta">
-      ${attempt ? `attempt <code>${escapeHtml(attempt.attemptId)}</code>` : 'No attempt yet'}
+      ${attempt ? `${escapeHtml(t('workflow.detail.attempt'))} <code>${escapeHtml(attempt.attemptId)}</code>` : escapeHtml(t('workflow.detail.noAttempt'))}
     </div>
     ${controls}
     <div class="wf-io-grid">
-      ${renderPreviewBlock(keyPrefix, 'Authored input', io?.input, openBlocks)}
-      ${renderPreviewBlock(keyPrefix, 'Resolved input', io?.resolvedInput, openBlocks)}
-      ${renderPreviewBlock(keyPrefix, 'Output', io?.output, openBlocks)}
-      ${renderPreviewBlock(keyPrefix, 'Execution log', io?.log, openBlocks)}
-      ${io?.waitPrompt ? renderPreviewBlock(keyPrefix, 'Wait prompt', io.waitPrompt, openBlocks) : ''}
+      ${renderPreviewBlock(keyPrefix, t('workflow.detail.authoredInput'), io?.input, openBlocks)}
+      ${renderPreviewBlock(keyPrefix, t('workflow.detail.resolvedInput'), io?.resolvedInput, openBlocks)}
+      ${renderPreviewBlock(keyPrefix, t('workflow.detail.output'), io?.output, openBlocks)}
+      ${renderPreviewBlock(keyPrefix, t('workflow.detail.executionLog'), io?.log, openBlocks)}
+      ${io?.waitPrompt ? renderPreviewBlock(keyPrefix, t('workflow.detail.waitPrompt'), io.waitPrompt, openBlocks) : ''}
     </div>
   </article>`;
 }
@@ -905,13 +926,13 @@ function renderApprovalControls(
   const statusClass = status?.kind === 'error' ? 'hint-warn' : 'hint-ok';
   return `<div class="wf-approval-box" data-wf-approval="${escapeHtml(attemptId)}">
     <label>
-      <span>Approval comment</span>
-      <textarea class="wf-approval-comment" data-wf-approval-comment="${escapeHtml(attemptId)}" rows="2" placeholder="Optional comment"${resolving ? ' disabled' : ''}>${escapeHtml(comment)}</textarea>
+      <span>${escapeHtml(t('workflow.detail.approvalComment'))}</span>
+      <textarea class="wf-approval-comment" data-wf-approval-comment="${escapeHtml(attemptId)}" rows="2" placeholder="${escapeHtml(t('workflow.detail.optionalComment'))}"${resolving ? ' disabled' : ''}>${escapeHtml(comment)}</textarea>
     </label>
     <div class="wf-approval-actions">
-      <button type="button" class="primary" data-wf-approval-action="approve" data-wf-attempt-id="${escapeHtml(attemptId)}"${resolving ? ' disabled' : ''}>Approve</button>
-      <button type="button" data-wf-approval-action="reject" data-wf-attempt-id="${escapeHtml(attemptId)}"${resolving ? ' disabled' : ''}>Reject</button>
-      ${resolving ? '<span class="muted">Submitting...</span>' : ''}
+      <button type="button" class="primary" data-wf-approval-action="approve" data-wf-attempt-id="${escapeHtml(attemptId)}"${resolving ? ' disabled' : ''}>${escapeHtml(t('workflow.detail.approve'))}</button>
+      <button type="button" data-wf-approval-action="reject" data-wf-attempt-id="${escapeHtml(attemptId)}"${resolving ? ' disabled' : ''}>${escapeHtml(t('workflow.detail.reject'))}</button>
+      ${resolving ? `<span class="muted">${escapeHtml(t('workflow.detail.submitting'))}</span>` : ''}
     </div>
     ${status ? `<div class="${statusClass} wf-approval-status">${escapeHtml(status.text)}</div>` : ''}
   </div>`;
@@ -1013,36 +1034,36 @@ function attachIOBlockScrollTracking(root: HTMLElement, scrollTops: Map<string, 
 }
 
 function previewMeta(preview?: BlobPreview): string {
-  if (!preview) return '<span class="muted">empty</span>';
+  if (!preview) return `<span class="muted">${escapeHtml(t('workflow.detail.empty'))}</span>`;
   const bits: string[] = [];
   if (preview.outputBytes !== undefined) bits.push(`${preview.outputBytes}B`);
-  if (preview.truncated) bits.push('truncated');
-  if (preview.error) bits.push('error');
+  if (preview.truncated) bits.push(t('workflow.detail.truncated'));
+  if (preview.error) bits.push(t('workflow.detail.error'));
   if (preview.outputHash) bits.push(short(preview.outputHash));
   return bits.length ? `<span class="muted">${escapeHtml(bits.join(' · '))}</span>` : '';
 }
 
 function renderPreview(preview?: BlobPreview): string {
-  if (!preview) return '<div class="muted wf-io-empty">No data.</div>';
+  if (!preview) return `<div class="muted wf-io-empty">${escapeHtml(t('workflow.detail.noData'))}</div>`;
   const body =
     preview.value !== undefined
       ? JSON.stringify(preview.value, null, 2)
       : preview.text ?? '';
   const error = preview.error ? `<div class="muted error">${escapeHtml(preview.error)}</div>` : '';
-  if (!body) return `${error}<div class="muted wf-io-empty">No preview.</div>`;
+  if (!body) return `${error}<div class="muted wf-io-empty">${escapeHtml(t('workflow.detail.noPreview'))}</div>`;
   return `${error}<pre class="wf-io-pre">${escapeHtml(body)}</pre>`;
 }
 
 function renderAttemptDetail(at: AttemptState): string {
   const parts: string[] = [];
-  if (at.effectAttempted) parts.push(`effect ${escapeHtml(at.effectAttempted.provider)}`);
+  if (at.effectAttempted) parts.push(`${escapeHtml(t('workflow.detail.effect'))} ${escapeHtml(at.effectAttempted.provider)}`);
   if (at.wait) {
     const res = at.wait.resolution
       ? `${at.wait.resolution.kind}${at.wait.resolution.resolution ? ':' + at.wait.resolution.resolution : ''}`
-      : 'open';
-    parts.push(`wait ${escapeHtml(at.wait.waitKind)} ${escapeHtml(res)}`);
+      : t('workflow.detail.open');
+    parts.push(`${escapeHtml(t('workflow.detail.wait'))} ${escapeHtml(at.wait.waitKind)} ${escapeHtml(res)}`);
     if (at.wait.deadlineAt !== undefined) {
-      parts.push(`deadline ${escapeHtml(formatClock(at.wait.deadlineAt))}`);
+      parts.push(`${escapeHtml(t('workflow.detail.deadline'))} ${escapeHtml(formatClock(at.wait.deadlineAt))}`);
     }
   }
   if (at.error) {
@@ -1052,7 +1073,7 @@ function renderAttemptDetail(at: AttemptState): string {
       parts.push(`<span class="error wf-error-msg">${escapeHtml(at.error.errorMessage)}</span>`);
     }
   }
-  if (at.output) parts.push(`output ${escapeHtml(short(at.output.outputHash))}`);
+  if (at.output) parts.push(`${escapeHtml(t('workflow.detail.output'))} ${escapeHtml(short(at.output.outputHash))}`);
   if (at.runningMs !== undefined) parts.push(`${at.runningMs}ms`);
   return parts.length > 0 ? parts.join('<br/>') : '<span class="muted">-</span>';
 }
@@ -1061,7 +1082,7 @@ function renderEvents(tbody: HTMLElement, events: WorkflowEvent[]): void {
   tbody.innerHTML =
     events.length > 0
       ? events.map(renderEventRow).join('')
-      : '<tr><td colspan="7" class="empty">No events.</td></tr>';
+      : `<tr><td colspan="7" class="empty">${escapeHtml(t('workflow.detail.noEvents'))}</td></tr>`;
 }
 
 function renderEventRow(ev: WorkflowEvent): string {

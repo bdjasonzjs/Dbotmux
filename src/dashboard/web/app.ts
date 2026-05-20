@@ -5,8 +5,10 @@ import { renderSchedulesPage } from './schedules.js';
 import { renderGroupsPage } from './groups.js';
 import { renderBotDefaultsPage } from './bot-defaults.js';
 import { renderWorkflowsPage } from './workflows.js';
+import { getLang, onLangChange, setLang, t, translateDom, type Lang } from './i18n.js';
 
 const root = document.getElementById('root')!;
+const langPicker = document.getElementById('lang-picker') as HTMLSelectElement | null;
 
 // Pages that own a polling loop / cleanup return a disposer; we run it
 // on the next route switch so timers don't leak across navigations.
@@ -36,10 +38,21 @@ function route() {
 const statusEl = document.getElementById('status');
 function paintStatus() {
   if (!statusEl) return;
-  statusEl.textContent = store.online ? '● live' : '● disconnected';
+  statusEl.textContent = store.online ? t('status.live') : t('status.offline');
   statusEl.className = 'status ' + (store.online ? 'online' : 'offline');
 }
 store.on(paintStatus);
+translateDom();
+if (langPicker) {
+  langPicker.value = getLang();
+  langPicker.addEventListener('change', () => setLang(langPicker.value as Lang));
+}
+onLangChange(() => {
+  translateDom();
+  if (langPicker) langPicker.value = getLang();
+  paintStatus();
+  route();
+});
 paintStatus();
 
 // esbuild's IIFE bundle does not support top-level await — use an async IIFE.
