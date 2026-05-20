@@ -137,4 +137,5 @@ input.row-select { cursor: pointer; }
 .wf-io-block summary .muted { margin-left: 0.3rem; font-weight: 400; }
 .wf-io-pre { margin: 0; padding: 0.5rem; max-height: 340px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: white; border-top: 1px solid var(--border); }
 .wf-io-empty { padding: 0.5rem; }
+.wf-error-msg { display: block; margin-top: 0.15rem; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
 td code, .wf-summary-item code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }

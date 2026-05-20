@@ -266,6 +266,57 @@ describe('readRunSnapshot', () => {
     });
   });
 
+  it('returns the tail when terminal.log exceeds the 64KiB cap', async () => {
+    await seedSucceeded('r-tail-log');
+    const activityId = workActivityId('r-tail-log', 'only');
+    const attemptId = 'r-tail-log::work::only::att-1';
+    const attemptDir = join(runsDir, 'r-tail-log', 'attempts', activityId, attemptId);
+    mkdirSync(attemptDir, { recursive: true });
+    // Write head sentinel + filler + tail sentinel, total > 64KiB.
+    // Both sentinels are distinct strings; if the preview is a head-window
+    // (the buggy past behavior) tail sentinel won't appear and head will.
+    const HEAD = 'HEAD_SENTINEL_DO_NOT_SHOW';
+    const TAIL = 'TAIL_SENTINEL_MUST_SHOW';
+    const filler = 'x'.repeat(70 * 1024); // 70KiB filler so head+filler+tail > 64KiB
+    writeFileSync(
+      join(attemptDir, 'terminal.log'),
+      `${HEAD}\n${filler}\n${TAIL}\n`,
+      'utf-8',
+    );
+
+    const snap = await readRunSnapshot(runsDir, 'r-tail-log');
+    const log = snap?.attemptIO[attemptId]?.log;
+    expect(log).toBeDefined();
+    expect(log!.truncated).toBe(true);
+    expect(log!.outputBytes).toBeGreaterThan(64 * 1024);
+    expect(log!.text).toContain(TAIL);
+    expect(log!.text).not.toContain(HEAD);
+  });
+
+  it('preserves activityFailed errorMessage in attempt error', async () => {
+    const failingSpawn: WorkerSpawnFn = async () => ({
+      kind: 'failure',
+      errorCode: 'InputBindingFailed',
+      errorClass: 'userFault',
+      errorMessage: 'humanGate.prompt is too large after binding (4950 bytes; max 4096)',
+    });
+    const log = new EventLog('r-failed-msg', runsDir);
+    await createRun(log, {
+      def: HELLO_DEF,
+      params: {},
+      initiator: 'test',
+      botResolver: () => ({}),
+    });
+    await runLoop({ log, def: HELLO_DEF, spawnSubagent: failingSpawn });
+
+    const snap = await readRunSnapshot(runsDir, 'r-failed-msg');
+    const activity = snap?.activities.find((a) => a.ownerNodeId === 'only');
+    const attempt = activity?.attempts[activity.attempts.length - 1];
+    expect(attempt?.error?.errorCode).toBe('InputBindingFailed');
+    expect(attempt?.error?.errorClass).toBe('userFault');
+    expect(attempt?.error?.errorMessage).toContain('humanGate.prompt is too large');
+  });
+
   it('inlines chatBinding when present', async () => {
     await seedActive('r-binded');
     writeFileSync(

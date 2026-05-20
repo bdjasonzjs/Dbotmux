@@ -892,7 +892,13 @@ function renderAttemptDetail(at: AttemptState): string {
       parts.push(`deadline ${escapeHtml(formatClock(at.wait.deadlineAt))}`);
     }
   }
-  if (at.error) parts.push(`<span class="muted error">${escapeHtml(at.error.errorCode)}</span>`);
+  if (at.error) {
+    const tag = `${at.error.errorCode}${at.error.errorClass ? ` · ${at.error.errorClass}` : ''}`;
+    parts.push(`<span class="muted error">${escapeHtml(tag)}</span>`);
+    if (at.error.errorMessage) {
+      parts.push(`<span class="error wf-error-msg">${escapeHtml(at.error.errorMessage)}</span>`);
+    }
+  }
   if (at.output) parts.push(`output ${escapeHtml(short(at.output.outputHash))}`);
   if (at.runningMs !== undefined) parts.push(`${at.runningMs}ms`);
   return parts.length > 0 ? parts.join('<br/>') : '<span class="muted">-</span>';
