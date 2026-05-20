@@ -12,10 +12,19 @@
  *   2. open humanGate (waitCreated dangling) → resume returns
  *      `awaiting-wait` with zero `waitResolved` and zero new IM side
  *      effects.
- *   3. subagent dispatch reachable during resume → throw-free stub returns
+ *   3. subagent dispatch reachable during resume (orchestrator emits
+ *      `dispatchWork` on a fresh run) → throw-free stub returns
  *      `WorkerCrashed/manual` → runLoop writes activityFailed + advances
  *      orchestrator to terminal failed.  Verifies the CLI does NOT crash
  *      on a JS exception when subagent work is reached.
+ *   4. **cold-start in-flight subagent edge** — runDir has `attemptCreated`
+ *      for a subagent activity but NO terminal and NO `effectAttempted`.
+ *      R0 recovery only handles the side-effect family, so resume() does
+ *      not touch this; orchestrator sees the activity in flight and emits
+ *      no actions → runLoop returns `no-progress`.  R1 deliberately does
+ *      NOT mark these as WorkerCrashed (R2 daemon cold-scan owns that
+ *      decision); this test locks the current behavior so R2's change is
+ *      a deliberate flip, not silent drift.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -328,7 +337,7 @@ describe('R1 — open humanGate cold resume from runDir', () => {
 
 // ─── Test 3: subagent dispatch reachable → stub returns failure ─────────
 
-describe('R1 — subagent dispatch during cold resume is rejected, not crashing', () => {
+describe('R1 — fresh subagent dispatch during cold resume is rejected, not crashing', () => {
   it('throw-free spawn stub lands as activityFailed{WorkerCrashed/manual} and run terminates failed', async () => {
     const def = parseWorkflowDefinition({
       workflowId: 'wf-r1-subagent',
@@ -399,5 +408,99 @@ describe('R1 — subagent dispatch during cold resume is rejected, not crashing'
     // And the orchestrator closed the run cleanly.
     const snap = replay(events);
     expect(snap.run.failedNodeId).toBe('n1');
+  });
+});
+
+// ─── Test 4: cold-start in-flight subagent → no-progress (R2 boundary) ──
+
+describe('R1 — in-flight subagent activity on cold resume stays no-progress', () => {
+  it('attemptCreated without terminal and without effectAttempted is NOT touched by resume; runLoop returns no-progress (R2 will own the WorkerCrashed flip)', async () => {
+    const def = parseWorkflowDefinition({
+      workflowId: 'wf-r1-inflight',
+      version: 1,
+      nodes: {
+        n1: {
+          type: 'subagent',
+          bot: 'b',
+          prompt: 'do work',
+        },
+      },
+    });
+    const log = new EventLog(RUN_ID, runsDir);
+    await createRun(log, {
+      def,
+      params: {},
+      initiator: 'r1',
+      botResolver: () => ({}),
+    });
+
+    // Seed an in-flight subagent state: attemptCreated written, no
+    // activitySucceeded / activityFailed, and crucially NO effectAttempted
+    // (subagent activities don't write that — only hostExecutor does).
+    // R0 recovery only consumes the side-effect family, so this entry
+    // does NOT show up in danglingEffectAttempted.
+    const activityId = workActivityId(RUN_ID, 'n1');
+    const attemptId = `${activityId}::att-1`;
+    await log.append({
+      runId: RUN_ID,
+      type: 'attemptCreated',
+      actor: 'scheduler',
+      payload: {
+        nodeId: 'n1',
+        activityId,
+        attemptId,
+        attemptNumber: 1,
+        inputRef: {
+          outputHash: 'sha256:' + 'c'.repeat(64),
+          outputBytes: 12,
+          outputSchemaVersion: 1,
+        },
+      },
+    });
+
+    const eventsBefore = await log.readAll();
+    const seqBefore = eventsBefore[eventsBefore.length - 1]!.seq;
+
+    const {
+      createDefaultHostExecutorRegistry,
+      createDefaultProviderReconcilers,
+    } = await import('../src/workflows/hostExecutors/registry.js');
+    const { loadEffectInputSidecar } = await import(
+      '../src/workflows/effect-input.js'
+    );
+
+    // Spy on spawnSubagent: if anything calls it here, the test was
+    // wrong about the seeded state (orchestrator should see the activity
+    // in flight and emit no actions).
+    let spawnCalls = 0;
+    const ctx: WorkflowRuntimeContext = {
+      log,
+      def,
+      spawnSubagent: async (input) => {
+        spawnCalls++;
+        return resumeSpawnStub(input);
+      },
+      hostExecutors: createDefaultHostExecutorRegistry(),
+      reconcilers: createDefaultProviderReconcilers(),
+      loadEffectInput: (aid, atid) => loadEffectInputSidecar(log, aid, atid),
+    };
+
+    const result = await runLoop(ctx, { maxTicks: 50 });
+
+    // Locked R1 behavior: in-flight subagent activity is invisible to
+    // R0 recovery and not re-dispatched by the orchestrator → no-progress.
+    expect(result.reason).toBe('no-progress');
+    expect(result.lastSnapshot.run.status).toBe('running');
+    expect(spawnCalls).toBe(0);
+
+    // The activity is dangling at the activity level but NOT at the
+    // effect level — R2's cold-scan will be the one to decide whether
+    // to flip it to WorkerCrashed.
+    expect(result.lastSnapshot.danglingActivities).toContain(activityId);
+    expect(result.lastSnapshot.danglingEffectAttempted).not.toContain(activityId);
+
+    // No new events written during the no-progress detection.
+    const eventsAfter = await log.readAll();
+    expect(eventsAfter[eventsAfter.length - 1]!.seq).toBe(seqBefore);
   });
 });
