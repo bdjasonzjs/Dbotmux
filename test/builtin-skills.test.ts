@@ -53,5 +53,7 @@ describe('built-in botmux-workflow-create skill', () => {
     expect(skill!.content).toContain('botmux-schedule');
     expect(skill!.content).toContain('当前没有字符串模板语言');
     expect(skill!.content).toContain('"$ref": "params.<path>"');
+    expect(skill!.content).toContain('语法支持两种形式');
+    expect(skill!.content).not.toContain('语法只能是 `<nodeId>.output.<path>`');
   });
 });

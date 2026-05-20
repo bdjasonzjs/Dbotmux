@@ -546,10 +546,11 @@ humanGate：
 \`\`\`
 
 约束：
-- 语法只能是 \`<nodeId>.output.<path>\`。
+- 语法支持两种形式：\`<nodeId>.output.<path>\` 引上游 output，\`params.<path>\` 引 run 启动入参。
 - \`$ref\` 对象必须独占，不能有额外 key。
 - \`$ref\` 是整值替换，不能拼字符串。
 - 引用某个 node 的 output 时，当前 node 必须在 \`depends\` 里声明该 node。
+- 引用 \`params.<path>\` 时，不需要写 \`depends\`。
 - validate 不会证明 output 字段存在；用 \`outputSchema\` 和 few-shot prompt 约束 subagent 返回 JSON。
 
 ## humanGate 启发式
@@ -667,7 +668,6 @@ humanGate：
 \`\`\`
 
 **Params 注入最适合的场景**：路由信息（chat id / app id / recipient）、模式开关（mode='draft'|'send'）、配置（threshold、超时）。**不适合**：放完整 prompt 指令——因为 \`$ref\` 不能拼接字符串，prompt 应该是节点设计时确定的固定指令，让 bot 拿 params 当上下文 input 不如直接固定 prompt 简单。
-\`\`\`
 
 ## 常见错误
 
