@@ -65,6 +65,16 @@ describe('parseWorkflowOutput', () => {
     if (result.ok) throw new Error('expected failure');
     expect(result.reason).toBe('invalid-json');
   });
+
+  it('sanitizes PTY control sequences and hard wraps inside marker JSON', () => {
+    const text =
+      `\u001b[?25lstatus\r\n${WORKFLOW_OUTPUT_BEGIN}\r\n` +
+      `{"plan":"hello\u001b[0K\r\nworld","highlights":["a"]}\r\n` +
+      `${WORKFLOW_OUTPUT_END}\u001b[?25h`;
+    const result = parseWorkflowOutput(text);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value).toEqual({ plan: 'helloworld', highlights: ['a'] });
+  });
 });
 
 describe('withWorkflowOutputProtocol', () => {

@@ -1,5 +1,9 @@
 import { describe, it, expect, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import {
   createWorkflowDaemonSpawn,
@@ -44,6 +48,18 @@ function scriptedFactory(script: Script): WorkerProcessFactory {
       // Run script async so the caller can hook .on('message') first.
       setImmediate(() => script(scriptHandle));
       return handle;
+    },
+  };
+}
+
+function scriptedFactoryWithOpts(
+  script: Script,
+  onSpawn: (opts: { cwd: string; workerPath: string }) => void,
+): WorkerProcessFactory {
+  return {
+    spawn(opts) {
+      onSpawn(opts);
+      return scriptedFactory(script).spawn(opts);
     },
   };
 }
@@ -199,5 +215,76 @@ describe('createWorkflowDaemonSpawn', () => {
     });
     await deps.runOneShot({ ...baseInput, botName: 'codex-loopy' });
     expect(resolver).toHaveBeenCalledWith('codex-loopy');
+  });
+
+  it('expands tilde workingDir before spawning and initializing the worker', async () => {
+    const sent: unknown[] = [];
+    let spawnedCwd: string | undefined;
+    const deps = createWorkflowDaemonSpawn({
+      resolveLarkCredentials: () => fakeCreds,
+      quiesceMs: 30,
+      factory: scriptedFactoryWithOpts(
+        (s) => {
+          s.onSend((msg) => sent.push(msg));
+          s.emit({ type: 'ready', port: 1, token: 't' });
+          s.emit({
+            type: 'final_output',
+            content: `${WORKFLOW_OUTPUT_BEGIN}{}${WORKFLOW_OUTPUT_END}`,
+            lastUuid: 'u',
+            turnId: 't',
+          });
+          s.emit({ type: 'screen_update', content: '', status: 'idle' });
+        },
+        (opts) => {
+          spawnedCwd = opts.cwd;
+        },
+      ),
+    });
+
+    const expectedCwd = join(homedir(), 'claude-code-workspace');
+    const result = await deps.runOneShot({
+      ...baseInput,
+      workingDir: '~/claude-code-workspace',
+    });
+
+    const init = sent.find(
+      (m): m is Record<string, unknown> =>
+        typeof m === 'object' && m !== null && (m as Record<string, unknown>).type === 'init',
+    );
+    expect(spawnedCwd).toBe(expectedCwd);
+    expect(init?.workingDir).toBe(expectedCwd);
+    expect(result.session.workingDir).toBe(expectedCwd);
+  });
+
+  it('writes per-attempt execution log when attemptLogPath is provided', async () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'wf-daemon-log-'));
+    try {
+      const attemptLogPath = join(tmp, 'terminal.log');
+      const deps = createWorkflowDaemonSpawn({
+        resolveLarkCredentials: () => fakeCreds,
+        quiesceMs: 30,
+        factory: scriptedFactory((s) => {
+          s.emit({ type: 'ready', port: 1, token: 't' });
+          s.emit({
+            type: 'final_output',
+            content: `${WORKFLOW_OUTPUT_BEGIN}{"ok":true}${WORKFLOW_OUTPUT_END}`,
+            lastUuid: 'u',
+            turnId: 'turn-1',
+          });
+          s.emit({ type: 'screen_update', content: '', status: 'idle' });
+        }),
+      });
+
+      const result = await deps.runOneShot({ ...baseInput, attemptLogPath });
+
+      expect(result.session.logPath).toBe(attemptLogPath);
+      const log = readFileSync(attemptLogPath, 'utf-8');
+      expect(log).toContain('system starting workflow worker');
+      expect(log).toContain('system worker ready port=1');
+      expect(log).toContain('final_output:turn-1');
+      expect(log).toContain(WORKFLOW_OUTPUT_BEGIN);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
   });
 });

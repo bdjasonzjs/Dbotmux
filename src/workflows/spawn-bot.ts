@@ -86,7 +86,8 @@ export function parseWorkflowOutput(text: string): ParseWorkflowOutputResult {
   if (beginBeforeEnd < 0) {
     return { ok: false, reason: 'no-marker' };
   }
-  const block = text.slice(beginBeforeEnd + WORKFLOW_OUTPUT_BEGIN.length, lastEnd).trim();
+  const rawBlock = text.slice(beginBeforeEnd + WORKFLOW_OUTPUT_BEGIN.length, lastEnd).trim();
+  const block = sanitizeWorkflowOutputBlock(rawBlock);
   try {
     return { ok: true, value: JSON.parse(block), raw: block };
   } catch (err) {
@@ -96,6 +97,19 @@ export function parseWorkflowOutput(text: string): ParseWorkflowOutputResult {
       detail: err instanceof Error ? err.message : String(err),
     };
   }
+}
+
+function sanitizeWorkflowOutputBlock(block: string): string {
+  // PTY fallback transcripts can include terminal control sequences and
+  // hard-wrapped CR/LF bytes inside an otherwise valid one-line JSON block.
+  // Agent transcript files remain preferred when available; this keeps the
+  // fallback from rejecting clean model output just because the terminal view
+  // polluted it.
+  return block
+    .replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\)/g, '')
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/[\u0000-\u001f\u007f]/g, '')
+    .trim();
 }
 
 // ─── Stub factory (test / dev) ────────────────────────────────────────────
@@ -157,6 +171,8 @@ export type DaemonRunOneShotInput = {
   nodeId: string;
   activityId: string;
   attemptId: string;
+  /** Conventional per-attempt execution log path. */
+  attemptLogPath?: string;
 };
 
 export type DaemonRunOneShotResult = {
@@ -205,6 +221,7 @@ export function createDaemonSpawnFn(deps: DaemonSpawnDeps): WorkerSpawnFn {
         nodeId: input.nodeId,
         activityId: input.activityId,
         attemptId: input.attemptId,
+        attemptLogPath: input.attemptLogPath,
       });
     } catch (err) {
       return {

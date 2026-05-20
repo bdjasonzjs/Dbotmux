@@ -107,6 +107,66 @@ const lastRepoScan = new Map<string, import('./services/project-scanner.js').Pro
 const cliVersionCache = new Map<string, { version: string; lastCheckAt: number }>();
 const VERSION_CHECK_INTERVAL = 60_000; // cache 1 min
 
+function parsePositiveIntEnv(name: string): number {
+  const raw = process.env[name];
+  if (!raw) return 0;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    logger.warn(`[memdiag] ignoring invalid ${name}=${JSON.stringify(raw)}`);
+    return 0;
+  }
+  return Math.floor(parsed);
+}
+
+function formatMiB(bytes: number | undefined): string {
+  if (!Number.isFinite(bytes)) return 'n/a';
+  return `${((bytes ?? 0) / 1024 / 1024).toFixed(1)}MiB`;
+}
+
+function summarizeActiveResources(): string {
+  if (typeof process.getActiveResourcesInfo !== 'function') return 'unavailable';
+  const counts = new Map<string, number>();
+  for (const name of process.getActiveResourcesInfo()) {
+    counts.set(name, (counts.get(name) ?? 0) + 1);
+  }
+  if (counts.size === 0) return 'none';
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, 16)
+    .map(([name, count]) => `${name}:${count}`)
+    .join(',');
+}
+
+function logMemoryDiagnostics(reason: string): void {
+  const usage = process.memoryUsage();
+  const external = usage.external ?? 0;
+  const arrayBuffers = usage.arrayBuffers ?? 0;
+  const nativeOther = Math.max(0, usage.rss - usage.heapTotal - external);
+  logger.info(
+    `[memdiag] reason=${reason} ` +
+    `rss=${formatMiB(usage.rss)} ` +
+    `heapUsed=${formatMiB(usage.heapUsed)} ` +
+    `heapTotal=${formatMiB(usage.heapTotal)} ` +
+    `external=${formatMiB(external)} ` +
+    `arrayBuffers=${formatMiB(arrayBuffers)} ` +
+    `nativeOther~=${formatMiB(nativeOther)} ` +
+    `activeSessions=${activeSessions.size} ` +
+    `workflowRuns=${workflowRuns.size} ` +
+    `workflowWatchers=${workflowEventWatchers.size} ` +
+    `resources=${summarizeActiveResources()}`,
+  );
+}
+
+function startMemoryDiagnostics(): ReturnType<typeof setInterval> | undefined {
+  const intervalMs = parsePositiveIntEnv('BOTMUX_MEMORY_DIAG_INTERVAL_MS');
+  if (!intervalMs) return undefined;
+  logger.info(`[memdiag] enabled intervalMs=${intervalMs}`);
+  logMemoryDiagnostics('startup');
+  const timer = setInterval(() => logMemoryDiagnostics('interval'), intervalMs);
+  if (typeof timer.unref === 'function') timer.unref();
+  return timer;
+}
+
 /**
  * Reply into a session — scope-aware.
  *
@@ -508,6 +568,12 @@ async function attachColdWorkflowRuns(ownerLarkAppId: string): Promise<void> {
  * bot-registry at module-init time (it isn't loaded yet); each call
  * resolves credentials by the workflow node's `bot` name, falling
  * back to the IM larkAppId if the bot rename hasn't propagated.
+ *
+ * Multi-daemon: each process registers only its own bot in memory, but
+ * workflow subagent nodes may target sibling bots (e.g. coco/aiden) that
+ * live in other daemon processes. The shared bots.json is the source of
+ * truth across daemons, so we fall back to it when the in-memory
+ * registry misses.
  */
 function workflowSpawnFn(): WorkerSpawnFn {
   const daemonDeps = createWorkflowDaemonSpawn({
@@ -515,12 +581,22 @@ function workflowSpawnFn(): WorkerSpawnFn {
       const bot = getAllBots().find(
         (b) => b.config.name === botName || b.botName === botName || b.config.larkAppId === botName,
       );
-      if (!bot) {
+      if (bot) {
+        return {
+          larkAppId: bot.config.larkAppId,
+          larkAppSecret: bot.config.larkAppSecret,
+        };
+      }
+      const siblingConfigs = loadBotConfigs();
+      const sibling = siblingConfigs.find(
+        (c) => c.name === botName || c.larkAppId === botName,
+      );
+      if (!sibling) {
         throw new Error(`workflow: bot '${botName}' not found in registry`);
       }
       return {
-        larkAppId: bot.config.larkAppId,
-        larkAppSecret: bot.config.larkAppSecret,
+        larkAppId: sibling.larkAppId,
+        larkAppSecret: sibling.larkAppSecret,
       };
     },
   });
@@ -1427,6 +1503,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   logger.info(`Bot ${idx}/${botConfigs.length}: ${cfg.larkAppId} (cli: ${cfg.cliId})`)
 
   writePidFile();
+  const memoryDiagnostics = startMemoryDiagnostics();
 
   // Publish self-descriptor for the dashboard registry. The dashboard sibling
   // process discovers running daemons by scanning ~/.botmux/data/dashboard-daemons/
@@ -1588,6 +1665,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     workflowEventWatchers.clear();
     workflowRuns.clear();
     clearInterval(descriptorHeartbeat);
+    if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     removeDaemonDescriptor(cfg.larkAppId);
     ipcHandle.close().catch(() => { /* swallow */ });
 
@@ -1651,6 +1729,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // the descriptor so the dashboard doesn't see a phantom daemon.
   process.on('exit', () => {
     clearInterval(descriptorHeartbeat);
+    if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     removeDaemonDescriptor(cfg.larkAppId);
     // Plain-exit path (uncaught fatal, manual process.exit) bypasses the
     // graceful shutdown above. flushIdentityCacheSync is synchronous and

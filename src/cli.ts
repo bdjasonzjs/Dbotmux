@@ -73,6 +73,7 @@ const CONFIG_DIR = join(homedir(), '.botmux');
 const ENV_FILE = join(CONFIG_DIR, '.env');
 const DATA_DIR = join(CONFIG_DIR, 'data');
 const LOG_DIR = join(CONFIG_DIR, 'logs');
+const HEAPSHOT_DIR = join(CONFIG_DIR, 'heapshots');
 const BOTS_JSON_FILE = join(CONFIG_DIR, 'bots.json');
 const PM2_NAME = 'botmux';
 /**
@@ -86,7 +87,7 @@ const PM2_HOME = join(CONFIG_DIR, 'pm2');
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function ensureConfigDir(): void {
-  for (const dir of [CONFIG_DIR, DATA_DIR, LOG_DIR, PM2_HOME]) {
+  for (const dir of [CONFIG_DIR, DATA_DIR, LOG_DIR, HEAPSHOT_DIR, PM2_HOME]) {
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   }
 }
@@ -206,6 +207,13 @@ function ecosystemConfig(): string {
     restart_delay: 3000,
     log_date_format: 'YYYY-MM-DD HH:mm:ss',
     merge_logs: true,
+    node_args: [
+      '--max-old-space-size=8192',
+      // Do not enable --heapsnapshot-near-heap-limit here. On large V8
+      // heaps the snapshot generator is synchronous, can add many GiB of
+      // RSS, and blocks the daemon before our memdiag timer can run.
+      `--diagnostic-dir=${HEAPSHOT_DIR}`,
+    ],
   };
 
   const apps: any[] = bots.map((_bot: any, i: number) => ({
@@ -213,7 +221,13 @@ function ecosystemConfig(): string {
     name: botProcessName(_bot, i, PM2_NAME),
     error_file: join(LOG_DIR, `daemon-${i}-error.log`),
     out_file: join(LOG_DIR, `daemon-${i}-out.log`),
-    env: { SESSION_DATA_DIR: DATA_DIR, BOTMUX_BOT_INDEX: String(i) },
+    env: {
+      SESSION_DATA_DIR: DATA_DIR,
+      BOTMUX_BOT_INDEX: String(i),
+      // Short-term native-memory diagnostics for the workflow OOM investigation.
+      // Keep it scoped to daemon-0 unless the operator explicitly overrides it.
+      BOTMUX_MEMORY_DIAG_INTERVAL_MS: process.env.BOTMUX_MEMORY_DIAG_INTERVAL_MS ?? (i === 0 ? '5000' : '0'),
+    },
   }));
 
   apps.push({

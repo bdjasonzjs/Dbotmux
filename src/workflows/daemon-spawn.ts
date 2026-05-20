@@ -20,7 +20,8 @@
  */
 
 import { fork, type ChildProcess } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { appendFileSync, existsSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -29,6 +30,7 @@ import type {
   DaemonRunOneShotResult,
   DaemonSpawnDeps,
 } from './spawn-bot.js';
+import { logger } from '../utils/logger.js';
 
 // ─── IPC payloads (subset of WorkerToDaemon we care about) ────────────────
 
@@ -60,6 +62,8 @@ export interface WorkerHandle {
   on(event: 'error', cb: (err: Error) => void): void;
   kill(signal?: NodeJS.Signals): void;
   readonly pid?: number;
+  readonly stdout?: NodeJS.ReadableStream | null;
+  readonly stderr?: NodeJS.ReadableStream | null;
 }
 
 export interface WorkerProcessFactory {
@@ -90,6 +94,12 @@ export const forkWorkerJsFactory: WorkerProcessFactory = {
       },
       get pid() {
         return child.pid;
+      },
+      get stdout() {
+        return child.stdout;
+      },
+      get stderr() {
+        return child.stderr;
       },
     } as WorkerHandle;
   },
@@ -169,13 +179,19 @@ async function runOneShotImpl(
   input: DaemonRunOneShotInput,
   deps: RunOneShotInternalDeps,
 ): Promise<DaemonRunOneShotResult> {
+  logOneShotMemory(input, 'enter');
   const creds = deps.resolveLarkCredentials(input.botName);
+  logOneShotMemory(input, 'after-resolve-credentials');
   const startedAt = Date.now();
   const synthetic = syntheticIds(input);
+  logOneShotMemory(input, 'after-synthetic-ids');
+  const cwd = expandWorkflowWorkingDir(input.workingDir) ?? process.cwd();
+  appendAttemptLog(input, 'system', `starting workflow worker cwd=${cwd}`);
 
+  logOneShotMemory(input, 'before-worker-spawn');
   const worker = deps.factory.spawn({
     workerPath: deps.workerPath,
-    cwd: input.workingDir ?? process.cwd(),
+    cwd,
     env: {
       ...process.env,
       // Marker so the CLI session / skill detect a workflow-issued worker.
@@ -184,6 +200,10 @@ async function runOneShotImpl(
       BOTMUX_WORKFLOW_NODE_ID: input.nodeId,
     },
   });
+  logOneShotMemory(input, `after-worker-spawn pid=${worker.pid ?? 'unknown'}`);
+  appendAttemptLog(input, 'system', `worker spawned pid=${worker.pid ?? 'unknown'}`);
+  drainWorkerDiagnostics(worker, input);
+  logOneShotMemory(input, 'after-drain-diagnostics');
 
   let webPort: number | undefined;
   const collectedOutputs: Array<{ content: string; turnId: string }> = [];
@@ -195,7 +215,7 @@ async function runOneShotImpl(
     sessionId: synthetic.sessionId,
     chatId: synthetic.chatId,
     rootMessageId: synthetic.rootMessageId,
-    workingDir: input.workingDir ?? process.cwd(),
+    workingDir: cwd,
     cliId,
     backendType: 'pty' as const,
     prompt: input.prompt,
@@ -205,12 +225,13 @@ async function runOneShotImpl(
     botName: input.botName,
     locale: 'zh' as const,
   };
+  logOneShotMemory(input, 'after-init-object');
 
   return new Promise<DaemonRunOneShotResult>((resolve, reject) => {
+    let settled = false;
     const timeoutMs = input.timeoutMs ?? deps.defaultTimeoutMs;
     const hardDeadline = setTimeout(() => {
-      cleanup();
-      reject(new Error(`workflow worker timeout after ${timeoutMs} ms`));
+      fail(new Error(`workflow worker timeout after ${timeoutMs} ms`));
     }, timeoutMs);
 
     const cleanup = (): void => {
@@ -225,13 +246,22 @@ async function runOneShotImpl(
       setTimeout(() => worker.kill('SIGTERM'), 250);
     };
 
+    const fail = (err: Error): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(err);
+    };
+
     const finish = (): void => {
+      if (settled) return;
       cleanup();
       const last = collectedOutputs[collectedOutputs.length - 1];
       if (!last) {
-        reject(new Error('workflow worker quiesced without final_output'));
+        fail(new Error('workflow worker quiesced without final_output'));
         return;
       }
+      settled = true;
       resolve({
         finalTranscript: last.content,
         session: {
@@ -239,8 +269,9 @@ async function runOneShotImpl(
           larkAppId: creds.larkAppId,
           botName: input.botName,
           cliId,
-          workingDir: input.workingDir,
+          workingDir: cwd,
           webPort,
+          logPath: input.attemptLogPath,
           startedAt,
           endedAt: Date.now(),
         },
@@ -255,13 +286,23 @@ async function runOneShotImpl(
     worker.on('message', (event) => {
       switch (event.type) {
         case 'ready':
+          if (settled) break;
           webPort = event.port;
-          worker.send(init);
+          appendAttemptLog(input, 'system', `worker ready port=${event.port}`);
+          logOneShotMemory(input, 'worker-ready-before-init-send');
+          try {
+            worker.send(init);
+            logOneShotMemory(input, 'worker-ready-after-init-send');
+          } catch (err) {
+            fail(err instanceof Error ? err : new Error(String(err)));
+          }
           // Note: init may already have been sent by tests' scripted
           // factory before 'ready' lands.  Re-sending is a no-op
           // because `lastInitConfig` short-circuits.
           break;
         case 'final_output':
+          if (settled) break;
+          appendAttemptLog(input, `final_output:${event.turnId}`, event.content);
           collectedOutputs.push({
             content: event.content,
             turnId: event.turnId,
@@ -277,15 +318,19 @@ async function runOneShotImpl(
           if (collectedOutputs.length > 0) armQuiesce();
           break;
         case 'error':
-          cleanup();
-          reject(new Error(`worker error: ${event.message}`));
+          appendAttemptLog(input, 'error', event.message);
+          fail(new Error(`worker error: ${event.message}`));
           break;
         case 'claude_exit':
+          appendAttemptLog(
+            input,
+            'system',
+            `CLI exited code=${event.code ?? 'null'} signal=${event.signal ?? 'null'}`,
+          );
           if (collectedOutputs.length > 0) {
             finish();
           } else {
-            cleanup();
-            reject(
+            fail(
               new Error(
                 `CLI exited (code=${event.code ?? 'null'}, signal=${event.signal ?? 'null'}) before producing final_output`,
               ),
@@ -296,17 +341,16 @@ async function runOneShotImpl(
     });
 
     worker.on('error', (err) => {
-      cleanup();
-      reject(err);
+      appendAttemptLog(input, 'error', err.message);
+      fail(err);
     });
 
     worker.on('exit', (code) => {
+      appendAttemptLog(input, 'system', `worker process exit code=${code ?? 'null'}`);
       // If we already resolved, the cleanup() already killed the worker;
       // ignore the exit.  If we're still waiting for output, treat as fail.
-      if (collectedOutputs.length === 0) {
-        clearTimeout(hardDeadline);
-        if (quiesceTimer) clearTimeout(quiesceTimer);
-        reject(
+      if (!settled && collectedOutputs.length === 0) {
+        fail(
           new Error(
             `worker exited (code=${code ?? 'null'}) before producing final_output`,
           ),
@@ -319,11 +363,92 @@ async function runOneShotImpl(
     // 'ready' (it allocates a port first), but it also short-circuits a
     // double `init`, so a redundant send is harmless.
     try {
+      logOneShotMemory(input, 'before-eager-init-send');
       worker.send(init);
+      logOneShotMemory(input, 'after-eager-init-send');
     } catch {
       /* worker may not be ready yet — wait for 'ready' to retry */
+      logOneShotMemory(input, 'eager-init-send-failed');
     }
   });
+}
+
+function logOneShotMemory(input: DaemonRunOneShotInput, phase: string): void {
+  const usage = process.memoryUsage();
+  const external = usage.external ?? 0;
+  const nativeOther = Math.max(0, usage.rss - usage.heapTotal - external);
+  logger.info(
+    `[workflow:${input.runId}:${input.nodeId}:spawn-mem] ` +
+    `phase=${phase} ` +
+    `rss=${formatMiB(usage.rss)} ` +
+    `heapUsed=${formatMiB(usage.heapUsed)} ` +
+    `heapTotal=${formatMiB(usage.heapTotal)} ` +
+    `external=${formatMiB(external)} ` +
+    `arrayBuffers=${formatMiB(usage.arrayBuffers ?? 0)} ` +
+    `nativeOther~=${formatMiB(nativeOther)} ` +
+    `promptBytes=${Buffer.byteLength(input.prompt, 'utf-8')} ` +
+    `cwd=${expandWorkflowWorkingDir(input.workingDir) ?? process.cwd()}`,
+  );
+}
+
+export function expandWorkflowWorkingDir(workingDir: string | undefined): string | undefined {
+  if (!workingDir) return undefined;
+  if (workingDir === '~') return homedir();
+  if (workingDir.startsWith('~/')) return join(homedir(), workingDir.slice(2));
+  return workingDir;
+}
+
+function formatMiB(bytes: number): string {
+  return `${(bytes / 1024 / 1024).toFixed(1)}MiB`;
+}
+
+function drainWorkerDiagnostics(worker: WorkerHandle, input: DaemonRunOneShotInput): void {
+  const { runId, nodeId } = input;
+  const prefix = `[workflow:${runId}:${nodeId}:worker]`;
+  worker.stdout?.on?.('data', (data: Buffer | string) => {
+    for (const line of String(data).split('\n')) {
+      const trimmed = line.trim();
+      if (trimmed) logger.info(`${prefix}:out ${truncateLogLine(trimmed)}`);
+    }
+    appendAttemptLog(input, 'stdout', String(data));
+  });
+  worker.stderr?.on?.('data', (data: Buffer | string) => {
+    for (const line of String(data).split('\n')) {
+      const trimmed = line.trim();
+      if (trimmed) logger.info(`${prefix}:err ${truncateLogLine(trimmed)}`);
+    }
+    appendAttemptLog(input, 'stderr', String(data));
+  });
+}
+
+function appendAttemptLog(
+  input: Pick<DaemonRunOneShotInput, 'attemptLogPath'>,
+  channel: string,
+  chunk: string,
+): void {
+  if (!input.attemptLogPath) return;
+  const ts = new Date().toISOString();
+  const text = chunk.endsWith('\n') ? chunk : `${chunk}\n`;
+  const lines = text.replace(/\r/g, '').split('\n');
+  let out = '';
+  for (const line of lines) {
+    if (line === '') continue;
+    out += `[${ts}] ${channel} ${line}\n`;
+  }
+  if (!out) return;
+  try {
+    appendFileSync(input.attemptLogPath, out, 'utf-8');
+  } catch (err) {
+    logger.warn(
+      `failed to append workflow attempt log ${input.attemptLogPath}: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
+}
+
+function truncateLogLine(line: string): string {
+  return line.length > 2000 ? `${line.slice(0, 2000)}…[truncated]` : line;
 }
 
 function syntheticIds(input: DaemonRunOneShotInput): {
