@@ -39,7 +39,7 @@ export function workflowApprovalCardNonce(
 }
 
 export function workflowRunDetailUrl(runId: string): string {
-  return `http://${config.dashboard.externalHost}:${config.dashboard.port}/#workflow/${encodeURIComponent(runId)}`;
+  return `http://${config.dashboard.externalHost}:${config.dashboard.port}/#/workflows/${encodeURIComponent(runId)}`;
 }
 
 export function getWorkflowApprovalCardContext(

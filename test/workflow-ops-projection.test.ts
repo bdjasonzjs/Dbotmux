@@ -25,6 +25,7 @@ import { EventLog } from '../src/workflows/events/append.js';
 import { parseWorkflowDefinition } from '../src/workflows/definition.js';
 import { createRun } from '../src/workflows/run-init.js';
 import { runLoop } from '../src/workflows/loop.js';
+import { workActivityId } from '../src/workflows/orchestrator.js';
 import type { WorkerSpawnFn } from '../src/workflows/runtime.js';
 
 let runsDir: string;
@@ -206,6 +207,62 @@ describe('readRunSnapshot', () => {
       effectAttempted: expect.any(Array),
       waits: expect.any(Array),
       cancels: expect.any(Array),
+    });
+  });
+
+  it('includes readable input/output previews for attempts', async () => {
+    await seedSucceeded('r-io');
+    const activityId = workActivityId('r-io', 'only');
+    const attemptId = 'r-io::work::only::att-1';
+    const attemptDir = join(runsDir, 'r-io', 'attempts', activityId, attemptId);
+    mkdirSync(attemptDir, { recursive: true });
+    writeFileSync(
+      join(attemptDir, 'terminal.log'),
+      '[2026-05-20T00:00:00.000Z] stdout running step\n',
+      'utf-8',
+    );
+    const snap = await readRunSnapshot(runsDir, 'r-io');
+
+    expect(snap?.attemptIO[attemptId]?.input?.value).toEqual({
+      kind: 'subagent',
+      bot: 'b',
+      prompt: 'hi',
+    });
+    expect(snap?.attemptIO[attemptId]?.resolvedInput?.value).toEqual({
+      kind: 'subagent',
+      bot: 'b',
+      prompt: 'hi',
+    });
+    expect(snap?.attemptIO[attemptId]?.output?.value).toEqual({ ok: true });
+    expect(snap?.attemptIO[attemptId]?.log?.text).toContain('stdout running step');
+  });
+
+  it('shows interpolated prompt in resolved input preview', async () => {
+    const def = parseWorkflowDefinition({
+      workflowId: 'proj-template',
+      version: 1,
+      params: { city: { type: 'string', required: true } },
+      nodes: {
+        weather: { type: 'subagent', bot: 'b', prompt: '查 ${params.city} 天气' },
+      },
+    });
+    const log = new EventLog('r-template', runsDir);
+    await createRun(log, {
+      def,
+      params: { city: '上海' },
+      initiator: 'test',
+      botResolver: () => ({}),
+    });
+    await runLoop({ log, def, spawnSubagent: okSpawn });
+
+    const snap = await readRunSnapshot(runsDir, 'r-template');
+    const attemptId = 'r-template::work::weather::att-1';
+
+    expect(snap?.attemptIO[attemptId]?.input?.value).toMatchObject({
+      prompt: '查 ${params.city} 天气',
+    });
+    expect(snap?.attemptIO[attemptId]?.resolvedInput?.value).toMatchObject({
+      prompt: '查 上海 天气',
     });
   });
 

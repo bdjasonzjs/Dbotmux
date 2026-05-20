@@ -17,8 +17,12 @@
  *     runDir + blobDir, which is wrong for a read-only API.
  */
 import { promises as fs } from 'node:fs';
-import { join } from 'node:path';
+import { relative, resolve, sep, join } from 'node:path';
 
+import {
+  parseWorkflowDefinition,
+  type WorkflowDefinition,
+} from './definition.js';
 import {
   parseEvent,
   type WorkflowEvent,
@@ -31,6 +35,7 @@ import {
   type Snapshot,
 } from './events/replay.js';
 import type { OutputRef } from './events/payloads.js';
+import { workActivityId } from './orchestrator.js';
 
 export const TERMINAL_RUN_STATUSES = new Set(['succeeded', 'failed', 'cancelled']);
 
@@ -172,9 +177,29 @@ export type RunSnapshotDTO = {
     cancels: string[];
   };
   outputs: Record<string, OutputRef>;
+  attemptIO: Record<string, AttemptIODTO>;
   chatBinding?: { chatId: string; larkAppId: string };
   updatedAt: number;
 };
+
+export type BlobPreviewDTO = {
+  outputHash?: string;
+  outputBytes?: number;
+  contentType?: string;
+  truncated?: boolean;
+  value?: unknown;
+  text?: string;
+  error?: string;
+};
+
+export type AttemptIODTO = {
+  input?: BlobPreviewDTO;
+  resolvedInput?: BlobPreviewDTO;
+  output?: BlobPreviewDTO;
+  log?: BlobPreviewDTO;
+};
+
+const BLOB_PREVIEW_MAX_BYTES = 64 * 1024;
 
 /**
  * Build a JSON-serializable snapshot for a single run.  Returns null when
@@ -198,6 +223,8 @@ export async function readRunSnapshot(
   const binding = await readChatBindingPure(runDir);
   const outputs: Record<string, OutputRef> = {};
   for (const [aid, ref] of snap.outputs) outputs[aid] = ref;
+  const def = await readWorkflowDefinitionPure(runDir);
+  const attemptIO = await buildAttemptIO(runDir, snap, def);
   return {
     runId,
     run: snap.run,
@@ -211,9 +238,297 @@ export async function readRunSnapshot(
       cancels: snap.danglingCancels,
     },
     outputs,
+    attemptIO,
     chatBinding: binding ?? undefined,
     updatedAt: events[events.length - 1]!.timestamp,
   };
+}
+
+async function buildAttemptIO(
+  runDir: string,
+  snap: Snapshot,
+  def: WorkflowDefinition | null,
+): Promise<Record<string, AttemptIODTO>> {
+  const out: Record<string, AttemptIODTO> = {};
+  const cache = new Map<string, BlobPreviewDTO>();
+  for (const activity of snap.activities.values()) {
+    for (const attempt of activity.attempts) {
+      const io: AttemptIODTO = {};
+      io.input = await previewRef(runDir, attempt.inputRef, cache);
+      if (attempt.output) {
+        io.output = await previewRef(runDir, attempt.output, cache);
+      }
+      io.log = await previewAttemptLog(runDir, activity.activityId, attempt.attemptId);
+      if (io.input?.value !== undefined && def) {
+        io.resolvedInput = await previewResolvedInput(runDir, snap, def, io.input.value, cache);
+      }
+      out[attempt.attemptId] = io;
+    }
+  }
+  return out;
+}
+
+async function previewAttemptLog(
+  runDir: string,
+  activityId: string,
+  attemptId: string,
+): Promise<BlobPreviewDTO | undefined> {
+  const logPath = join(runDir, 'attempts', activityId, attemptId, 'terminal.log');
+  if (!isPathInside(runDir, logPath)) {
+    return { contentType: 'text/plain', error: 'attempt log is outside run directory' };
+  }
+  try {
+    const handle = await fs.open(logPath, 'r');
+    try {
+      const stat = await handle.stat();
+      const bytesToRead = Math.min(stat.size, BLOB_PREVIEW_MAX_BYTES);
+      const start = Math.max(0, stat.size - bytesToRead);
+      const buf = Buffer.alloc(bytesToRead);
+      await handle.read(buf, 0, bytesToRead, start);
+      return {
+        contentType: 'text/plain',
+        outputBytes: stat.size,
+        truncated: stat.size > BLOB_PREVIEW_MAX_BYTES,
+        text: buf.toString('utf-8'),
+      };
+    } finally {
+      await handle.close();
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    return {
+      contentType: 'text/plain',
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+async function previewRef(
+  runDir: string,
+  ref: OutputRef,
+  cache: Map<string, BlobPreviewDTO>,
+): Promise<BlobPreviewDTO> {
+  const key = ref.outputHash;
+  const cached = cache.get(key);
+  if (cached) return cached;
+
+  const base: BlobPreviewDTO = {
+    outputHash: ref.outputHash,
+    outputBytes: ref.outputBytes,
+    contentType: ref.contentType,
+  };
+  if (!ref.outputPath) {
+    const res = { ...base, error: 'outputRef has no outputPath' };
+    cache.set(key, res);
+    return res;
+  }
+  if (!isPathInside(runDir, ref.outputPath)) {
+    const res = { ...base, error: 'outputPath is outside run directory' };
+    cache.set(key, res);
+    return res;
+  }
+
+  try {
+    const handle = await fs.open(ref.outputPath, 'r');
+    try {
+      const stat = await handle.stat();
+      const bytesToRead = Math.min(stat.size, BLOB_PREVIEW_MAX_BYTES);
+      const buf = Buffer.alloc(bytesToRead);
+      await handle.read(buf, 0, bytesToRead, 0);
+      const text = buf.toString('utf-8');
+      const truncated = stat.size > BLOB_PREVIEW_MAX_BYTES;
+      const res: BlobPreviewDTO = {
+        ...base,
+        outputBytes: stat.size,
+        truncated,
+      };
+      if (!truncated && isJsonContent(ref.contentType)) {
+        try {
+          res.value = JSON.parse(text);
+        } catch (err) {
+          res.text = text;
+          res.error = `invalid JSON: ${err instanceof Error ? err.message : String(err)}`;
+        }
+      } else {
+        res.text = text;
+      }
+      cache.set(key, res);
+      return res;
+    } finally {
+      await handle.close();
+    }
+  } catch (err) {
+    const res = {
+      ...base,
+      error: err instanceof Error ? err.message : String(err),
+    };
+    cache.set(key, res);
+    return res;
+  }
+}
+
+function isPathInside(parent: string, child: string): boolean {
+  const rel = relative(resolve(parent), resolve(child));
+  return rel === '' || (!!rel && !rel.startsWith('..') && !rel.startsWith(sep));
+}
+
+function isJsonContent(contentType?: string): boolean {
+  return (contentType ?? '').toLowerCase().includes('json');
+}
+
+async function readWorkflowDefinitionPure(runDir: string): Promise<WorkflowDefinition | null> {
+  try {
+    const raw = await fs.readFile(join(runDir, 'workflow.json'), 'utf-8');
+    return parseWorkflowDefinition(JSON.parse(raw));
+  } catch {
+    return null;
+  }
+}
+
+async function previewResolvedInput(
+  runDir: string,
+  snap: Snapshot,
+  def: WorkflowDefinition,
+  rawInput: unknown,
+  cache: Map<string, BlobPreviewDTO>,
+): Promise<BlobPreviewDTO> {
+  try {
+    const value = await resolveDashboardBindings(rawInput, { runDir, snap, def, cache });
+    return {
+      contentType: 'application/json',
+      value,
+      outputBytes: Buffer.byteLength(JSON.stringify(value), 'utf-8'),
+    };
+  } catch (err) {
+    return {
+      contentType: 'application/json',
+      value: rawInput,
+      error: `failed to resolve bindings: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+}
+
+type DashboardBindingContext = {
+  runDir: string;
+  snap: Snapshot;
+  def: WorkflowDefinition;
+  cache: Map<string, BlobPreviewDTO>;
+};
+
+async function resolveDashboardBindings(
+  value: unknown,
+  ctx: DashboardBindingContext,
+): Promise<unknown> {
+  if (isRefSpec(value)) return resolveDashboardRef(value.$ref, ctx);
+  if (typeof value === 'string') return interpolateDashboardStringRefs(value, ctx);
+  if (Array.isArray(value)) {
+    const out: unknown[] = [];
+    for (const item of value) out.push(await resolveDashboardBindings(item, ctx));
+    return out;
+  }
+  if (value !== null && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      out[key] = await resolveDashboardBindings(item, ctx);
+    }
+    return out;
+  }
+  return value;
+}
+
+async function interpolateDashboardStringRefs(
+  value: string,
+  ctx: DashboardBindingContext,
+): Promise<string> {
+  if (!value.includes('${')) return value;
+  let out = '';
+  let cursor = 0;
+  while (cursor < value.length) {
+    const start = value.indexOf('${', cursor);
+    if (start < 0) {
+      out += value.slice(cursor);
+      break;
+    }
+    out += value.slice(cursor, start);
+    const end = value.indexOf('}', start + 2);
+    if (end < 0) throw new Error(`unterminated string ref interpolation in '${value}'`);
+    const ref = value.slice(start + 2, end);
+    if (!ref) throw new Error(`empty string ref interpolation in '${value}'`);
+    out += stringifyDashboardInterpolatedValue(ref, await resolveDashboardRef(ref, ctx));
+    cursor = end + 1;
+  }
+  return out;
+}
+
+function stringifyDashboardInterpolatedValue(ref: string, value: unknown): string {
+  if (value === null) return 'null';
+  const t = typeof value;
+  if (t === 'string') return value as string;
+  if (t === 'number' || t === 'boolean') return String(value);
+  throw new Error(
+    `string interpolation '\${${ref}}' resolved to ${Array.isArray(value) ? 'array' : t} ` +
+    `(expected string/number/boolean/null; use whole-field $ref for structured values)`,
+  );
+}
+
+function isRefSpec(value: unknown): value is { $ref: string } {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const entries = Object.entries(value as Record<string, unknown>);
+  return entries.length === 1 && entries[0]?.[0] === '$ref' && typeof entries[0]?.[1] === 'string';
+}
+
+async function resolveDashboardRef(ref: string, ctx: DashboardBindingContext): Promise<unknown> {
+  if (ref.startsWith('params.')) {
+    const inputRef = ctx.snap.run.input;
+    if (!inputRef) throw new Error(`$ref '${ref}' requires run input`);
+    const params = (await previewRef(ctx.runDir, inputRef, ctx.cache)).value;
+    return walkPreviewPath(params, ref.slice('params.'.length).split('.'), ref);
+  }
+
+  const sepIdx = ref.indexOf('.output.');
+  if (sepIdx < 0) {
+    throw new Error(`$ref '${ref}' missing '.output.' separator`);
+  }
+  const nodeId = ref.slice(0, sepIdx);
+  const path = ref.slice(sepIdx + '.output.'.length).split('.');
+  const node = ctx.def.nodes[nodeId];
+  if (!node) throw new Error(`$ref '${ref}' targets unknown node '${nodeId}'`);
+  const outputRef = ctx.snap.outputs.get(workActivityId(ctx.snap.run.runId, nodeId));
+  if (!outputRef) throw new Error(`$ref '${ref}' has no successful output yet`);
+  const preview = await previewRef(ctx.runDir, outputRef, ctx.cache);
+  if (preview.value === undefined) {
+    throw new Error(preview.error ?? `$ref '${ref}' output preview has no JSON value`);
+  }
+  const root =
+    node.type === 'hostExecutor' &&
+    preview.value !== null &&
+    typeof preview.value === 'object' &&
+    Object.prototype.hasOwnProperty.call(preview.value, 'output')
+      ? (preview.value as { output?: unknown }).output
+      : preview.value;
+  return walkPreviewPath(root, path, ref);
+}
+
+function walkPreviewPath(value: unknown, segments: string[], ref: string): unknown {
+  let cursor = value;
+  for (const seg of segments) {
+    if (cursor === null || cursor === undefined) {
+      throw new Error(`$ref '${ref}' hit ${cursor === null ? 'null' : 'undefined'} at '${seg}'`);
+    }
+    if (Array.isArray(cursor)) {
+      const idx = Number(seg);
+      if (!Number.isInteger(idx) || idx < 0 || idx >= cursor.length) {
+        throw new Error(`$ref '${ref}' array index '${seg}' out of bounds`);
+      }
+      cursor = cursor[idx];
+      continue;
+    }
+    if (typeof cursor !== 'object' || !Object.prototype.hasOwnProperty.call(cursor, seg)) {
+      throw new Error(`$ref '${ref}' segment '${seg}' not found`);
+    }
+    cursor = (cursor as Record<string, unknown>)[seg];
+  }
+  return cursor;
 }
 
 // ─── event window ──────────────────────────────────────────────────────────

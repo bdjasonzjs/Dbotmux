@@ -211,16 +211,28 @@ const server = createServer(async (req, res) => {
       return jsonRes(res, 200, { url: fullUrl });
     }
 
+    // Workflow read-only paths + static SPA shell are public — the dashboard
+    // is meant to be linkable from Lark cards without forcing a `botmux
+    // dashboard` round-trip. Write actions (POST cancel etc.) still require
+    // the active token, matching the "get_write_link" pattern on session
+    // terminal cards.
+    const isWorkflowReadOnly =
+      req.method === 'GET' && url.pathname.startsWith('/api/workflows/');
+    const isStaticShell =
+      req.method === 'GET' && (url.pathname === '/' || url.pathname.startsWith('/assets/'));
+
     // All other paths require an authenticated session.
     const tok = authedToken(req, url);
-    if (!tok || tok !== activeToken) {
+    const authed = !!tok && tok === activeToken;
+    if (!authed && !isWorkflowReadOnly && !isStaticShell) {
       res.writeHead(401, { 'content-type': 'text/html; charset=utf-8' });
       res.end('<h1>Token expired</h1><p>Run <code>botmux dashboard</code> to get a fresh URL.</p>');
       return;
     }
 
     // First hit with `?t=<token>` sets the cookie + redirects to clean URL.
-    if (url.searchParams.has('t')) {
+    // Only reached when the token matched (authed=true && tok set above).
+    if (url.searchParams.has('t') && authed && tok) {
       res.writeHead(302, {
         'set-cookie': buildSetCookie(tok),
         'location': url.pathname || '/',

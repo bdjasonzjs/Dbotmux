@@ -26,6 +26,23 @@ type OutputRef = {
   contentType?: string;
 };
 
+type BlobPreview = {
+  outputHash?: string;
+  outputBytes?: number;
+  contentType?: string;
+  truncated?: boolean;
+  value?: unknown;
+  text?: string;
+  error?: string;
+};
+
+type AttemptIO = {
+  input?: BlobPreview;
+  resolvedInput?: BlobPreview;
+  output?: BlobPreview;
+  log?: BlobPreview;
+};
+
 type AttemptState = {
   attemptId: string;
   attemptNumber: number;
@@ -81,6 +98,7 @@ type RunSnapshot = {
     cancels: string[];
   };
   outputs: Record<string, OutputRef>;
+  attemptIO?: Record<string, AttemptIO>;
   chatBinding?: { chatId: string; larkAppId: string };
   updatedAt: number;
 };
@@ -340,6 +358,12 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
     </section>
     <section class="wf-panel">
       <div class="wf-panel-title">
+        <h3>Node I/O</h3>
+      </div>
+      <div id="wf-io-list" class="wf-io-list"></div>
+    </section>
+    <section class="wf-panel">
+      <div class="wf-panel-title">
         <h3>Timeline</h3>
         <button id="wf-load-older" type="button" hidden>Load older</button>
       </div>
@@ -362,6 +386,8 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
   const summaryEl = root.querySelector<HTMLElement>('#wf-summary')!;
   const danglingEl = root.querySelector<HTMLElement>('#wf-dangling-panel')!;
   const nodeTbody = root.querySelector<HTMLElement>('#wf-node-tbody')!;
+  const ioList = root.querySelector<HTMLElement>('#wf-io-list')!;
+  const timelineScroll = root.querySelector<HTMLElement>('.wf-timeline-scroll')!;
   const eventTbody = root.querySelector<HTMLElement>('#wf-event-tbody')!;
   const eventMeta = root.querySelector<HTMLElement>('#wf-event-meta')!;
   const cancelBtn = root.querySelector<HTMLButtonElement>('#wf-cancel-run')!;
@@ -378,6 +404,9 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
   let disposed = false;
   let inflight = false;
   let canceling = false;
+  const openIOBlocks = new Set<string>();
+  const ioScrollTops = new Map<string, number>();
+  let timelineScrollTop = 0;
 
   function setError(message: string | null): void {
     if (!message) {
@@ -504,6 +533,9 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ reason: 'cancelled via dashboard' }),
       });
+      if (res.status === 401) {
+        throw new Error('write access required: run `botmux dashboard` in the terminal to get a one-time URL, open it once to set the cookie, then come back and click cancel again.');
+      }
       const body = (await res.json().catch(() => ({}))) as CancelRunResponse;
       if (!res.ok || !body.ok) {
         throw new Error(body.hint ?? body.error ?? `cancel HTTP ${res.status}`);
@@ -522,6 +554,7 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
 
   function rerender(): void {
     if (!snapshot) return;
+    timelineScrollTop = timelineScroll.scrollTop;
     const run = snapshot.run;
     if (TERMINAL.has(run.status)) setCancelStatus(null);
     subtitle.innerHTML = `${escapeHtml(run.workflowId ?? '?')} · ${statusBadge(run.status)} · lastSeq ${snapshot.lastSeq}`;
@@ -535,7 +568,9 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
     renderSummary(summaryEl, snapshot);
     renderDangling(danglingEl, snapshot);
     renderNodeActivityRows(nodeTbody, snapshot);
+    renderNodeIO(ioList, snapshot, openIOBlocks, ioScrollTops);
     renderEvents(eventTbody, events);
+    timelineScroll.scrollTop = timelineScrollTop;
     loadOlder.hidden = !hasOlder;
     eventMeta.textContent = `${events.length}/${totalCount} events loaded`;
   }
@@ -683,6 +718,166 @@ function renderNodeActivityRow(node?: NodeState, activity?: ActivityState): stri
     <td>${latest ? `<code>${escapeHtml(latest.attemptId)}</code>` : '<span class="muted">-</span>'}</td>
     <td>${latest ? renderAttemptDetail(latest) : '<span class="muted">idle</span>'}</td>
   </tr>`;
+}
+
+function renderNodeIO(
+  el: HTMLElement,
+  snap: RunSnapshot,
+  openBlocks: Set<string>,
+  scrollTops: Map<string, number>,
+): void {
+  syncIOBlockState(el, openBlocks, scrollTops);
+  const byId = new Map(snap.activities.map((a) => [a.activityId, a]));
+  const used = new Set<string>();
+  const cards: string[] = [];
+
+  for (const node of snap.nodes) {
+    const activity =
+      (node.activityId ? byId.get(node.activityId) : undefined) ??
+      snap.activities.find((a) => a.ownerNodeId === node.nodeId);
+    if (!activity) {
+      cards.push(renderIOCard(node, undefined, undefined, openBlocks));
+      continue;
+    }
+    used.add(activity.activityId);
+    cards.push(renderIOCard(
+      node,
+      activity,
+      snap.attemptIO?.[latestAttempt(activity)?.attemptId ?? ''],
+      openBlocks,
+    ));
+  }
+
+  for (const activity of snap.activities) {
+    if (used.has(activity.activityId)) continue;
+    cards.push(renderIOCard(
+      undefined,
+      activity,
+      snap.attemptIO?.[latestAttempt(activity)?.attemptId ?? ''],
+      openBlocks,
+    ));
+  }
+
+  el.innerHTML = cards.length > 0 ? cards.join('') : '<div class="empty">No node I/O yet.</div>';
+  restoreIOBlockScroll(el, scrollTops);
+  attachIOBlockToggleTracking(el, openBlocks);
+  attachIOBlockScrollTracking(el, scrollTops);
+}
+
+function latestAttempt(activity?: ActivityState): AttemptState | undefined {
+  return activity?.attempts[activity.attempts.length - 1];
+}
+
+function renderIOCard(
+  node: NodeState | undefined,
+  activity: ActivityState | undefined,
+  io: AttemptIO | undefined,
+  openBlocks: Set<string>,
+): string {
+  const attempt = latestAttempt(activity);
+  const title = node?.nodeId ?? activity?.ownerNodeId ?? activity?.activityId ?? 'unknown';
+  const keyPrefix = attempt?.attemptId ?? activity?.activityId ?? node?.nodeId ?? 'unknown';
+  return `<article class="wf-io-card">
+    <header>
+      <div>
+        <strong><code>${escapeHtml(title)}</code></strong>
+        <span class="muted">${activity ? escapeHtml(activity.activityId) : 'not dispatched'}</span>
+      </div>
+      <div>${node ? statusBadge(node.status) : ''} ${activity ? statusBadge(activity.status) : ''}</div>
+    </header>
+    <div class="wf-io-meta">
+      ${attempt ? `attempt <code>${escapeHtml(attempt.attemptId)}</code>` : 'No attempt yet'}
+    </div>
+    <div class="wf-io-grid">
+      ${renderPreviewBlock(keyPrefix, 'Authored input', io?.input, openBlocks)}
+      ${renderPreviewBlock(keyPrefix, 'Resolved input', io?.resolvedInput, openBlocks)}
+      ${renderPreviewBlock(keyPrefix, 'Output', io?.output, openBlocks)}
+      ${renderPreviewBlock(keyPrefix, 'Execution log', io?.log, openBlocks)}
+    </div>
+  </article>`;
+}
+
+function renderPreviewBlock(
+  keyPrefix: string,
+  label: string,
+  preview: BlobPreview | undefined,
+  openBlocks: Set<string>,
+): string {
+  const key = `${keyPrefix}:${label}`;
+  return `<details class="wf-io-block" data-io-key="${escapeHtml(key)}"${openBlocks.has(key) ? ' open' : ''}>
+    <summary>${escapeHtml(label)} ${previewMeta(preview)}</summary>
+    ${renderPreview(preview)}
+  </details>`;
+}
+
+function syncIOBlockState(
+  root: HTMLElement,
+  openBlocks: Set<string>,
+  scrollTops: Map<string, number>,
+): void {
+  root.querySelectorAll<HTMLDetailsElement>('details.wf-io-block[data-io-key]').forEach((el) => {
+    const key = el.dataset.ioKey;
+    if (!key) return;
+    if (el.open) openBlocks.add(key);
+    else openBlocks.delete(key);
+    const pre = el.querySelector<HTMLElement>('.wf-io-pre');
+    if (pre) scrollTops.set(key, pre.scrollTop);
+  });
+}
+
+function attachIOBlockToggleTracking(root: HTMLElement, openBlocks: Set<string>): void {
+  root.querySelectorAll<HTMLDetailsElement>('details.wf-io-block[data-io-key]').forEach((el) => {
+    el.addEventListener('toggle', () => {
+      const key = el.dataset.ioKey;
+      if (!key) return;
+      if (el.open) openBlocks.add(key);
+      else openBlocks.delete(key);
+    });
+  });
+}
+
+function restoreIOBlockScroll(root: HTMLElement, scrollTops: Map<string, number>): void {
+  root.querySelectorAll<HTMLDetailsElement>('details.wf-io-block[data-io-key]').forEach((el) => {
+    const key = el.dataset.ioKey;
+    if (!key) return;
+    const top = scrollTops.get(key);
+    if (top === undefined) return;
+    const pre = el.querySelector<HTMLElement>('.wf-io-pre');
+    if (pre) pre.scrollTop = top;
+  });
+}
+
+function attachIOBlockScrollTracking(root: HTMLElement, scrollTops: Map<string, number>): void {
+  root.querySelectorAll<HTMLDetailsElement>('details.wf-io-block[data-io-key]').forEach((el) => {
+    const key = el.dataset.ioKey;
+    if (!key) return;
+    const pre = el.querySelector<HTMLElement>('.wf-io-pre');
+    if (!pre) return;
+    pre.addEventListener('scroll', () => {
+      scrollTops.set(key, pre.scrollTop);
+    });
+  });
+}
+
+function previewMeta(preview?: BlobPreview): string {
+  if (!preview) return '<span class="muted">empty</span>';
+  const bits: string[] = [];
+  if (preview.outputBytes !== undefined) bits.push(`${preview.outputBytes}B`);
+  if (preview.truncated) bits.push('truncated');
+  if (preview.error) bits.push('error');
+  if (preview.outputHash) bits.push(short(preview.outputHash));
+  return bits.length ? `<span class="muted">${escapeHtml(bits.join(' · '))}</span>` : '';
+}
+
+function renderPreview(preview?: BlobPreview): string {
+  if (!preview) return '<div class="muted wf-io-empty">No data.</div>';
+  const body =
+    preview.value !== undefined
+      ? JSON.stringify(preview.value, null, 2)
+      : preview.text ?? '';
+  const error = preview.error ? `<div class="muted error">${escapeHtml(preview.error)}</div>` : '';
+  if (!body) return `${error}<div class="muted wf-io-empty">No preview.</div>`;
+  return `${error}<pre class="wf-io-pre">${escapeHtml(body)}</pre>`;
 }
 
 function renderAttemptDetail(at: AttemptState): string {
