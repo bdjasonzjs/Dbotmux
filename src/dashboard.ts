@@ -14,13 +14,7 @@ import {
 import { DaemonRegistry } from './dashboard/registry.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
 import { pickCreatorForGroup } from './dashboard/operator-selector.js';
-import {
-  listRuns,
-  readRunSnapshot,
-  readEventWindow,
-  isValidRunId,
-  TERMINAL_RUN_STATUSES,
-} from './workflows/ops-projection.js';
+import { handleWorkflowApi, jsonRes } from './dashboard/workflow-api.js';
 import { getRunsDir } from './workflows/runs-dir.js';
 
 const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
@@ -146,18 +140,6 @@ function authedToken(req: IncomingMessage, url: URL): string | undefined {
   const q = url.searchParams.get('t');
   if (q && q === activeToken) return q;
   return parseCookie(req.headers.cookie);
-}
-
-function jsonRes(res: ServerResponse, status: number, body: unknown): void {
-  res.writeHead(status, { 'content-type': 'application/json' });
-  res.end(JSON.stringify(body));
-}
-
-async function readJsonBody<T = unknown>(req: IncomingMessage): Promise<T> {
-  const chunks: Buffer[] = [];
-  for await (const c of req) chunks.push(c as Buffer);
-  if (chunks.length === 0) return {} as T;
-  return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
 
 async function proxyToDaemon(
@@ -294,96 +276,10 @@ const server = createServer(async (req, res) => {
     // Mutations are intentionally proxied to the owner daemon from
     // chat-binding.larkAppId so only the daemon with live workflow runtime
     // context writes the event log.
-
-    if (req.method === 'GET' && url.pathname === '/api/workflows/runs') {
-      const all = url.searchParams.get('all') === '1';
-      const statusParam = url.searchParams.get('status');
-      const statuses = statusParam
-        ? new Set(statusParam.split(',').map(s => s.trim()).filter(Boolean))
-        : undefined;
-      try {
-        const rows = await listRuns(getRunsDir(), {
-          all,
-          statuses,
-          includeBinding: true,
-        });
-        return jsonRes(res, 200, { runs: rows });
-      } catch (e: any) {
-        return jsonRes(res, 500, { error: 'listRuns_failed', message: e?.message ?? String(e) });
-      }
-    }
-
-    if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/workflows\/runs\/([^/]+)\/snapshot$/))) {
-      const runId = decodeURIComponent(m[1]);
-      const snap = await readRunSnapshot(getRunsDir(), runId);
-      if (!snap) return jsonRes(res, 404, { error: 'unknown_run' });
-      return jsonRes(res, 200, snap);
-    }
-
-    if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/workflows\/runs\/([^/]+)\/events$/))) {
-      const runId = decodeURIComponent(m[1]);
-      const q = url.searchParams;
-      const optNum = (name: string): number | undefined => {
-        const v = q.get(name);
-        if (v === null) return undefined;
-        const n = Number(v);
-        return Number.isFinite(n) ? n : undefined;
-      };
-      const window = await readEventWindow(getRunsDir(), runId, {
-        tail: optNum('tail'),
-        beforeSeq: optNum('beforeSeq'),
-        afterSeq: optNum('afterSeq'),
-        limit: optNum('limit'),
-      });
-      if (!window) return jsonRes(res, 404, { error: 'unknown_run' });
-      return jsonRes(res, 200, window);
-    }
-
-    if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/workflows\/runs\/([^/]+)\/cancel$/))) {
-      const runId = decodeURIComponent(m[1]);
-      if (!isValidRunId(runId)) {
-        return jsonRes(res, 400, { ok: false, error: 'bad_run_id' });
-      }
-      let body: { reason?: unknown };
-      try {
-        body = await readJsonBody<{ reason?: string }>(req);
-      } catch {
-        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
-      }
-      const reason =
-        typeof body.reason === 'string' && body.reason.trim()
-          ? body.reason.trim()
-          : 'cancelled via dashboard';
-      const snap = await readRunSnapshot(getRunsDir(), runId);
-      if (!snap) return jsonRes(res, 404, { ok: false, error: 'unknown_run' });
-      if (TERMINAL_RUN_STATUSES.has(snap.run.status)) {
-        return jsonRes(res, 200, {
-          ok: true,
-          runId,
-          status: snap.run.status,
-          alreadyTerminal: true,
-          lastSeq: snap.lastSeq,
-        });
-      }
-      const owner = snap.chatBinding?.larkAppId;
-      if (!owner) {
-        return jsonRes(res, 409, {
-          ok: false,
-          error: 'needs_cli_cancel',
-          hint: `This run has no chat-binding owner; use 'botmux workflow cancel ${runId}' instead.`,
-        });
-      }
-      const upstream = await proxyToDaemon(
-        owner,
-        `/api/workflows/runs/${encodeURIComponent(runId)}/cancel`,
-        {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ reason }),
-        },
-      );
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
+    if (await handleWorkflowApi(req, res, url, {
+      runsDir: getRunsDir(),
+      proxyToDaemon,
+    })) {
       return;
     }
 
