@@ -39,6 +39,11 @@ import type {
   WorkerSpawnFn,
   WorkflowRuntimeContext,
 } from '../workflows/runtime.js';
+import {
+  eventSeqFromId,
+  extractEventContext,
+  listRuns,
+} from '../workflows/ops-projection.js';
 
 // Local arg parsers — mirror cli.ts shape; deliberately not exported.
 function argValue(args: string[], ...flags: string[]): string | undefined {
@@ -632,100 +637,19 @@ async function cmdWorkflowLs(rest: string[]): Promise<void> {
     : undefined;
 
   const runsDir = getRunsDir();
-  let entries: Array<{ name: string; isDirectory(): boolean }>;
+  let rows;
   try {
-    entries = await fs.readdir(runsDir, { withFileTypes: true });
+    rows = await listRuns(runsDir, {
+      all,
+      statuses: wantStatuses,
+      // chat-binding columns are only printed in --wide or --json; skip the
+      // extra fs op otherwise.
+      includeBinding: wide || json,
+    });
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-      if (json) return;
-      console.log(`(空 runsDir：${runsDir})`);
-      return;
-    }
     console.error(`读取 ${runsDir} 失败：${(err as Error).message}`);
     process.exit(1);
   }
-
-  const { replay } = await import('../workflows/events/replay.js');
-  const { readRunChatBinding } = await import('../workflows/loader.js');
-
-  type Row = {
-    runId: string;
-    workflowId: string;
-    status: string;
-    lastSeq: number;
-    dEf: number;
-    dAct: number;
-    dWait: number;
-    updatedAt: number;
-    failedNodeId?: string;
-    chatId?: string;
-    larkAppId?: string;
-  };
-
-  const rows: Row[] = [];
-  for (const entry of entries!) {
-    if (!entry.isDirectory()) continue;
-    const runId = entry.name;
-    const log = new EventLog(runId, runsDir);
-    let events;
-    try {
-      events = await log.readAll();
-    } catch {
-      continue;
-    }
-    if (events.length === 0) continue;
-    let snap;
-    try {
-      snap = replay(events);
-    } catch {
-      continue;
-    }
-    const status = snap.run.status;
-    const terminalStatuses = new Set(['succeeded', 'failed', 'cancelled']);
-
-    if (wantStatuses) {
-      if (!wantStatuses.has(status)) continue;
-    } else if (!all && terminalStatuses.has(status)) {
-      continue;
-    }
-
-    // dAct = non-wait, non-effect dangling activities (the "worker-style"
-    // bucket; gates show up in dWait, effects in dEf).
-    const effectSet = new Set(snap.danglingEffectAttempted);
-    const waitSet = new Set(snap.danglingWaits);
-    const dAct = snap.danglingActivities.filter(
-      (a) => !effectSet.has(a) && !waitSet.has(a),
-    ).length;
-
-    const row: Row = {
-      runId,
-      workflowId: snap.run.workflowId ?? '?',
-      status,
-      lastSeq: snap.lastSeq,
-      dEf: snap.danglingEffectAttempted.length,
-      dAct,
-      dWait: snap.danglingWaits.length,
-      updatedAt: events[events.length - 1]!.timestamp,
-      failedNodeId: snap.run.failedNodeId,
-    };
-
-    if (wide || json) {
-      try {
-        const binding = await readRunChatBinding(runId, {
-          runDir: join(runsDir, runId),
-        });
-        row.chatId = binding.chatId;
-        row.larkAppId = binding.larkAppId;
-      } catch {
-        // CLI-only run — no chat binding on disk.  Leave fields undefined.
-      }
-    }
-
-    rows.push(row);
-  }
-
-  // Most recently updated first — typical operator scan pattern.
-  rows.sort((a, b) => b.updatedAt - a.updatedAt);
 
   if (json) {
     for (const r of rows) console.log(JSON.stringify(r));
@@ -880,18 +804,6 @@ async function cmdWorkflowTail(rest: string[]): Promise<void> {
   }
 }
 
-/**
- * Recover the monotonic seq from `<runId>-<seq>`.  Events embed seq into
- * eventId (events doc v0.1.2 §3.1) and do not expose it as a top-level
- * field — operator surfaces have to parse it out themselves.
- */
-function eventSeqFromId(eventId: string): number {
-  const dash = eventId.lastIndexOf('-');
-  if (dash < 0) return 0;
-  const n = Number(eventId.slice(dash + 1));
-  return Number.isFinite(n) ? n : 0;
-}
-
 function printEventLine(ev: unknown, json: boolean): void {
   if (json) {
     console.log(JSON.stringify(ev));
@@ -911,22 +823,6 @@ function printEventLine(ev: unknown, json: boolean): void {
   const where = parts.join(' ');
   const err = ctx.errorCode ? ' err=' + ctx.errorCode : '';
   console.log(seq + '  ' + type + '  ' + where + err);
-}
-
-function extractEventContext(
-  payload: unknown,
-): { nodeId?: string; activityId?: string; errorCode?: string } {
-  if (!payload || typeof payload !== 'object' || 'ref' in payload) return {};
-  const p = payload as Record<string, unknown>;
-  const out: { nodeId?: string; activityId?: string; errorCode?: string } = {};
-  if (typeof p.nodeId === 'string') out.nodeId = p.nodeId;
-  if (typeof p.activityId === 'string') out.activityId = p.activityId;
-  if (typeof p.failedNodeId === 'string') out.nodeId = p.failedNodeId;
-  const err = p.error;
-  if (err && typeof err === 'object' && 'errorCode' in err) {
-    out.errorCode = String((err as { errorCode: unknown }).errorCode);
-  }
-  return out;
 }
 
 // ─── show ─────────────────────────────────────────────────────────────────

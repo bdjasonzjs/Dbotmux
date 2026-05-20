@@ -14,6 +14,12 @@ import {
 import { DaemonRegistry } from './dashboard/registry.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
 import { pickCreatorForGroup } from './dashboard/operator-selector.js';
+import {
+  listRuns,
+  readRunSnapshot,
+  readEventWindow,
+} from './workflows/ops-projection.js';
+import { getRunsDir } from './workflows/runs-dir.js';
 
 const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 const REGISTRY_DIR = join(homedir(), '.botmux', 'data', 'dashboard-daemons');
@@ -269,6 +275,56 @@ const server = createServer(async (req, res) => {
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());
       return;
+    }
+
+    // ─── Workflows (D0 — read-only) ──────────────────────────────────────────
+    //
+    // Dashboard reads runsDir directly (single-process; cross-daemon ownership
+    // doesn't matter for read-only).  All readers in `ops-projection` are
+    // pure: no mkdir, no EventLog instantiation.  Unknown / corrupt run → 404.
+
+    if (req.method === 'GET' && url.pathname === '/api/workflows/runs') {
+      const all = url.searchParams.get('all') === '1';
+      const statusParam = url.searchParams.get('status');
+      const statuses = statusParam
+        ? new Set(statusParam.split(',').map(s => s.trim()).filter(Boolean))
+        : undefined;
+      try {
+        const rows = await listRuns(getRunsDir(), {
+          all,
+          statuses,
+          includeBinding: true,
+        });
+        return jsonRes(res, 200, { runs: rows });
+      } catch (e: any) {
+        return jsonRes(res, 500, { error: 'listRuns_failed', message: e?.message ?? String(e) });
+      }
+    }
+
+    if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/workflows\/runs\/([^/]+)\/snapshot$/))) {
+      const runId = decodeURIComponent(m[1]);
+      const snap = await readRunSnapshot(getRunsDir(), runId);
+      if (!snap) return jsonRes(res, 404, { error: 'unknown_run' });
+      return jsonRes(res, 200, snap);
+    }
+
+    if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/workflows\/runs\/([^/]+)\/events$/))) {
+      const runId = decodeURIComponent(m[1]);
+      const q = url.searchParams;
+      const optNum = (name: string): number | undefined => {
+        const v = q.get(name);
+        if (v === null) return undefined;
+        const n = Number(v);
+        return Number.isFinite(n) ? n : undefined;
+      };
+      const window = await readEventWindow(getRunsDir(), runId, {
+        tail: optNum('tail'),
+        beforeSeq: optNum('beforeSeq'),
+        afterSeq: optNum('afterSeq'),
+        limit: optNum('limit'),
+      });
+      if (!window) return jsonRes(res, 404, { error: 'unknown_run' });
+      return jsonRes(res, 200, window);
     }
 
     // ─── Groups (Phase B) ────────────────────────────────────────────────────

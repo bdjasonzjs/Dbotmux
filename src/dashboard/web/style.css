@@ -91,3 +91,14 @@ input.row-select { cursor: pointer; }
 .bd-body .bd-row input[type=text]:disabled { background: #f6f8fa; color: var(--muted); }
 .bd-meta { display: flex; gap: 1rem; flex-wrap: wrap; color: var(--muted); font-size: 12px; margin: 0.3rem 0; }
 .oncall-status.hint-ok { background: transparent; border: none; padding: 0; margin: 0; color: #1a7f37; }
+.muted { color: var(--muted); font-size: 12px; }
+.muted.error { color: #cf222e; }
+.wf-status { padding: 0.05rem 0.4rem; border-radius: 999px; font-size: 11px; font-variant: small-caps; background: var(--header-bg); }
+.wf-status-pending       { background: #eee; color: var(--muted); }
+.wf-status-running       { background: #d6e4ff; color: #0969da; }
+.wf-status-waiting       { background: #fff3a8; color: #7a5800; }
+.wf-status-succeeded     { background: #d4f4dd; color: #1a7f37; }
+.wf-status-failed        { background: #ffd1d1; color: #cf222e; }
+.wf-status-cancelled     { background: #eee; color: var(--muted); }
+.wf-dangling.has  { color: #cf222e; font-weight: 600; }
+.wf-dangling.none { color: var(--muted); }

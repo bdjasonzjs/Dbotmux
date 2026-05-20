@@ -1,0 +1,358 @@
+/**
+ * Unit tests for `src/workflows/ops-projection.ts` — the shared module
+ * backing `botmux workflow ls/tail` and the dashboard read-only API.
+ *
+ * Side-effect contract under test: no `mkdir` on read paths.  We assert
+ * this by seeding events.ndjson without `chat-binding.json` and
+ * verifying that calls to `readRunSnapshot` / `readEventWindow` for
+ * unknown runIds DO NOT create directories.
+ */
+
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import {
+  eventSeqFromId,
+  extractEventContext,
+  isValidRunId,
+  listRuns,
+  readEventWindow,
+  readRunSnapshot,
+} from '../src/workflows/ops-projection.js';
+import { EventLog } from '../src/workflows/events/append.js';
+import { parseWorkflowDefinition } from '../src/workflows/definition.js';
+import { createRun } from '../src/workflows/run-init.js';
+import { runLoop } from '../src/workflows/loop.js';
+import type { WorkerSpawnFn } from '../src/workflows/runtime.js';
+
+let runsDir: string;
+let tmp: string;
+
+beforeEach(() => {
+  tmp = mkdtempSync(join(tmpdir(), 'ops-proj-'));
+  runsDir = join(tmp, 'runs');
+  mkdirSync(runsDir, { recursive: true });
+});
+
+afterEach(() => {
+  rmSync(tmp, { recursive: true, force: true });
+});
+
+const HELLO_DEF = parseWorkflowDefinition({
+  workflowId: 'proj-hello',
+  version: 1,
+  nodes: { only: { type: 'subagent', bot: 'b', prompt: 'hi' } },
+});
+
+const okSpawn: WorkerSpawnFn = async (input) => ({
+  kind: 'success',
+  output: { ok: true },
+  session: {
+    sessionId: `s-${input.activityId}`,
+    botName: input.botName,
+    startedAt: 1,
+    endedAt: 2,
+  },
+});
+
+async function seedActive(runId: string): Promise<EventLog> {
+  const log = new EventLog(runId, runsDir);
+  await createRun(log, {
+    def: HELLO_DEF,
+    params: {},
+    initiator: 'test',
+    botResolver: () => ({}),
+  });
+  return log;
+}
+
+async function seedSucceeded(runId: string): Promise<void> {
+  const log = await seedActive(runId);
+  await runLoop({ log, def: HELLO_DEF, spawnSubagent: okSpawn });
+}
+
+// ─── isValidRunId ───────────────────────────────────────────────────────────
+
+describe('isValidRunId', () => {
+  it('accepts UUIDs and slug-shaped ids', () => {
+    expect(isValidRunId('run-abc-123')).toBe(true);
+    expect(isValidRunId('o1-canary-1748000000')).toBe(true);
+    expect(isValidRunId('A_B.c-9')).toBe(true);
+  });
+  it('rejects path traversal and separators', () => {
+    expect(isValidRunId('..')).toBe(false);
+    expect(isValidRunId('../etc')).toBe(false);
+    expect(isValidRunId('foo/bar')).toBe(false);
+    expect(isValidRunId('foo\\bar')).toBe(false);
+    expect(isValidRunId('')).toBe(false);
+    expect(isValidRunId('.hidden')).toBe(false);
+  });
+  it('rejects overly long ids', () => {
+    expect(isValidRunId('a'.repeat(129))).toBe(false);
+    expect(isValidRunId('a'.repeat(128))).toBe(true);
+  });
+});
+
+// ─── listRuns ───────────────────────────────────────────────────────────────
+
+describe('listRuns', () => {
+  it('returns [] when runsDir does not exist (no throw, no mkdir)', async () => {
+    const missing = join(tmp, 'no-such');
+    const rows = await listRuns(missing);
+    expect(rows).toEqual([]);
+    expect(existsSync(missing)).toBe(false);
+  });
+
+  it('default hides terminal runs', async () => {
+    await seedActive('r-active');
+    await seedSucceeded('r-done');
+    const rows = await listRuns(runsDir);
+    expect(rows.map((r) => r.runId)).toEqual(['r-active']);
+  });
+
+  it('all=true surfaces terminal runs too', async () => {
+    await seedActive('r-active');
+    await seedSucceeded('r-done');
+    const rows = await listRuns(runsDir, { all: true });
+    expect(new Set(rows.map((r) => r.runId))).toEqual(new Set(['r-active', 'r-done']));
+  });
+
+  it('statuses filter wins over all flag', async () => {
+    await seedActive('r-active');
+    await seedSucceeded('r-done');
+    const rows = await listRuns(runsDir, { statuses: new Set(['succeeded']) });
+    expect(rows.map((r) => r.runId)).toEqual(['r-done']);
+  });
+
+  it('sorts by updatedAt desc', async () => {
+    await seedActive('r-older');
+    // Give the second run a strictly-later log line.
+    await new Promise((r) => setTimeout(r, 10));
+    await seedActive('r-newer');
+    const rows = await listRuns(runsDir);
+    expect(rows.map((r) => r.runId)).toEqual(['r-newer', 'r-older']);
+  });
+
+  it('skips runs with corrupt event log', async () => {
+    await seedActive('r-ok');
+    const badDir = join(runsDir, 'r-bad');
+    mkdirSync(badDir, { recursive: true });
+    writeFileSync(join(badDir, 'events.ndjson'), '{not json\n', 'utf-8');
+    const rows = await listRuns(runsDir);
+    expect(rows.map((r) => r.runId)).toEqual(['r-ok']);
+  });
+
+  it('skips disallowed dir names (path traversal guard)', async () => {
+    // `..foo` starts with `.` → rejected by isValidRunId.
+    mkdirSync(join(runsDir, '..foo'), { recursive: true });
+    await seedActive('r-good');
+    const rows = await listRuns(runsDir);
+    expect(rows.map((r) => r.runId)).toEqual(['r-good']);
+  });
+
+  it('includeBinding pulls chatId/larkAppId when present', async () => {
+    await seedActive('r-with-binding');
+    writeFileSync(
+      join(runsDir, 'r-with-binding', 'chat-binding.json'),
+      JSON.stringify({ chatId: 'chat-1', larkAppId: 'app-1' }),
+      'utf-8',
+    );
+    const [row] = await listRuns(runsDir, { includeBinding: true });
+    expect(row?.chatId).toBe('chat-1');
+    expect(row?.larkAppId).toBe('app-1');
+  });
+
+  it('includeBinding=false leaves chatId/larkAppId undefined', async () => {
+    await seedActive('r-no-binding');
+    writeFileSync(
+      join(runsDir, 'r-no-binding', 'chat-binding.json'),
+      JSON.stringify({ chatId: 'chat-1', larkAppId: 'app-1' }),
+      'utf-8',
+    );
+    const [row] = await listRuns(runsDir);
+    expect(row?.chatId).toBeUndefined();
+    expect(row?.larkAppId).toBeUndefined();
+  });
+});
+
+// ─── readRunSnapshot ────────────────────────────────────────────────────────
+
+describe('readRunSnapshot', () => {
+  it('returns null for unknown runId (no mkdir side effect)', async () => {
+    const fake = 'never-existed';
+    const snap = await readRunSnapshot(runsDir, fake);
+    expect(snap).toBeNull();
+    expect(existsSync(join(runsDir, fake))).toBe(false);
+  });
+
+  it('returns null for path-traversal runId', async () => {
+    expect(await readRunSnapshot(runsDir, '..')).toBeNull();
+    expect(await readRunSnapshot(runsDir, '../../etc/passwd')).toBeNull();
+  });
+
+  it('returns full snapshot for a healthy run', async () => {
+    await seedActive('r-snap');
+    const snap = await readRunSnapshot(runsDir, 'r-snap');
+    expect(snap).not.toBeNull();
+    expect(snap!.runId).toBe('r-snap');
+    expect(snap!.run.workflowId).toBe('proj-hello');
+    expect(typeof snap!.lastSeq).toBe('number');
+    expect(Array.isArray(snap!.nodes)).toBe(true);
+    expect(Array.isArray(snap!.activities)).toBe(true);
+    expect(snap!.dangling).toEqual({
+      activities: expect.any(Array),
+      effectAttempted: expect.any(Array),
+      waits: expect.any(Array),
+      cancels: expect.any(Array),
+    });
+  });
+
+  it('inlines chatBinding when present', async () => {
+    await seedActive('r-binded');
+    writeFileSync(
+      join(runsDir, 'r-binded', 'chat-binding.json'),
+      JSON.stringify({ chatId: 'c-x', larkAppId: 'app-x' }),
+      'utf-8',
+    );
+    const snap = await readRunSnapshot(runsDir, 'r-binded');
+    expect(snap?.chatBinding).toEqual({ chatId: 'c-x', larkAppId: 'app-x' });
+  });
+
+  it('returns null on corrupt event log', async () => {
+    const dir = join(runsDir, 'r-corrupt');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'events.ndjson'), 'not-json\n', 'utf-8');
+    expect(await readRunSnapshot(runsDir, 'r-corrupt')).toBeNull();
+  });
+});
+
+// ─── readEventWindow ────────────────────────────────────────────────────────
+
+describe('readEventWindow', () => {
+  it('returns null for unknown runId', async () => {
+    expect(await readEventWindow(runsDir, 'no-run', {})).toBeNull();
+  });
+
+  it('default tail returns last 100 events (or fewer)', async () => {
+    await seedSucceeded('r-tail');
+    const w = await readEventWindow(runsDir, 'r-tail', {});
+    expect(w).not.toBeNull();
+    expect(w!.events.length).toBeGreaterThan(0);
+    expect(w!.events.length).toBeLessThanOrEqual(100);
+    expect(w!.totalCount).toBe(w!.events.length);
+    expect(w!.hasNewer).toBe(false);
+  });
+
+  it('tail=N clips correctly', async () => {
+    await seedSucceeded('r-tail-n');
+    const w = await readEventWindow(runsDir, 'r-tail-n', { tail: 2 });
+    expect(w!.events.length).toBe(2);
+    // last two events of the run
+    expect(w!.hasOlder).toBe(true);
+    expect(w!.hasNewer).toBe(false);
+  });
+
+  it('afterSeq=K returns only events with seq > K', async () => {
+    await seedSucceeded('r-after');
+    const fullWindow = await readEventWindow(runsDir, 'r-after', {});
+    const total = fullWindow!.totalCount;
+    expect(total).toBeGreaterThan(2);
+
+    // Pick seq of the second-to-last event.
+    const k = eventSeqFromId(fullWindow!.events[total - 2]!.eventId);
+    const w = await readEventWindow(runsDir, 'r-after', { afterSeq: k });
+    expect(w!.events.length).toBe(1);
+    expect(w!.events[0]!.eventId).toBe(fullWindow!.events[total - 1]!.eventId);
+    expect(w!.hasOlder).toBe(true);
+    expect(w!.hasNewer).toBe(false);
+  });
+
+  it('afterSeq beyond last → empty slice, hasNewer=false', async () => {
+    await seedSucceeded('r-after-end');
+    const full = await readEventWindow(runsDir, 'r-after-end', {});
+    const lastSeq = eventSeqFromId(full!.events[full!.events.length - 1]!.eventId);
+    const w = await readEventWindow(runsDir, 'r-after-end', { afterSeq: lastSeq });
+    expect(w!.events.length).toBe(0);
+    expect(w!.hasNewer).toBe(false);
+    expect(w!.hasOlder).toBe(true);
+  });
+
+  it('beforeSeq=K returns events with seq < K (ascending)', async () => {
+    await seedSucceeded('r-before');
+    const full = await readEventWindow(runsDir, 'r-before', {});
+    // beforeSeq = 3 → seqs [1, 2]
+    const w = await readEventWindow(runsDir, 'r-before', { beforeSeq: 3 });
+    expect(w!.events.length).toBe(2);
+    expect(eventSeqFromId(w!.events[0]!.eventId)).toBe(1);
+    expect(eventSeqFromId(w!.events[1]!.eventId)).toBe(2);
+    expect(w!.hasOlder).toBe(false);
+    expect(w!.hasNewer).toBe(true);
+    // Sanity: full has more than 2 events so we proved beforeSeq window was a slice.
+    expect(full!.totalCount).toBeGreaterThan(2);
+  });
+
+  it('beforeSeq with limit clamps to limit', async () => {
+    await seedSucceeded('r-before-lim');
+    const full = await readEventWindow(runsDir, 'r-before-lim', {});
+    const total = full!.totalCount;
+    const w = await readEventWindow(runsDir, 'r-before-lim', {
+      beforeSeq: total + 1,
+      limit: 2,
+    });
+    expect(w!.events.length).toBe(2);
+    expect(w!.hasOlder).toBe(total > 2);
+    expect(w!.hasNewer).toBe(false);
+  });
+
+  it('empty event log returns zero counts', async () => {
+    const dir = join(runsDir, 'r-empty');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'events.ndjson'), '', 'utf-8');
+    const w = await readEventWindow(runsDir, 'r-empty', {});
+    expect(w).not.toBeNull();
+    expect(w!.events).toEqual([]);
+    expect(w!.totalCount).toBe(0);
+    expect(w!.hasOlder).toBe(false);
+    expect(w!.hasNewer).toBe(false);
+  });
+
+  it('events are returned in seq-ascending order', async () => {
+    await seedSucceeded('r-order');
+    const w = await readEventWindow(runsDir, 'r-order', { tail: 5 });
+    const seqs = w!.events.map((e) => eventSeqFromId(e.eventId));
+    const sorted = [...seqs].sort((a, b) => a - b);
+    expect(seqs).toEqual(sorted);
+  });
+});
+
+// ─── helpers ────────────────────────────────────────────────────────────────
+
+describe('eventSeqFromId', () => {
+  it('extracts trailing seq', () => {
+    expect(eventSeqFromId('run-abc-1')).toBe(1);
+    expect(eventSeqFromId('foo-bar-42')).toBe(42);
+  });
+  it('returns 0 for malformed ids', () => {
+    expect(eventSeqFromId('no-dash')).toBe(0);
+    expect(eventSeqFromId('run-')).toBe(0);
+    expect(eventSeqFromId('run-abc')).toBe(0);
+  });
+});
+
+describe('extractEventContext', () => {
+  it('pulls nodeId/activityId/errorCode from payload', () => {
+    expect(
+      extractEventContext({ nodeId: 'n1', activityId: 'a1', error: { errorCode: 'TimedOut' } }),
+    ).toEqual({ nodeId: 'n1', activityId: 'a1', errorCode: 'TimedOut' });
+  });
+  it('failedNodeId promotes to nodeId', () => {
+    expect(extractEventContext({ failedNodeId: 'n9' })).toEqual({ nodeId: 'n9' });
+  });
+  it('returns empty for ref-payloads / nullish', () => {
+    expect(extractEventContext({ ref: 'b1', bytes: 10, schemaVersion: 1 })).toEqual({});
+    expect(extractEventContext(null)).toEqual({});
+    expect(extractEventContext(undefined)).toEqual({});
+  });
+});

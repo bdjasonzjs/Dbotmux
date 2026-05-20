@@ -4,12 +4,19 @@ import { renderSessionsPage } from './sessions.js';
 import { renderSchedulesPage } from './schedules.js';
 import { renderGroupsPage } from './groups.js';
 import { renderBotDefaultsPage } from './bot-defaults.js';
+import { renderWorkflowsPage } from './workflows.js';
 
 const root = document.getElementById('root')!;
 
+// Pages that own a polling loop / cleanup return a disposer; we run it
+// on the next route switch so timers don't leak across navigations.
+let pageDispose: (() => void) | null = null;
+
 function route() {
+  if (pageDispose) { pageDispose(); pageDispose = null; }
   const hash = location.hash || '#/';
-  if (hash.startsWith('#/groups')) renderGroupsPage(root);
+  if (hash.startsWith('#/workflows')) pageDispose = renderWorkflowsPage(root);
+  else if (hash.startsWith('#/groups')) renderGroupsPage(root);
   else if (hash.startsWith('#/bot-defaults')) renderBotDefaultsPage(root);
   else if (hash.startsWith('#/schedules')) renderSchedulesPage(root);
   else renderSessionsPage(root);
