@@ -10,7 +10,7 @@ import {
   parseCookie,
 } from '../src/dashboard/auth.js';
 import { handleWorkflowApi, jsonRes } from '../src/dashboard/workflow-api.js';
-import { parseWorkflowDefinition } from '../src/workflows/definition.js';
+import { computeRevisionId, parseWorkflowDefinition } from '../src/workflows/definition.js';
 import { EventLog } from '../src/workflows/events/append.js';
 import { createRun } from '../src/workflows/run-init.js';
 import { runLoop } from '../src/workflows/loop.js';
@@ -95,8 +95,34 @@ describe('dashboard route smoke auth boundary', () => {
     expect(reject.status).toBe(401);
     expect(proxyCalls).toEqual([]);
 
+    const trigger = await fetch(`${baseUrl}/api/workflows/definitions/route-smoke-wait/run`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        params: {},
+        chatBinding: { chatId: 'oc_chat', larkAppId: 'cli_owner' },
+      }),
+    });
+    expect(trigger.status).toBe(401);
+    expect(proxyCalls).toEqual([]);
+
     const sessions = await fetch(`${baseUrl}/api/sessions`);
     expect(sessions.status).toBe(401);
+  });
+
+  it('allows GET catalog definitions list + detail without cookie', async () => {
+    const list = await fetch(`${baseUrl}/api/workflows/definitions`);
+    expect(list.status).toBe(200);
+    expect(await list.json()).toMatchObject({ definitions: expect.any(Array) });
+
+    const detail = await fetch(
+      `${baseUrl}/api/workflows/definitions/route-smoke-wait`,
+    );
+    expect(detail.status).toBe(200);
+    expect(await detail.json()).toMatchObject({
+      definition: expect.objectContaining({ workflowId: 'route-smoke-wait' }),
+      revisionId: expect.stringMatching(/^sha256:/),
+    });
   });
 
   it('keeps health and static shell public while missing assets stay public 404', async () => {
@@ -186,6 +212,23 @@ async function startDashboardSmokeServer(): Promise<{ server: Server; baseUrl: s
             headers: { 'content-type': 'application/json' },
           });
         },
+        listWorkflowDefinitions: async () => [{
+          workflowId: 'route-smoke-wait',
+          version: 1,
+          path: '/tmp/route-smoke-wait.workflow.json',
+          revisionId: computeRevisionId(WAIT_DEF),
+          paramCount: 0,
+          requiredParamCount: 0,
+          nodeCount: 1,
+        }],
+        loadCatalogDefinition: async (id) =>
+          id === 'route-smoke-wait'
+            ? {
+                definition: WAIT_DEF,
+                revisionId: computeRevisionId(WAIT_DEF),
+                path: '/tmp/route-smoke-wait.workflow.json',
+              }
+            : undefined,
       })) return;
 
       jsonRes(res, 404, { error: 'not_found_yet', path: url.pathname });

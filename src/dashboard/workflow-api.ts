@@ -1,6 +1,13 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
 import {
+  isValidWorkflowId,
+  listWorkflowDefinitions as defaultListWorkflowDefinitions,
+  loadCatalogDefinition as defaultLoadCatalogDefinition,
+  type CatalogDefinition,
+  type CatalogEntry,
+} from '../workflows/catalog.js';
+import {
   listRuns,
   readRunSnapshot,
   readEventWindow,
@@ -15,6 +22,13 @@ export type WorkflowApiDeps = {
     daemonPath: string,
     init: RequestInit,
   ) => Promise<Response>;
+  /**
+   * Test seam: override catalog list/load so route tests can scope to a tmp
+   * workflow dir instead of $HOME/.botmux/workflows.  Production callers omit
+   * these and the defaults read the real search paths.
+   */
+  listWorkflowDefinitions?: () => Promise<CatalogEntry[]>;
+  loadCatalogDefinition?: (workflowId: string) => Promise<CatalogDefinition | undefined>;
 };
 
 export function jsonRes(res: ServerResponse, status: number, body: unknown): void {
@@ -27,6 +41,16 @@ async function readJsonBody<T = unknown>(req: IncomingMessage): Promise<T> {
   for await (const c of req) chunks.push(c as Buffer);
   if (chunks.length === 0) return {} as T;
   return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+}
+
+function parseChatBinding(
+  raw: unknown,
+): { chatId: string; larkAppId: string } | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const r = raw as { chatId?: unknown; larkAppId?: unknown };
+  if (typeof r.chatId !== 'string' || !r.chatId.trim()) return undefined;
+  if (typeof r.larkAppId !== 'string' || !r.larkAppId.trim()) return undefined;
+  return { chatId: r.chatId.trim(), larkAppId: r.larkAppId.trim() };
 }
 
 /**
@@ -43,6 +67,105 @@ export async function handleWorkflowApi(
   deps: WorkflowApiDeps,
 ): Promise<boolean> {
   let m: RegExpMatchArray | null;
+
+  // ─── Catalog: definitions list / detail / trigger ──────────────────────────
+  // GET list + detail are intentionally public-read (auth boundary in
+  // `decideDashboardAuth` allows any `GET /api/workflows/*`).  Trigger is POST,
+  // so the same boundary forces cookie auth before this handler runs.
+  const listDefinitions = deps.listWorkflowDefinitions ?? defaultListWorkflowDefinitions;
+  const loadDefinition = deps.loadCatalogDefinition ?? defaultLoadCatalogDefinition;
+
+  if (req.method === 'GET' && url.pathname === '/api/workflows/definitions') {
+    try {
+      const definitions = await listDefinitions();
+      jsonRes(res, 200, { definitions });
+    } catch (e: any) {
+      jsonRes(res, 500, {
+        error: 'list_definitions_failed',
+        message: e?.message ?? String(e),
+      });
+    }
+    return true;
+  }
+
+  if (
+    req.method === 'GET' &&
+    (m = url.pathname.match(/^\/api\/workflows\/definitions\/([^/]+)$/))
+  ) {
+    const id = decodeURIComponent(m[1]);
+    if (!isValidWorkflowId(id)) {
+      jsonRes(res, 400, { error: 'bad_id' });
+      return true;
+    }
+    try {
+      const found = await loadDefinition(id);
+      if (!found) {
+        jsonRes(res, 404, { error: 'unknown_workflow' });
+        return true;
+      }
+      jsonRes(res, 200, found);
+    } catch (e: any) {
+      jsonRes(res, 500, {
+        error: 'load_definition_failed',
+        message: e?.message ?? String(e),
+      });
+    }
+    return true;
+  }
+
+  if (
+    req.method === 'POST' &&
+    (m = url.pathname.match(/^\/api\/workflows\/definitions\/([^/]+)\/run$/))
+  ) {
+    const id = decodeURIComponent(m[1]);
+    if (!isValidWorkflowId(id)) {
+      jsonRes(res, 400, { ok: false, error: 'bad_id' });
+      return true;
+    }
+    let body: { params?: unknown; chatBinding?: unknown };
+    try {
+      body = await readJsonBody<{ params?: unknown; chatBinding?: unknown }>(req);
+    } catch {
+      jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      return true;
+    }
+    const chatBinding = parseChatBinding(body.chatBinding);
+    if (!chatBinding) {
+      jsonRes(res, 400, {
+        ok: false,
+        error: 'missing_chat_binding',
+        hint:
+          'Body must include chatBinding={chatId, larkAppId}. The chatId/larkAppId ' +
+          'pair binds the run to a Lark chat for approval cards + cancel routing; ' +
+          'pick a chat the target bot is already in (see /api/groups).',
+      });
+      return true;
+    }
+    // Params: optional record of arbitrary JSON values.  Validate the wrapper
+    // shape here; the owner daemon does per-field coercion against the schema.
+    if (body.params !== undefined) {
+      if (
+        typeof body.params !== 'object' ||
+        body.params === null ||
+        Array.isArray(body.params)
+      ) {
+        jsonRes(res, 400, { ok: false, error: 'bad_params_shape' });
+        return true;
+      }
+    }
+    const upstream = await deps.proxyToDaemon(
+      chatBinding.larkAppId,
+      `/api/workflows/definitions/${encodeURIComponent(id)}/run`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ params: body.params, chatBinding }),
+      },
+    );
+    res.writeHead(upstream.status, { 'content-type': 'application/json' });
+    res.end(await upstream.text());
+    return true;
+  }
 
   if (req.method === 'GET' && url.pathname === '/api/workflows/runs') {
     const all = url.searchParams.get('all') === '1';

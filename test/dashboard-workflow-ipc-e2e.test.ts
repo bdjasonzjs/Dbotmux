@@ -17,6 +17,8 @@ import {
 import { cancelWorkflowRun } from '../src/workflows/cancel-run.js';
 import { requestCancel } from '../src/workflows/cancel.js';
 import { resolveWait } from '../src/workflows/wait.js';
+import { triggerWorkflowRun } from '../src/workflows/trigger-run.js';
+import type { RawParamInput } from '../src/workflows/params.js';
 import { parseWorkflowDefinition } from '../src/workflows/definition.js';
 import { EventLog } from '../src/workflows/events/append.js';
 import type { WorkflowEvent } from '../src/workflows/events/schema.js';
@@ -240,6 +242,56 @@ describe('dashboard workflow IPC e2e', () => {
     });
   });
 
+  it('proxies dashboard catalog trigger to daemon IPC and writes runCreated', async () => {
+    const res = await fetch(`${dashboardBaseUrl}/api/workflows/definitions/${WAIT_DEF.workflowId}/run`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        params: {},
+        chatBinding: { chatId: 'oc_owner', larkAppId: 'cli_owner' },
+      }),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      ok: boolean;
+      runId: string;
+      workflowId: string;
+      status: string;
+    };
+    expect(body.ok).toBe(true);
+    expect(body.runId).toBe('ipc-trigger:test-run');
+    expect(body.workflowId).toBe(WAIT_DEF.workflowId);
+    expect(body.status).toBe('running');
+
+    expect(daemonRequests).toEqual([
+      {
+        path: `/api/workflows/definitions/${WAIT_DEF.workflowId}/run`,
+        body: {
+          params: {},
+          chatBinding: { chatId: 'oc_owner', larkAppId: 'cli_owner' },
+        },
+      },
+    ]);
+
+    const log = new EventLog(body.runId, runsDir);
+    const events = await log.readAll();
+    expect(events.map((e) => e.type)).toEqual(['runCreated', 'runStarted']);
+  });
+
+  it('surfaces daemon unknown_workflow as 404 on trigger', async () => {
+    const res = await fetch(`${dashboardBaseUrl}/api/workflows/definitions/nope-missing/run`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        params: {},
+        chatBinding: { chatId: 'oc_owner', larkAppId: 'cli_owner' },
+      }),
+    });
+    expect(res.status).toBe(404);
+    const body = (await res.json()) as { ok: boolean; error: string };
+    expect(body).toMatchObject({ ok: false, error: 'unknown_workflow' });
+  });
+
   it('passes daemon pending cancel responses through without draining the run', async () => {
     const { log } = await seedOwnedWaitingRun(
       'ipc-running-01',
@@ -305,6 +357,13 @@ async function startDaemonIpcServer(): Promise<{
       const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
       if (req.method !== 'POST') {
         jsonRes(res, 404, { ok: false, error: 'not_found' });
+        return;
+      }
+      const triggerMatch = url.pathname.match(
+        /^\/api\/workflows\/definitions\/([^/]+)\/run$/,
+      );
+      if (triggerMatch) {
+        await handleTrigger(req, res, url, triggerMatch);
         return;
       }
       const approveMatch = url.pathname.match(
@@ -389,6 +448,66 @@ async function startDaemonIpcServer(): Promise<{
       jsonRes(res, 500, { ok: false, error: String(err) });
     }
   });
+}
+
+async function handleTrigger(
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+  match: RegExpMatchArray,
+): Promise<void> {
+  let body: { params?: unknown; chatBinding?: unknown };
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    jsonRes(res, 400, { ok: false, error: 'bad_json' });
+    return;
+  }
+  daemonRequests.push({ path: url.pathname, body });
+  const workflowId = decodeURIComponent(match[1]!);
+  // Fake daemon trigger: drive triggerWorkflowRun with a known def so the
+  // dashboard ↔ daemon proxy can be exercised end-to-end without booting the
+  // real daemon.
+  const triggerResult = await triggerWorkflowRun(
+    {
+      workflowId,
+      rawParams: rawParamsFromBody(body.params),
+      chatBinding: body.chatBinding as { chatId: string; larkAppId: string },
+      initiator: 'dashboard',
+    },
+    {
+      spawnSubagent: unusedSpawn,
+      botResolver: () => ({}),
+      makeRuntimeContext: (log, def, spawn) => ({ log, def, spawnSubagent: spawn }),
+      attachRuntime: () => ({}),
+      driveRun: () => { /* fire-and-forget; tests don't need a real loop */ },
+      loadWorkflowDefinition: async (id) =>
+        id === WAIT_DEF.workflowId
+          ? WAIT_DEF
+          : (() => {
+              throw new Error(`Workflow '${id}' not found. Looked in:\n- /nope`);
+            })(),
+      makeRunId: () => 'ipc-trigger:test-run',
+      makeEventLog: (runId) => new EventLog(runId, runsDir),
+    },
+  );
+  if (!triggerResult.ok) {
+    const status =
+      triggerResult.error === 'unknown_workflow' ? 404 :
+        triggerResult.error === 'invalid_params' ? 400 : 500;
+    jsonRes(res, status, triggerResult);
+    return;
+  }
+  jsonRes(res, 200, triggerResult);
+}
+
+function rawParamsFromBody(raw: unknown): Record<string, RawParamInput> {
+  const out: Record<string, RawParamInput> = {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    out[k] = { kind: 'json', value: v };
+  }
+  return out;
 }
 
 async function handleApproveReject(

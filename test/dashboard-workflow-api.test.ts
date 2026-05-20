@@ -13,10 +13,15 @@ import {
   type WorkflowApiDeps,
 } from '../src/dashboard/workflow-api.js';
 import { EventLog } from '../src/workflows/events/append.js';
-import { parseWorkflowDefinition, type WorkflowDefinition } from '../src/workflows/definition.js';
+import {
+  computeRevisionId,
+  parseWorkflowDefinition,
+  type WorkflowDefinition,
+} from '../src/workflows/definition.js';
 import { createRun } from '../src/workflows/run-init.js';
 import { runLoop } from '../src/workflows/loop.js';
 import type { WorkerSpawnFn } from '../src/workflows/runtime.js';
+import type { CatalogEntry } from '../src/workflows/catalog.js';
 
 const WAIT_DEF = parseWorkflowDefinition({
   workflowId: 'dash-wait',
@@ -48,6 +53,8 @@ let runsDir: string;
 let server: Server | null;
 let baseUrl: string;
 let proxyToDaemon: ReturnType<typeof vi.fn>;
+let catalogEntries: CatalogEntry[];
+let catalogDefs: Map<string, { definition: WorkflowDefinition; revisionId: string; path: string }>;
 
 beforeEach(async () => {
   tempDir = mkdtempSync(join(tmpdir(), 'wf-dashboard-api-'));
@@ -58,9 +65,13 @@ beforeEach(async () => {
       headers: { 'content-type': 'application/json' },
     }),
   );
+  catalogEntries = [];
+  catalogDefs = new Map();
   const started = await startWorkflowApiServer({
     runsDir,
     proxyToDaemon,
+    listWorkflowDefinitions: async () => catalogEntries,
+    loadCatalogDefinition: async (id) => catalogDefs.get(id),
   });
   server = started.server;
   baseUrl = started.baseUrl;
@@ -302,6 +313,154 @@ describe('dashboard workflow API routes', () => {
         body: JSON.stringify({ comment: 'nope' }),
       }),
     );
+  });
+
+  // ─── Catalog: definitions list / detail / trigger ─────────────────────────
+
+  it('lists workflow definitions via injected catalog dep', async () => {
+    catalogEntries = [
+      {
+        workflowId: 'demo-a',
+        version: 1,
+        path: '/tmp/demo-a.workflow.json',
+        revisionId: 'sha256:abc',
+        paramCount: 2,
+        requiredParamCount: 1,
+        nodeCount: 3,
+      },
+    ];
+    const res = await fetch(`${baseUrl}/api/workflows/definitions`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { definitions: CatalogEntry[] };
+    expect(body.definitions).toEqual(catalogEntries);
+  });
+
+  it('returns load_definitions_failed when the catalog source throws', async () => {
+    catalogEntries = [];
+    server!.close();
+    const started = await startWorkflowApiServer({
+      runsDir,
+      proxyToDaemon,
+      listWorkflowDefinitions: async () => {
+        throw new Error('disk gone');
+      },
+    });
+    server = started.server;
+    baseUrl = started.baseUrl;
+    const res = await fetch(`${baseUrl}/api/workflows/definitions`);
+    expect(res.status).toBe(500);
+    expect(await res.json()).toMatchObject({ error: 'list_definitions_failed' });
+  });
+
+  it('serves a single definition by id', async () => {
+    const def = parseWorkflowDefinition({
+      workflowId: 'detail-demo',
+      version: 1,
+      params: { name: { type: 'string', required: true } },
+      nodes: { d: { type: 'subagent', bot: 'cli_x', prompt: 'p' } },
+    });
+    catalogDefs.set('detail-demo', {
+      definition: def,
+      revisionId: computeRevisionId(def),
+      path: '/tmp/detail-demo.workflow.json',
+    });
+    const res = await fetch(`${baseUrl}/api/workflows/definitions/detail-demo`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { definition: WorkflowDefinition; revisionId: string; path: string };
+    expect(body.definition).toMatchObject({ workflowId: 'detail-demo', version: 1 });
+    expect(body.revisionId).toMatch(/^sha256:/);
+    expect(body.path).toContain('detail-demo');
+  });
+
+  it('rejects bad_id on definition detail before touching catalog', async () => {
+    const res = await fetch(`${baseUrl}/api/workflows/definitions/${encodeURIComponent('../escape')}`);
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: 'bad_id' });
+  });
+
+  it('returns unknown_workflow when catalog returns undefined', async () => {
+    const res = await fetch(`${baseUrl}/api/workflows/definitions/missing`);
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: 'unknown_workflow' });
+  });
+
+  it('proxies the trigger POST to the owning daemon', async () => {
+    const res = await fetch(`${baseUrl}/api/workflows/definitions/demo/run`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        params: { name: 'alice' },
+        chatBinding: { chatId: 'oc_chat', larkAppId: 'cli_owner' },
+      }),
+    });
+    expect(res.status).toBe(202);
+    expect(await res.json()).toMatchObject({ ok: true });
+    expect(proxyToDaemon).toHaveBeenCalledWith(
+      'cli_owner',
+      '/api/workflows/definitions/demo/run',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({
+          params: { name: 'alice' },
+          chatBinding: { chatId: 'oc_chat', larkAppId: 'cli_owner' },
+        }),
+      }),
+    );
+  });
+
+  it('rejects trigger with missing chat binding before proxying', async () => {
+    const res = await fetch(`${baseUrl}/api/workflows/definitions/demo/run`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ params: { name: 'alice' } }),
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string; hint?: string };
+    expect(body.error).toBe('missing_chat_binding');
+    expect(body.hint).toMatch(/chatBinding/);
+    expect(proxyToDaemon).not.toHaveBeenCalled();
+  });
+
+  it('rejects trigger with bad_id before proxying', async () => {
+    const res = await fetch(
+      `${baseUrl}/api/workflows/definitions/${encodeURIComponent('../boom')}/run`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          params: {},
+          chatBinding: { chatId: 'oc_chat', larkAppId: 'cli_owner' },
+        }),
+      },
+    );
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ ok: false, error: 'bad_id' });
+    expect(proxyToDaemon).not.toHaveBeenCalled();
+  });
+
+  it('rejects trigger with bad params shape (non-object) before proxying', async () => {
+    const res = await fetch(`${baseUrl}/api/workflows/definitions/demo/run`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        params: ['not', 'an', 'object'],
+        chatBinding: { chatId: 'oc_chat', larkAppId: 'cli_owner' },
+      }),
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ ok: false, error: 'bad_params_shape' });
+    expect(proxyToDaemon).not.toHaveBeenCalled();
+  });
+
+  it('rejects trigger with malformed JSON body before proxying', async () => {
+    const res = await fetch(`${baseUrl}/api/workflows/definitions/demo/run`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{not-json',
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ ok: false, error: 'bad_json' });
+    expect(proxyToDaemon).not.toHaveBeenCalled();
   });
 });
 

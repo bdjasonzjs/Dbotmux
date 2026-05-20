@@ -68,6 +68,7 @@ import { handleCardAction } from './im/lark/card-handler.js';
 import type { CardHandlerDeps } from './im/lark/card-handler.js';
 import {
   executeWorkflowCommand,
+  resolveBotSnapshot,
   type WorkflowCommandResult,
 } from './im/lark/workflow-slash-command.js';
 import { workflowRunDetailUrl } from './im/lark/workflow-cards.js';
@@ -84,6 +85,9 @@ import { createDaemonSpawnFn } from './workflows/spawn-bot.js';
 import { attachColdWorkflowRunsForDaemon } from './workflows/cold-attach.js';
 import { getRunsDir } from './workflows/runs-dir.js';
 import { loadEffectInputSidecar } from './workflows/effect-input.js';
+import { isValidWorkflowId } from './workflows/catalog.js';
+import { triggerWorkflowRun } from './workflows/trigger-run.js';
+import type { RawParamInput } from './workflows/params.js';
 import {
   createDefaultHostExecutorRegistry,
   createDefaultProviderReconcilers,
@@ -984,6 +988,84 @@ ipcRoute('POST', '/api/workflows/runs/:runId/cancel', async (req, res, params) =
   }
   return jsonRes(res, 200, result);
 });
+
+ipcRoute('POST', '/api/workflows/definitions/:id/run', async (req, res, params) => {
+  const workflowId = params.id;
+  if (!isValidWorkflowId(workflowId)) {
+    return jsonRes(res, 400, { ok: false, error: 'bad_id' });
+  }
+  let body: { params?: unknown; chatBinding?: unknown };
+  try {
+    body = await readJsonBody<{ params?: unknown; chatBinding?: unknown }>(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const chatBinding = parseTriggerChatBinding(body.chatBinding);
+  if (!chatBinding) {
+    return jsonRes(res, 400, { ok: false, error: 'missing_chat_binding' });
+  }
+  if (body.params !== undefined) {
+    if (typeof body.params !== 'object' || body.params === null || Array.isArray(body.params)) {
+      return jsonRes(res, 400, { ok: false, error: 'bad_params_shape' });
+    }
+  }
+  // Convert JSON-channel params (decoded values) into the shared RawParamInput
+  // map.  String-channel coercion stays on the IM `/workflow run` path.
+  const rawParams: Record<string, RawParamInput> = {};
+  for (const [k, v] of Object.entries((body.params as Record<string, unknown> | undefined) ?? {})) {
+    rawParams[k] = { kind: 'json', value: v };
+  }
+
+  const result = await triggerWorkflowRun(
+    {
+      workflowId,
+      rawParams,
+      chatBinding,
+      initiator: 'dashboard',
+    },
+    {
+      spawnSubagent: workflowSpawnFn(),
+      botResolver: resolveBotSnapshot,
+      makeRuntimeContext: (log, def, spawnSubagent) => ({
+        log,
+        def,
+        spawnSubagent,
+        hostExecutors: createDefaultHostExecutorRegistry(),
+        reconcilers: createDefaultProviderReconcilers(),
+        loadEffectInput: (activityId, attemptId) =>
+          loadEffectInputSidecar(log, activityId, attemptId),
+      }),
+      attachRuntime: (runId, ctx) => attachWorkflowEventWatcher(runId, ctx),
+      driveRun: (runId) => {
+        driveWorkflowRun(runId).catch((err) => {
+          logger.warn(
+            `[workflow:${runId}] dashboard-trigger drive failed: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        });
+      },
+    },
+  );
+  if (!result.ok) {
+    const status =
+      result.error === 'unknown_workflow' ? 404 :
+        result.error === 'invalid_params' ? 400 :
+          500;
+    return jsonRes(res, status, result);
+  }
+  return jsonRes(res, 200, result);
+});
+
+function parseTriggerChatBinding(
+  raw: unknown,
+): { chatId: string; larkAppId: string } | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const r = raw as { chatId?: unknown; larkAppId?: unknown };
+  if (typeof r.chatId !== 'string' || !r.chatId.trim()) return undefined;
+  if (typeof r.larkAppId !== 'string' || !r.larkAppId.trim()) return undefined;
+  return { chatId: r.chatId.trim(), larkAppId: r.larkAppId.trim() };
+}
 
 // ─── Event handling ──────────────────────────────────────────────────────────
 
