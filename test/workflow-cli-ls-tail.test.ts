@@ -158,10 +158,11 @@ describe('botmux workflow ls', () => {
     expect(typeof row.updatedAt).toBe('number');
   });
 
-  // Codex review (O1 medium #2): replay's `waitsOpen` doesn't clear on
-  // activityCanceled, so danglingWaits over-counts on cancelled runs.
-  // ls works around this by filtering by activity status — verify the
-  // workaround holds before we forget about the root cause in replay.ts.
+  // Regression: replay's `waitsOpen` clears when the wait's activity
+  // reaches any terminal (succeeded/failed/timedOut/cancelled).  ls
+  // surfaces `snap.danglingWaits` raw — if replay ever stops clearing,
+  // dWait over-counts on cancelled runs and operators see misleading
+  // numbers.  Sister coverage lives in test/workflow-events-replay.test.ts.
   it('dWait does NOT count waits whose activity is already terminal (cancelled-run regression)', async () => {
     const log = await seedActiveRun('run-gate');
     const gateActivityId = 'run-gate::gate::approve';

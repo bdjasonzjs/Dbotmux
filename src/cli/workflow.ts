@@ -697,17 +697,6 @@ async function cmdWorkflowLs(rest: string[]): Promise<void> {
       (a) => !effectSet.has(a) && !waitSet.has(a),
     ).length;
 
-    // Codex review (O1 medium #2): replay's `waitsOpen` does NOT clear
-    // when the wait's activity reaches a cancel/timeout/failure terminal,
-    // so danglingWaits over-counts on cancelled runs.  Operator surface
-    // filter here is a band-aid; root cause is in
-    // src/workflows/events/replay.ts and tracked as a follow-up.
-    const activityTerminal = new Set(['succeeded', 'failed', 'timedOut', 'cancelled']);
-    const dWait = snap.danglingWaits.filter((aid) => {
-      const a = snap.activities.get(aid);
-      return !a || !activityTerminal.has(a.status);
-    }).length;
-
     const row: Row = {
       runId,
       workflowId: snap.run.workflowId ?? '?',
@@ -715,7 +704,7 @@ async function cmdWorkflowLs(rest: string[]): Promise<void> {
       lastSeq: snap.lastSeq,
       dEf: snap.danglingEffectAttempted.length,
       dAct,
-      dWait,
+      dWait: snap.danglingWaits.length,
       updatedAt: events[events.length - 1]!.timestamp,
       failedNodeId: snap.run.failedNodeId,
     };
