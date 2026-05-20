@@ -196,6 +196,113 @@ describe('dashboard workflow API routes', () => {
       }),
     );
   });
+
+  // ─── approve / reject ────────────────────────────────────────────────────
+
+  it('short-circuits approve for terminal runs without proxying to daemon', async () => {
+    await seedSucceededRun('api-done-approve', DONE_DEF);
+    const res = await fetch(`${baseUrl}/api/workflows/runs/api-done-approve/approve`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ comment: 'looks good' }),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean; alreadyTerminal: boolean };
+    expect(body.ok).toBe(true);
+    expect(body.alreadyTerminal).toBe(true);
+    expect(proxyToDaemon).not.toHaveBeenCalled();
+  });
+
+  it('rejects invalid approve runId before touching disk or proxying', async () => {
+    const res = await fetch(
+      `${baseUrl}/api/workflows/runs/${encodeURIComponent('../boom')}/approve`,
+      { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' },
+    );
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ ok: false, error: 'bad_run_id' });
+    expect(proxyToDaemon).not.toHaveBeenCalled();
+  });
+
+  it('returns unknown_run for missing runDir on approve / reject', async () => {
+    for (const action of ['approve', 'reject'] as const) {
+      const res = await fetch(`${baseUrl}/api/workflows/runs/no-such-run/${action}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: '{}',
+      });
+      expect(res.status).toBe(404);
+      expect(await res.json()).toEqual({ ok: false, error: 'unknown_run' });
+    }
+    expect(proxyToDaemon).not.toHaveBeenCalled();
+  });
+
+  it('rejects malformed approve JSON before reading run state', async () => {
+    const res = await fetch(`${baseUrl}/api/workflows/runs/api-bad-json/approve`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{not-json',
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ ok: false, error: 'bad_json' });
+    expect(proxyToDaemon).not.toHaveBeenCalled();
+  });
+
+  it('returns needs_lark_or_cli when run has no chat-binding owner', async () => {
+    await seedWaitingRun('api-no-owner-approve', WAIT_DEF);
+    const res = await fetch(`${baseUrl}/api/workflows/runs/api-no-owner-approve/approve`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { ok: boolean; error: string; hint: string };
+    expect(body.ok).toBe(false);
+    expect(body.error).toBe('needs_lark_or_cli');
+    expect(body.hint).toMatch(/Lark/);
+    expect(proxyToDaemon).not.toHaveBeenCalled();
+  });
+
+  it('proxies approve to the owner daemon from chat-binding', async () => {
+    await seedWaitingRun('api-owned-approve', WAIT_DEF, {
+      chatId: 'oc_owner_chat',
+      larkAppId: 'cli_owner',
+    });
+    const res = await fetch(`${baseUrl}/api/workflows/runs/api-owned-approve/approve`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ comment: 'lgtm' }),
+    });
+    expect(res.status).toBe(202);
+    expect(proxyToDaemon).toHaveBeenCalledWith(
+      'cli_owner',
+      '/api/workflows/runs/api-owned-approve/approve',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ comment: 'lgtm' }),
+      }),
+    );
+  });
+
+  it('proxies reject to the owner daemon from chat-binding', async () => {
+    await seedWaitingRun('api-owned-reject', WAIT_DEF, {
+      chatId: 'oc_owner_chat',
+      larkAppId: 'cli_owner',
+    });
+    const res = await fetch(`${baseUrl}/api/workflows/runs/api-owned-reject/reject`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ comment: 'nope' }),
+    });
+    expect(res.status).toBe(202);
+    expect(proxyToDaemon).toHaveBeenCalledWith(
+      'cli_owner',
+      '/api/workflows/runs/api-owned-reject/reject',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ comment: 'nope' }),
+      }),
+    );
+  });
 });
 
 async function startWorkflowApiServer(deps: WorkflowApiDeps): Promise<{

@@ -16,6 +16,7 @@ import {
 } from '../src/dashboard/workflow-api.js';
 import { cancelWorkflowRun } from '../src/workflows/cancel-run.js';
 import { requestCancel } from '../src/workflows/cancel.js';
+import { resolveWait } from '../src/workflows/wait.js';
 import { parseWorkflowDefinition } from '../src/workflows/definition.js';
 import { EventLog } from '../src/workflows/events/append.js';
 import type { WorkflowEvent } from '../src/workflows/events/schema.js';
@@ -160,6 +161,85 @@ describe('dashboard workflow IPC e2e', () => {
     expect(await log.readAll()).toEqual(before);
   });
 
+  it('proxies dashboard approve to daemon IPC and writes resolveWait events', async () => {
+    const { log } = await seedOwnedWaitingRun('ipc-approve-01', {
+      chatId: 'oc_owner',
+      larkAppId: 'cli_owner',
+    });
+
+    const res = await fetch(`${dashboardBaseUrl}/api/workflows/runs/ipc-approve-01/approve`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ comment: 'lgtm' }),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      ok: boolean;
+      runId: string;
+      resolution: string;
+      activityId: string;
+      attemptId: string;
+    };
+    expect(body.ok).toBe(true);
+    expect(body.runId).toBe('ipc-approve-01');
+    expect(body.resolution).toBe('approved');
+    expect(body.activityId).toBeTruthy();
+    expect(body.attemptId).toBeTruthy();
+
+    expect(daemonRequests).toEqual([
+      {
+        path: '/api/workflows/runs/ipc-approve-01/approve',
+        body: { comment: 'lgtm' },
+      },
+    ]);
+
+    const events = await log.readAll();
+    expect(events.map((e) => e.type)).toEqual([
+      'runCreated',
+      'runStarted',
+      'attemptCreated',
+      'waitCreated',
+      'waitResolved',
+      'activitySucceeded',
+    ]);
+    expect(findEvent(events, 'waitResolved')?.payload).toMatchObject({
+      resolution: 'approved',
+      by: 'dashboard',
+      comment: 'lgtm',
+    });
+  });
+
+  it('proxies dashboard reject to daemon IPC and writes failure terminal', async () => {
+    const { log } = await seedOwnedWaitingRun('ipc-reject-01', {
+      chatId: 'oc_owner',
+      larkAppId: 'cli_owner',
+    });
+
+    const res = await fetch(`${dashboardBaseUrl}/api/workflows/runs/ipc-reject-01/reject`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ comment: 'nope' }),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { resolution: string };
+    expect(body.resolution).toBe('rejected');
+
+    const events = await log.readAll();
+    expect(events.map((e) => e.type)).toEqual([
+      'runCreated',
+      'runStarted',
+      'attemptCreated',
+      'waitCreated',
+      'waitResolved',
+      'activityFailed',
+    ]);
+    expect(findEvent(events, 'waitResolved')?.payload).toMatchObject({
+      resolution: 'rejected',
+      by: 'dashboard',
+      comment: 'nope',
+    });
+  });
+
   it('passes daemon pending cancel responses through without draining the run', async () => {
     const { log } = await seedOwnedWaitingRun(
       'ipc-running-01',
@@ -223,8 +303,19 @@ async function startDaemonIpcServer(): Promise<{
   return startServer(async (req, res) => {
     try {
       const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
+      if (req.method !== 'POST') {
+        jsonRes(res, 404, { ok: false, error: 'not_found' });
+        return;
+      }
+      const approveMatch = url.pathname.match(
+        /^\/api\/workflows\/runs\/([^/]+)\/(approve|reject)$/,
+      );
+      if (approveMatch) {
+        await handleApproveReject(req, res, url, approveMatch);
+        return;
+      }
       const m = url.pathname.match(/^\/api\/workflows\/runs\/([^/]+)\/cancel$/);
-      if (req.method !== 'POST' || !m) {
+      if (!m) {
         jsonRes(res, 404, { ok: false, error: 'not_found' });
         return;
       }
@@ -297,6 +388,74 @@ async function startDaemonIpcServer(): Promise<{
     } catch (err) {
       jsonRes(res, 500, { ok: false, error: String(err) });
     }
+  });
+}
+
+async function handleApproveReject(
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+  match: RegExpMatchArray,
+): Promise<void> {
+  let body: { comment?: unknown };
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    jsonRes(res, 400, { ok: false, error: 'bad_json' });
+    return;
+  }
+  daemonRequests.push({ path: url.pathname, body });
+
+  const runId = decodeURIComponent(match[1]!);
+  const resolution: 'approved' | 'rejected' =
+    match[2] === 'approve' ? 'approved' : 'rejected';
+  const comment =
+    typeof body.comment === 'string' && body.comment.trim()
+      ? body.comment.trim()
+      : undefined;
+
+  const entry = daemonContexts.get(runId);
+  if (!entry) {
+    jsonRes(res, 409, { ok: false, error: 'workflow_not_attached' });
+    return;
+  }
+
+  const events = await entry.ctx.log.readAll();
+  // Pick the unique dangling human-gate wait — mirrors daemon's
+  // `resolveDashboardWait` selection rule.
+  const snap = replay(events);
+  const candidates: Array<{ activityId: string; attemptId: string }> = [];
+  for (const activityId of snap.danglingWaits) {
+    const activity = snap.activities.get(activityId);
+    const at = activity?.attempts[activity.attempts.length - 1];
+    if (!at?.wait || at.wait.waitKind !== 'human-gate') continue;
+    candidates.push({ activityId, attemptId: at.attemptId });
+  }
+  if (candidates.length === 0) {
+    jsonRes(res, 409, { ok: false, error: 'no_open_wait' });
+    return;
+  }
+  if (candidates.length > 1) {
+    jsonRes(res, 409, { ok: false, error: 'ambiguous_wait' });
+    return;
+  }
+  const target = candidates[0]!;
+  const resolved = await resolveWait(entry.ctx.log, {
+    activityId: target.activityId,
+    attemptId: target.attemptId,
+    resolution,
+    by: 'dashboard',
+    comment,
+  });
+  const after = replay(await entry.ctx.log.readAll());
+  jsonRes(res, 200, {
+    ok: true,
+    runId,
+    resolution,
+    activityId: target.activityId,
+    attemptId: target.attemptId,
+    resolvedAt: resolved.resolutionEvent.timestamp,
+    lastSeq: after.lastSeq,
   });
 }
 

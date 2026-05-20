@@ -91,6 +91,72 @@ export async function handleWorkflowApi(
     return true;
   }
 
+  // approve / reject share the same shape: { comment? } body, route to the
+  // owner daemon via chat-binding, daemon picks the unique dangling
+  // human-gate wait and calls resolveWait().  See `resolveDashboardWait` in
+  // daemon.ts for the error matrix.
+  m = url.pathname.match(/^\/api\/workflows\/runs\/([^/]+)\/(approve|reject)$/);
+  if (req.method === 'POST' && m) {
+    const runId = decodeURIComponent(m[1]);
+    const action = m[2] as 'approve' | 'reject';
+    if (!isValidRunId(runId)) {
+      jsonRes(res, 400, { ok: false, error: 'bad_run_id' });
+      return true;
+    }
+    let body: { comment?: unknown };
+    try {
+      body = await readJsonBody<{ comment?: unknown }>(req);
+    } catch {
+      jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      return true;
+    }
+    const comment =
+      typeof body.comment === 'string' && body.comment.trim()
+        ? body.comment.trim()
+        : undefined;
+    const snap = await readRunSnapshot(deps.runsDir, runId);
+    if (!snap) {
+      jsonRes(res, 404, { ok: false, error: 'unknown_run' });
+      return true;
+    }
+    if (TERMINAL_RUN_STATUSES.has(snap.run.status)) {
+      jsonRes(res, 200, {
+        ok: true,
+        runId,
+        resolution: action === 'approve' ? 'approved' : 'rejected',
+        activityId: '',
+        attemptId: '',
+        resolvedAt: snap.updatedAt,
+        lastSeq: snap.lastSeq,
+        alreadyTerminal: true,
+      });
+      return true;
+    }
+    const owner = snap.chatBinding?.larkAppId;
+    if (!owner) {
+      jsonRes(res, 409, {
+        ok: false,
+        error: 'needs_lark_or_cli',
+        hint:
+          `This run has no chat-binding owner; dashboard approval requires ` +
+          `the owning daemon. Use the Lark approval card for now.`,
+      });
+      return true;
+    }
+    const upstream = await deps.proxyToDaemon(
+      owner,
+      `/api/workflows/runs/${encodeURIComponent(runId)}/${action}`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ comment }),
+      },
+    );
+    res.writeHead(upstream.status, { 'content-type': 'application/json' });
+    res.end(await upstream.text());
+    return true;
+  }
+
   if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/workflows\/runs\/([^/]+)\/cancel$/))) {
     const runId = decodeURIComponent(m[1]);
     if (!isValidRunId(runId)) {

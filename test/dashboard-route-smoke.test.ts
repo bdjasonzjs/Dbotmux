@@ -81,6 +81,20 @@ describe('dashboard route smoke auth boundary', () => {
     expect(cancel.status).toBe(401);
     expect(proxyCalls).toEqual([]);
 
+    const approve = await fetch(`${baseUrl}/api/workflows/runs/route-smoke-01/approve`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    expect(approve.status).toBe(401);
+    const reject = await fetch(`${baseUrl}/api/workflows/runs/route-smoke-01/reject`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    expect(reject.status).toBe(401);
+    expect(proxyCalls).toEqual([]);
+
     const sessions = await fetch(`${baseUrl}/api/sessions`);
     expect(sessions.status).toBe(401);
   });

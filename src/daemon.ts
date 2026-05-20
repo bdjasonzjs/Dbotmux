@@ -94,6 +94,7 @@ import {
   isTerminalRunStatus,
 } from './workflows/cancel-run.js';
 import { requestCancel } from './workflows/cancel.js';
+import { resolveWait } from './workflows/wait.js';
 import { replay } from './workflows/events/replay.js';
 import { isValidRunId, readRunSnapshot } from './workflows/ops-projection.js';
 
@@ -525,6 +526,190 @@ async function cancelWorkflowRunOnDaemon(
   };
 }
 
+/**
+ * Result shape for dashboard-side approve/reject — uniform `{ ok, error,
+ * hint?, message? }` failure envelope as agreed with codex so the dashboard
+ * UI only has to render `hint ?? message ?? error`.
+ */
+type ResolveDashboardWaitResult =
+  | {
+      ok: true;
+      runId: string;
+      resolution: 'approved' | 'rejected';
+      activityId: string;
+      attemptId: string;
+      resolvedAt: number;
+      lastSeq: number;
+      /** True when the run was already terminal before this call (idempotent). */
+      alreadyTerminal?: boolean;
+      /** True when the resolveWait wrote but driveWorkflowRun hasn't
+       *  finished propagating downstream nodes yet. */
+      pending?: boolean;
+    }
+  | {
+      ok: false;
+      error:
+        | 'bad_run_id'
+        | 'unknown_run'
+        | 'workflow_not_attached'
+        | 'no_open_wait'
+        | 'ambiguous_wait'
+        | 'needs_lark_approval'
+        | 'internal_error';
+      hint?: string;
+      message?: string;
+      status?: string;
+    };
+
+async function resolveDashboardWait(
+  runId: string,
+  resolution: 'approved' | 'rejected',
+  comment: string | undefined,
+): Promise<ResolveDashboardWaitResult> {
+  if (!isValidRunId(runId)) return { ok: false, error: 'bad_run_id' };
+
+  const entry = workflowRuns.get(runId);
+  if (!entry) {
+    const snapshot = await readRunSnapshot(getRunsDir(), runId);
+    if (!snapshot) return { ok: false, error: 'unknown_run' };
+    if (isTerminalRunStatus(snapshot.run.status)) {
+      // Treat as benign idempotent success — the wait was already resolved
+      // by an earlier action (Lark card, CLI, or this dashboard).
+      return {
+        ok: true,
+        runId,
+        resolution,
+        activityId: '',
+        attemptId: '',
+        resolvedAt: snapshot.updatedAt,
+        lastSeq: snapshot.lastSeq,
+        alreadyTerminal: true,
+      };
+    }
+    return {
+      ok: false,
+      error: 'workflow_not_attached',
+      status: snapshot.run.status,
+      hint: 'Run not attached to this daemon (perhaps still cold). Try again shortly or check daemon logs.',
+    };
+  }
+
+  const events = await entry.ctx.log.readAll();
+  const snapshot = replay(events);
+  const updatedAt = events[events.length - 1]?.timestamp ?? Date.now();
+  if (isTerminalRunStatus(snapshot.run.status)) {
+    return {
+      ok: true,
+      runId,
+      resolution,
+      activityId: '',
+      attemptId: '',
+      resolvedAt: updatedAt,
+      lastSeq: snapshot.lastSeq,
+      alreadyTerminal: true,
+    };
+  }
+
+  // Find the unique pending human-gate wait.  Other wait kinds (time /
+  // condition) aren't approvable through this dashboard route; restricting
+  // to human-gate matches codex's API contract and keeps the surface tight.
+  // `approvers` lives on the original waitCreated event payload, not on
+  // replay state — pull it from there so we don't reshape replay AttemptState
+  // for a single auth check.
+  const waitEventsByActivity = new Map<string, { approvers?: string[] }>();
+  for (const ev of events) {
+    if (ev.type !== 'waitCreated') continue;
+    const p = ev.payload as { activityId?: string; approvers?: unknown };
+    if (typeof p.activityId !== 'string') continue;
+    const approvers = Array.isArray(p.approvers)
+      ? p.approvers.filter((x): x is string => typeof x === 'string')
+      : undefined;
+    // Last waitCreated for the activity wins (re-create case).
+    waitEventsByActivity.set(p.activityId, { approvers });
+  }
+
+  const candidates: Array<{ activityId: string; attemptId: string; approvers?: string[] }> = [];
+  for (const activityId of snapshot.danglingWaits) {
+    const activity = snapshot.activities.get(activityId);
+    const at = activity?.attempts[activity.attempts.length - 1];
+    if (!at?.wait || at.wait.waitKind !== 'human-gate') continue;
+    candidates.push({
+      activityId,
+      attemptId: at.attemptId,
+      approvers: waitEventsByActivity.get(activityId)?.approvers,
+    });
+  }
+  if (candidates.length === 0) {
+    return {
+      ok: false,
+      error: 'no_open_wait',
+      hint: 'No pending humanGate wait on this run.',
+    };
+  }
+  if (candidates.length > 1) {
+    return {
+      ok: false,
+      error: 'ambiguous_wait',
+      hint:
+        `Run has ${candidates.length} pending humanGate waits; dashboard cannot ` +
+        `pick one yet. Use the Lark approval card.`,
+    };
+  }
+  const target = candidates[0]!;
+  // approvers allowlist non-empty → preserve restricted-approval semantics.
+  // Dashboard cookie auth doesn't carry user identity, so we don't try to
+  // satisfy the allowlist from this path — defer to the Lark card.
+  // Read approvers from the wait state (we stashed it on the candidate).
+  if ((target.approvers?.length ?? 0) > 0) {
+    return {
+      ok: false,
+      error: 'needs_lark_approval',
+      hint:
+        'This gate has an approver allowlist; the Lark approval card is the ' +
+        'only path that authenticates the approver identity.',
+    };
+  }
+
+  try {
+    const resolved = await resolveWait(entry.ctx.log, {
+      activityId: target.activityId,
+      attemptId: target.attemptId,
+      resolution,
+      by: 'dashboard',
+      comment,
+    });
+    const after = replay(await entry.ctx.log.readAll());
+    // Fire-and-forget re-drive — same pattern as Lark card path
+    // (workflowApprovalResolved hook).  Don't await; the dashboard caller
+    // only needs the wait resolution to be persisted before responding.
+    driveWorkflowRun(runId).catch((err) => {
+      logger.warn(
+        `[workflow:${runId}] re-entry after dashboard approval failed: ` +
+          (err instanceof Error ? err.message : String(err)),
+      );
+    });
+    logger.info(
+      `[workflow:${runId}] wait ${target.activityId}/${target.attemptId} resolved=${resolution} via dashboard`,
+    );
+    return {
+      ok: true,
+      runId,
+      resolution,
+      activityId: target.activityId,
+      attemptId: target.attemptId,
+      resolvedAt: resolved.resolutionEvent.timestamp,
+      lastSeq: after.lastSeq,
+      pending: !isTerminalRunStatus(after.run.status),
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      error: 'internal_error',
+      message: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
 async function attachColdWorkflowRuns(ownerLarkAppId: string): Promise<void> {
   const runsDir = getRunsDir();
   const result = await attachColdWorkflowRunsForDaemon({
@@ -740,6 +925,41 @@ const cardDeps: CardHandlerDeps = {
     });
   },
 };
+
+function dashboardWaitStatus(error: ResolveDashboardWaitResult & { ok: false }): number {
+  switch (error.error) {
+    case 'bad_run_id': return 400;
+    case 'unknown_run': return 404;
+    case 'workflow_not_attached': return 409;
+    case 'no_open_wait': return 409;
+    case 'ambiguous_wait': return 409;
+    case 'needs_lark_approval': return 403;
+    case 'internal_error': return 500;
+  }
+}
+
+for (const [path, resolution] of [
+  ['/api/workflows/runs/:runId/approve', 'approved'] as const,
+  ['/api/workflows/runs/:runId/reject', 'rejected'] as const,
+]) {
+  ipcRoute('POST', path, async (req, res, params) => {
+    let body: { comment?: unknown };
+    try {
+      body = await readJsonBody<{ comment?: unknown }>(req);
+    } catch {
+      return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+    }
+    const comment =
+      typeof body.comment === 'string' && body.comment.trim()
+        ? body.comment.trim()
+        : undefined;
+    const result = await resolveDashboardWait(params.runId, resolution, comment);
+    if (!result.ok) {
+      return jsonRes(res, dashboardWaitStatus(result), result);
+    }
+    return jsonRes(res, 200, result);
+  });
+}
 
 ipcRoute('POST', '/api/workflows/runs/:runId/cancel', async (req, res, params) => {
   let body: { reason?: unknown };
