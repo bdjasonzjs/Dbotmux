@@ -16,9 +16,12 @@
  *      tick's ready set; no separate scheduling state needed.
  *   3. Run dispatches via `Promise.allSettled` so a sibling throwing doesn't
  *      starve the rest.  After settle, replay fresh and patch any non-terminal
- *      activity with an `activityFailed { errorClass: 'infrastructure' }` —
+ *      activity with an `activityFailed` (errorClass=fatal, errorCode=
+ *      WorkerCrashed; closest fit in the existing enum — see payloads.ts) —
  *      but NEVER write a second terminal if the dispatch already wrote one
- *      before throwing.
+ *      before throwing.  If a dispatch throws BEFORE writing `attemptCreated`,
+ *      we have no attempt to attach the failure to; the tick returns
+ *      `no-progress` rather than re-dispatching the same action forever.
  *   4. Settle actions (`completeNode*` / `completeRun*`) run sequentially so
  *      event log order stays readable and `completeRun*` is never racy.
  *
@@ -164,6 +167,7 @@ export async function runLoop(
     const { dispatches, settles } = partitionActions(actions);
     const { selected, deferred } = selectDispatchBatch(dispatches, maxConcurrency);
 
+    let anyUnpatchable = false;
     if (selected.length > 0) {
       const settled = await Promise.allSettled(
         selected.map((a) => runDispatch(ctx, a, snapshot)),
@@ -176,7 +180,16 @@ export async function runLoop(
         const result = settled[i]!;
         if (result.status === 'fulfilled') continue;
         const action = selected[i]!;
-        await maybePatchInfrastructureFailure(ctx, post, action, result.reason);
+        const outcome = await maybePatchInfrastructureFailure(ctx, post, action, result.reason);
+        if (outcome === 'unpatchable') {
+          // Dispatch blew up before writing `attemptCreated`, so there's
+          // no per-attempt failure we can pin the error to.  Re-running
+          // the loop would re-emit the same dispatch and infinite-loop
+          // until maxTicks.  Stop here so the operator can diagnose
+          // (e.g. log-write failure, blob-write OOM).  Sibling dispatches
+          // that DID write events still keep their events.
+          anyUnpatchable = true;
+        }
       }
     }
 
@@ -198,6 +211,13 @@ export async function runLoop(
 
     snapshot = replay(await ctx.log.readAll());
     ticks++;
+
+    if (anyUnpatchable) {
+      // See the `anyUnpatchable = true` branch above.  We deliberately
+      // return after applying any sibling settle actions so the operator
+      // sees the snapshot in its progressed-as-far-as-possible state.
+      return { reason: 'no-progress', ticks, lastSnapshot: snapshot };
+    }
 
     // Defensive: dispatches all got deferred AND no settles ran — we'd
     // loop forever with nothing to do.  Per-bot serialization shouldn't
@@ -304,20 +324,35 @@ async function runSettle(
   void _exhaustive;
 }
 
+type FallbackOutcome =
+  | 'patched' // We wrote an infrastructure-failure event tying the throw to the existing attempt.
+  | 'alreadyTerminal' // Dispatch had already written a terminal event before throwing — leave events alone.
+  | 'unpatchable'; // Throw happened before any attemptCreated — no attemptId to attach a failure to.
+
 /**
  * Post-`allSettled` recovery: when a dispatch threw, check whether the
  * activity is still non-terminal in the latest replay.  If yes, write one
- * `activityFailed { errorClass: 'infrastructure' }` so downstream replay
- * stops waiting.  If the dispatch already wrote a terminal event before
- * throwing (e.g. activityFailed + then RangeError), skip — appending
- * another terminal would corrupt replay's per-attempt state.
+ * `activityFailed` (errorClass=fatal, errorCode=WorkerCrashed — closest
+ * existing enum fit for a dispatch-time hard throw, see payloads.ts) so
+ * downstream replay stops waiting.  If the dispatch already wrote a
+ * terminal event before throwing (e.g. activitySucceeded then sidecar
+ * OOM), skip — appending another terminal would corrupt replay's
+ * per-attempt state.
+ *
+ * Returns one of:
+ *   - 'patched'         → infra-failure event appended; loop can continue
+ *   - 'alreadyTerminal' → dispatch self-terminated already; no patch needed
+ *   - 'unpatchable'     → throw happened before any attemptCreated; loop
+ *                         MUST stop or it will re-dispatch the same action
+ *                         on the next tick.  Caller is responsible for
+ *                         turning this into `no-progress`.
  */
 async function maybePatchInfrastructureFailure(
   ctx: WorkflowRuntimeContext,
   snapshot: Snapshot,
   action: DispatchAction,
   reason: unknown,
-): Promise<void> {
+): Promise<FallbackOutcome> {
   const activityId = action.activityId;
   const activity = snapshot.activities.get(activityId);
   const status = activity?.status;
@@ -332,20 +367,22 @@ async function maybePatchInfrastructureFailure(
         reason instanceof Error ? reason.message : String(reason)
       }`,
     );
-    return;
+    return 'alreadyTerminal';
   }
   const latest = activity?.attempts[activity.attempts.length - 1];
   const attemptId = latest?.attemptId;
   if (!attemptId) {
-    // Dispatch threw before writing `attemptCreated`.  Without an attempt
-    // we have nothing to tie a failure event to; log and let the next tick
-    // re-dispatch from a clean state.
+    // Dispatch threw before writing `attemptCreated` — likely a log/blob
+    // write failure inside dispatchWork.  We can't tie an `activityFailed`
+    // to a non-existent attempt, and re-running the loop would just
+    // re-emit the same dispatch and burn through `maxTicks`.  Mark
+    // unpatchable so the caller stops the run.
     logger.warn?.(
-      `runLoop(${ctx.log.runId}): dispatch ${action.kind} for ${activityId} threw before attemptCreated; will retry next tick: ${
+      `runLoop(${ctx.log.runId}): dispatch ${action.kind} for ${activityId} threw before attemptCreated; stopping run to avoid infinite retry: ${
         reason instanceof Error ? reason.message : String(reason)
       }`,
     );
-    return;
+    return 'unpatchable';
   }
   await ctx.log.append({
     runId: ctx.log.runId,
@@ -355,14 +392,11 @@ async function maybePatchInfrastructureFailure(
       activityId,
       attemptId,
       error: {
-        // The existing 'WorkerCrashed' / 'fatal' pair is the closest enum
-        // fit for a dispatch-time hard throw (RangeError / OOM / spawn
-        // explosion).  We don't add a new enum value to keep replay
-        // compatibility across runs.  See payloads.ts ErrorCodeEnum.
         errorClass: 'fatal',
         errorCode: 'WorkerCrashed',
         errorMessage: reason instanceof Error ? reason.message : String(reason),
       },
     },
   });
+  return 'patched';
 }

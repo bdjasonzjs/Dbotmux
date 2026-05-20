@@ -232,56 +232,80 @@ describe('runLoop — parallel dispatch', () => {
   // `cancelledRunIntent` mid-loop is a v0.1.4 follow-up.
 
   it('does not double-terminal an activity when dispatch wrote terminal then threw', async () => {
-    // Synthetic: spawn writes its own success event, then we simulate a
-    // downstream throw.  In real code, dispatchWork writes
-    // activitySucceeded inside the await — if a post-step (e.g. session
-    // sidecar) blew up after, the loop must not append a second terminal.
-    const spawn: WorkerSpawnFn = async (input) => {
-      if (input.nodeId === 'b') {
-        // Simulate the rare race: spawn resolved success but a follow-up
-        // step in dispatchWork (e.g. sidecar write) blew up.  We can't
-        // reach into dispatchWork from here, but we CAN simulate the
-        // analogous outer pattern by returning success and then having
-        // the outer dispatch throw via a custom spawn that resolves and
-        // then throws on the SECOND tick.  Easier proxy: write success
-        // through okSpawn, then let normal flow continue.
-        return {
-          kind: 'success',
-          output: { ok: true, from: input.nodeId },
-          session: {
-            sessionId: `s-${input.activityId}`,
-            botName: input.botName,
-            startedAt: 0,
-          },
-        };
-      }
-      return {
-        kind: 'success',
-        output: { ok: true, from: input.nodeId },
-        session: { sessionId: `s-${input.activityId}`, botName: input.botName, startedAt: 0 },
-      };
-    };
+    // Targeted regression for the allSettled fallback path: monkey-patch
+    // EventLog.append so that the moment dispatchWork tries to append
+    // `activitySucceeded` for node b, the real event is written THEN the
+    // append throws a synthetic error.  That propagates through
+    // dispatchWork → allSettled-reject.  Replay must then see b's
+    // activity already succeeded, and `maybePatchInfrastructureFailure`
+    // must return `alreadyTerminal` instead of appending a second
+    // terminal event.
     const def = fanoutDef();
-    const { log, ctx } = await bootstrap(def, spawn);
-    const result = await runLoop(ctx);
-    expect(result.reason).toBe('terminal');
-    const events = await log.readAll();
-    // Per-activity terminal-event uniqueness invariant: at most ONE of
-    // succeeded/failed/cancelled/timedOut per (activityId).
-    const terminalByActivity = new Map<string, number>();
-    for (const e of events) {
+    const { log, ctx } = await bootstrap(def, okSpawn);
+
+    const bActivityId = workActivityId(log.runId, 'b');
+    const origAppend = log.append.bind(log);
+    let injected = false;
+    (log as any).append = async (draft: any) => {
+      const event = await origAppend(draft);
       if (
-        e.type !== 'activitySucceeded' &&
-        e.type !== 'activityFailed' &&
-        e.type !== 'activityCanceled' &&
-        e.type !== 'activityTimedOut'
-      ) continue;
-      const aid = (e.payload as any).activityId as string;
-      terminalByActivity.set(aid, (terminalByActivity.get(aid) ?? 0) + 1);
+        !injected &&
+        draft.type === 'activitySucceeded' &&
+        draft.payload?.activityId === bActivityId
+      ) {
+        injected = true;
+        throw new Error('synthetic post-terminal failure');
+      }
+      return event;
+    };
+
+    await runLoop(ctx);
+    expect(injected).toBe(true);
+
+    // Restore so the readAll below doesn't go through the patched fn.
+    (log as any).append = origAppend;
+    const events = await log.readAll();
+
+    // Per-activity terminal-event uniqueness invariant.  b should have
+    // exactly ONE activitySucceeded (the one we wrote before throwing),
+    // and ZERO follow-up activityFailed from the fallback path.
+    let bSucceededCount = 0;
+    let bFailedCount = 0;
+    for (const e of events) {
+      const aid = (e.payload as any).activityId;
+      if (aid !== bActivityId) continue;
+      if (e.type === 'activitySucceeded') bSucceededCount++;
+      if (e.type === 'activityFailed') bFailedCount++;
     }
-    for (const [aid, count] of terminalByActivity) {
-      expect(count, `activity ${aid} should have at most 1 terminal event`).toBeLessThanOrEqual(1);
-    }
+    expect(bSucceededCount).toBe(1);
+    expect(bFailedCount).toBe(0);
+  });
+
+  it('stops the run when dispatch throws before attemptCreated (pre-attempt throw)', async () => {
+    // M1 regression: if dispatch blows up before writing attemptCreated,
+    // there's no attemptId to pin a failure to.  Without the unpatchable
+    // path, the loop would re-emit the same dispatch every tick until
+    // maxTicks.  Verify we bail out as no-progress promptly.
+    const def = fanoutDef();
+    const { log, ctx } = await bootstrap(def, okSpawn);
+
+    const bActivityId = workActivityId(log.runId, 'b');
+    const origAppend = log.append.bind(log);
+    (log as any).append = async (draft: any) => {
+      if (
+        draft.type === 'attemptCreated' &&
+        draft.payload?.activityId === bActivityId
+      ) {
+        throw new Error('synthetic pre-attempt log write failure');
+      }
+      return origAppend(draft);
+    };
+
+    const result = await runLoop(ctx, { maxTicks: 50 });
+    expect(result.reason).toBe('no-progress');
+    // ticks should be small (we caught it on the first tick that tried
+    // to dispatch b); definitely not anywhere near the cap.
+    expect(result.ticks).toBeLessThan(5);
   });
 
   it('concurrent EventLog.append calls maintain seq monotonicity and NDJSON integrity', async () => {
