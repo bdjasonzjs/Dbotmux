@@ -6,10 +6,21 @@
  * actions (which on a non-terminal run means we're paused on an open
  * `waitCreated`).
  *
- * The loop is **synchronous in event-log terms** — every action it
- * dispatches synchronously writes one or more events before the next
- * tick reads the log.  Concurrency is bounded to a single in-flight
- * action per tick; multi-action parallelism is a Slice D+ optimization.
+ * Per-tick dispatch model (v0.1.3+):
+ *   1. Split ready actions into `dispatch*` (gate / work) and `complete*`
+ *      (settle node / run).  The two phases have different concurrency
+ *      semantics — dispatch can race, settles must not.
+ *   2. Within the dispatch phase: cap concurrency by `defaults.maxConcurrency`
+ *      (default 4) and enforce per-bot serialization (one in-flight subagent
+ *      per bot within a tick).  Deferred dispatches just stay in the next
+ *      tick's ready set; no separate scheduling state needed.
+ *   3. Run dispatches via `Promise.allSettled` so a sibling throwing doesn't
+ *      starve the rest.  After settle, replay fresh and patch any non-terminal
+ *      activity with an `activityFailed { errorClass: 'infrastructure' }` —
+ *      but NEVER write a second terminal if the dispatch already wrote one
+ *      before throwing.
+ *   4. Settle actions (`completeNode*` / `completeRun*`) run sequentially so
+ *      event log order stays readable and `completeRun*` is never racy.
  *
  * Re-entry: external events (e.g. `waitResolved` written by the lark
  * card handler) don't drive this loop — the caller is responsible for
@@ -19,6 +30,8 @@
 
 import {
   decideNextActions,
+  type DispatchGateAction,
+  type DispatchWorkAction,
   type OrchestratorAction,
 } from './orchestrator.js';
 import { replay, type Snapshot } from './events/replay.js';
@@ -33,6 +46,11 @@ import {
   type WorkflowRuntimeContext,
 } from './runtime.js';
 import { logger } from '../utils/logger.js';
+
+const DEFAULT_MAX_CONCURRENCY = 4;
+
+type DispatchAction = DispatchGateAction | DispatchWorkAction;
+type SettleAction = Exclude<OrchestratorAction, DispatchAction>;
 
 export type RunLoopStopReason =
   | 'terminal' // run reached succeeded / failed / cancelled
@@ -142,12 +160,55 @@ export async function runLoop(
       return { reason: stopped, ticks, lastSnapshot: snapshot };
     }
 
-    for (const action of actions) {
-      await dispatchAction(ctx, action, snapshot);
+    const maxConcurrency = ctx.def.defaults?.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY;
+    const { dispatches, settles } = partitionActions(actions);
+    const { selected, deferred } = selectDispatchBatch(dispatches, maxConcurrency);
+
+    if (selected.length > 0) {
+      const settled = await Promise.allSettled(
+        selected.map((a) => runDispatch(ctx, a, snapshot)),
+      );
+      // Replay once before patching infrastructure failures so we don't
+      // double-terminal an activity whose dispatch wrote `activityFailed`
+      // and then threw on a follow-up step.
+      const post = replay(await ctx.log.readAll());
+      for (let i = 0; i < settled.length; i++) {
+        const result = settled[i]!;
+        if (result.status === 'fulfilled') continue;
+        const action = selected[i]!;
+        await maybePatchInfrastructureFailure(ctx, post, action, result.reason);
+      }
+    }
+
+    // Settle phase: sequential so event log stays in causal order and
+    // `completeRun*` is never racy with a sibling complete.
+    for (const action of settles) {
+      try {
+        await runSettle(ctx, action);
+      } catch (err) {
+        logger.warn?.(
+          `runLoop(${ctx.log.runId}): settle action ${action.kind} threw — stopping tick: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+        snapshot = replay(await ctx.log.readAll());
+        return { reason: 'no-progress', ticks, lastSnapshot: snapshot };
+      }
     }
 
     snapshot = replay(await ctx.log.readAll());
     ticks++;
+
+    // Defensive: dispatches all got deferred AND no settles ran — we'd
+    // loop forever with nothing to do.  Per-bot serialization shouldn't
+    // hit this in practice because decideNextActions only emits ready
+    // actions, but treat as no-progress to be safe.
+    if (selected.length === 0 && settles.length === 0 && deferred > 0) {
+      logger.warn?.(
+        `runLoop(${ctx.log.runId}): all ${deferred} dispatches deferred and no settle work — stopping with no-progress.`,
+      );
+      return { reason: 'no-progress', ticks, lastSnapshot: snapshot };
+    }
   }
 
   // Edge case: the tick that hit maxTicks may itself have written the
@@ -166,18 +227,65 @@ function isTerminalStatus(snapshot: Snapshot): boolean {
   );
 }
 
-async function dispatchAction(
+function partitionActions(actions: OrchestratorAction[]): {
+  dispatches: DispatchAction[];
+  settles: SettleAction[];
+} {
+  const dispatches: DispatchAction[] = [];
+  const settles: SettleAction[] = [];
+  for (const a of actions) {
+    if (a.kind === 'dispatchGate' || a.kind === 'dispatchWork') dispatches.push(a);
+    else settles.push(a);
+  }
+  return { dispatches, settles };
+}
+
+/**
+ * Apply per-bot serialization + global concurrency cap.  Same-bot siblings
+ * are silently deferred — they survive into the next tick's ready set
+ * because their nodeState stays idle (no `attemptCreated` written yet).
+ */
+function selectDispatchBatch(
+  dispatches: DispatchAction[],
+  maxConcurrency: number,
+): { selected: DispatchAction[]; deferred: number } {
+  const inflightBots = new Set<string>();
+  const selected: DispatchAction[] = [];
+  let deferred = 0;
+  for (const a of dispatches) {
+    if (selected.length >= maxConcurrency) {
+      deferred++;
+      continue;
+    }
+    if (a.kind === 'dispatchWork' && a.node.type === 'subagent') {
+      if (inflightBots.has(a.node.bot)) {
+        deferred++;
+        continue;
+      }
+      inflightBots.add(a.node.bot);
+    }
+    selected.push(a);
+  }
+  return { selected, deferred };
+}
+
+async function runDispatch(
   ctx: WorkflowRuntimeContext,
-  action: OrchestratorAction,
+  action: DispatchAction,
   snapshot: Snapshot,
 ): Promise<void> {
+  if (action.kind === 'dispatchGate') {
+    await dispatchGate(ctx, action);
+    return;
+  }
+  await dispatchWork(ctx, action, { snapshot });
+}
+
+async function runSettle(
+  ctx: WorkflowRuntimeContext,
+  action: SettleAction,
+): Promise<void> {
   switch (action.kind) {
-    case 'dispatchGate':
-      await dispatchGate(ctx, action);
-      return;
-    case 'dispatchWork':
-      await dispatchWork(ctx, action, { snapshot });
-      return;
     case 'completeNodeSucceeded':
       await completeNodeSucceeded(ctx, action);
       return;
@@ -191,8 +299,70 @@ async function dispatchAction(
       await completeRunFailed(ctx, action);
       return;
   }
-  // Exhaustive — TS will flag if a new action kind is added without
-  // a branch.
+  // Exhaustive — TS will flag if a new settle kind appears.
   const _exhaustive: never = action;
   void _exhaustive;
+}
+
+/**
+ * Post-`allSettled` recovery: when a dispatch threw, check whether the
+ * activity is still non-terminal in the latest replay.  If yes, write one
+ * `activityFailed { errorClass: 'infrastructure' }` so downstream replay
+ * stops waiting.  If the dispatch already wrote a terminal event before
+ * throwing (e.g. activityFailed + then RangeError), skip — appending
+ * another terminal would corrupt replay's per-attempt state.
+ */
+async function maybePatchInfrastructureFailure(
+  ctx: WorkflowRuntimeContext,
+  snapshot: Snapshot,
+  action: DispatchAction,
+  reason: unknown,
+): Promise<void> {
+  const activityId = action.activityId;
+  const activity = snapshot.activities.get(activityId);
+  const status = activity?.status;
+  if (
+    status === 'succeeded' ||
+    status === 'failed' ||
+    status === 'cancelled' ||
+    status === 'timedOut'
+  ) {
+    logger.warn?.(
+      `runLoop(${ctx.log.runId}): dispatch ${action.kind} for ${activityId} threw after already settling (${status}); skipping infrastructure fallback: ${
+        reason instanceof Error ? reason.message : String(reason)
+      }`,
+    );
+    return;
+  }
+  const latest = activity?.attempts[activity.attempts.length - 1];
+  const attemptId = latest?.attemptId;
+  if (!attemptId) {
+    // Dispatch threw before writing `attemptCreated`.  Without an attempt
+    // we have nothing to tie a failure event to; log and let the next tick
+    // re-dispatch from a clean state.
+    logger.warn?.(
+      `runLoop(${ctx.log.runId}): dispatch ${action.kind} for ${activityId} threw before attemptCreated; will retry next tick: ${
+        reason instanceof Error ? reason.message : String(reason)
+      }`,
+    );
+    return;
+  }
+  await ctx.log.append({
+    runId: ctx.log.runId,
+    type: 'activityFailed',
+    actor: 'scheduler',
+    payload: {
+      activityId,
+      attemptId,
+      error: {
+        // The existing 'WorkerCrashed' / 'fatal' pair is the closest enum
+        // fit for a dispatch-time hard throw (RangeError / OOM / spawn
+        // explosion).  We don't add a new enum value to keep replay
+        // compatibility across runs.  See payloads.ts ErrorCodeEnum.
+        errorClass: 'fatal',
+        errorCode: 'WorkerCrashed',
+        errorMessage: reason instanceof Error ? reason.message : String(reason),
+      },
+    },
+  });
 }

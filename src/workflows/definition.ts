@@ -159,6 +159,17 @@ export const WorkflowDefinitionSchema = z.object({
       retryPolicy: RetryPolicySchema.optional(),
       timeoutMs: z.number().int().positive().optional(),
       maxOutputBytes: z.number().int().positive().optional(),
+      /**
+       * Cap on concurrent dispatch actions (dispatchGate + dispatchWork)
+       * within a single runLoop tick.  v0.1.3 first-cut parallelism defaults
+       * to 4 — small enough that a wide fan-out won't immediately exhaust
+       * worker / OOM headroom, large enough that ~typical 2-3 branch DAGs
+       * fully parallelize.  Set higher on workflows that want more throughput.
+       *
+       * Per-bot serialization is independent of this cap; same-bot siblings
+       * still get dispatched one-per-tick regardless of the limit.
+       */
+      maxConcurrency: z.number().int().positive().optional(),
     })
     .optional(),
   nodes: z.record(NodeIdSchema, WorkflowNodeSchema),
