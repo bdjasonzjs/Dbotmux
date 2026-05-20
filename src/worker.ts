@@ -2134,7 +2134,24 @@ async function flushPending(): Promise<void> {
         codexBridgeMarkPendingTurn(msg);
       }
       log(`Writing to PTY (flush): "${msg.substring(0, 80)}"`);
-      const result = await cliAdapter.writeInput(backend, msg);
+      // Defense in depth: TmuxPipeBackend's send methods no longer throw on a
+      // dead pane (they fire onExit instead), but writeInput can still throw
+      // for other reasons (fs errors while resolving the JSONL, a future
+      // backend regression). flushPending is invoked fire-and-forget, so an
+      // escaping rejection would become an unhandledRejection and crash the
+      // worker — exactly the failure mode this change is closing. Contain it.
+      let result: Awaited<ReturnType<typeof cliAdapter.writeInput>>;
+      try {
+        result = await cliAdapter.writeInput(backend, msg);
+      } catch (err: any) {
+        log(`writeInput threw: ${err?.message ?? err}`);
+        // If the CLI exited mid-write the backend already fired onExit (which
+        // nulled `backend` and told the user the CLI exited) — nothing more to
+        // do. Otherwise surface it as a submit failure so the message isn't
+        // silently lost.
+        if (backend) scheduleSubmitFailureNotify(msg, undefined, '会话 JSONL', bridgeTurnId);
+        break;
+      }
       // Persist any sessionId the adapter observed via authoritative sources
       // (Claude's pid file, Codex's history). Done independently of submit
       // outcome — the rotation is real even when the current Enter didn't
@@ -2146,7 +2163,10 @@ async function flushPending(): Promise<void> {
         // attributed to this turn.
         if (codexBridgeActive) codexBridgeNotifyCliSessionId(result.cliSessionId);
       }
-      if (result && result.submitted === false) {
+      // `&& backend`: if the CLI exited during this write (pane gone → onExit
+      // nulled backend) the user already got a "CLI exited" notice; don't also
+      // nag that the submit wasn't confirmed.
+      if (result && result.submitted === false && backend) {
         scheduleSubmitFailureNotify(msg, result.recheck, '会话 JSONL', bridgeTurnId);
       }
       // Codex bridge: stop after one writeInput per idle cycle. Codex's

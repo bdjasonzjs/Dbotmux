@@ -398,6 +398,67 @@ describe('TmuxPipeBackend lifecycle watcher', () => {
   });
 });
 
+describe('TmuxPipeBackend send failure handling', () => {
+  // Regression: a CLI that exits mid-write destroys its tmux session, so the
+  // next `tmux send-keys` returns exit 1. Previously execFileSync's throw
+  // propagated through writeInput → flushPending (fire-and-forget async) →
+  // unhandledRejection and killed the whole worker. The send methods must
+  // never throw: pane-gone is converted to a normal onExit, a transient
+  // failure on a live pane is logged and dropped.
+  it('fires onExit (does NOT throw) when send-keys fails and the pane is gone', () => {
+    const be = new TmuxPipeBackend('bmx-dead', { ownsSession: true });
+    const exits: Array<[number | null, string | null]> = [];
+    be.onExit((c, s) => exits.push([c, s]));
+    be.spawn('', [], spawnOpts());
+
+    // The actual send-keys (execFileSync) fails…
+    mockedExecFileSync.mockImplementation((_bin: any, args: any) => {
+      if ((args as string[]).includes('send-keys')) throw new Error('no server running');
+      return '' as any;
+    });
+    // …and the liveness probe (execSync display-message) also fails ⇒ pane GONE.
+    mockedExecSync.mockImplementation(() => { throw new Error('no server running'); });
+
+    expect(() => be.sendSpecialKeys('Enter')).not.toThrow();
+    expect(exits).toEqual([[1, null]]);
+  });
+
+  it('drops the write (no throw, no exit) when send-keys fails but the pane is alive', () => {
+    const be = new TmuxPipeBackend('bmx-live', { ownsSession: true });
+    const exits: Array<[number | null, string | null]> = [];
+    be.onExit((c, s) => exits.push([c, s]));
+    be.spawn('', [], spawnOpts());
+
+    mockedExecFileSync.mockImplementation((_bin: any, args: any) => {
+      if ((args as string[]).includes('send-keys')) throw new Error('transient tmux error');
+      return '' as any;
+    });
+    // Liveness probe succeeds ⇒ pane ALIVE ⇒ transient error, just dropped.
+    mockedExecSync.mockReturnValue('' as any);
+
+    expect(() => be.sendText('hi')).not.toThrow();
+    expect(exits).toEqual([]);
+  });
+
+  it('paste failure with a gone pane fires onExit instead of throwing', () => {
+    const be = new TmuxPipeBackend('bmx-dead2', { ownsSession: true });
+    const exits: Array<[number | null, string | null]> = [];
+    be.onExit((c, s) => exits.push([c, s]));
+    be.spawn('', [], spawnOpts());
+
+    mockedExecFileSync.mockImplementation((_bin: any, args: any) => {
+      if ((args as string[]).includes('load-buffer') || (args as string[]).includes('paste-buffer')) {
+        throw new Error('no server running');
+      }
+      return '' as any;
+    });
+    mockedExecSync.mockImplementation(() => { throw new Error('no server running'); });
+
+    expect(() => be.pasteText('hello')).not.toThrow();
+    expect(exits).toEqual([[1, null]]);
+  });
+});
+
 describe('TmuxPipeBackend.kill', () => {
   it('cancels pipe-pane subscription and unlinks the fifo without firing onExit', () => {
     const be = new TmuxPipeBackend('0:2.0');

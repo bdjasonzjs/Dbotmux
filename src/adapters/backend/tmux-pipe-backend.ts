@@ -161,37 +161,89 @@ export class TmuxPipeBackend implements SessionBackend {
   sendText(text: string): void {
     if (this.exited) return;
     this.exitCopyModeIfNeeded();
-    execFileSync('tmux', ['send-keys', '-t', this.paneTarget, '-l', '--', text], {
-      stdio: 'ignore',
-      timeout: 5000,
-      env: tmuxEnv(),
+    this.guardedSend('send-keys (text)', () => {
+      execFileSync('tmux', ['send-keys', '-t', this.paneTarget, '-l', '--', text], {
+        stdio: 'ignore',
+        timeout: 5000,
+        env: tmuxEnv(),
+      });
     });
   }
 
   sendSpecialKeys(...keys: string[]): void {
     if (this.exited) return;
     this.exitCopyModeIfNeeded();
-    execFileSync('tmux', ['send-keys', '-t', this.paneTarget, ...keys], {
-      stdio: 'ignore',
-      timeout: 5000,
-      env: tmuxEnv(),
+    this.guardedSend(`send-keys ${keys.join(' ')}`, () => {
+      execFileSync('tmux', ['send-keys', '-t', this.paneTarget, ...keys], {
+        stdio: 'ignore',
+        timeout: 5000,
+        env: tmuxEnv(),
+      });
     });
   }
 
   pasteText(text: string): void {
     if (this.exited) return;
     this.exitCopyModeIfNeeded();
-    execFileSync('tmux', ['load-buffer', '-'], {
-      input: text,
-      stdio: ['pipe', 'ignore', 'ignore'],
-      timeout: 5000,
-      env: tmuxEnv(),
+    this.guardedSend('paste-buffer', () => {
+      execFileSync('tmux', ['load-buffer', '-'], {
+        input: text,
+        stdio: ['pipe', 'ignore', 'ignore'],
+        timeout: 5000,
+        env: tmuxEnv(),
+      });
+      execFileSync('tmux', ['paste-buffer', '-t', this.paneTarget, '-d'], {
+        stdio: 'ignore',
+        timeout: 5000,
+        env: tmuxEnv(),
+      });
     });
-    execFileSync('tmux', ['paste-buffer', '-t', this.paneTarget, '-d'], {
-      stdio: 'ignore',
-      timeout: 5000,
-      env: tmuxEnv(),
-    });
+  }
+
+  /**
+   * Run a tmux write (send-keys / load-buffer / paste-buffer) that must never
+   * crash the worker on failure.
+   *
+   * Background: when the CLI process exits mid-write its tmux session/pane is
+   * destroyed, so the very next `tmux send-keys` returns exit 1. The 1s
+   * lifecycle watcher hasn't fired yet, so `this.exited` is still false and the
+   * guard above doesn't help. Previously execFileSync's synchronous throw
+   * propagated through writeInput → flushPending (a fire-and-forget async with
+   * no .catch) → unhandledRejection, which killed the entire worker process
+   * (and with it every Lark session it served).
+   *
+   * Classify the failure instead of letting it escape:
+   *   - pane GONE  → the CLI exited; convert to a normal onExit so the worker
+   *                  tears the session down and tells the user "CLI exited",
+   *                  exactly like the lifecycle watcher would have.
+   *   - pane ALIVE → a transient tmux hiccup; log and drop the keystroke. The
+   *                  claude-code adapter's JSONL retry/verify loop will catch a
+   *                  non-submission and surface a submit-failure notice.
+   *
+   * Either way this method never throws — every send-keys caller (web-terminal
+   * keys, TUI input, the typing loop) stays crash-safe without its own guard.
+   */
+  private guardedSend(op: string, run: () => void): void {
+    try {
+      run();
+    } catch (err: any) {
+      // A kill()/handlePaneExit() may have flipped exited between the guard
+      // and here; if so the teardown already happened.
+      if (this.exited) return;
+      const alive = this.isPaneAlive();
+      process.stderr.write(
+        `[tmux-pipe-backend] ${op} failed (pane ${alive ? 'ALIVE' : 'GONE'}): ${err?.message ?? err}\n`,
+      );
+      if (!alive) {
+        // Diagnostic: snapshot whatever the CLI left on screen before it
+        // vanished — its final stderr/API error often explains WHY it exited.
+        const tail = this.captureViewport();
+        if (tail.trim()) {
+          process.stderr.write(`[tmux-pipe-backend] CLI pane final screen before exit:\n${tail}\n`);
+        }
+        this.handlePaneExit();
+      }
+    }
   }
 
   private exitCopyModeIfNeeded(): void {
