@@ -36,7 +36,7 @@ export interface TmuxResult {
   manualCommand?: string;
 }
 
-function probeTmuxVersion(): string | undefined {
+export function probeTmuxVersion(): string | undefined {
   try {
     const out = execSync('tmux -V', {
       encoding: 'utf-8',
@@ -48,6 +48,80 @@ function probeTmuxVersion(): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Minimum tmux version botmux supports.
+ *
+ * The feature floor implied by our actual tmux usage is ~2.9 — that's where
+ * `resize-window` and `set-option window-size largest` (both relied on by the
+ * tmux backends) were introduced. We pin the *enforced* minimum higher, at
+ * 3.3a, because:
+ *   - 3.3a is the version validated in the field, and
+ *   - very old / oddly-built tmux (e.g. a broken Homebrew bottle) can pass
+ *     `tmux -V` yet mishandle the pipe-pane + `send-keys -l` input path —
+ *     observed in the wild as "CLI exits while botmux is still typing the
+ *     message" (which then used to crash the worker; see TmuxPipeBackend
+ *     guardedSend). A conservative floor keeps users clear of that class of bug.
+ * Bump this if we ever adopt a flag/option newer than 3.3a.
+ */
+export const MIN_TMUX_VERSION = '3.3a';
+
+export interface TmuxVersionParts { major: number; minor: number; suffix: string; }
+
+/** Parse the numeric core out of a `tmux -V` string ("tmux 3.3a",
+ *  "tmux next-3.4", "tmux 3.4-rc", …). Returns null when there's no comparable
+ *  version (e.g. `tmux master` from a source build) — callers treat null as
+ *  "can't tell, assume OK" to avoid false alarms. */
+export function parseTmuxVersion(raw: string): TmuxVersionParts | null {
+  const m = /(\d+)\.(\d+)([a-z]?)/i.exec(raw);
+  if (!m) return null;
+  return { major: parseInt(m[1]!, 10), minor: parseInt(m[2]!, 10), suffix: (m[3] || '').toLowerCase() };
+}
+
+/** Compare two parsed tmux versions: <0 if a<b, 0 if equal, >0 if a>b.
+ *  Suffix ordering matches tmux's own release sequence — a missing suffix
+ *  sorts BEFORE any letter, so 3.3 < 3.3a (3.3a was the patch release after
+ *  3.3) and 3.3a < 3.3b. */
+export function compareTmuxVersion(a: TmuxVersionParts, b: TmuxVersionParts): number {
+  if (a.major !== b.major) return a.major - b.major;
+  if (a.minor !== b.minor) return a.minor - b.minor;
+  if (a.suffix === b.suffix) return 0;
+  return a.suffix < b.suffix ? -1 : 1;
+}
+
+export interface TmuxVersionCheck {
+  ok: boolean;
+  /** Raw `tmux -V` output, when available. */
+  detected?: string;
+  /** Parsed numeric version, when parseable. */
+  parsed?: TmuxVersionParts;
+  /** The enforced minimum (MIN_TMUX_VERSION). */
+  min: string;
+  /** Set when ok=false: human-readable reason. */
+  reason?: string;
+}
+
+/**
+ * Evaluate the installed tmux against {@link MIN_TMUX_VERSION}. Never throws.
+ *
+ *   - tmux missing        → ok (tmux is optional; PTY backend covers it and
+ *                            ensureTmux already warns separately about absence).
+ *   - version unparseable → ok (source build / `next-*`; don't false-alarm).
+ *   - parseable & too old → NOT ok, with a reason.
+ *
+ * Pass `versionString` to evaluate a known string (tests); omit to probe live.
+ */
+export function evaluateTmuxVersion(versionString?: string): TmuxVersionCheck {
+  const raw = versionString ?? probeTmuxVersion();
+  const min = MIN_TMUX_VERSION;
+  if (!raw) return { ok: true, min };
+  const parsed = parseTmuxVersion(raw);
+  if (!parsed) return { ok: true, detected: raw, min };
+  if (compareTmuxVersion(parsed, parseTmuxVersion(min)!) < 0) {
+    return { ok: false, detected: raw, parsed, min, reason: `${raw} 低于要求的最低版本 tmux ${min}` };
+  }
+  return { ok: true, detected: raw, parsed, min };
 }
 
 /**

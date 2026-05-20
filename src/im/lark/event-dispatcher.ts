@@ -14,6 +14,7 @@ import { parseForceTopicInvocation } from '../../core/command-handler.js';
 import { stripLeadingMentions } from './message-parser.js';
 import { recordObservedBots } from '../../services/observed-bots-store.js';
 import { BOTMUX_REQUIRED_SCOPES, buildScopeDeepLink } from '../../setup/verify-permissions.js';
+import { evaluateTmuxVersion } from '../../setup/ensure-tmux.js';
 
 // ─── Bot identity ─────────────────────────────────────────────────────────
 
@@ -231,6 +232,42 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
   } catch (err: any) {
     logger.debug(`[${larkAppId}] scope check errored: ${err?.message ?? err}`);
   }
+}
+
+// ─── tmux version check ─────────────────────────────────────────────────────
+//
+// botmux 的 tmux 模式依赖 pipe-pane + `send-keys -l` 注入输入。版本过低 / 异常
+// 构建的 tmux（例如某些 Homebrew bottle）能通过 `tmux -V`，却会错误处理这套输入
+// 路径——线上踩到的现象是「消息还没打完，CLI 就退出了」（进而曾打死整个 worker，
+// 见 TmuxPipeBackend guardedSend）。启动时核对一次 tmux 版本，过低就 logger.error
+// 并私信 admin 提示升级。校验异步、best-effort，失败不影响 daemon。
+export async function checkTmuxVersion(larkAppId: string): Promise<void> {
+  const result = evaluateTmuxVersion();
+  if (result.ok) {
+    if (result.detected) logger.info(`[${larkAppId}] tmux 版本检查通过：${result.detected}（要求 ≥ tmux ${result.min}）`);
+    return;
+  }
+  const bot = getBot(larkAppId);
+  logger.error(
+    `[${larkAppId}] tmux 版本过低：检测到 ${result.detected}，botmux 要求至少 tmux ${result.min}。` +
+    `过低 / 异常构建的 tmux 在 tmux 模式下可能导致输入异常、会话中途退出。请升级 tmux 后 \`botmux restart\`。`,
+  );
+  const adminOpenId = getAdminOpenId(bot);
+  if (!adminOpenId) {
+    logger.warn(`[${larkAppId}] no resolved admin open_id in allowedUsers; tmux-version warning visible only in daemon log`);
+    return;
+  }
+  const dm =
+    `⚠️ botmux 启动检查发现运行环境的 tmux 版本过低\n\n` +
+    `**当前版本**：${result.detected}\n` +
+    `**要求最低版本**：tmux ${result.min}\n\n` +
+    `过低 / 异常构建的 tmux 在 botmux 的 tmux 模式下可能导致输入异常，甚至会话在消息还没发完时中途退出。\n\n` +
+    `**请升级 tmux 后重启 daemon**：\n` +
+    `- macOS（Homebrew）：\`brew upgrade tmux\`；若当前就是 Homebrew 装的旧版/异常构建，建议 \`brew reinstall tmux\`\n` +
+    `- Debian/Ubuntu：\`sudo apt-get update && sudo apt-get install -y tmux\`\n` +
+    `- 或装最新发行版：https://github.com/tmux/tmux/releases\n\n` +
+    `升级后执行 \`botmux restart\`，botmux 会再次自检。`;
+  await dmAdmin(larkAppId, adminOpenId, dm, `tmux version too old (${result.detected})`);
 }
 
 // ─── Group chat stats cache ───────────────────────────────────────────────

@@ -66,7 +66,7 @@ import {
 } from './core/session-manager.js';
 import { handleCardAction } from './im/lark/card-handler.js';
 import type { CardHandlerDeps } from './im/lark/card-handler.js';
-import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, writeBotInfoFile, canOperate, isKnownPeerBot, checkRequiredScopes, type RoutingContext } from './im/lark/event-dispatcher.js';
+import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, writeBotInfoFile, canOperate, isKnownPeerBot, checkRequiredScopes, checkTmuxVersion, type RoutingContext } from './im/lark/event-dispatcher.js';
 import { learnFromMentions, resolveSender, flushIdentityCacheSync } from './im/lark/identity-cache.js';
 import { renderSenderTag } from './core/session-manager.js';
 import { markSessionActivity } from './core/session-activity.js';
@@ -1165,6 +1165,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // 私信 allowedUsers[0]。校验异步，跑失败不影响 daemon。
     checkRequiredScopes(cfg.larkAppId).catch(err => {
       logger.debug(`[${cfg.larkAppId}] required-scope check failed: ${err?.message ?? err}`);
+    });
+
+    // tmux 版本自检：过低/异常构建在 tmux 模式下会导致输入异常、会话中途退出。
+    // logger.error + 私信 admin 提示升级。异步 best-effort，不影响 daemon。
+    checkTmuxVersion(cfg.larkAppId).catch(err => {
+      logger.debug(`[${cfg.larkAppId}] tmux version check failed: ${err?.message ?? err}`);
     });
 
     // Start event dispatcher for this bot
