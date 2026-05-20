@@ -321,6 +321,7 @@ export async function dispatchGate(
     waitKind: 'human-gate',
     deadlineAt,
     prompt: resolvedPrompt,
+    approvers: action.humanGate.approvers,
     onTimeout: action.humanGate.onTimeout,
   });
 

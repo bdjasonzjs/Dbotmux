@@ -1,6 +1,7 @@
 import { logger } from '../../utils/logger.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
 import { EventLog } from '../../workflows/events/append.js';
+import type { WorkflowEvent } from '../../workflows/events/schema.js';
 import { getRunsDir } from '../../workflows/runs-dir.js';
 import {
   resolveWait,
@@ -50,7 +51,8 @@ export type WorkflowApprovalHandlerResult =
       duplicate: false;
       cardNonce: string;
       result: ResolveWaitResult | CancelRequestedEvent;
-    };
+    }
+  | { ok: false; error: 'not_approver'; cardNonce: string };
 
 export function isWorkflowApprovalAction(action?: string): boolean {
   return (
@@ -92,10 +94,14 @@ export async function handleWorkflowApprovalAction(
     return { ok: true, duplicate: true, cardNonce };
   }
 
+  const comment = cleanComment(data.action?.form_value?.[WORKFLOW_COMMENT_FIELD]);
   const runsDir = deps.runsDir ?? workflowRunsDir();
   const makeEventLog = deps.makeEventLog ?? ((rid, base) => new EventLog(rid, base));
   const log = makeEventLog(runId, runsDir);
-  const comment = cleanComment(data.action?.form_value?.[WORKFLOW_COMMENT_FIELD]);
+  if (!(await canApprove(log, activityId, by))) {
+    logger.info(`[workflow:${runId}] approval card action blocked for non-approver ${by}`);
+    return { ok: false, error: 'not_approver', cardNonce };
+  }
   const result =
     action === WORKFLOW_CANCEL_ACTION
       ? await (deps.requestCancelFn ?? requestCancel)(
@@ -155,4 +161,29 @@ function cleanComment(s: string | undefined): string | undefined {
 
 function cancelReason(comment: string | undefined): string {
   return comment ? `cancelled from approval card: ${comment}` : 'cancelled from approval card';
+}
+
+async function canApprove(log: EventLog, activityId: string, by: string): Promise<boolean> {
+  const events = await log.readAll();
+  const wait = [...events].reverse().find((event) =>
+    event.type === 'waitCreated' &&
+    waitCreatedActivityId(event) === activityId
+  );
+  const approvers = waitCreatedApprovers(wait);
+  if (!approvers || approvers.length === 0) return true;
+  return approvers.includes(by);
+}
+
+function waitCreatedActivityId(event: WorkflowEvent): string | undefined {
+  const payload = event.payload;
+  if (typeof payload !== 'object' || payload === null || 'ref' in payload) return undefined;
+  return (payload as { activityId?: string }).activityId;
+}
+
+function waitCreatedApprovers(event: WorkflowEvent | undefined): string[] | undefined {
+  if (!event) return undefined;
+  const payload = event.payload;
+  if (typeof payload !== 'object' || payload === null || 'ref' in payload) return undefined;
+  const approvers = (payload as { approvers?: unknown }).approvers;
+  return Array.isArray(approvers) ? approvers.filter((x): x is string => typeof x === 'string') : undefined;
 }

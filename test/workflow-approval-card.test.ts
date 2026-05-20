@@ -76,7 +76,10 @@ const attemptCreated: EventDraft = {
   },
 };
 
-async function bootstrapWait(prompt = '请确认订票计划'): Promise<WaitCreatedEvent> {
+async function bootstrapWait(
+  prompt = '请确认订票计划',
+  approvers?: string[],
+): Promise<WaitCreatedEvent> {
   await log.append(runCreated);
   await log.append(attemptCreated);
   return createWait(log, {
@@ -86,6 +89,7 @@ async function bootstrapWait(prompt = '请确认订票计划'): Promise<WaitCrea
     waitKind: 'human-gate',
     deadlineAt: 2_000_000_000_000,
     prompt,
+    approvers,
   });
 }
 
@@ -93,9 +97,9 @@ function cardText(card: unknown): string {
   return JSON.stringify(card);
 }
 
-function cardActionData(action: string, comment?: string) {
+function cardActionData(action: string, comment?: string, operatorOpenId = 'ou_approver') {
   return {
-    operator: { open_id: 'ou_approver' },
+    operator: { open_id: operatorOpenId },
     action: {
       value: {
         action,
@@ -250,6 +254,30 @@ describe('handleWorkflowApprovalAction', () => {
       requestedBy: 'ou_approver',
       reason: 'cancelled from approval card: stop it',
     });
+  });
+
+  it('blocks approve/reject/cancel clicks from users outside humanGate approvers', async () => {
+    await bootstrapWait('manager only', ['ou_manager']);
+    const saveFrozenCardsFn = vi.fn();
+
+    const result = await handleWorkflowApprovalAction(
+      cardActionData(WORKFLOW_CANCEL_ACTION, undefined, 'ou_intruder'),
+      {
+        runsDir: baseDir,
+        loadFrozenCardsFn: () => new Map(),
+        saveFrozenCardsFn,
+      },
+    );
+
+    expect(result).toEqual({
+      ok: false,
+      error: 'not_approver',
+      cardNonce: workflowApprovalCardNonce(RUN_ID, ACTIVITY_ID, ATTEMPT_ID),
+    });
+    const events = await log.readAll();
+    expect(events.find((e) => e.type === 'cancelRequested')).toBeUndefined();
+    expect(events.find((e) => e.type === 'waitResolved')).toBeUndefined();
+    expect(saveFrozenCardsFn).not.toHaveBeenCalled();
   });
 
   it('freezes the approval card so approve after cancel is ignored', async () => {

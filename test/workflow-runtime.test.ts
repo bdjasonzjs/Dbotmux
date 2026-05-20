@@ -54,6 +54,7 @@ function gatedDef(): WorkflowDefinition {
         humanGate: {
           stage: 'before',
           prompt: 'approve?',
+          approvers: ['ou_manager'],
           deadlineMs: 60_000,
           onTimeout: 'fail',
         },
@@ -188,6 +189,7 @@ describe('dispatchGate', () => {
       activityId: gateActivityId(RUN_ID, 'gated'),
       waitKind: 'human-gate',
       prompt: 'approve?',
+      approvers: ['ou_manager'],
       onTimeout: 'fail',
     });
     const waitP = waitCreated.payload as { deadlineAt: number };

@@ -53,6 +53,8 @@ export type CreateWaitInput = {
   deadlineAt?: number;
   /** Human-readable prompt (rendered to approvers / dashboards). */
   prompt?: string;
+  /** Optional open_id allow list for human-gate card actions. */
+  approvers?: string[];
   /** What to write as the activity terminal when the deadline fires
    *  without resolution.  Default `fail` (spec default). */
   onTimeout?: WaitOnTimeout;
@@ -123,6 +125,7 @@ export async function createWait(
       waitKind: input.waitKind,
       deadlineAt: input.deadlineAt,
       prompt: input.prompt,
+      approvers: input.approvers,
       onTimeout: input.onTimeout,
     },
   })) as WaitCreatedEvent;

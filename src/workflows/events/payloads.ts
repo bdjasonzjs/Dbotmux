@@ -270,6 +270,7 @@ export const WaitCreatedPayload = z.object({
   waitKind: WaitKindEnum,
   deadlineAt: z.number().int().positive().optional(),
   prompt: z.string().optional(),
+  approvers: z.array(z.string()).optional(),
   onTimeout: WaitOnTimeoutEnum.optional(),
 });
 
