@@ -18,6 +18,91 @@ type RunRow = {
   larkAppId?: string;
 };
 
+type OutputRef = {
+  outputHash: string;
+  outputBytes: number;
+  outputSchemaVersion: number;
+  outputPath?: string;
+  contentType?: string;
+};
+
+type AttemptState = {
+  attemptId: string;
+  attemptNumber: number;
+  status: string;
+  effectAttempted?: { provider: string; idempotencyKey: string };
+  wait?: {
+    waitKind: string;
+    prompt?: string;
+    deadlineAt?: number;
+    resolution?: { kind: string; resolution?: string; by?: string; eventId: string };
+  };
+  output?: OutputRef;
+  error?: { errorCode: string; errorClass: string; errorMessage?: string };
+  runningMs?: number;
+};
+
+type ActivityState = {
+  activityId: string;
+  attempts: AttemptState[];
+  status: string;
+  currentAttemptId?: string;
+  ownerNodeId?: string;
+};
+
+type NodeState = {
+  nodeId: string;
+  status: string;
+  activityId?: string;
+  retryCount: number;
+  nextAttemptAt?: number;
+  errorClass?: string;
+};
+
+type RunSnapshot = {
+  runId: string;
+  run: {
+    runId: string;
+    status: string;
+    workflowId?: string;
+    revisionId?: string;
+    initiator?: string;
+    failedNodeId?: string;
+    rootCauseEventId?: string;
+    cancelOriginEventId?: string;
+  };
+  lastSeq: number;
+  nodes: NodeState[];
+  activities: ActivityState[];
+  dangling: {
+    activities: string[];
+    effectAttempted: string[];
+    waits: string[];
+    cancels: string[];
+  };
+  outputs: Record<string, OutputRef>;
+  chatBinding?: { chatId: string; larkAppId: string };
+  updatedAt: number;
+};
+
+type WorkflowEvent = {
+  eventId: string;
+  runId: string;
+  type: string;
+  actor: string;
+  timestamp: number;
+  payload?: unknown;
+};
+
+type EventWindow = {
+  events: WorkflowEvent[];
+  oldestSeq: number | null;
+  newestSeq: number | null;
+  totalCount: number;
+  hasOlder: boolean;
+  hasNewer: boolean;
+};
+
 const PAGE_HTML = `
 <form id="wf-filters" class="filters">
   <input type="search" name="q" placeholder="search runId / workflowId / chatId" />
@@ -44,6 +129,7 @@ const PAGE_HTML = `
 `;
 
 const POLL_MS = 5000;
+const DETAIL_POLL_MS = 2000;
 const TERMINAL = new Set(['succeeded', 'failed', 'cancelled']);
 
 function escapeHtml(s: string): string {
@@ -68,6 +154,14 @@ function statusBadge(status: string): string {
 }
 
 export function renderWorkflowsPage(root: HTMLElement): () => void {
+  const detailMatch = location.hash.match(/^#\/workflows\/([^/?#]+)$/);
+  if (detailMatch) {
+    return renderWorkflowDetailPage(root, decodeURIComponent(detailMatch[1]!));
+  }
+  return renderWorkflowListPage(root);
+}
+
+function renderWorkflowListPage(root: HTMLElement): () => void {
   root.innerHTML = PAGE_HTML;
   const tbody = root.querySelector<HTMLElement>('#wf-tbody')!;
   const form = root.querySelector<HTMLFormElement>('#wf-filters')!;
@@ -203,4 +297,351 @@ export function renderWorkflowsPage(root: HTMLElement): () => void {
     if (timer !== null) window.clearTimeout(timer);
     document.removeEventListener('visibilitychange', onVisibility);
   };
+}
+
+function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void {
+  root.innerHTML = `
+    <div class="wf-detail-head">
+      <a class="btn-link" href="#/workflows">Back</a>
+      <div>
+        <h2><code>${escapeHtml(runId)}</code></h2>
+        <div id="wf-detail-subtitle" class="muted">Loading...</div>
+      </div>
+      <span id="wf-detail-refresh" class="muted"></span>
+    </div>
+    <section id="wf-detail-error" class="hint-warn" hidden></section>
+    <section id="wf-summary" class="wf-summary-grid"></section>
+    <section id="wf-dangling-panel"></section>
+    <section class="wf-panel">
+      <div class="wf-panel-title">
+        <h3>Nodes / Activities</h3>
+      </div>
+      <div class="wf-table-scroll">
+        <table>
+          <thead><tr>
+            <th>node</th><th>node status</th><th>activity</th><th>activity status</th>
+            <th>attempts</th><th>current</th><th>detail</th>
+          </tr></thead>
+          <tbody id="wf-node-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+    <section class="wf-panel">
+      <div class="wf-panel-title">
+        <h3>Timeline</h3>
+        <button id="wf-load-older" type="button">Load older</button>
+      </div>
+      <div class="wf-table-scroll wf-timeline-scroll">
+        <table>
+          <thead><tr>
+            <th>seq</th><th>event</th><th>actor</th><th>node</th><th>activity</th><th>error</th><th>time</th>
+          </tr></thead>
+          <tbody id="wf-event-tbody"></tbody>
+        </table>
+      </div>
+      <div id="wf-event-meta" class="muted"></div>
+    </section>
+  `;
+
+  const subtitle = root.querySelector<HTMLElement>('#wf-detail-subtitle')!;
+  const refresh = root.querySelector<HTMLElement>('#wf-detail-refresh')!;
+  const errorEl = root.querySelector<HTMLElement>('#wf-detail-error')!;
+  const summaryEl = root.querySelector<HTMLElement>('#wf-summary')!;
+  const danglingEl = root.querySelector<HTMLElement>('#wf-dangling-panel')!;
+  const nodeTbody = root.querySelector<HTMLElement>('#wf-node-tbody')!;
+  const eventTbody = root.querySelector<HTMLElement>('#wf-event-tbody')!;
+  const eventMeta = root.querySelector<HTMLElement>('#wf-event-meta')!;
+  const loadOlder = root.querySelector<HTMLButtonElement>('#wf-load-older')!;
+
+  let snapshot: RunSnapshot | null = null;
+  let events: WorkflowEvent[] = [];
+  let eventIds = new Set<string>();
+  let oldestSeq: number | null = null;
+  let newestSeq: number | null = null;
+  let hasOlder = false;
+  let totalCount = 0;
+  let timer: number | null = null;
+  let disposed = false;
+  let inflight = false;
+
+  function setError(message: string | null): void {
+    if (!message) {
+      errorEl.hidden = true;
+      errorEl.textContent = '';
+      return;
+    }
+    errorEl.hidden = false;
+    errorEl.textContent = message;
+  }
+
+  async function fetchSnapshot(): Promise<void> {
+    const res = await fetch(`/api/workflows/runs/${encodeURIComponent(runId)}/snapshot`);
+    if (res.status === 404) {
+      throw new Error('unknown run');
+    }
+    if (!res.ok) throw new Error(`snapshot HTTP ${res.status}`);
+    snapshot = (await res.json()) as RunSnapshot;
+  }
+
+  async function fetchEvents(params: URLSearchParams): Promise<EventWindow> {
+    const res = await fetch(`/api/workflows/runs/${encodeURIComponent(runId)}/events?${params}`);
+    if (res.status === 404) throw new Error('unknown run');
+    if (!res.ok) throw new Error(`events HTTP ${res.status}`);
+    return (await res.json()) as EventWindow;
+  }
+
+  function mergeEvents(incoming: WorkflowEvent[], direction: 'append' | 'prepend'): void {
+    const fresh = incoming.filter((ev) => {
+      if (eventIds.has(ev.eventId)) return false;
+      eventIds.add(ev.eventId);
+      return true;
+    });
+    if (fresh.length === 0) return;
+    events = direction === 'prepend' ? [...fresh, ...events] : [...events, ...fresh];
+    events.sort((a, b) => eventSeqFromId(a.eventId) - eventSeqFromId(b.eventId));
+  }
+
+  async function initialLoad(): Promise<void> {
+    await fetchSnapshot();
+    const win = await fetchEvents(new URLSearchParams({ tail: '100' }));
+    events = [];
+    eventIds = new Set();
+    mergeEvents(win.events, 'append');
+    oldestSeq = win.oldestSeq;
+    newestSeq = win.newestSeq;
+    hasOlder = win.hasOlder;
+    totalCount = win.totalCount;
+    rerender();
+  }
+
+  async function poll(): Promise<void> {
+    if (disposed || inflight || document.hidden) return;
+    if (snapshot && TERMINAL.has(snapshot.run.status)) return;
+    inflight = true;
+    try {
+      await fetchSnapshot();
+      if (newestSeq !== null) {
+        const win = await fetchEvents(new URLSearchParams({ afterSeq: String(newestSeq), limit: '200' }));
+        mergeEvents(win.events, 'append');
+        if (win.newestSeq !== null) newestSeq = win.newestSeq;
+        if (oldestSeq === null && win.oldestSeq !== null) oldestSeq = win.oldestSeq;
+        totalCount = win.totalCount;
+      }
+      setError(null);
+      rerender();
+    } catch (err: any) {
+      setError(err?.message ?? String(err));
+    } finally {
+      inflight = false;
+    }
+  }
+
+  async function loadOlderEvents(): Promise<void> {
+    if (oldestSeq === null || !hasOlder) return;
+    loadOlder.disabled = true;
+    try {
+      const win = await fetchEvents(new URLSearchParams({ beforeSeq: String(oldestSeq), limit: '100' }));
+      mergeEvents(win.events, 'prepend');
+      if (win.oldestSeq !== null) oldestSeq = win.oldestSeq;
+      hasOlder = win.hasOlder;
+      totalCount = win.totalCount;
+      setError(null);
+      rerender();
+    } catch (err: any) {
+      setError(err?.message ?? String(err));
+    } finally {
+      loadOlder.disabled = false;
+    }
+  }
+
+  function rerender(): void {
+    if (!snapshot) return;
+    const run = snapshot.run;
+    subtitle.innerHTML = `${escapeHtml(run.workflowId ?? '?')} · ${statusBadge(run.status)} · lastSeq ${snapshot.lastSeq}`;
+    refresh.textContent = `refreshed ${new Date().toLocaleTimeString()}`;
+    renderSummary(summaryEl, snapshot);
+    renderDangling(danglingEl, snapshot);
+    renderNodeActivityRows(nodeTbody, snapshot);
+    renderEvents(eventTbody, events);
+    loadOlder.hidden = !hasOlder;
+    eventMeta.textContent = `${events.length}/${totalCount} events loaded`;
+  }
+
+  function scheduleNext(): void {
+    if (timer !== null) window.clearTimeout(timer);
+    timer = window.setTimeout(async () => {
+      await poll();
+      if (!disposed) scheduleNext();
+    }, DETAIL_POLL_MS);
+  }
+
+  function onVisibility(): void {
+    if (document.hidden) return;
+    void poll();
+  }
+
+  loadOlder.addEventListener('click', () => void loadOlderEvents());
+  document.addEventListener('visibilitychange', onVisibility);
+
+  void initialLoad()
+    .then(() => {
+      setError(null);
+      if (!disposed) scheduleNext();
+    })
+    .catch((err: any) => {
+      setError(err?.message ?? String(err));
+      subtitle.textContent = 'Load failed';
+    });
+
+  return () => {
+    disposed = true;
+    if (timer !== null) window.clearTimeout(timer);
+    document.removeEventListener('visibilitychange', onVisibility);
+  };
+}
+
+function renderSummary(el: HTMLElement, snap: RunSnapshot): void {
+  const r = snap.run;
+  const items: Array<[string, string]> = [
+    ['workflow', escapeHtml(r.workflowId ?? '?')],
+    ['status', statusBadge(r.status)],
+    ['lastSeq', String(snap.lastSeq)],
+    ['updated', escapeHtml(new Date(snap.updatedAt).toLocaleString())],
+    ['revision', escapeHtml(short(r.revisionId))],
+    ['initiator', escapeHtml(r.initiator ?? '-')],
+  ];
+  if (r.failedNodeId) items.push(['failedNode', escapeHtml(r.failedNodeId)]);
+  if (r.cancelOriginEventId) items.push(['cancelOrigin', escapeHtml(r.cancelOriginEventId)]);
+  if (snap.chatBinding) {
+    items.push(['chat', `<code>${escapeHtml(snap.chatBinding.chatId)}</code>`]);
+    items.push(['app', `<code>${escapeHtml(snap.chatBinding.larkAppId)}</code>`]);
+  }
+  el.innerHTML = items
+    .map(([label, value]) => `<div class="wf-summary-item"><span>${label}</span><strong>${value}</strong></div>`)
+    .join('');
+}
+
+function renderDangling(el: HTMLElement, snap: RunSnapshot): void {
+  const d = snap.dangling;
+  const groups: Array<[string, string[]]> = [
+    ['activities', d.activities],
+    ['effects', d.effectAttempted],
+    ['waits', d.waits],
+    ['cancels', d.cancels],
+  ];
+  const total = new Set(groups.flatMap(([, xs]) => xs)).size;
+  el.className = total > 0 ? 'wf-panel wf-dangling-panel has' : 'wf-panel wf-dangling-panel';
+  if (total === 0) {
+    el.innerHTML = `<div class="wf-panel-title"><h3>Dangling</h3></div><div class="muted">No dangling work.</div>`;
+    return;
+  }
+  el.innerHTML = `<div class="wf-panel-title"><h3>Dangling</h3><span class="wf-dangling has">${total}</span></div>
+    <div class="wf-dangling-grid">
+      ${groups
+        .map(
+          ([name, xs]) => `<div><strong>${name}</strong>${
+            xs.length === 0
+              ? '<div class="muted">none</div>'
+              : `<ul>${xs.map((x) => `<li><code>${escapeHtml(x)}</code></li>`).join('')}</ul>`
+          }</div>`,
+        )
+        .join('')}
+    </div>`;
+}
+
+function renderNodeActivityRows(tbody: HTMLElement, snap: RunSnapshot): void {
+  const byId = new Map(snap.activities.map((a) => [a.activityId, a]));
+  const used = new Set<string>();
+  const rows: string[] = [];
+
+  for (const node of snap.nodes) {
+    const activity =
+      (node.activityId ? byId.get(node.activityId) : undefined) ??
+      snap.activities.find((a) => a.ownerNodeId === node.nodeId);
+    if (activity) used.add(activity.activityId);
+    rows.push(renderNodeActivityRow(node, activity));
+  }
+
+  for (const activity of snap.activities) {
+    if (used.has(activity.activityId)) continue;
+    rows.push(renderNodeActivityRow(undefined, activity));
+  }
+
+  tbody.innerHTML = rows.length > 0 ? rows.join('') : '<tr><td colspan="7" class="empty">No nodes yet.</td></tr>';
+}
+
+function renderNodeActivityRow(node?: NodeState, activity?: ActivityState): string {
+  const latest = activity?.attempts[activity.attempts.length - 1];
+  return `<tr>
+    <td>${node ? `<code>${escapeHtml(node.nodeId)}</code>` : '<span class="muted">-</span>'}</td>
+    <td>${node ? statusBadge(node.status) : '<span class="muted">-</span>'}</td>
+    <td>${activity ? `<code>${escapeHtml(activity.activityId)}</code>` : '<span class="muted">-</span>'}</td>
+    <td>${activity ? statusBadge(activity.status) : '<span class="muted">-</span>'}</td>
+    <td>${activity?.attempts.length ?? 0}</td>
+    <td>${latest ? `<code>${escapeHtml(latest.attemptId)}</code>` : '<span class="muted">-</span>'}</td>
+    <td>${latest ? renderAttemptDetail(latest) : '<span class="muted">idle</span>'}</td>
+  </tr>`;
+}
+
+function renderAttemptDetail(at: AttemptState): string {
+  const parts: string[] = [];
+  if (at.effectAttempted) parts.push(`effect ${escapeHtml(at.effectAttempted.provider)}`);
+  if (at.wait) {
+    const res = at.wait.resolution
+      ? `${at.wait.resolution.kind}${at.wait.resolution.resolution ? ':' + at.wait.resolution.resolution : ''}`
+      : 'open';
+    parts.push(`wait ${escapeHtml(at.wait.waitKind)} ${escapeHtml(res)}`);
+  }
+  if (at.error) parts.push(`<span class="muted error">${escapeHtml(at.error.errorCode)}</span>`);
+  if (at.output) parts.push(`output ${escapeHtml(short(at.output.outputHash))}`);
+  if (at.runningMs !== undefined) parts.push(`${at.runningMs}ms`);
+  return parts.length > 0 ? parts.join('<br/>') : '<span class="muted">-</span>';
+}
+
+function renderEvents(tbody: HTMLElement, events: WorkflowEvent[]): void {
+  tbody.innerHTML =
+    events.length > 0
+      ? events.map(renderEventRow).join('')
+      : '<tr><td colspan="7" class="empty">No events.</td></tr>';
+}
+
+function renderEventRow(ev: WorkflowEvent): string {
+  const ctx = extractEventContext(ev.payload);
+  return `<tr>
+    <td>${eventSeqFromId(ev.eventId)}</td>
+    <td><code>${escapeHtml(ev.type)}</code></td>
+    <td>${escapeHtml(ev.actor)}</td>
+    <td>${ctx.nodeId ? `<code>${escapeHtml(ctx.nodeId)}</code>` : '-'}</td>
+    <td>${ctx.activityId ? `<code>${escapeHtml(ctx.activityId)}</code>` : '-'}</td>
+    <td>${ctx.errorCode ? `<span class="muted error">${escapeHtml(ctx.errorCode)}</span>` : '-'}</td>
+    <td title="${escapeHtml(new Date(ev.timestamp).toISOString())}">${fmtUpdated(ev.timestamp)}</td>
+  </tr>`;
+}
+
+function eventSeqFromId(eventId: string): number {
+  const dash = eventId.lastIndexOf('-');
+  if (dash < 0) return 0;
+  const n = Number(eventId.slice(dash + 1));
+  return Number.isFinite(n) ? n : 0;
+}
+
+function extractEventContext(
+  payload: unknown,
+): { nodeId?: string; activityId?: string; errorCode?: string } {
+  if (!payload || typeof payload !== 'object' || 'ref' in (payload as object)) return {};
+  const p = payload as Record<string, unknown>;
+  const out: { nodeId?: string; activityId?: string; errorCode?: string } = {};
+  if (typeof p.nodeId === 'string') out.nodeId = p.nodeId;
+  if (typeof p.activityId === 'string') out.activityId = p.activityId;
+  if (typeof p.failedNodeId === 'string') out.nodeId = p.failedNodeId;
+  const err = p.error;
+  if (err && typeof err === 'object' && 'errorCode' in err) {
+    out.errorCode = String((err as { errorCode: unknown }).errorCode);
+  }
+  return out;
+}
+
+function short(value?: string): string {
+  if (!value) return '-';
+  return value.length > 18 ? value.slice(0, 10) + '...' + value.slice(-6) : value;
 }

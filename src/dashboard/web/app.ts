@@ -23,9 +23,11 @@ function route() {
 
   // active nav highlighting
   for (const a of document.querySelectorAll<HTMLAnchorElement>('header nav a')) {
+    const href = a.getAttribute('href');
     a.classList.toggle(
       'active',
-      a.getAttribute('href') === (hash || '#/') ||
+      href === (hash || '#/') ||
+        (href && href !== '#/' && hash.startsWith(href + '/')) ||
         (hash === '#/' && a.dataset.route === 'sessions'),
     );
   }
