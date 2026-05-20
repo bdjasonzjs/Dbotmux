@@ -195,6 +195,36 @@ describe('parseWorkflowDefinition', () => {
     expect(def.nodes.send!.description).toBe('Send the approved draft to Feishu.');
   });
 
+  it('accepts params refs in bound prompt and hostExecutor input', () => {
+    const def = parseWorkflowDefinition({
+      workflowId: 'wf-params',
+      version: 1,
+      params: {
+        name: { type: 'string', required: true },
+        chatId: { type: 'string', required: true },
+      },
+      nodes: {
+        greet: {
+          type: 'subagent',
+          bot: 'b1',
+          prompt: { $ref: 'params.name' },
+        },
+        send: {
+          type: 'hostExecutor',
+          executor: 'feishu-send',
+          depends: ['greet'],
+          input: {
+            chatId: { $ref: 'params.chatId' },
+            content: { $ref: 'greet.output.text' },
+          },
+        },
+      },
+    });
+
+    expect(def.nodes.greet!.type).toBe('subagent');
+    expect(def.nodes.send!.type).toBe('hostExecutor');
+  });
+
   it('rejects empty nodes map', () => {
     const raw = { workflowId: 'wf-x', version: 1, nodes: {} };
     expect(() => parseWorkflowDefinition(raw)).toThrow();

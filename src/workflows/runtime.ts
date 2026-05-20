@@ -27,6 +27,7 @@ import {
   BindingError,
   resolveBindings,
   resolveBoundString,
+  type BindingContext,
 } from './output-binding.js';
 import type { BotSnapshot, ErrorClass, ErrorCode, OutputRef } from './events/payloads.js';
 import { replay, type Snapshot } from './events/replay.js';
@@ -202,6 +203,35 @@ async function resolveWorkflowIdentity(
   return { workflowId: snap.run.workflowId, revisionId: snap.run.revisionId };
 }
 
+function bindingContext(
+  ctx: WorkflowRuntimeContext,
+  snapshot: Snapshot,
+): BindingContext {
+  let paramsPromise: Promise<Record<string, unknown>> | undefined;
+  return {
+    snapshot,
+    def: ctx.def,
+    log: ctx.log,
+    loadParams: () => {
+      paramsPromise ??= loadRunParamsFromSnapshot(snapshot);
+      return paramsPromise;
+    },
+  };
+}
+
+async function loadRunParamsFromSnapshot(snapshot: Snapshot): Promise<Record<string, unknown>> {
+  const inputPath = snapshot.run.input?.outputPath;
+  if (!inputPath) {
+    throw new BindingError('run input params missing outputPath');
+  }
+  const raw = await fs.readFile(inputPath, 'utf-8');
+  const parsed = JSON.parse(raw) as unknown;
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new BindingError('run input params blob is not an object');
+  }
+  return parsed as Record<string, unknown>;
+}
+
 async function failHostExecutor(
   ctx: WorkflowRuntimeContext,
   activityId: string,
@@ -292,11 +322,10 @@ export async function dispatchGate(
 
   let resolvedPrompt: string;
   try {
-    resolvedPrompt = await resolveBoundString(action.humanGate.prompt, {
-      snapshot: options.snapshot ?? replay(await ctx.log.readAll()),
-      def: ctx.def,
-      log: ctx.log,
-    });
+    resolvedPrompt = await resolveBoundString(
+      action.humanGate.prompt,
+      bindingContext(ctx, options.snapshot ?? replay(await ctx.log.readAll())),
+    );
   } catch (err) {
     if (err instanceof BindingError) {
       const activityFailed = await writeBindingFailure(
@@ -385,11 +414,10 @@ export async function dispatchWork(
   const attemptId = workAttemptId(action.activityId, attemptNumber);
   const node = action.node;
 
-  const bindingCtx = {
-    snapshot: options.snapshot ?? replay(await ctx.log.readAll()),
-    def: ctx.def,
-    log: ctx.log,
-  };
+  const bindingCtx = bindingContext(
+    ctx,
+    options.snapshot ?? replay(await ctx.log.readAll()),
+  );
 
   if (node.type === 'hostExecutor') {
     // attemptCreated carries the RAW (pre-binding) input.  Operator-side

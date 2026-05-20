@@ -21,10 +21,12 @@
  *
  * Reference syntax:
  *   `<nodeId>.output.<segment>(.<segment>)*`
+ *   `params.<segment>(.<segment>)*`
  *
  *   - `nodeId` is everything before the FIRST `.output.` occurrence.  We
  *     split on `.output.` rather than the first `.` because `NODE_ID_PATTERN`
  *     allows dots in node ids (e.g. `team.draft`).
+ *   - `params.*` reads the immutable run input blob written at runCreated.
  *   - Each path segment must match `[A-Za-z0-9_-]+` or be a non-negative
  *     integer (array index).  `__proto__` / `prototype` / `constructor`
  *     are explicitly rejected to prevent prototype pollution.
@@ -50,14 +52,19 @@ export type ParsedRef = {
 };
 
 const REF_MARKER = '.output.';
+const PARAMS_PREFIX = 'params.';
 const SEGMENT_PATTERN = /^[A-Za-z0-9_-]+$/;
 const FORBIDDEN_SEGMENTS = new Set(['__proto__', 'prototype', 'constructor']);
 
 export function parseRef(ref: string): ParsedRef {
   const idx = ref.indexOf(REF_MARKER);
+  if (idx < 0 && ref.startsWith(PARAMS_PREFIX)) {
+    const rawPath = ref.slice(PARAMS_PREFIX.length);
+    return { nodeId: 'params', pathSegments: parsePathSegments(rawPath, ref) };
+  }
   if (idx < 0) {
     throw new BindingError(
-      `$ref '${ref}' missing '.output.' separator (expected '<nodeId>.output.<path>')`,
+      `$ref '${ref}' missing '.output.' separator (expected '<nodeId>.output.<path>' or 'params.<path>')`,
     );
   }
   const nodeId = ref.slice(0, idx);
@@ -67,6 +74,14 @@ export function parseRef(ref: string): ParsedRef {
   const rawPath = ref.slice(idx + REF_MARKER.length);
   if (!rawPath) {
     throw new BindingError(`$ref '${ref}' has empty path after '.output.'`);
+  }
+  const segments = parsePathSegments(rawPath, ref);
+  return { nodeId, pathSegments: segments };
+}
+
+function parsePathSegments(rawPath: string, ref: string): string[] {
+  if (!rawPath) {
+    throw new BindingError(`$ref '${ref}' has empty path`);
   }
   const segments = rawPath.split('.');
   for (const seg of segments) {
@@ -82,7 +97,7 @@ export function parseRef(ref: string): ParsedRef {
       );
     }
   }
-  return { nodeId, pathSegments: segments };
+  return segments;
 }
 
 function isOutputRefSpec(value: unknown): value is { $ref: string } {
@@ -97,6 +112,7 @@ export type BindingContext = {
   snapshot: Snapshot;
   def: WorkflowDefinition;
   log: EventLog;
+  loadParams?: () => Promise<Record<string, unknown>>;
 };
 
 export async function resolveOutputRef(
@@ -104,6 +120,11 @@ export async function resolveOutputRef(
   ctx: BindingContext,
 ): Promise<unknown> {
   const { nodeId, pathSegments } = parseRef(ref);
+
+  if (nodeId === 'params' && !ref.includes(REF_MARKER)) {
+    const params = await loadRunParams(ref, ctx);
+    return walkPath(params, pathSegments, ref);
+  }
 
   const nodeDef = ctx.def.nodes[nodeId];
   if (!nodeDef) {
@@ -150,6 +171,31 @@ export async function resolveOutputRef(
     : blob;
 
   return walkPath(root, pathSegments, ref);
+}
+
+async function loadRunParams(ref: string, ctx: BindingContext): Promise<Record<string, unknown>> {
+  if (ctx.loadParams) return ctx.loadParams();
+  const inputRef = ctx.snapshot.run.input;
+  if (!inputRef?.outputPath) {
+    throw new BindingError(
+      `$ref '${ref}' requires run input params, but runCreated.inputRef has no outputPath`,
+    );
+  }
+  let params: unknown;
+  try {
+    const raw = await fs.readFile(inputRef.outputPath, 'utf-8');
+    params = JSON.parse(raw);
+  } catch (err) {
+    throw new BindingError(
+      `$ref '${ref}' failed to read run params at ${inputRef.outputPath}: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
+  if (params === null || typeof params !== 'object' || Array.isArray(params)) {
+    throw new BindingError(`$ref '${ref}' resolved run params to non-object input`);
+  }
+  return params as Record<string, unknown>;
 }
 
 function walkPath(value: unknown, segments: string[], ref: string): unknown {

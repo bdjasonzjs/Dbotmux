@@ -282,6 +282,52 @@ describe('dispatchWork — subagent', () => {
     expect(p.error.errorClass).toBe('retryable');
   });
 
+  it('resolves params refs into subagent prompt before spawning', async () => {
+    const def = parseWorkflowDefinition({
+      workflowId: 'wf-param-subagent',
+      version: 1,
+      params: {
+        name: { type: 'string', required: true },
+      },
+      nodes: {
+        greet: {
+          type: 'subagent',
+          bot: 'b1',
+          prompt: { $ref: 'params.name' },
+        },
+      },
+    });
+    const log = new EventLog(RUN_ID, baseDir);
+    await createRun(log, {
+      def,
+      params: { name: 'Alice' },
+      initiator: 'tester',
+      botResolver: noopResolver,
+    });
+    const prompts: string[] = [];
+    const ctx: WorkflowRuntimeContext = {
+      log,
+      def,
+      spawnSubagent: async (input) => {
+        prompts.push(input.prompt);
+        return {
+          kind: 'success',
+          output: { ok: true },
+          session: { sessionId: 's', botName: input.botName, startedAt: 0 },
+        };
+      },
+    };
+
+    await dispatchWork(ctx, {
+      kind: 'dispatchWork',
+      nodeId: 'greet',
+      activityId: workActivityId(RUN_ID, 'greet'),
+      node: def.nodes.greet!,
+    });
+
+    expect(prompts).toEqual(['Alice']);
+  });
+
   it('unknown hostExecutor writes attemptCreated + activityFailed{manual} terminal', async () => {
     const def = parseWorkflowDefinition({
       workflowId: 'wf-host',
@@ -362,6 +408,53 @@ describe('dispatchWork — subagent', () => {
     });
     expect(await loadEffectInputSidecar(log, workActivityId(RUN_ID, 'h'), result.attemptId)).toEqual({
       msg: 'hi',
+    });
+  });
+
+  it('resolves params refs into hostExecutor input before parseInput', async () => {
+    const def = parseWorkflowDefinition({
+      workflowId: 'wf-host-params',
+      version: 1,
+      params: {
+        message: { type: 'string', required: true },
+      },
+      nodes: {
+        h: {
+          type: 'hostExecutor',
+          executor: 'test-host',
+          input: { msg: { $ref: 'params.message' } },
+        },
+      },
+    });
+    const log = new EventLog(RUN_ID, baseDir);
+    await createRun(log, {
+      def,
+      params: { message: 'hello from params' },
+      initiator: 'tester',
+      botResolver: noopResolver,
+    });
+    const ctx: WorkflowRuntimeContext = {
+      log,
+      def,
+      spawnSubagent: successSpawn,
+      hostExecutors: fakeHostRegistry(),
+    };
+
+    const result = await dispatchWork(ctx, {
+      kind: 'dispatchWork',
+      nodeId: 'h',
+      activityId: workActivityId(RUN_ID, 'h'),
+      node: def.nodes.h!,
+    });
+
+    expect(result.kind).toBe('succeeded');
+    const effect = (await log.readAll()).find((e) => e.type === 'effectAttempted')!;
+    expect(effect.payload).toMatchObject({
+      inputHash: expect.stringMatching(/^sha256:/),
+    });
+    if (result.kind !== 'succeeded') return;
+    expect(await loadEffectInputSidecar(log, workActivityId(RUN_ID, 'h'), result.attemptId)).toEqual({
+      msg: 'hello from params',
     });
   });
 

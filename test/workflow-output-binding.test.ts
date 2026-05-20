@@ -144,6 +144,13 @@ describe('parseRef', () => {
       pathSegments: ['0', 'x'],
     });
   });
+
+  it('accepts params refs without .output. separator', () => {
+    expect(parseRef('params.user.email')).toEqual({
+      nodeId: 'params',
+      pathSegments: ['user', 'email'],
+    });
+  });
 });
 
 // ─── resolveOutputRef against a real snapshot ────────────────────────────
@@ -294,6 +301,54 @@ describe('resolveOutputRef — snapshot+blob walk', () => {
     expect(
       await resolveOutputRef('upstream.output.payload', { snapshot: snap, def, log }),
     ).toEqual({ $ref: 'looks.output.like.a.ref' });
+  });
+
+  it('resolves params refs from runCreated inputRef', async () => {
+    const def = parseWorkflowDefinition({
+      workflowId: 'wf-bind',
+      version: 1,
+      nodes: {
+        only: { type: 'subagent', bot: 'claude-loopy', prompt: 'go' },
+      },
+    });
+    const log = new EventLog(RUN_ID, baseDir);
+    await createRun(log, {
+      def,
+      params: {
+        user: { email: 'alice@example.com' },
+        tags: ['alpha', 'beta'],
+      },
+      initiator: 't',
+      botResolver: () => ({}),
+    });
+    const snap = replay(await log.readAll());
+
+    expect(await resolveOutputRef('params.user.email', { snapshot: snap, def, log }))
+      .toBe('alice@example.com');
+    expect(await resolveOutputRef('params.tags.1', { snapshot: snap, def, log }))
+      .toBe('beta');
+  });
+
+  it('fails when params path is missing', async () => {
+    const def = parseWorkflowDefinition({
+      workflowId: 'wf-bind',
+      version: 1,
+      nodes: {
+        only: { type: 'subagent', bot: 'claude-loopy', prompt: 'go' },
+      },
+    });
+    const log = new EventLog(RUN_ID, baseDir);
+    await createRun(log, {
+      def,
+      params: { user: { email: 'alice@example.com' } },
+      initiator: 't',
+      botResolver: () => ({}),
+    });
+    const snap = replay(await log.readAll());
+
+    await expect(
+      resolveOutputRef('params.user.name', { snapshot: snap, def, log }),
+    ).rejects.toThrow(/not found/);
   });
 });
 
