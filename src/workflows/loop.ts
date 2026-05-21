@@ -46,11 +46,13 @@ import {
   completeRunSucceeded,
   dispatchGate,
   dispatchWork,
+  type AbortCancelReason,
   type WorkflowRuntimeContext,
 } from './runtime.js';
 import { logger } from '../utils/logger.js';
 
 const DEFAULT_MAX_CONCURRENCY = 4;
+const CANCEL_OBSERVER_INTERVAL_MS = 200;
 
 type DispatchAction = DispatchGateAction | DispatchWorkAction;
 type SettleAction = Exclude<OrchestratorAction, DispatchAction>;
@@ -169,27 +171,41 @@ export async function runLoop(
 
     let anyUnpatchable = false;
     if (selected.length > 0) {
-      const settled = await Promise.allSettled(
-        selected.map((a) => runDispatch(ctx, a, snapshot)),
-      );
-      // Replay once before patching infrastructure failures so we don't
-      // double-terminal an activity whose dispatch wrote `activityFailed`
-      // and then threw on a follow-up step.
-      const post = replay(await ctx.log.readAll());
-      for (let i = 0; i < settled.length; i++) {
-        const result = settled[i]!;
-        if (result.status === 'fulfilled') continue;
-        const action = selected[i]!;
-        const outcome = await maybePatchInfrastructureFailure(ctx, post, action, result.reason);
-        if (outcome === 'unpatchable') {
-          // Dispatch blew up before writing `attemptCreated`, so there's
-          // no per-attempt failure we can pin the error to.  Re-running
-          // the loop would re-emit the same dispatch and infinite-loop
-          // until maxTicks.  Stop here so the operator can diagnose
-          // (e.g. log-write failure, blob-write OOM).  Sibling dispatches
-          // that DID write events still keep their events.
-          anyUnpatchable = true;
+      // v0.1.4-a: per-dispatch AbortControllers so out-of-band callers
+      // (cancelWorkflowRunOnDaemon → ctx.registerAborters) can fire abort
+      // before the EventLog polling fallback notices `cancelRequested`.
+      const aborters = new Map<string, AbortController>();
+      for (const a of selected) aborters.set(a.activityId, new AbortController());
+      ctx.registerAborters?.(aborters);
+      const stopObserver = startCancelObserver(ctx, aborters);
+      try {
+        const settled = await Promise.allSettled(
+          selected.map((a) =>
+            runDispatch(ctx, a, snapshot, aborters.get(a.activityId)!.signal),
+          ),
+        );
+        // Replay once before patching infrastructure failures so we don't
+        // double-terminal an activity whose dispatch wrote `activityFailed`
+        // and then threw on a follow-up step.
+        const post = replay(await ctx.log.readAll());
+        for (let i = 0; i < settled.length; i++) {
+          const result = settled[i]!;
+          if (result.status === 'fulfilled') continue;
+          const action = selected[i]!;
+          const outcome = await maybePatchInfrastructureFailure(ctx, post, action, result.reason);
+          if (outcome === 'unpatchable') {
+            // Dispatch blew up before writing `attemptCreated`, so there's
+            // no per-attempt failure we can pin the error to.  Re-running
+            // the loop would re-emit the same dispatch and infinite-loop
+            // until maxTicks.  Stop here so the operator can diagnose
+            // (e.g. log-write failure, blob-write OOM).  Sibling dispatches
+            // that DID write events still keep their events.
+            anyUnpatchable = true;
+          }
         }
+      } finally {
+        stopObserver();
+        ctx.registerAborters?.(undefined);
       }
     }
 
@@ -293,12 +309,63 @@ async function runDispatch(
   ctx: WorkflowRuntimeContext,
   action: DispatchAction,
   snapshot: Snapshot,
+  cancelSignal?: AbortSignal,
 ): Promise<void> {
   if (action.kind === 'dispatchGate') {
+    // dispatchGate writes events synchronously — no long-running worker
+    // to cancel, so we ignore the signal.  If a cancel arrives mid-tick
+    // the orchestrator short-circuit on the next tick will stop further
+    // dispatch.
     await dispatchGate(ctx, action);
     return;
   }
-  await dispatchWork(ctx, action, { snapshot });
+  await dispatchWork(ctx, action, { snapshot, cancelSignal });
+}
+
+/**
+ * Polling fallback that fires abort signals when `cancelRequested` for
+ * the run lands in the EventLog after the tick already started.
+ *
+ * Daemon-driven cancel (cancelWorkflowRunOnDaemon) fires synchronously
+ * via `ctx.registerAborters` and doesn't need this observer.  The
+ * observer is just a safety net for callers that write `cancelRequested`
+ * directly to the log without going through the daemon (cold attach,
+ * tests, future async producers).
+ */
+function startCancelObserver(
+  ctx: WorkflowRuntimeContext,
+  aborters: Map<string, AbortController>,
+): () => void {
+  let stopped = false;
+  let firing = false;
+  const tick = async (): Promise<void> => {
+    if (stopped || firing) return;
+    firing = true;
+    try {
+      const snapshot = replay(await ctx.log.readAll());
+      const origin = snapshot.cancelledRunIntent?.cancelOriginEventId;
+      if (!origin) return;
+      const reason: AbortCancelReason = { cancelOriginEventId: origin };
+      for (const ac of aborters.values()) {
+        if (!ac.signal.aborted) ac.abort(reason);
+      }
+    } catch (err) {
+      logger.warn?.(
+        `runLoop(${ctx.log.runId}): cancel observer poll failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    } finally {
+      firing = false;
+    }
+  };
+  const handle = setInterval(() => void tick(), CANCEL_OBSERVER_INTERVAL_MS);
+  // unref so the timer doesn't keep the process alive if the loop hangs.
+  handle.unref?.();
+  return () => {
+    stopped = true;
+    clearInterval(handle);
+  };
 }
 
 async function runSettle(

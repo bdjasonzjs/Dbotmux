@@ -72,7 +72,23 @@ export type WorkerSpawnInput = {
   runId: string;
   /** Conventional per-attempt execution log path, used by daemon-backed workers. */
   attemptLogPath?: string;
+  /**
+   * Cooperative cancel handle (v0.1.4-a).  Daemon-backed workers should
+   * listen and initiate graceful shutdown (SIGINT) then escalate
+   * (SIGKILL) per policy.  Test-stub spawns can just inspect `aborted`
+   * and resolve eagerly to `kind: 'cancelled'`.
+   *
+   * The abort reason is `AbortCancelReason` carrying the originating
+   * `cancelRequested` event id, which the spawn must echo back in
+   * `WorkerSpawnResult.kind === 'cancelled'` so dispatchWork can write
+   * `activityCanceled.payload.cancelOriginEventId` without re-replaying
+   * the log.
+   */
+  cancelSignal?: AbortSignal;
 };
+
+/** Reason payload attached to `AbortController.abort()` for spawn cancel. */
+export type AbortCancelReason = { cancelOriginEventId: string };
 
 export type WorkerSessionInfo = {
   sessionId: string;
@@ -104,6 +120,18 @@ export type WorkerSpawnResult =
       errorClass: ErrorClass;
       errorMessage: string;
       session?: WorkerSessionInfo;
+    }
+  | {
+      /**
+       * Cancel-induced terminal (v0.1.4-a).  Returned when the worker
+       * observed `cancelSignal.aborted` and shut down (cleanly via SIGINT
+       * or escalated via SIGKILL).  `cancelOriginEventId` must echo the
+       * value from `AbortCancelReason` so dispatchWork can populate
+       * `activityCanceled.payload.cancelOriginEventId` directly.
+       */
+      kind: 'cancelled';
+      cancelOriginEventId: string;
+      session?: WorkerSessionInfo;
     };
 
 export type WorkerSpawnFn = (input: WorkerSpawnInput) => Promise<WorkerSpawnResult>;
@@ -131,6 +159,14 @@ export type WorkflowRuntimeContext = {
   loadEffectInput?: (activityId: string, attemptId: string) => Promise<unknown>;
   /** Wall-clock source — injectable for deterministic tests. */
   now?: () => number;
+  /**
+   * v0.1.4-a cancel responsiveness: runLoop publishes its per-tick
+   * activityId→AbortController map here so out-of-band callers (e.g.
+   * `cancelWorkflowRunOnDaemon`) can fire abort signals immediately
+   * without waiting for the EventLog polling fallback to notice the
+   * `cancelRequested` event.  Pass `undefined` on tick exit to clear.
+   */
+  registerAborters?: (aborters: Map<string, AbortController> | undefined) => void;
 };
 
 function nowMs(ctx: WorkflowRuntimeContext): number {
@@ -473,6 +509,13 @@ export type DispatchWorkResult =
       errorCode: string;
       errorMessage: string;
       session?: WorkerSessionInfo;
+    }
+  | {
+      /** Cancel-induced terminal (v0.1.4-a). */
+      kind: 'cancelled';
+      attemptId: string;
+      cancelOriginEventId: string;
+      session?: WorkerSessionInfo;
     };
 
 /**
@@ -491,7 +534,7 @@ export type DispatchWorkResult =
 export async function dispatchWork(
   ctx: WorkflowRuntimeContext,
   action: DispatchWorkAction,
-  options: { attemptNumber?: number; snapshot?: Snapshot } = {},
+  options: { attemptNumber?: number; snapshot?: Snapshot; cancelSignal?: AbortSignal } = {},
 ): Promise<DispatchWorkResult> {
   const attemptNumber = options.attemptNumber ?? 1;
   const attemptId = workAttemptId(action.activityId, attemptNumber);
@@ -669,6 +712,7 @@ export async function dispatchWork(
     nodeId: action.nodeId,
     runId: ctx.log.runId,
     attemptLogPath,
+    cancelSignal: options.cancelSignal,
   });
 
   if (spawnResult.session) {
@@ -689,6 +733,31 @@ export async function dispatchWork(
       },
     });
     return { kind: 'succeeded', attemptId, outputRef, session: spawnResult.session };
+  }
+
+  if (spawnResult.kind === 'cancelled') {
+    // Worker observed `cancelSignal.aborted` and shut down (gracefully via
+    // SIGINT or forcefully via SIGKILL).  Echo `cancelOriginEventId` from
+    // the abort reason straight into `activityCanceled.payload` — we avoid
+    // re-replaying the log here, which would otherwise miss the origin if
+    // cancel landed mid-tick (the dispatch's snapshot is tick-start, before
+    // `cancelRequested` was appended).
+    await ctx.log.append({
+      runId: ctx.log.runId,
+      type: 'activityCanceled',
+      actor: 'worker',
+      payload: {
+        activityId: action.activityId,
+        attemptId,
+        cancelOriginEventId: spawnResult.cancelOriginEventId,
+      },
+    });
+    return {
+      kind: 'cancelled',
+      attemptId,
+      cancelOriginEventId: spawnResult.cancelOriginEventId,
+      session: spawnResult.session,
+    };
   }
 
   await ctx.log.append({

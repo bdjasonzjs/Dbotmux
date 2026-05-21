@@ -147,6 +147,18 @@ export function decideNextActions(
     return [];
   }
 
+  // cancel-intent short-circuit (v0.1.4-a): once `cancelRequested` for the
+  // whole run has been written, we stop emitting fresh dispatches.  Letting
+  // the loop continue would let late `activitySucceeded` from workers that
+  // hadn't yet observed the cancel walk the run past the cancel into a
+  // terminal-success — exactly the race that parallel dispatch widens.
+  // `cancelWorkflowRun` (called from `cancelWorkflowRunOnDaemon` after this
+  // returns []) is responsible for fanning out cancelDelivered →
+  // activityCanceled → nodeCanceled → runCanceled.
+  if (snapshot.cancelledRunIntent) {
+    return [];
+  }
+
   const actions: OrchestratorAction[] = [];
   const runId = snapshot.run.runId;
   const order = topologicalOrder(def);

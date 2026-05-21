@@ -88,6 +88,7 @@ import { loadEffectInputSidecar } from './workflows/effect-input.js';
 import { isValidWorkflowId } from './workflows/catalog.js';
 import { triggerWorkflowRun } from './workflows/trigger-run.js';
 import type { RawParamInput } from './workflows/params.js';
+import type { AbortCancelReason } from './workflows/runtime.js';
 import {
   createDefaultHostExecutorRegistry,
   createDefaultProviderReconcilers,
@@ -106,7 +107,22 @@ import { isValidRunId, readRunSnapshot } from './workflows/ops-projection.js';
 
 const activeSessions = new Map<string, DaemonSession>();
 const workflowEventWatchers = new Map<string, WorkflowEventWatcher>();
-const workflowRuns = new Map<string, { ctx: WorkflowRuntimeContext; running?: Promise<RunLoopResult> }>();
+/**
+ * Per-run state for active workflow loops.
+ *
+ * `aborters` is published by runLoop each tick so that
+ * `cancelWorkflowRunOnDaemon` can fire AbortControllers immediately when
+ * a cancel request arrives (v0.1.4-a).  `cancelling` deduplicates
+ * concurrent cancel calls — if a second cancel comes in while we're
+ * still finalizing the first, it awaits the in-flight finalize instead
+ * of re-firing.
+ */
+const workflowRuns = new Map<string, {
+  ctx: WorkflowRuntimeContext;
+  running?: Promise<RunLoopResult>;
+  aborters?: Map<string, AbortController>;
+  cancelling?: Promise<unknown>;
+}>();
 // Cache last /repo scan results per chat for /repo <number> fallback
 const lastRepoScan = new Map<string, import('./services/project-scanner.js').ProjectInfo[]>();
 const cliVersionCache = new Map<string, { version: string; lastCheckAt: number }>();
@@ -368,6 +384,16 @@ function tag(ds: DaemonSession): string {
 
 export function attachWorkflowEventWatcher(runId: string, ctx?: WorkflowRuntimeContext): WorkflowEventWatcher {
   if (ctx) {
+    // v0.1.4-a: wire registerAborters so runLoop's per-tick AbortController
+    // map is reachable from `cancelWorkflowRunOnDaemon` without having to
+    // poll the EventLog.  Wrap idempotently — if the caller already set
+    // one, prefer ours so the workflowRuns entry stays the source of truth.
+    ctx.registerAborters = (aborters) => {
+      const entry = workflowRuns.get(runId);
+      if (!entry) return;
+      if (aborters) entry.aborters = aborters;
+      else delete entry.aborters;
+    };
     const existingRun = workflowRuns.get(runId);
     workflowRuns.set(runId, { ...existingRun, ctx });
   }
@@ -467,6 +493,23 @@ async function cancelWorkflowRunOnDaemon(
         lastSeq: snapshot.lastSeq,
       };
     }
+    // Dedup concurrent cancel calls — second caller awaits the in-flight
+    // finalize instead of re-firing abort/cancelRequested.
+    if (entry.cancelling) {
+      await entry.cancelling.catch(() => {});
+      const finalSnap = replay(await entry.ctx.log.readAll());
+      return {
+        ok: true,
+        runId,
+        status: finalSnap.run.status,
+        alreadyTerminal: isTerminalRunStatus(finalSnap.run.status),
+        cancelEventId: finalSnap.cancelledRunIntent?.cancelOriginEventId,
+        loopReason: 'already-cancelling',
+        pending: !isTerminalRunStatus(finalSnap.run.status),
+        lastSeq: finalSnap.lastSeq,
+      };
+    }
+    // 1) Write cancelRequested if not already present.
     let cancelEventId = snapshot.cancelledRunIntent?.cancelOriginEventId;
     if (!cancelEventId) {
       const cancel = await requestCancel(
@@ -480,6 +523,50 @@ async function cancelWorkflowRunOnDaemon(
       );
       cancelEventId = cancel.eventId;
     }
+    // 2) Fire all in-flight dispatch aborters so workers can shut down
+    //    promptly instead of waiting for the EventLog polling fallback
+    //    (~200ms latency) to notice the new cancelRequested.
+    if (entry.aborters && entry.aborters.size > 0) {
+      const reason: AbortCancelReason = { cancelOriginEventId: cancelEventId };
+      for (const ac of entry.aborters.values()) {
+        if (!ac.signal.aborted) ac.abort(reason);
+      }
+    }
+    // 3) Await the running loop draining, then 4) drive finalize so
+    //    cancel-fanout + nodeCanceled + runCanceled actually get written.
+    //    Without this, the orchestrator's `cancelledRunIntent` short-
+    //    circuit would leave the loop returning no-progress and the
+    //    run would stay non-terminal forever.
+    const finalize = (async () => {
+      try {
+        await entry.running?.catch(() => {});
+      } finally {
+        const current = workflowRuns.get(runId);
+        if (current) {
+          const result = await cancelWorkflowRun({
+            ctx: current.ctx,
+            reason,
+            by: opts.by ?? 'dashboard',
+            actor: 'human',
+            maxTicks: 200,
+          });
+          if (isTerminalRunStatus(result.snapshot.run.status)) {
+            cleanupWorkflowRun(runId);
+          }
+        }
+      }
+    })();
+    entry.cancelling = finalize;
+    finalize.catch((err) => {
+      logger.warn(
+        `[workflow:${runId}] cancel finalize failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }).finally(() => {
+      const e = workflowRuns.get(runId);
+      if (e && e.cancelling === finalize) delete e.cancelling;
+    });
     const after = replay(await entry.ctx.log.readAll());
     return {
       ok: true,
