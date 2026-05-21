@@ -460,9 +460,15 @@ async function driveWorkflowRun(runId: string): Promise<RunLoopResult> {
   if (entry.running) return entry.running;
 
   entry.running = runLoop(entry.ctx)
-    .then((result) => {
+    .then(async (result) => {
       logger.info(`[workflow:${runId}] loop stopped: ${result.reason} (ticks=${result.ticks})`);
-      if (result.reason === 'terminal') cleanupWorkflowRun(runId);
+      if (result.reason === 'terminal') {
+        // Codex round 1 blocker: patch the final card BEFORE cleanup deletes
+        // the cardMessageId, otherwise the watcher's drain may run too late
+        // and the user is stuck looking at a "running" tile forever.
+        await updateWorkflowProgressCard(runId);
+        cleanupWorkflowRun(runId);
+      }
       return result;
     })
     .catch((err) => {
@@ -600,6 +606,7 @@ async function cancelWorkflowRunOnDaemon(
     maxTicks: 200,
   });
   if (isTerminalRunStatus(result.snapshot.run.status)) {
+    await updateWorkflowProgressCard(runId);
     cleanupWorkflowRun(runId);
   }
   return {
@@ -685,6 +692,7 @@ async function startRunningCancel(
             maxTicks: 200,
           });
           if (isTerminalRunStatus(result.snapshot.run.status)) {
+            await updateWorkflowProgressCard(runId);
             cleanupWorkflowRun(runId);
           }
         } catch (err) {
@@ -980,6 +988,11 @@ async function handleWorkflowCommandIfAny(
   larkAppId: string,
   initiator: string | undefined,
 ): Promise<boolean> {
+  // Captured by the `onRunCreated` closure so the trailing text reply can be
+  // suppressed when the run-level progress card already landed.  Codex
+  // round 1 medium: "single self-updating tile" promise breaks if we also
+  // dump a `Workflow loop stopped: …` line at the end.
+  let startingCardSent = false;
   const result = await executeWorkflowCommand(
     {
       content,
@@ -1010,6 +1023,7 @@ async function handleWorkflowCommandIfAny(
               chatId,
             });
           }
+          startingCardSent = true;
         } catch (err) {
           logger.warn(
             `[workflow:${info.runId}] failed to send progress card (falling back to text): ${
@@ -1043,6 +1057,14 @@ async function handleWorkflowCommandIfAny(
       'text',
       larkAppId,
     );
+    return true;
+  }
+
+  // Skip the trailing text echo only for `run` commands whose progress card
+  // landed — the card already shows status/runId/web link, and the card
+  // patch path covers final state.  `cancel` keeps the text since cancel
+  // doesn't drive `onRunCreated` and may target a card-less run.
+  if (result.command === 'run' && startingCardSent) {
     return true;
   }
 

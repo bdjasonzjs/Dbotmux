@@ -1,11 +1,15 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { tmpdir } from 'node:os';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
 
 import {
   buildWorkflowProgressCard,
   buildWorkflowStartingCard,
   type WorkflowProgressCardTerminalLink,
 } from '../src/im/lark/workflow-progress-card.js';
-import type { Snapshot } from '../src/workflows/events/replay.js';
+import { EventLog, type EventDraft } from '../src/workflows/events/append.js';
+import { replay, type Snapshot } from '../src/workflows/events/replay.js';
 
 function emptySnapshot(over: Partial<Snapshot['run']> = {}): Snapshot {
   return {
@@ -185,6 +189,79 @@ describe('workflow-progress-card', () => {
     expect(json).toContain('only');
     expect(json).not.toContain('查看当前终端');
     expect(json).not.toContain('查看执行日志');
+  });
+
+  // ─── Integration: EventLog → replay → card (codex round 1 blocker) ───
+  //
+  // Even when the fanout watcher's drain hasn't fired yet (e.g. cleanup
+  // raced the final terminal event), the daemon's
+  // `updateWorkflowProgressCard(runId)` path replays the EventLog from
+  // disk and rebuilds the card.  These two tests prove that pipeline
+  // resolves to the expected succeeded/cancelled card body — so the
+  // pre-cleanup `await updateWorkflowProgressCard(runId)` we added to
+  // `driveWorkflowRun` / `cancelWorkflowRunOnDaemon` / `startRunningCancel`
+  // patches the right state even if the watcher never gets to fire.
+  describe('terminal patch path: replay-from-disk renders terminal card', () => {
+    const RUN_ID = 'run-progress-terminal-test';
+    let baseDir: string;
+    let log: EventLog;
+
+    beforeEach(() => {
+      baseDir = mkdtempSync(join(tmpdir(), 'wf-progress-card-'));
+      log = new EventLog(RUN_ID, baseDir);
+    });
+    afterEach(() => {
+      rmSync(baseDir, { recursive: true, force: true });
+    });
+
+    const runCreated: EventDraft = {
+      runId: RUN_ID,
+      type: 'runCreated',
+      actor: 'scheduler',
+      payload: {
+        workflowId: 'wf-progress',
+        revisionId: 'rev-001',
+        inputRef: { outputHash: 'sha256:' + 'c'.repeat(64), outputBytes: 64, outputSchemaVersion: 1 },
+        initiator: 'tester',
+      },
+    };
+
+    it('runSucceeded log → buildWorkflowProgressCard yields green ✅ card', async () => {
+      await log.append(runCreated);
+      await log.append({ runId: RUN_ID, type: 'runStarted', actor: 'scheduler', payload: {} });
+      await log.append({
+        runId: RUN_ID,
+        type: 'runSucceeded',
+        actor: 'scheduler',
+        payload: { outputRef: { outputHash: 'sha256:' + 'd'.repeat(64), outputBytes: 32, outputSchemaVersion: 1 } },
+      });
+      const snapshot = replay(await log.readAll());
+      expect(snapshot.run.status).toBe('succeeded');
+
+      const json = buildWorkflowProgressCard(snapshot);
+      const parsed = JSON.parse(json);
+      expect(parsed.header.template).toBe('green');
+      expect(parsed.header.title.content).toContain('✅');
+      expect(json).toContain('wf-progress');
+    });
+
+    it('runCanceled log → buildWorkflowProgressCard yields grey 🛑 card', async () => {
+      await log.append(runCreated);
+      await log.append({
+        runId: RUN_ID,
+        type: 'runCanceled',
+        actor: 'scheduler',
+        payload: { cancelOriginEventId: `${RUN_ID}-cancel-1` },
+      });
+      const snapshot = replay(await log.readAll());
+      expect(snapshot.run.status).toBe('cancelled');
+
+      const json = buildWorkflowProgressCard(snapshot);
+      const parsed = JSON.parse(json);
+      expect(parsed.header.template).toBe('grey');
+      expect(parsed.header.title.content).toContain('🛑');
+      expect(json).toContain('🛑 已取消');
+    });
   });
 
   it('inline rows cap at maxInlineRows with "+N more" trailer', () => {
