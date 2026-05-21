@@ -149,6 +149,15 @@ const workflowRunCards = new Map<string, {
   cardMessageId: string;
   larkAppId: string;
   chatId: string;
+  /**
+   * Per-runId update-promise chain.  fanout events arrive faster than
+   * `updateMessage` finishes, so multiple `updateWorkflowProgressCard`
+   * calls race — the older snapshot's PATCH can land AFTER the newer
+   * one's, overwriting `red` (failed) with `blue` (still-running).
+   * Chain so each update awaits the previous one's PATCH before
+   * reading the log + sending its own.
+   */
+  updateChain: Promise<void>;
 }>();
 // Cache last /repo scan results per chat for /repo <number> fallback
 const lastRepoScan = new Map<string, import('./services/project-scanner.js').ProjectInfo[]>();
@@ -509,22 +518,45 @@ function cleanupWorkflowRun(runId: string): void {
 async function updateWorkflowProgressCard(runId: string): Promise<void> {
   const card = workflowRunCards.get(runId);
   if (!card) return;
-  try {
-    const log = new WorkflowEventLog(runId, getRunsDir());
-    const snapshot = replayWorkflow(await log.readAll());
-    const cardJson = buildWorkflowProgressCard(snapshot, {
-      // v0.1.5 slice 3: hand the per-row "查看当前终端" link to the
-      // dashboard deeplink contract codex set up in slice 2 (3335adc).
-      enrichWithTerminalLink: buildAttemptDeeplinkEnricher(runId, snapshot),
-    });
-    await updateMessage(card.larkAppId, card.cardMessageId, cardJson);
-  } catch (err) {
-    logger.warn(
-      `[workflow:${runId}] progress card update failed (continuing): ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    );
-  }
+  // Chain on the previous update so two fanout-triggered updates can't
+  // race and PATCH out of order (which manifests as the card briefly
+  // flipping back to an older state, e.g. red → blue after a failed
+  // run).  Each call awaits the predecessor's PATCH to land first.
+  const next = card.updateChain.then(async () => {
+    // Re-fetch the card entry — it may have been GC'd between when
+    // we were enqueued and when our turn came (e.g. terminal cleanup
+    // ran while we were waiting).
+    const current = workflowRunCards.get(runId);
+    if (!current) return;
+    try {
+      const log = new WorkflowEventLog(runId, getRunsDir());
+      const snapshot = replayWorkflow(await log.readAll());
+      // Pull node count from the live workflow definition if we still
+      // hold a runtime context for this run — `snapshot.nodes` only
+      // contains TRIGGERED nodes so its size grows as the run
+      // progresses and gives a misleading "X / Y" fraction otherwise.
+      // (e.g. 1/2 when first node fires → 2/3 at end on a 3-node wf).
+      const runtimeEntry = workflowRuns.get(runId);
+      const totalNodes = runtimeEntry?.ctx.def?.nodes
+        ? Object.keys(runtimeEntry.ctx.def.nodes).length
+        : undefined;
+      const cardJson = buildWorkflowProgressCard(snapshot, {
+        // v0.1.5 slice 3: hand the per-row "查看当前终端" link to the
+        // dashboard deeplink contract codex set up in slice 2 (3335adc).
+        enrichWithTerminalLink: buildAttemptDeeplinkEnricher(runId, snapshot),
+        totalNodes,
+      });
+      await updateMessage(current.larkAppId, current.cardMessageId, cardJson);
+    } catch (err) {
+      logger.warn(
+        `[workflow:${runId}] progress card update failed (continuing): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  });
+  card.updateChain = next;
+  await next;
 }
 
 async function cancelWorkflowRunOnDaemon(
@@ -1026,6 +1058,7 @@ async function handleWorkflowCommandIfAny(
               cardMessageId,
               larkAppId,
               chatId,
+              updateChain: Promise.resolve(),
             });
           }
           startingCardSent = true;

@@ -41,6 +41,14 @@ export type WorkflowProgressCardOptions = {
   webDetailUrl?: string;
   /** Max running/waiting nodes to inline.  Excess collapses to "+N more". */
   maxInlineRows?: number;
+  /**
+   * Total number of nodes in the workflow definition.  Used as the
+   * denominator in the "X / Y 节点完成" progress line.  Falls back to
+   * `snapshot.nodes.size` when omitted — that only counts TRIGGERED
+   * nodes so the fraction grows misleadingly (1/2 → 2/3 …) on
+   * longer workflows.
+   */
+  totalNodes?: number;
 };
 
 const DEFAULT_MAX_INLINE_ROWS = 6;
@@ -92,8 +100,21 @@ export function buildWorkflowProgressCard(
   const title = `${headerEmoji(status)} Workflow · ${snapshot.run.workflowId ?? 'unknown'}`;
 
   const counts = summarizeNodes(snapshot);
-  const runningRows = collectRunningRows(snapshot);
-  const waitingRows = collectWaitingRows(snapshot);
+  // Use the workflow-definition total when supplied; falls back to
+  // observed-triggered count (the old behaviour) only when the caller
+  // doesn't know.  Either way clamp to `max(observed, total)` so a
+  // stale def can't claim fewer nodes than we've actually seen events
+  // for.
+  const denominator = opts.totalNodes != null
+    ? Math.max(opts.totalNodes, counts.total)
+    : counts.total;
+  const isTerminal = status === 'succeeded' || status === 'failed' || status === 'cancelled';
+  // Run-terminal state hides the 🏃 进行中 list — otherwise a parallel
+  // branch whose `activityCanceled` hasn't been written yet would
+  // appear "still running" on a card that's already red/grey, which
+  // contradicts the header status.
+  const runningRows = isTerminal ? [] : collectRunningRows(snapshot);
+  const waitingRows = isTerminal ? [] : collectWaitingRows(snapshot);
   const failureSummary = summarizeFailure(snapshot);
 
   const elements: Array<Record<string, unknown>> = [
@@ -102,7 +123,7 @@ export function buildWorkflowProgressCard(
       fields: [
         { is_short: true, text: { tag: 'lark_md', content: `**runId**\n${escapeMd(short(snapshot.run.runId, 28))}` } },
         { is_short: true, text: { tag: 'lark_md', content: `**状态**\n${statusBadge(status)}` } },
-        { is_short: true, text: { tag: 'lark_md', content: `**进度**\n${counts.succeeded} / ${counts.total} 节点完成` } },
+        { is_short: true, text: { tag: 'lark_md', content: `**进度**\n${counts.succeeded} / ${denominator} 节点完成` } },
         { is_short: true, text: { tag: 'lark_md', content: `**failed**\n${counts.failed}  ·  **cancelled**\n${counts.cancelled}` } },
       ],
     },

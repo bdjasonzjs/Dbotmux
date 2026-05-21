@@ -481,13 +481,15 @@ function renderWorkflowDetailPage(
   const approvalComments = new Map<string, string>();
   const approvalStatuses = new Map<string, { kind: 'ok' | 'error'; text: string }>();
   const resolvingWaits = new Set<string>();
-  // Cache live iframe elements across snapshot polls so the 2s
-  // re-render of `renderNodeIO` (which `innerHTML=`'s the whole card
-  // list) doesn't tear down + reload the terminal iframe — the reload
-  // reconnects the WebSocket and the user sees a full-screen flicker.
-  // Key by URL: same worker port → same iframe instance; worker
-  // restart (port flips) gets a fresh iframe naturally.
-  const terminalIframes = new Map<string, HTMLIFrameElement>();
+  // Per-card surgical update state.  innerHTML-wiping the whole IO
+  // list every 2s polls causes terminal iframes inside to be torn off
+  // the document — the browser then discards the iframe's browsing
+  // context, and the next render reloads its src, which the user sees
+  // as flicker.  Instead we keep each <article> stable across polls
+  // and only innerHTML-wipe the head/grid sub-containers; the
+  // terminal slot (with its iframe) is never detached.  Keyed by
+  // activityId or nodeId so retries don't recreate the card.
+  const cardElements = new Map<string, CardEntry>();
   let timelineScrollTop = 0;
   let focusAttemptId = opts.focusAttemptId;
 
@@ -702,7 +704,7 @@ function renderWorkflowDetailPage(
       statuses: approvalStatuses,
       resolving: resolvingWaits,
       onResolve: resolveHumanGate,
-    }, focusAttemptId, terminalIframes);
+    }, focusAttemptId, cardElements);
     if (focusConsumed) focusAttemptId = undefined;
     renderEvents(eventTbody, events);
     timelineScroll.scrollTop = timelineScrollTop;
@@ -1022,6 +1024,14 @@ function renderNodeActivityRow(node?: NodeState, activity?: ActivityState): stri
   </tr>`;
 }
 
+type CardEntry = {
+  article: HTMLElement;
+  head: HTMLElement;
+  terminalSlot: HTMLElement;
+  grid: HTMLElement;
+  currentTerminalUrl: string | null;
+};
+
 function renderNodeIO(
   el: HTMLElement,
   snap: RunSnapshot,
@@ -1029,7 +1039,7 @@ function renderNodeIO(
   scrollTops: Map<string, number>,
   approval: ApprovalRenderState,
   focusAttemptId?: string,
-  terminalIframes?: Map<string, HTMLIFrameElement>,
+  cardElements?: Map<string, CardEntry>,
 ): boolean {
   syncIOBlockState(el, openBlocks, scrollTops);
   syncApprovalComments(el, approval.comments);
@@ -1037,83 +1047,55 @@ function renderNodeIO(
   if (focusHasTerminal && focusAttemptId) {
     openBlocks.add(ioBlockKey(focusAttemptId, t('workflow.detail.liveTerminal')));
   }
-  // Pull every live terminal iframe currently mounted into the cache
-  // BEFORE we blow away the DOM with innerHTML.  After the rebuild we
-  // re-mount the same iframe instance into the new placeholder div so
-  // the iframe's document + WebSocket are never reloaded — without
-  // this, the 2s snapshot poll causes the terminal to flicker as the
-  // WebSocket reconnects.
-  if (terminalIframes) {
-    for (const iframe of el.querySelectorAll<HTMLIFrameElement>('iframe.wf-terminal-frame')) {
-      const url = iframe.dataset.wfTerminalUrl;
-      if (url) terminalIframes.set(url, iframe);
-    }
-  }
-  const byId = new Map(snap.activities.map((a) => [a.activityId, a]));
-  const used = new Set<string>();
-  const cards: string[] = [];
-
-  for (const node of snap.nodes) {
-    const activity =
-      (node.activityId ? byId.get(node.activityId) : undefined) ??
-      snap.activities.find((a) => a.ownerNodeId === node.nodeId);
-    if (!activity) {
-      cards.push(renderIOCard(node, undefined, undefined, openBlocks, approval, focusAttemptId));
-      continue;
-    }
-    used.add(activity.activityId);
-    cards.push(renderIOCard(
-      node,
-      activity,
-      snap.attemptIO?.[latestAttempt(activity)?.attemptId ?? ''],
-      openBlocks,
-      approval,
-      focusAttemptId,
-    ));
-  }
-
-  for (const activity of snap.activities) {
-    if (used.has(activity.activityId)) continue;
-    cards.push(renderIOCard(
-      undefined,
-      activity,
-      snap.attemptIO?.[latestAttempt(activity)?.attemptId ?? ''],
-      openBlocks,
-      approval,
-      focusAttemptId,
-    ));
-  }
-
-  el.innerHTML = cards.length > 0
-    ? cards.join('')
-    : `<div class="empty">${escapeHtml(t('workflow.detail.noNodeIO'))}</div>`;
-  // Restore preserved iframes into the just-rendered placeholders.
-  // A placeholder is `<div class="wf-terminal-host" data-wf-terminal-host="<url>">` —
-  // see renderTerminal.  For URLs we don't have cached yet (first
-  // render of a freshly-spawned worker), create a new iframe.  GC the
-  // cache after we've seen every placeholder so iframes for ended
-  // attempts release their WebSockets.
-  if (terminalIframes) {
-    const seenUrls = new Set<string>();
-    for (const host of el.querySelectorAll<HTMLDivElement>('.wf-terminal-host[data-wf-terminal-host]')) {
-      const url = host.dataset.wfTerminalHost;
-      if (!url) continue;
-      seenUrls.add(url);
-      let iframe = terminalIframes.get(url);
-      if (!iframe) {
-        iframe = document.createElement('iframe');
-        iframe.className = 'wf-terminal-frame';
-        iframe.src = url;
-        iframe.title = t('workflow.detail.liveTerminal');
-        iframe.loading = 'lazy';
-        iframe.dataset.wfTerminalUrl = url;
-        terminalIframes.set(url, iframe);
+  // Per-card surgical update — we never `innerHTML=`-wipe the parent
+  // `el` because doing so detaches every terminal iframe from the
+  // document, which in all major browsers discards the iframe's
+  // browsing context (the WebSocket included) and the next paint
+  // reloads the iframe → terminal flickers.  Instead we keep each
+  // <article> stable across polls and only innerHTML-wipe the
+  // per-card head/grid sub-containers; the terminal-slot div (whose
+  // iframe holds the live WebSocket) is never detached.
+  const descriptors = buildCardDescriptors(snap);
+  const seenKeys = new Set<string>();
+  if (cardElements) {
+    for (const desc of descriptors) {
+      seenKeys.add(desc.key);
+      let entry = cardElements.get(desc.key);
+      if (!entry) {
+        entry = createCardEntry(desc.key);
+        cardElements.set(desc.key, entry);
+        el.appendChild(entry.article);
       }
-      host.replaceWith(iframe);
+      updateCardEntry(entry, desc, openBlocks, approval, focusAttemptId);
     }
-    for (const url of Array.from(terminalIframes.keys())) {
-      if (!seenUrls.has(url)) terminalIframes.delete(url);
+    for (const [key, entry] of Array.from(cardElements)) {
+      if (seenKeys.has(key)) continue;
+      entry.article.remove();
+      cardElements.delete(key);
     }
+    if (descriptors.length === 0) {
+      // Empty-state placeholder.  Use a sentinel child rather than
+      // wiping innerHTML so any (hypothetically lingering) terminal
+      // iframe wouldn't be detached.  Cards are already cleared via
+      // the loop above, so it's safe to add the placeholder here.
+      if (!el.querySelector('.wf-io-empty-placeholder')) {
+        const empty = document.createElement('div');
+        empty.className = 'empty wf-io-empty-placeholder';
+        empty.textContent = t('workflow.detail.noNodeIO');
+        el.appendChild(empty);
+      }
+    } else {
+      el.querySelector('.wf-io-empty-placeholder')?.remove();
+    }
+  } else {
+    // No cache provided (unit tests etc.): fall back to bulk innerHTML.
+    const cards: string[] = [];
+    for (const desc of descriptors) {
+      cards.push(renderIOCardHtml(desc, openBlocks, approval, focusAttemptId));
+    }
+    el.innerHTML = cards.length > 0
+      ? cards.join('')
+      : `<div class="empty">${escapeHtml(t('workflow.detail.noNodeIO'))}</div>`;
   }
   restoreIOBlockScroll(el, scrollTops);
   const focusVisible = scrollFocusedAttemptIntoView(el, focusAttemptId);
@@ -1127,6 +1109,204 @@ function renderNodeIO(
   return focusVisible && focusHasTerminal;
 }
 
+type CardDescriptor = {
+  key: string;
+  node?: NodeState;
+  activity?: ActivityState;
+  io?: AttemptIO;
+};
+
+function buildCardDescriptors(snap: RunSnapshot): CardDescriptor[] {
+  const byId = new Map(snap.activities.map((a) => [a.activityId, a]));
+  const used = new Set<string>();
+  const out: CardDescriptor[] = [];
+  for (const node of snap.nodes) {
+    const activity =
+      (node.activityId ? byId.get(node.activityId) : undefined) ??
+      snap.activities.find((a) => a.ownerNodeId === node.nodeId);
+    if (!activity) {
+      out.push({ key: `node:${node.nodeId}`, node });
+      continue;
+    }
+    used.add(activity.activityId);
+    out.push({
+      key: `activity:${activity.activityId}`,
+      node,
+      activity,
+      io: snap.attemptIO?.[latestAttempt(activity)?.attemptId ?? ''],
+    });
+  }
+  for (const activity of snap.activities) {
+    if (used.has(activity.activityId)) continue;
+    out.push({
+      key: `activity:${activity.activityId}`,
+      activity,
+      io: snap.attemptIO?.[latestAttempt(activity)?.attemptId ?? ''],
+    });
+  }
+  return out;
+}
+
+function createCardEntry(key: string): CardEntry {
+  const article = document.createElement('article');
+  article.className = 'wf-io-card';
+  article.dataset.wfCardKey = key;
+  const head = document.createElement('div');
+  head.className = 'wf-io-card-head';
+  const terminalSlot = document.createElement('div');
+  terminalSlot.className = 'wf-io-terminal-slot';
+  const grid = document.createElement('div');
+  grid.className = 'wf-io-grid';
+  article.appendChild(head);
+  article.appendChild(terminalSlot);
+  article.appendChild(grid);
+  return { article, head, terminalSlot, grid, currentTerminalUrl: null };
+}
+
+function updateCardEntry(
+  entry: CardEntry,
+  desc: CardDescriptor,
+  openBlocks: Set<string>,
+  approval: ApprovalRenderState,
+  focusAttemptId: string | undefined,
+): void {
+  const attempt = latestAttempt(desc.activity);
+  const title = desc.node?.nodeId ?? desc.activity?.ownerNodeId ?? desc.activity?.activityId ?? 'unknown';
+  const focusMatch = !!(attempt && attempt.attemptId === focusAttemptId);
+  entry.article.classList.toggle('is-focused', focusMatch);
+  if (attempt) {
+    entry.article.dataset.wfAttemptCard = attempt.attemptId;
+  } else {
+    delete entry.article.dataset.wfAttemptCard;
+  }
+  // Head: header (title + status badges) + meta (attemptId) + approval controls.
+  // These all re-render every poll; no live state survives in them.
+  const controls = renderApprovalControls(attempt, approval);
+  entry.head.innerHTML = `
+    <header>
+      <div>
+        <strong><code>${escapeHtml(title)}</code></strong>
+        <span class="muted">${desc.activity ? escapeHtml(desc.activity.activityId) : escapeHtml(t('workflow.detail.notDispatched'))}</span>
+      </div>
+      <div>${desc.node ? statusBadge(desc.node.status) : ''} ${desc.activity ? statusBadge(desc.activity.status) : ''}</div>
+    </header>
+    <div class="wf-io-meta">
+      ${attempt ? `${escapeHtml(t('workflow.detail.attempt'))} <code>${escapeHtml(attempt.attemptId)}</code>` : escapeHtml(t('workflow.detail.noAttempt'))}
+    </div>
+    ${controls}
+  `;
+  // Terminal slot: only re-render when the URL changes (worker
+  // restart / attempt-id flip).  The iframe DOM node stays live
+  // through every same-URL poll so its WebSocket isn't torn down.
+  const desiredUrl = computeTerminalUrl(attempt, desc.io?.terminal);
+  if (desiredUrl !== entry.currentTerminalUrl) {
+    if (desiredUrl === null) {
+      entry.terminalSlot.innerHTML = '';
+    } else {
+      entry.terminalSlot.innerHTML = renderTerminalBlockHtml(
+        desc.key,
+        attempt,
+        desc.io?.terminal,
+        desiredUrl,
+        openBlocks,
+      );
+    }
+    entry.currentTerminalUrl = desiredUrl;
+  } else if (desiredUrl !== null && desc.io?.terminal) {
+    // Same URL — refresh only the summary meta (status badge text)
+    // inline to avoid touching the iframe.
+    const summary = entry.terminalSlot.querySelector<HTMLElement>('details.wf-terminal-block > summary');
+    if (summary) {
+      summary.innerHTML = `${escapeHtml(t('workflow.detail.liveTerminal'))} ${terminalMeta(attempt, desc.io.terminal)}`;
+    }
+  }
+  // Grid: previews other than terminal.  Wipe + rebuild — no live
+  // resources here so flicker doesn't matter.
+  const keyPrefix = attempt?.attemptId ?? desc.activity?.activityId ?? desc.node?.nodeId ?? 'unknown';
+  entry.grid.innerHTML = `
+    ${renderPreviewBlock(keyPrefix, t('workflow.detail.authoredInput'), desc.io?.input, openBlocks)}
+    ${renderPreviewBlock(keyPrefix, t('workflow.detail.resolvedInput'), desc.io?.resolvedInput, openBlocks)}
+    ${renderPreviewBlock(keyPrefix, t('workflow.detail.output'), desc.io?.output, openBlocks)}
+    ${renderPreviewBlock(keyPrefix, t('workflow.detail.executionLog'), desc.io?.log, openBlocks)}
+    ${desc.io?.waitPrompt ? renderPreviewBlock(keyPrefix, t('workflow.detail.waitPrompt'), desc.io.waitPrompt, openBlocks) : ''}
+  `;
+}
+
+function computeTerminalUrl(
+  attempt: AttemptState | undefined,
+  terminal: AttemptTerminal | undefined,
+): string | null {
+  if (!terminal) return null;
+  if (terminal.error) return null;
+  if (!isLiveTerminal(attempt, terminal)) return null;
+  return terminalReadOnlyUrl(terminal);
+}
+
+function renderTerminalBlockHtml(
+  keyPrefix: string,
+  attempt: AttemptState | undefined,
+  terminal: AttemptTerminal | undefined,
+  url: string,
+  openBlocks: Set<string>,
+): string {
+  if (!terminal) return '';
+  const label = t('workflow.detail.liveTerminal');
+  const key = ioBlockKey(keyPrefix, label);
+  const meta = terminalMeta(attempt, terminal);
+  return `<details class="wf-io-block wf-terminal-block" data-io-key="${escapeHtml(key)}"${openBlocks.has(key) ? ' open' : ''}>
+    <summary>${escapeHtml(label)} ${meta}</summary>
+    <div class="wf-terminal-actions">
+      <a class="btn-link" href="${escapeHtml(url)}" target="_blank" rel="noreferrer">${escapeHtml(t('workflow.detail.openTerminalNewTab'))}</a>
+    </div>
+    <iframe class="wf-terminal-frame" src="${escapeHtml(url)}" title="${escapeHtml(label)}" loading="lazy"></iframe>
+  </details>`;
+}
+
+/**
+ * Legacy bulk renderer kept for the no-cache fallback path (tests).
+ * The live dashboard always goes through the surgical update path.
+ */
+function renderIOCardHtml(
+  desc: CardDescriptor,
+  openBlocks: Set<string>,
+  approval: ApprovalRenderState,
+  focusAttemptId: string | undefined,
+): string {
+  const attempt = latestAttempt(desc.activity);
+  const title = desc.node?.nodeId ?? desc.activity?.ownerNodeId ?? desc.activity?.activityId ?? 'unknown';
+  const keyPrefix = attempt?.attemptId ?? desc.activity?.activityId ?? desc.node?.nodeId ?? 'unknown';
+  const controls = renderApprovalControls(attempt, approval);
+  const focusClass = attempt?.attemptId === focusAttemptId ? ' is-focused' : '';
+  const attemptAttr = attempt ? ` data-wf-attempt-card="${escapeHtml(attempt.attemptId)}"` : '';
+  const terminalUrl = computeTerminalUrl(attempt, desc.io?.terminal);
+  const terminalHtml = terminalUrl
+    ? renderTerminalBlockHtml(keyPrefix, attempt, desc.io?.terminal, terminalUrl, openBlocks)
+    : '';
+  return `<article class="wf-io-card${focusClass}" data-wf-card-key="${escapeHtml(desc.key)}"${attemptAttr}>
+    <div class="wf-io-card-head">
+      <header>
+        <div>
+          <strong><code>${escapeHtml(title)}</code></strong>
+          <span class="muted">${desc.activity ? escapeHtml(desc.activity.activityId) : escapeHtml(t('workflow.detail.notDispatched'))}</span>
+        </div>
+        <div>${desc.node ? statusBadge(desc.node.status) : ''} ${desc.activity ? statusBadge(desc.activity.status) : ''}</div>
+      </header>
+      <div class="wf-io-meta">
+        ${attempt ? `${escapeHtml(t('workflow.detail.attempt'))} <code>${escapeHtml(attempt.attemptId)}</code>` : escapeHtml(t('workflow.detail.noAttempt'))}
+      </div>
+      ${controls}
+    </div>
+    <div class="wf-io-terminal-slot">${terminalHtml}</div>
+    <div class="wf-io-grid">
+      ${renderPreviewBlock(keyPrefix, t('workflow.detail.authoredInput'), desc.io?.input, openBlocks)}
+      ${renderPreviewBlock(keyPrefix, t('workflow.detail.resolvedInput'), desc.io?.resolvedInput, openBlocks)}
+      ${renderPreviewBlock(keyPrefix, t('workflow.detail.output'), desc.io?.output, openBlocks)}
+      ${renderPreviewBlock(keyPrefix, t('workflow.detail.executionLog'), desc.io?.log, openBlocks)}
+      ${desc.io?.waitPrompt ? renderPreviewBlock(keyPrefix, t('workflow.detail.waitPrompt'), desc.io.waitPrompt, openBlocks) : ''}
+    </div>
+  </article>`;
+}
+
 type ApprovalRenderState = {
   comments: Map<string, string>;
   statuses: Map<string, { kind: 'ok' | 'error'; text: string }>;
@@ -1138,59 +1318,6 @@ function latestAttempt(activity?: ActivityState): AttemptState | undefined {
   return activity?.attempts[activity.attempts.length - 1];
 }
 
-function renderIOCard(
-  node: NodeState | undefined,
-  activity: ActivityState | undefined,
-  io: AttemptIO | undefined,
-  openBlocks: Set<string>,
-  approval: ApprovalRenderState,
-  focusAttemptId?: string,
-): string {
-  const attempt = latestAttempt(activity);
-  const title = node?.nodeId ?? activity?.ownerNodeId ?? activity?.activityId ?? 'unknown';
-  const keyPrefix = attempt?.attemptId ?? activity?.activityId ?? node?.nodeId ?? 'unknown';
-  const controls = renderApprovalControls(attempt, approval);
-  const focusClass = attempt?.attemptId === focusAttemptId ? ' is-focused' : '';
-  const attemptAttr = attempt ? ` data-wf-attempt-card="${escapeHtml(attempt.attemptId)}"` : '';
-  return `<article class="wf-io-card${focusClass}"${attemptAttr}>
-    <header>
-      <div>
-        <strong><code>${escapeHtml(title)}</code></strong>
-        <span class="muted">${activity ? escapeHtml(activity.activityId) : escapeHtml(t('workflow.detail.notDispatched'))}</span>
-      </div>
-      <div>${node ? statusBadge(node.status) : ''} ${activity ? statusBadge(activity.status) : ''}</div>
-    </header>
-    <div class="wf-io-meta">
-      ${attempt ? `${escapeHtml(t('workflow.detail.attempt'))} <code>${escapeHtml(attempt.attemptId)}</code>` : escapeHtml(t('workflow.detail.noAttempt'))}
-    </div>
-    ${controls}
-    <div class="wf-io-grid">
-      ${renderTerminalBlock(keyPrefix, attempt, io?.terminal, openBlocks)}
-      ${renderPreviewBlock(keyPrefix, t('workflow.detail.authoredInput'), io?.input, openBlocks)}
-      ${renderPreviewBlock(keyPrefix, t('workflow.detail.resolvedInput'), io?.resolvedInput, openBlocks)}
-      ${renderPreviewBlock(keyPrefix, t('workflow.detail.output'), io?.output, openBlocks)}
-      ${renderPreviewBlock(keyPrefix, t('workflow.detail.executionLog'), io?.log, openBlocks)}
-      ${io?.waitPrompt ? renderPreviewBlock(keyPrefix, t('workflow.detail.waitPrompt'), io.waitPrompt, openBlocks) : ''}
-    </div>
-  </article>`;
-}
-
-function renderTerminalBlock(
-  keyPrefix: string,
-  attempt: AttemptState | undefined,
-  terminal: AttemptTerminal | undefined,
-  openBlocks: Set<string>,
-): string {
-  if (!terminal) return '';
-  const label = t('workflow.detail.liveTerminal');
-  const key = ioBlockKey(keyPrefix, label);
-  const meta = terminalMeta(attempt, terminal);
-  return `<details class="wf-io-block wf-terminal-block" data-io-key="${escapeHtml(key)}"${openBlocks.has(key) ? ' open' : ''}>
-    <summary>${escapeHtml(label)} ${meta}</summary>
-    ${renderTerminal(attempt, terminal)}
-  </details>`;
-}
-
 function terminalMeta(attempt: AttemptState | undefined, terminal: AttemptTerminal): string {
   const bits: string[] = [];
   if (terminal.error) bits.push(t('workflow.detail.error'));
@@ -1198,22 +1325,6 @@ function terminalMeta(attempt: AttemptState | undefined, terminal: AttemptTermin
   if (attempt?.status) bits.push(attempt.status);
   if (terminal.webPort > 0) bits.push(`:${terminal.webPort}`);
   return `<span class="muted">${escapeHtml(bits.join(' · '))}</span>`;
-}
-
-function renderTerminal(attempt: AttemptState | undefined, terminal: AttemptTerminal): string {
-  if (terminal.error) {
-    return `<div class="muted error wf-io-empty">${escapeHtml(terminal.error)}</div>`;
-  }
-  if (!isLiveTerminal(attempt, terminal)) {
-    return `<div class="muted wf-io-empty">${escapeHtml(t('workflow.detail.terminalClosed'))}</div>`;
-  }
-  const url = terminalReadOnlyUrl(terminal);
-  // Placeholder div: renderNodeIO swaps this for a cached iframe element
-  // post-innerHTML so the iframe instance survives the snapshot poll.
-  return `<div class="wf-terminal-actions">
-      <a class="btn-link" href="${escapeHtml(url)}" target="_blank" rel="noreferrer">${escapeHtml(t('workflow.detail.openTerminalNewTab'))}</a>
-    </div>
-    <div class="wf-terminal-host" data-wf-terminal-host="${escapeHtml(url)}"></div>`;
 }
 
 function isLiveTerminal(attempt: AttemptState | undefined, terminal: AttemptTerminal): boolean {
