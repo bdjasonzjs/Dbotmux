@@ -4,8 +4,10 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 
 import {
+  buildAttemptDeeplinkEnricher,
   buildWorkflowProgressCard,
   buildWorkflowStartingCard,
+  workflowRunDetailUrl,
   type WorkflowProgressCardTerminalLink,
 } from '../src/im/lark/workflow-progress-card.js';
 import { EventLog, type EventDraft } from '../src/workflows/events/append.js';
@@ -284,5 +286,89 @@ describe('workflow-progress-card', () => {
     const json = buildWorkflowProgressCard(snap, { maxInlineRows: 4 });
     expect(json).toContain('🏃 进行中** (10)');
     expect(json).toContain('+6 more');
+  });
+
+  // ─── Slice 3: buildAttemptDeeplinkEnricher ─────────────────────────────
+  //
+  // Default enricher used by daemon.ts to wire the card-row link to the
+  // dashboard `#/workflows/<runId>?attempt=<attemptId>` deeplink (slice 2
+  // contract).  Only `running` / `effectAttempting` activities get a link
+  // — anything else returns undefined so users don't click into a Run
+  // Detail page that has no terminal sidecar to render.
+  describe('buildAttemptDeeplinkEnricher (slice 3 default hook)', () => {
+    const RUN_ID = 'run-slice3-enricher';
+
+    function snapWithActivity(status: 'pending' | 'acquired' | 'running' | 'waiting' | 'effectAttempting' | 'succeeded' | 'failed' | 'cancelled' | 'timedOut'): Snapshot {
+      const snap = emptySnapshot({ runId: RUN_ID, status: 'running' });
+      snap.activities.set('run-x::work::n1', {
+        activityId: 'run-x::work::n1',
+        attempts: [],
+        status,
+        currentAttemptId: 'run-x::work::n1::1',
+        ownerNodeId: 'n1',
+      });
+      return snap;
+    }
+
+    it('returns live-terminal link when activity is running', () => {
+      const hook = buildAttemptDeeplinkEnricher(RUN_ID, snapWithActivity('running'));
+      const link = hook('run-x::work::n1', 'run-x::work::n1::1');
+      expect(link).toBeDefined();
+      expect(link?.kind).toBe('live-terminal');
+      expect(link?.url).toBe(`${workflowRunDetailUrl(RUN_ID)}?attempt=${encodeURIComponent('run-x::work::n1::1')}`);
+    });
+
+    it('returns live-terminal link when activity is effectAttempting', () => {
+      const hook = buildAttemptDeeplinkEnricher(RUN_ID, snapWithActivity('effectAttempting'));
+      const link = hook('run-x::work::n1', 'run-x::work::n1::1');
+      expect(link?.kind).toBe('live-terminal');
+    });
+
+    it.each(['pending', 'acquired', 'waiting', 'succeeded', 'failed', 'cancelled', 'timedOut'] as const)(
+      'returns undefined when activity status is %s (no live web port)',
+      (status) => {
+        const hook = buildAttemptDeeplinkEnricher(RUN_ID, snapWithActivity(status));
+        expect(hook('run-x::work::n1', 'run-x::work::n1::1')).toBeUndefined();
+      },
+    );
+
+    it('returns undefined when activity is missing from snapshot', () => {
+      const snap = emptySnapshot({ runId: RUN_ID, status: 'running' });
+      const hook = buildAttemptDeeplinkEnricher(RUN_ID, snap);
+      expect(hook('run-x::work::nope', 'run-x::work::nope::1')).toBeUndefined();
+    });
+
+    it('URL encodes `::` in attemptId so deeplink survives URL parse', () => {
+      const hook = buildAttemptDeeplinkEnricher(RUN_ID, snapWithActivity('running'));
+      const link = hook('run-x::work::n1', 'run-x::work::n1::1');
+      // `:` itself is fine in hash query strings, but encodeURIComponent
+      // turns it into `%3A` — verify the encoding is applied so the
+      // dashboard's URLSearchParams parses the `attempt` param cleanly.
+      expect(link?.url).toContain('%3A%3A');
+    });
+
+    it('integrates with buildWorkflowProgressCard: running row gets the live-terminal link, waiting row does not', () => {
+      const snap = emptySnapshot({ runId: RUN_ID, status: 'running' });
+      snap.nodes.set('runner', { nodeId: 'runner', status: 'running', retryCount: 0, activityId: 'run-x::work::runner' });
+      snap.nodes.set('gate', { nodeId: 'gate', status: 'waiting', retryCount: 0, activityId: 'run-x::work::gate' });
+      snap.activities.set('run-x::work::runner', {
+        activityId: 'run-x::work::runner', attempts: [], status: 'running',
+        currentAttemptId: 'run-x::work::runner::1', ownerNodeId: 'runner',
+      });
+      snap.activities.set('run-x::work::gate', {
+        activityId: 'run-x::work::gate', attempts: [], status: 'waiting',
+        currentAttemptId: 'run-x::work::gate::1', ownerNodeId: 'gate',
+      });
+
+      const json = buildWorkflowProgressCard(snap, {
+        enrichWithTerminalLink: buildAttemptDeeplinkEnricher(RUN_ID, snap),
+      });
+      // Running row → 查看当前终端 link present.
+      expect(json).toContain('查看当前终端');
+      // The deeplink must target the running attempt, NOT the gate
+      // attempt (gate is waiting → enricher returns undefined).
+      expect(json).toContain(encodeURIComponent('run-x::work::runner::1'));
+      expect(json).not.toContain(encodeURIComponent('run-x::work::gate::1'));
+    });
   });
 });

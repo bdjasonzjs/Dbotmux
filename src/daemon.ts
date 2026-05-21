@@ -76,6 +76,7 @@ import { workflowRunDetailUrl } from './im/lark/workflow-cards.js';
 import {
   buildWorkflowStartingCard,
   buildWorkflowProgressCard,
+  buildAttemptDeeplinkEnricher,
 } from './im/lark/workflow-progress-card.js';
 import { EventLog as WorkflowEventLog } from './workflows/events/append.js';
 import { replay as replayWorkflow } from './workflows/events/replay.js';
@@ -511,7 +512,11 @@ async function updateWorkflowProgressCard(runId: string): Promise<void> {
   try {
     const log = new WorkflowEventLog(runId, getRunsDir());
     const snapshot = replayWorkflow(await log.readAll());
-    const cardJson = buildWorkflowProgressCard(snapshot);
+    const cardJson = buildWorkflowProgressCard(snapshot, {
+      // v0.1.5 slice 3: hand the per-row "查看当前终端" link to the
+      // dashboard deeplink contract codex set up in slice 2 (3335adc).
+      enrichWithTerminalLink: buildAttemptDeeplinkEnricher(runId, snapshot),
+    });
     await updateMessage(card.larkAppId, card.cardMessageId, cardJson);
   } catch (err) {
     logger.warn(

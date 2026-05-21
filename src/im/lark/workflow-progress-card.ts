@@ -18,8 +18,10 @@
  *     this slice.
  */
 
-import { config } from '../../config.js';
 import type { Snapshot, RunStatus, NodeStatus, ActivityStatus } from '../../workflows/events/replay.js';
+import { workflowRunDetailUrl } from './workflow-cards.js';
+
+export { workflowRunDetailUrl };
 
 export type WorkflowProgressCardTerminalLink = {
   url: string;
@@ -292,8 +294,32 @@ function statusBadge(status: RunStatus): string {
   return `${headerEmoji(status)} ${status}`;
 }
 
-export function workflowRunDetailUrl(runId: string): string {
-  return `http://${config.dashboard.externalHost}:${config.dashboard.port}/#/workflows/${encodeURIComponent(runId)}`;
+/**
+ * Slice 3 default enricher: pair the run-level card's per-row link with a
+ * deeplink into Run Detail focused on the given attempt.  The dashboard
+ * side (slice 2, codex 3335adc) reads `attemptIO[attemptId].terminal` and
+ * renders the iframe — this enricher just constructs the URL.
+ *
+ * Only `running` / `effectAttempting` activities get a link: those are the
+ * states where the worker has spawned and written `terminal.json` with a
+ * live web port.  `acquired` / `waiting` / `pending` skip the link so the
+ * user isn't dropped on an empty terminal block.
+ */
+export function buildAttemptDeeplinkEnricher(
+  runId: string,
+  snapshot: Snapshot,
+): NonNullable<WorkflowProgressCardOptions['enrichWithTerminalLink']> {
+  return (activityId, attemptId) => {
+    const activity = snapshot.activities.get(activityId);
+    if (!activity) return undefined;
+    const inFlight =
+      activity.status === 'running' || activity.status === 'effectAttempting';
+    if (!inFlight) return undefined;
+    return {
+      url: `${workflowRunDetailUrl(runId)}?attempt=${encodeURIComponent(attemptId)}`,
+      kind: 'live-terminal',
+    };
+  };
 }
 
 function escapeMd(s: string): string {
