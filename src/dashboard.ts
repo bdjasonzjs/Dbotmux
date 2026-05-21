@@ -14,8 +14,10 @@ import {
 import { DaemonRegistry } from './dashboard/registry.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
 import { pickCreatorForGroup } from './dashboard/operator-selector.js';
+import { BotOnboardingManager } from './dashboard/bot-onboarding.js';
 
 const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
+const BOTS_JSON_PATH = join(homedir(), '.botmux', 'bots.json');
 const REGISTRY_DIR = join(homedir(), '.botmux', 'data', 'dashboard-daemons');
 
 let activeToken: string | null = null;
@@ -34,6 +36,7 @@ const SECRET = loadOrCreateSecret();
 mkdirSync(REGISTRY_DIR, { recursive: true });
 const registry = new DaemonRegistry(REGISTRY_DIR);
 const aggregator = new Aggregator();
+const botOnboarding = new BotOnboardingManager({ botsJsonPath: BOTS_JSON_PATH });
 const subs = new Map<string, () => void>();
 const attaching = new Set<string>();   // dedup concurrent attaches per appId
 
@@ -250,8 +253,19 @@ const server = createServer(async (req, res) => {
       return jsonRes(res, 200, { schedules: aggregator.getSchedules() });
     }
 
+    if (req.method === 'POST' && url.pathname === '/api/bot-onboarding/start') {
+      const job = botOnboarding.start();
+      return jsonRes(res, 202, { job: botOnboarding.get(job.id) });
+    }
+    let mOnboard: RegExpMatchArray | null;
+    if (req.method === 'GET' && (mOnboard = url.pathname.match(/^\/api\/bot-onboarding\/([^/]+)$/))) {
+      const job = botOnboarding.get(decodeURIComponent(mOnboard[1]));
+      if (!job) return jsonRes(res, 404, { ok: false, error: 'unknown_onboarding_job' });
+      return jsonRes(res, 200, { job });
+    }
+
     let m: RegExpMatchArray | null;
-    if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/(close|locate)$/))) {
+    if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/(close|locate|resume)$/))) {
       const sid = decodeURIComponent(m[1]); const op = m[2];
       const owner = aggregator.ownerOf(sid);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });

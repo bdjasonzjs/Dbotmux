@@ -3,24 +3,29 @@
 // Groups & Bots tab). Saving here only affects NEW group chats first observed
 // after the save; existing chats are left alone, and chats already auto-bound
 // once stay user-controlled.
+import { escapeHtml, t } from './ui.js';
 
 let cache: { bots: any[] } = { bots: [] };
 let loadError: string | null = null;
 
-const PAGE_HTML = `
+function pageHtml(): string {
+  return `<section class="page">
+<div class="page-heading">
+  <div>
+    <p class="eyebrow">${t('nav.botDefaults')}</p>
+    <h1>${t('botDefaults.title')}</h1>
+    <p>${t('botDefaults.subtitle')}</p>
+  </div>
+</div>
 <form id="bd-filters" class="filters">
-  <input type="search" name="q" placeholder="search bot name / app id" />
-  <button type="button" id="bd-refresh">Refresh</button>
+  <input type="search" name="q" placeholder="${t('botDefaults.search')}" />
+  <button type="button" id="bd-refresh">${t('botDefaults.refresh')}</button>
 </form>
 <p class="hint-warn" style="max-width:760px">
-  开关 ON 后，<strong>所有没有 oncall binding 的群</strong>（包括老群）下一次开新话题会自动绑到下面填的目录；
-  Groups &amp; Bots 里已经手动绑过的群不动；通过 <code>/oncall unbind</code> 解过绑的群永远不再被自动覆盖。
+  ${t('botDefaults.warning')}
 </p>
 <div id="bd-list"></div>
-`;
-
-function escapeHtml(s: string): string {
-  return s.replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]!));
+</section>`;
 }
 
 async function loadBots(): Promise<void> {
@@ -59,7 +64,7 @@ function fmtSince(since: number): string {
 }
 
 export async function renderBotDefaultsPage(root: HTMLElement) {
-  root.innerHTML = PAGE_HTML;
+  root.innerHTML = pageHtml();
   const listEl = root.querySelector<HTMLElement>('#bd-list')!;
   const form = root.querySelector<HTMLFormElement>('#bd-filters')!;
   const refreshBtn = root.querySelector<HTMLButtonElement>('#bd-refresh')!;
@@ -85,7 +90,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
       return;
     }
     if (filtered.length === 0) {
-      listEl.innerHTML = `<p class="empty">没有在线的 bot。先 \`botmux restart\` 让 daemon 上线。</p>`;
+      listEl.innerHTML = `<p class="empty">${t('botDefaults.empty')}</p>`;
       return;
     }
     listEl.innerHTML = filtered.map(renderBotCard).join('');
@@ -110,22 +115,22 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
       <div class="bd-body">
         <label class="checkbox-row">
           <input type="checkbox" data-action="toggle" ${enabled ? 'checked' : ''}>
-          <strong>默认进 oncall 模式</strong>
-          <small>（所有未绑定的群下次开话题自动绑）</small>
+          <strong>${t('botDefaults.defaultOncall')}</strong>
+          <small>${t('botDefaults.defaultOncallHelp')}</small>
         </label>
         <div class="bd-row">
           <label>
-            <span>默认工作目录</span>
+            <span>${t('botDefaults.workingDir')}</span>
             <input type="text" data-input="workingDir" placeholder="e.g. /root/iserver/botmux"
               value="${escapeHtml(def.workingDir ?? '')}" ${enabled ? '' : 'disabled'}>
           </label>
         </div>
         <div class="bd-meta">
-          <small>上次启用时间：${escapeHtml(fmtSince(def.since ?? 0))}</small>
-          <small>已自动绑定 ${b.autoboundChatCount ?? 0} 个群</small>
+          <small>${t('botDefaults.lastEnabled')}: ${escapeHtml(fmtSince(def.since ?? 0))}</small>
+          <small>${t('botDefaults.autobound', { count: b.autoboundChatCount ?? 0 })}</small>
         </div>
         <div class="actions">
-          <button type="button" data-action="save">Save</button>
+          <button type="button" data-action="save">${t('botDefaults.save')}</button>
           <span class="oncall-status" data-status></span>
         </div>
       </div>
@@ -152,7 +157,7 @@ export async function renderBotDefaultsPage(root: HTMLElement) {
         const enabled = toggle.checked;
         const workingDir = input.value.trim();
         if (enabled && !workingDir) {
-          statusEl.textContent = '开启时必须填工作目录';
+          statusEl.textContent = t('botDefaults.required');
           statusEl.classList.add('hint-warn-inline');
           return;
         }

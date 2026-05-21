@@ -1,27 +1,33 @@
 import { store } from './store.js';
+import { escapeHtml, t } from './ui.js';
 
-const PAGE_HTML = `
+function pageHtml(): string {
+  return `<section class="page">
+<div class="page-heading">
+  <div>
+    <p class="eyebrow">${t('nav.schedules')}</p>
+    <h1>${t('schedules.title')}</h1>
+    <p>${t('schedules.subtitle')}</p>
+  </div>
+</div>
 <form id="sched-filters" class="filters">
-  <input type="search" name="q" placeholder="search name / prompt / workingDir" />
+  <input type="search" name="q" placeholder="${t('schedules.search')}" />
   <select name="kind">
-    <option value="">any kind</option>
+    <option value="">${t('schedules.anyKind')}</option>
     <option>cron</option>
     <option>interval</option>
     <option>once</option>
   </select>
-  <label><input type="checkbox" name="enabled"> enabled only</label>
+  <label><input type="checkbox" name="enabled"> ${t('schedules.enabledOnly')}</label>
 </form>
 <table>
   <thead><tr>
-    <th>name</th><th>bot</th><th>schedule</th><th>next</th><th>last</th>
-    <th>repeat</th><th>enabled</th><th>actions</th>
+    <th>${t('schedules.name')}</th><th>${t('schedules.bot')}</th><th>${t('schedules.schedule')}</th><th>${t('schedules.next')}</th><th>${t('schedules.last')}</th>
+    <th>${t('schedules.repeat')}</th><th>${t('schedules.enabled')}</th><th>${t('schedules.actions')}</th>
   </tr></thead>
   <tbody id="schedules-tbody"></tbody>
 </table>
-`;
-
-function escapeHtml(s: string): string {
-  return s.replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]!));
+</section>`;
 }
 
 function fmtDate(s?: string): string {
@@ -33,7 +39,7 @@ function fmtDate(s?: string): string {
 }
 
 export function renderSchedulesPage(root: HTMLElement) {
-  root.innerHTML = PAGE_HTML;
+  root.innerHTML = pageHtml();
   const tbody = root.querySelector<HTMLElement>('#schedules-tbody')!;
   const form = root.querySelector<HTMLFormElement>('#sched-filters')!;
 
@@ -65,12 +71,12 @@ export function renderSchedulesPage(root: HTMLElement) {
       <td>${s.repeat ? `${s.repeat.completed}/${s.repeat.times ?? '∞'}` : '—'}</td>
       <td>${s.enabled ? '✓' : '✗'}</td>
       <td class="actions-cell">
-        <button data-op="run" type="button">Run now</button>
+        <button data-op="run" type="button">${t('schedules.runNow')}</button>
         ${s.enabled
-          ? `<button data-op="pause" type="button">Pause</button>`
-          : `<button data-op="resume" type="button">Resume</button>`}
+          ? `<button data-op="pause" type="button">${t('schedules.pause')}</button>`
+          : `<button data-op="resume" type="button">${t('schedules.resume')}</button>`}
       </td>
-    </tr>`).join('') || '<tr><td colspan="8" class="empty">No schedules.</td></tr>';
+    </tr>`).join('') || `<tr><td colspan="8" class="empty">${t('schedules.empty')}</td></tr>`;
   }
 
   tbody.addEventListener('click', async e => {

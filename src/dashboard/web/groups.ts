@@ -2,25 +2,31 @@
 // The aggregator at /api/groups fans out to all online daemons and merges chats
 // by chatId; the dashboard displays this as a matrix where each cell shows
 // whether a bot is a member of a given chat.
+import { escapeHtml, t } from './ui.js';
 
 let cache: { chats: any[]; bots: any[] } = { chats: [], bots: [] };
 
-const PAGE_HTML = `
+function pageHtml(): string {
+  return `<section class="page">
+<div class="page-heading">
+  <div>
+    <p class="eyebrow">${t('nav.groups')}</p>
+    <h1>${t('groups.title')}</h1>
+    <p>${t('groups.subtitle')}</p>
+  </div>
+</div>
 <form id="g-filters" class="filters">
-  <input type="search" name="q" placeholder="search chat name / id / owner" />
-  <label><input type="checkbox" name="missing"> missing-bot only</label>
-  <button type="button" id="g-refresh">Refresh</button>
-  <button type="button" id="g-create">+ Create new group</button>
+  <input type="search" name="q" placeholder="${t('groups.search')}" />
+  <label><input type="checkbox" name="missing"> ${t('groups.missingOnly')}</label>
+  <button type="button" id="g-refresh">${t('groups.refresh')}</button>
+  <button type="button" id="g-create" class="primary">${t('groups.create')}</button>
 </form>
 <table>
   <thead id="g-head"></thead>
   <tbody id="g-body"></tbody>
 </table>
 <dialog id="g-drawer"></dialog>
-`;
-
-function escapeHtml(s: string): string {
-  return s.replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]!));
+</section>`;
 }
 
 async function loadGroups(): Promise<void> {
@@ -68,7 +74,7 @@ export function renderBotCheckboxes(
 }
 
 export async function renderGroupsPage(root: HTMLElement) {
-  root.innerHTML = PAGE_HTML;
+  root.innerHTML = pageHtml();
   const head = root.querySelector<HTMLElement>('#g-head')!;
   const body = root.querySelector<HTMLElement>('#g-body')!;
   const form = root.querySelector<HTMLFormElement>('#g-filters')!;
@@ -88,30 +94,30 @@ export async function renderGroupsPage(root: HTMLElement) {
   function openCreateModal() {
     const allBots = cache.bots;
     if (allBots.length === 0) {
-      alert('No bots online. Restart the daemon first.');
+      alert(t('groups.noBotsOnline'));
       return;
     }
     drawer.innerHTML = `
       <article>
-        <header><h3>Create new group</h3></header>
-        <p>Pick bots to invite. The dashboard auto-selects an online daemon as the chat creator/owner; the rest are added as members in the same call.</p>
+        <header><h3>${t('groups.createTitle')}</h3></header>
+        <p>${t('groups.createHelp')}</p>
         <form id="g-createform">
           <label class="form-row">
-            <span>Group name <small>(optional)</small></span>
-            <input type="text" name="name" placeholder="e.g. AI ChangeLog" maxlength="60">
+            <span>${t('groups.name')}</span>
+            <input type="text" name="name" placeholder="${t('groups.namePlaceholder')}" maxlength="60">
           </label>
           <label class="form-row">
-            <span>Bind directory <small>(optional)</small></span>
+            <span>${t('groups.bindDir')}</span>
             <input type="text" name="bindWorkingDir" placeholder="e.g. ~/projects/botmux">
-            <small>Create the group and bind every invited bot to this directory, so new topics skip the repo picker.</small>
+            <small>${t('groups.bindDirHelp')}</small>
           </label>
           <fieldset>
-            <legend>Bots</legend>
+            <legend>${t('groups.botPicker')}</legend>
             ${renderBotCheckboxes(allBots)}
           </fieldset>
           <div class="actions">
-            <button type="submit">Create</button>
-            <button type="button" id="g-create-cancel">Cancel</button>
+            <button type="submit" class="primary">${t('groups.createSubmit')}</button>
+            <button type="button" id="g-create-cancel">${t('groups.cancel')}</button>
           </div>
         </form>
       </article>`;
@@ -260,23 +266,23 @@ export async function renderGroupsPage(root: HTMLElement) {
 
     drawer.innerHTML = `
       <article>
-        <header><h3>群创建成功</h3></header>
-        <p><b>chatId:</b> <code>${escapeHtml(chatId)}</code> <button type="button" data-copy="${escapeHtml(chatId)}">copy</button></p>
+        <header><h3>${t('groups.successTitle')}</h3></header>
+        <p><b>chatId:</b> <code>${escapeHtml(chatId)}</code> <button type="button" data-copy="${escapeHtml(chatId)}">${t('sessions.copy')}</button></p>
         <p><b>创建者:</b> <code>${escapeHtml(resp.creator ?? '?')}</code></p>
         ${inviteNote}
         ${bindNote}
         ${invalidNote ? `<ul>${invalidNote}</ul>` : ''}
         <div class="actions">
-          <a class="btn-link primary" href="${appLink}" target="_blank" rel="noopener">↗ 打开新群</a>
-          <button type="button" id="g-create-close">关闭</button>
+          <a class="btn-link primary" href="${appLink}" target="_blank" rel="noopener">${t('groups.openGroup')}</a>
+          <button type="button" id="g-create-close">${t('sessions.dismiss')}</button>
         </div>
       </article>`;
 
     drawer.querySelectorAll<HTMLButtonElement>('[data-copy]').forEach(b => {
       b.onclick = () => {
         navigator.clipboard.writeText(b.dataset.copy ?? '');
-        b.textContent = 'copied';
-        setTimeout(() => { b.textContent = 'copy'; }, 800);
+        b.textContent = t('sessions.copied');
+        setTimeout(() => { b.textContent = t('sessions.copy'); }, 800);
       };
     });
     drawer.querySelector<HTMLButtonElement>('#g-create-close')!.onclick = () => drawer.close();
@@ -284,9 +290,9 @@ export async function renderGroupsPage(root: HTMLElement) {
 
   function renderHead() {
     head.innerHTML = `<tr>
-      <th>chat</th>
+      <th>${t('groups.chat')}</th>
       ${cache.bots.map(b => `<th>${escapeHtml(b.botName ?? b.larkAppId)}</th>`).join('')}
-      <th>actions</th>
+      <th>${t('groups.actions')}</th>
     </tr>`;
   }
 
@@ -305,7 +311,7 @@ export async function renderGroupsPage(root: HTMLElement) {
       .filter(c => !onlyMissing || c.memberBots.some((m: any) => !m.inChat));
 
     if (filtered.length === 0) {
-      body.innerHTML = `<tr><td colspan="${cache.bots.length + 2}" class="empty">No chats match the filter.</td></tr>`;
+      body.innerHTML = `<tr><td colspan="${cache.bots.length + 2}" class="empty">${t('groups.empty')}</td></tr>`;
       return;
     }
     body.innerHTML = filtered.map(c => `<tr data-chat="${escapeHtml(c.chatId)}">
@@ -320,8 +326,8 @@ export async function renderGroupsPage(root: HTMLElement) {
         return `<td class="${cls}" title="${escapeHtml(m?.error ?? '')}">${cell}</td>`;
       }).join('')}
       <td>
-        <button class="add-bots" type="button">Add bots</button>
-        <button class="manage-chat" type="button">Manage</button>
+        <button class="add-bots" type="button">${t('groups.addBots')}</button>
+        <button class="manage-chat" type="button">${t('groups.manage')}</button>
       </td>
     </tr>`).join('');
   }
@@ -347,13 +353,13 @@ export async function renderGroupsPage(root: HTMLElement) {
     }
     drawer.innerHTML = `
       <article>
-        <header><h3>Add bots to ${escapeHtml(chat.name ?? chat.chatId)}</h3></header>
-        <p>Select bots to add. The dashboard will pick a bot that's already in the chat as the proxy.</p>
+        <header><h3>${t('groups.addBots')} · ${escapeHtml(chat.name ?? chat.chatId)}</h3></header>
+        <p>${t('groups.createHelp')}</p>
         <form id="g-addform">
           ${renderBotCheckboxes(cache.bots, inChatSet)}
           <div class="actions">
-            <button type="submit">Confirm add</button>
-            <button type="button" id="g-cancel">Cancel</button>
+            <button type="submit" class="primary">${t('groups.addBots')}</button>
+            <button type="button" id="g-cancel">${t('groups.cancel')}</button>
           </div>
         </form>
       </article>`;
@@ -411,13 +417,13 @@ export async function renderGroupsPage(root: HTMLElement) {
     const ownerAppId = typeof chat.ownerId === 'string' ? chat.ownerId : '';
     drawer.innerHTML = `
       <article>
-        <header><h3>Manage ${escapeHtml(chat.name ?? chat.chatId)}</h3></header>
+        <header><h3>${t('groups.manageTitle', { name: chat.name ?? chat.chatId })}</h3></header>
         <p><b>chatId:</b> <code>${escapeHtml(chat.chatId)}</code></p>
-        <p><b>owner:</b> <code>${escapeHtml(chat.ownerId ?? '(unknown)')}</code></p>
+        <p><b>${t('groups.owner')}:</b> <code>${escapeHtml(chat.ownerId ?? t('common.unknown'))}</code></p>
 
         <fieldset>
-          <legend>Oncall 模式</legend>
-          <p><small>开启后：群内任何成员都能 @ 机器人提问，新话题直接用绑定目录启动 CLI；仅 allowedUsers 仍可执行 /cd /restart 等命令。</small></p>
+          <legend>${t('groups.oncall')}</legend>
+          <p><small>${t('groups.oncallHelp')}</small></p>
           ${inChat.length === 0
             ? `<p class="empty">没有机器人在群里</p>`
             : inChat.map((m: any) => {
@@ -433,7 +439,7 @@ export async function renderGroupsPage(root: HTMLElement) {
                   <div class="oncall-row-body">
                     <input type="text" data-input="workingDir" placeholder="e.g. /root/iserver/botmux"
                            value="${escapeHtml(wd)}" ${enabled ? '' : 'disabled'}>
-                    <button type="button" data-action="save">Save</button>
+                    <button type="button" data-action="save">${t('groups.save')}</button>
                     <span class="oncall-status" data-status></span>
                   </div>
                 </div>
@@ -442,7 +448,7 @@ export async function renderGroupsPage(root: HTMLElement) {
         </fieldset>
 
         <fieldset>
-          <legend>选择机器人退出群聊</legend>
+          <legend>${t('groups.leaveTitle')}</legend>
           ${inChat.length === 0
             ? `<p class="empty">没有机器人在群里</p>`
             : inChat.map((m: any) => `
@@ -455,11 +461,11 @@ export async function renderGroupsPage(root: HTMLElement) {
         </fieldset>
 
         <div class="actions">
-          <button id="g-leave-btn" type="button" ${inChat.length === 0 ? 'disabled' : ''}>选中机器人退出群聊</button>
-          <button id="g-disband-btn" type="button" class="contrast" ${inChat.length === 0 ? 'disabled' : ''}>解散群聊</button>
+          <button id="g-leave-btn" type="button" ${inChat.length === 0 ? 'disabled' : ''}>${t('groups.leaveSelected')}</button>
+          <button id="g-disband-btn" type="button" class="contrast" ${inChat.length === 0 ? 'disabled' : ''}>${t('groups.disband')}</button>
         </div>
-        <p class="hint-warn"><small>解散群聊仅当某个在群机器人是群主时才会成功。否则飞书会返回错误，建议改用「退出群聊」。</small></p>
-        <form method="dialog"><button>关闭</button></form>
+        <p class="hint-warn"><small>${t('groups.dangerHint')}</small></p>
+        <form method="dialog"><button>${t('sessions.dismiss')}</button></form>
       </article>`;
     drawer.showModal();
 
@@ -480,7 +486,7 @@ export async function renderGroupsPage(root: HTMLElement) {
         const want = cb.checked;
         const wd = input.value.trim();
         if (want && !wd) {
-          statusEl.textContent = '请填工作目录';
+          statusEl.textContent = t('groups.needWorkingDir');
           statusEl.classList.add('hint-warn-inline');
           return;
         }

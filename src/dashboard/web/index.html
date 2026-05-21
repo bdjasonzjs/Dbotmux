@@ -7,17 +7,48 @@
   <link rel="stylesheet" href="/assets/style.css">
 </head>
 <body>
-  <header class="topbar">
-    <strong>botmux</strong>
-    <nav>
-      <a href="#/" data-route="sessions">Sessions</a>
-      <a href="#/schedules" data-route="schedules">Schedules</a>
-      <a href="#/groups" data-route="groups">Groups &amp; Bots</a>
-      <a href="#/bot-defaults" data-route="bot-defaults">Bot Defaults</a>
-    </nav>
-    <span id="status" class="status"></span>
-  </header>
-  <main id="root"></main>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <a class="brand" href="#/">
+        <span class="brand-mark">bm</span>
+        <span>
+          <strong data-i18n="app.name">botmux</strong>
+          <small data-i18n="app.subtitle">飞书 AI CLI 控制台</small>
+        </span>
+      </a>
+      <nav class="sidebar-nav" aria-label="Dashboard">
+        <a href="#/" data-route="overview" data-i18n="nav.overview">总览</a>
+        <a href="#/sessions" data-route="sessions" data-i18n="nav.sessions">会话</a>
+        <a href="#/groups" data-route="groups" data-i18n="nav.groups">群组</a>
+        <a href="#/schedules" data-route="schedules" data-i18n="nav.schedules">定时</a>
+        <a href="#/bot-defaults" data-route="bot-defaults" data-i18n="nav.botDefaults">默认 Bot</a>
+      </nav>
+      <div class="sidebar-foot">
+        <span id="status" class="connection-status"></span>
+      </div>
+    </aside>
+    <div class="workspace">
+      <header class="topbar">
+        <div class="topbar-title">
+          <strong data-i18n="app.name">botmux</strong>
+          <span data-i18n="app.subtitle">飞书 AI CLI 控制台</span>
+        </div>
+        <div class="topbar-actions">
+          <button type="button" id="add-bot-btn" class="primary topbar-add-bot" data-i18n="botOnboarding.add">添加机器人</button>
+          <div class="segmented" aria-label="Language">
+            <button type="button" data-locale="zh">中</button>
+            <button type="button" data-locale="en">EN</button>
+          </div>
+          <div class="segmented theme-switch" aria-label="Theme">
+            <button type="button" data-theme-mode="system" data-i18n="status.system">系统</button>
+            <button type="button" data-theme-mode="light" data-i18n="status.light">浅色</button>
+            <button type="button" data-theme-mode="dark" data-i18n="status.dark">暗黑</button>
+          </div>
+        </div>
+      </header>
+      <main id="root"></main>
+    </div>
+  </div>
   <script src="/assets/app.js"></script>
 </body>
 </html>
