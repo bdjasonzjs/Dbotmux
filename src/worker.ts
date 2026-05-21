@@ -94,39 +94,59 @@ const pendingMessages: string[] = [];
 
 type RuntimeScreenStatus = Exclude<ScreenStatus, 'limited'>;
 
-let usageLimitTurnSeq = 0;
-let usageLimitDetectedTurnSeq: number | undefined;
-let suppressedRetryReadyUsageLimitKey: string | undefined;
+// Per-turn usage-limit state machine. Owns the turn counter plus the
+// "did this turn hit a limit" / "suppress a stale retry-ready banner" flags, so
+// classify()'s state writes are explicit method calls rather than hidden
+// mutations of module globals from a function that otherwise reads as a pure
+// mapper.
+function createUsageLimitTracker() {
+  let turnSeq = 0;
+  let detectedTurn: number | undefined;
+  let suppressedRetryReadyKey: string | undefined;
+
+  return {
+    currentTurn(): number {
+      return turnSeq;
+    },
+    // Open a new turn; remember any stale retry-ready banner still on screen so
+    // classify() doesn't re-flag it as a fresh limit this turn.
+    beginTurn(snapshot: string): number {
+      turnSeq++;
+      detectedTurn = undefined;
+      const current = detectCliUsageLimit(snapshot);
+      suppressedRetryReadyKey = current.limited && current.retryReady
+        ? usageLimitStateKey(current)
+        : undefined;
+      return turnSeq;
+    },
+    // Map a runtime status to a usage-limit-aware status, recording whether this
+    // turn hit a limit (read back via detectedThisTurn).
+    classify(
+      content: string,
+      status: RuntimeScreenStatus,
+    ): { status: RuntimeScreenStatus | 'limited'; usageLimit?: CliUsageLimitState } {
+      const detected = detectCliUsageLimit(content);
+      if (!detected.limited) return { status };
+
+      const key = usageLimitStateKey(detected);
+      if (detected.retryReady && key === suppressedRetryReadyKey) {
+        return { status };
+      }
+
+      suppressedRetryReadyKey = undefined;
+      detectedTurn = turnSeq;
+      return { status: 'limited', usageLimit: detected };
+    },
+    detectedThisTurn(seq: number): boolean {
+      return detectedTurn === seq;
+    },
+  };
+}
+
+const usageLimitTracker = createUsageLimitTracker();
 
 function currentUsageLimitSnapshot(): string {
   return lastAnalyzerSnapshot || renderer?.rawSnapshot() || '';
-}
-
-function beginUsageLimitTurn(): number {
-  usageLimitTurnSeq++;
-  usageLimitDetectedTurnSeq = undefined;
-  const current = detectCliUsageLimit(currentUsageLimitSnapshot());
-  suppressedRetryReadyUsageLimitKey = current.limited && current.retryReady
-    ? usageLimitStateKey(current)
-    : undefined;
-  return usageLimitTurnSeq;
-}
-
-function screenStatusWithUsageLimit(
-  content: string,
-  status: RuntimeScreenStatus,
-): { status: RuntimeScreenStatus | 'limited'; usageLimit?: CliUsageLimitState } {
-  const detected = detectCliUsageLimit(content);
-  if (!detected.limited) return { status };
-
-  const key = usageLimitStateKey(detected);
-  if (detected.retryReady && key === suppressedRetryReadyUsageLimitKey) {
-    return { status };
-  }
-
-  suppressedRetryReadyUsageLimitKey = undefined;
-  usageLimitDetectedTurnSeq = usageLimitTurnSeq;
-  return { status: 'limited', usageLimit: detected };
 }
 
 // ─── Adopt-bridge state (Claude Code only) ─────────────────────────────────
@@ -1794,7 +1814,7 @@ async function captureAndUpload(): Promise<void> {
 
   let status: RuntimeScreenStatus = isPromptReady ? 'idle' : 'working';
   if (screenAnalyzer?.isAnalyzing) status = 'analyzing';
-  send({ type: 'screenshot_uploaded', imageKey, ...screenStatusWithUsageLimit(usageLimitContent, status) });
+  send({ type: 'screenshot_uploaded', imageKey, ...usageLimitTracker.classify(usageLimitContent, status) });
 }
 
 function applyDisplayMode(mode: DisplayMode): void {
@@ -2051,7 +2071,7 @@ function markPromptReady(): void {
   // (where the initial prompt is queued before the CLI becomes idle).
   if (renderer && pendingMessages.length === 0 && !isFlushing) {
     const { content } = renderer.snapshot();
-    send({ type: 'screen_update', content, ...screenStatusWithUsageLimit(content, 'idle') });
+    send({ type: 'screen_update', content, ...usageLimitTracker.classify(content, 'idle') });
   }
   flushPending();
 }
@@ -2095,7 +2115,7 @@ function scheduleSubmitFailureNotify(
   transcriptLabel: string,
   bridgeTurnId?: string,
   failureReason?: string,
-  turnSeq = usageLimitTurnSeq,
+  turnSeq = usageLimitTracker.currentTurn(),
 ): void {
   const preview = msg.length > 60 ? msg.slice(0, 60) + '…' : msg;
   const dropBridgeMark = (): void => {
@@ -2127,7 +2147,7 @@ function scheduleSubmitFailureNotify(
         log(`Deferred recheck threw (${err?.message ?? err}); falling through to warning.`);
       }
     }
-    if (usageLimitDetectedTurnSeq === turnSeq) {
+    if (usageLimitTracker.detectedThisTurn(turnSeq)) {
       dropBridgeMark();
       log(`Deferred recheck missing but usage limit was detected for this turn — suppressing submit warning. preview="${preview}"`);
       return;
@@ -2174,7 +2194,7 @@ async function flushPending(): Promise<void> {
   try {
     while (pendingMessages.length > 0 && backend && cliAdapter) {
       const msg = pendingMessages.shift()!;
-      const turnSeq = beginUsageLimitTurn();
+      const turnSeq = usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
       // Bridge fallback: mark immediately before writeInput. Doing it here
       // (instead of at enqueue time) means markTimeMs anchors to the
       // moment the message actually starts hitting the PTY — so any
@@ -2318,7 +2338,7 @@ function startScreenUpdates(): void {
         return;
       }
 
-      const usageAware = screenStatusWithUsageLimit(content, status);
+      const usageAware = usageLimitTracker.classify(content, status);
       if (changed || usageAware.status !== lastSentStatus) {
         lastSentStatus = usageAware.status;
         send({ type: 'screen_update', content, ...usageAware });
@@ -3139,7 +3159,7 @@ process.on('message', async (raw: unknown) => {
     case 'message': {
       // Mark new turn baseline so the streaming card only shows this turn's content
       renderer?.markNewTurn();
-      const turnSeq = beginUsageLimitTurn();
+      const turnSeq = usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
       // Cancel any active tmux copy-mode scroll so user input reaches the CLI.
       if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
       const content = msg.content;
@@ -3224,7 +3244,7 @@ process.on('message', async (raw: unknown) => {
       // fires. Also skip adapter.writeInput() / pendingMessages queueing so
       // the prompt wrapping (Session ID, mention hints) is not prepended.
       renderer?.markNewTurn();
-      beginUsageLimitTurn();
+      usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
       if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
       if (backend) {
         if ('sendText' in backend && 'sendSpecialKeys' in backend) {
