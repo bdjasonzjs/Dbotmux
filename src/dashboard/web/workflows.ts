@@ -690,13 +690,13 @@ function renderWorkflowDetailPage(
     renderDangling(danglingEl, snapshot);
     renderParallelTimeline(parallelEl, parallelMeta, snapshot, events);
     renderNodeActivityRows(nodeTbody, snapshot);
-    renderNodeIO(ioList, snapshot, openIOBlocks, ioScrollTops, {
+    const focusConsumed = renderNodeIO(ioList, snapshot, openIOBlocks, ioScrollTops, {
       comments: approvalComments,
       statuses: approvalStatuses,
       resolving: resolvingWaits,
       onResolve: resolveHumanGate,
     }, focusAttemptId);
-    focusAttemptId = undefined;
+    if (focusConsumed) focusAttemptId = undefined;
     renderEvents(eventTbody, events);
     timelineScroll.scrollTop = timelineScrollTop;
     loadOlder.hidden = !hasOlder;
@@ -1022,10 +1022,11 @@ function renderNodeIO(
   scrollTops: Map<string, number>,
   approval: ApprovalRenderState,
   focusAttemptId?: string,
-): void {
+): boolean {
   syncIOBlockState(el, openBlocks, scrollTops);
   syncApprovalComments(el, approval.comments);
-  if (focusAttemptId) {
+  const focusHasTerminal = !!(focusAttemptId && snap.attemptIO?.[focusAttemptId]?.terminal);
+  if (focusHasTerminal && focusAttemptId) {
     openBlocks.add(ioBlockKey(focusAttemptId, t('workflow.detail.liveTerminal')));
   }
   const byId = new Map(snap.activities.map((a) => [a.activityId, a]));
@@ -1067,10 +1068,15 @@ function renderNodeIO(
     ? cards.join('')
     : `<div class="empty">${escapeHtml(t('workflow.detail.noNodeIO'))}</div>`;
   restoreIOBlockScroll(el, scrollTops);
-  scrollFocusedAttemptIntoView(el, focusAttemptId);
+  const focusVisible = scrollFocusedAttemptIntoView(el, focusAttemptId);
   attachIOBlockToggleTracking(el, openBlocks);
   attachIOBlockScrollTracking(el, scrollTops);
   attachApprovalControls(el, approval);
+  // Keep the deeplink focus active until terminal.json is visible.  The
+  // progress card link can appear at activityRunning, a little before the
+  // worker emits ready and writes the terminal sidecar; a later poll should
+  // still auto-open the terminal block when it arrives.
+  return focusVisible && focusHasTerminal;
 }
 
 type ApprovalRenderState = {
@@ -1245,13 +1251,14 @@ function ioBlockKey(keyPrefix: string, label: string): string {
   return `${keyPrefix}:${label}`;
 }
 
-function scrollFocusedAttemptIntoView(root: HTMLElement, focusAttemptId?: string): void {
-  if (!focusAttemptId) return;
+function scrollFocusedAttemptIntoView(root: HTMLElement, focusAttemptId?: string): boolean {
+  if (!focusAttemptId) return false;
   for (const card of root.querySelectorAll<HTMLElement>('[data-wf-attempt-card]')) {
     if (card.dataset.wfAttemptCard !== focusAttemptId) continue;
     card.scrollIntoView({ block: 'center' });
-    return;
+    return true;
   }
+  return false;
 }
 
 function syncIOBlockState(

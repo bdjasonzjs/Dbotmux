@@ -300,10 +300,11 @@ function statusBadge(status: RunStatus): string {
  * side (slice 2, codex 3335adc) reads `attemptIO[attemptId].terminal` and
  * renders the iframe — this enricher just constructs the URL.
  *
- * Only `running` / `effectAttempting` activities get a link: those are the
- * states where the worker has spawned and written `terminal.json` with a
- * live web port.  `acquired` / `waiting` / `pending` skip the link so the
- * user isn't dropped on an empty terminal block.
+ * Only `running` activities get a link: that is the state where a
+ * subagent worker has spawned and is expected to expose `terminal.json`
+ * with a live web port.  `effectAttempting` is hostExecutor-side work
+ * with no worker sidecar; `acquired` / `waiting` / `pending` skip for
+ * the same "no sidecar yet" reason.
  */
 export function buildAttemptDeeplinkEnricher(
   runId: string,

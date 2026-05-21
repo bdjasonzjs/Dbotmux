@@ -341,9 +341,10 @@ describe('workflow-progress-card', () => {
   //
   // Default enricher used by daemon.ts to wire the card-row link to the
   // dashboard `#/workflows/<runId>?attempt=<attemptId>` deeplink (slice 2
-  // contract).  Only `running` / `effectAttempting` activities get a link
-  // — anything else returns undefined so users don't click into a Run
-  // Detail page that has no terminal sidecar to render.
+  // contract).  Only `running` activities get a link — anything else
+  // returns undefined so users don't click into a Run Detail page that
+  // has no terminal sidecar to render.  HostExecutor `effectAttempting`
+  // also skips because it has no subagent worker.
   describe('buildAttemptDeeplinkEnricher (slice 3 default hook)', () => {
     const RUN_ID = 'run-slice3-enricher';
 
