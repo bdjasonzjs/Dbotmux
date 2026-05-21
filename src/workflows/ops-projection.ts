@@ -36,6 +36,10 @@ import {
 } from './events/replay.js';
 import type { OutputRef } from './events/payloads.js';
 import { workActivityId } from './orchestrator.js';
+import {
+  attemptTerminalSidecarPath,
+  type AttemptTerminalSidecar,
+} from './attempt-terminal.js';
 
 export const TERMINAL_RUN_STATUSES = new Set(['succeeded', 'failed', 'cancelled']);
 
@@ -224,10 +228,26 @@ export type AttemptIODTO = {
   resolvedInput?: BlobPreviewDTO;
   output?: BlobPreviewDTO;
   log?: BlobPreviewDTO;
+  terminal?: AttemptTerminalDTO;
   /** Full humanGate prompt when the producer spilled it to a blob via
    *  `promptRef`.  Read on demand via the same 64 KiB preview ladder as
    *  output / input blobs; cards never use this. */
   waitPrompt?: BlobPreviewDTO;
+};
+
+export type AttemptTerminalDTO = {
+  sessionId: string;
+  webPort: number;
+  status: 'live' | 'closed';
+  larkAppId?: string;
+  botName?: string;
+  cliId?: string;
+  workingDir?: string;
+  logPath?: string;
+  startedAt: number;
+  updatedAt: number;
+  closedAt?: number;
+  error?: string;
 };
 
 const BLOB_PREVIEW_MAX_BYTES = 64 * 1024;
@@ -290,6 +310,7 @@ async function buildAttemptIO(
         io.output = await previewRef(runDir, attempt.output, cache);
       }
       io.log = await previewAttemptLog(runDir, activity.activityId, attempt.attemptId);
+      io.terminal = await readAttemptTerminal(runDir, activity.activityId, attempt.attemptId);
       if (io.input?.value !== undefined && def) {
         io.resolvedInput = await previewResolvedInput(runDir, snap, def, io.input.value, cache);
       }
@@ -300,6 +321,55 @@ async function buildAttemptIO(
     }
   }
   return out;
+}
+
+async function readAttemptTerminal(
+  runDir: string,
+  activityId: string,
+  attemptId: string,
+): Promise<AttemptTerminalDTO | undefined> {
+  const path = attemptTerminalSidecarPath(runDir, activityId, attemptId);
+  if (!isPathInside(runDir, path)) {
+    return { sessionId: '', webPort: 0, status: 'closed', startedAt: 0, updatedAt: 0, error: 'terminal sidecar is outside run directory' };
+  }
+  try {
+    const raw = await fs.readFile(path, 'utf-8');
+    const parsed = JSON.parse(raw) as Partial<AttemptTerminalSidecar>;
+    // Schema bumps need an explicit migration story; reject unknown shapes for now.
+    if (
+      parsed.schemaVersion !== 1 ||
+      typeof parsed.sessionId !== 'string' ||
+      typeof parsed.webPort !== 'number' ||
+      (parsed.status !== 'live' && parsed.status !== 'closed') ||
+      typeof parsed.startedAt !== 'number' ||
+      typeof parsed.updatedAt !== 'number'
+    ) {
+      return { sessionId: '', webPort: 0, status: 'closed', startedAt: 0, updatedAt: 0, error: 'invalid terminal sidecar' };
+    }
+    return {
+      sessionId: parsed.sessionId,
+      webPort: parsed.webPort,
+      status: parsed.status,
+      larkAppId: parsed.larkAppId,
+      botName: parsed.botName,
+      cliId: parsed.cliId,
+      workingDir: parsed.workingDir,
+      logPath: parsed.logPath,
+      startedAt: parsed.startedAt,
+      updatedAt: parsed.updatedAt,
+      closedAt: parsed.closedAt,
+    };
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    return {
+      sessionId: '',
+      webPort: 0,
+      status: 'closed',
+      startedAt: 0,
+      updatedAt: 0,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
 }
 
 async function previewAttemptLog(

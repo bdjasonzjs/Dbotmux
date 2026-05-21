@@ -45,7 +45,23 @@ type AttemptIO = {
   resolvedInput?: BlobPreview;
   output?: BlobPreview;
   log?: BlobPreview;
+  terminal?: AttemptTerminal;
   waitPrompt?: BlobPreview;
+};
+
+type AttemptTerminal = {
+  sessionId: string;
+  webPort: number;
+  status: 'live' | 'closed';
+  larkAppId?: string;
+  botName?: string;
+  cliId?: string;
+  workingDir?: string;
+  logPath?: string;
+  startedAt: number;
+  updatedAt: number;
+  closedAt?: number;
+  error?: string;
 };
 
 type AttemptState = {
@@ -218,9 +234,12 @@ function statusLabel(status: string): string {
 }
 
 export function renderWorkflowsPage(root: HTMLElement): () => void {
-  const detailMatch = location.hash.match(/^#\/workflows\/([^/?#]+)$/);
+  const detailMatch = location.hash.match(/^#\/workflows\/([^?#]+)(?:\?([^#]*))?$/);
   if (detailMatch) {
-    return renderWorkflowDetailPage(root, decodeURIComponent(detailMatch[1]!));
+    const params = new URLSearchParams(detailMatch[2] ?? '');
+    return renderWorkflowDetailPage(root, decodeURIComponent(detailMatch[1]!), {
+      focusAttemptId: params.get('attempt') ?? undefined,
+    });
   }
   return renderWorkflowListPage(root);
 }
@@ -367,7 +386,11 @@ function renderWorkflowListPage(root: HTMLElement): () => void {
   };
 }
 
-function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void {
+function renderWorkflowDetailPage(
+  root: HTMLElement,
+  runId: string,
+  opts: { focusAttemptId?: string } = {},
+): () => void {
   root.innerHTML = `
     <div class="wf-detail-head">
       <a class="btn-link" href="#/workflows">${escapeHtml(t('workflow.detail.back'))}</a>
@@ -459,6 +482,7 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
   const approvalStatuses = new Map<string, { kind: 'ok' | 'error'; text: string }>();
   const resolvingWaits = new Set<string>();
   let timelineScrollTop = 0;
+  let focusAttemptId = opts.focusAttemptId;
 
   function setError(message: string | null): void {
     if (!message) {
@@ -671,7 +695,8 @@ function renderWorkflowDetailPage(root: HTMLElement, runId: string): () => void 
       statuses: approvalStatuses,
       resolving: resolvingWaits,
       onResolve: resolveHumanGate,
-    });
+    }, focusAttemptId);
+    focusAttemptId = undefined;
     renderEvents(eventTbody, events);
     timelineScroll.scrollTop = timelineScrollTop;
     loadOlder.hidden = !hasOlder;
@@ -996,9 +1021,13 @@ function renderNodeIO(
   openBlocks: Set<string>,
   scrollTops: Map<string, number>,
   approval: ApprovalRenderState,
+  focusAttemptId?: string,
 ): void {
   syncIOBlockState(el, openBlocks, scrollTops);
   syncApprovalComments(el, approval.comments);
+  if (focusAttemptId) {
+    openBlocks.add(ioBlockKey(focusAttemptId, t('workflow.detail.liveTerminal')));
+  }
   const byId = new Map(snap.activities.map((a) => [a.activityId, a]));
   const used = new Set<string>();
   const cards: string[] = [];
@@ -1008,7 +1037,7 @@ function renderNodeIO(
       (node.activityId ? byId.get(node.activityId) : undefined) ??
       snap.activities.find((a) => a.ownerNodeId === node.nodeId);
     if (!activity) {
-      cards.push(renderIOCard(node, undefined, undefined, openBlocks, approval));
+      cards.push(renderIOCard(node, undefined, undefined, openBlocks, approval, focusAttemptId));
       continue;
     }
     used.add(activity.activityId);
@@ -1018,6 +1047,7 @@ function renderNodeIO(
       snap.attemptIO?.[latestAttempt(activity)?.attemptId ?? ''],
       openBlocks,
       approval,
+      focusAttemptId,
     ));
   }
 
@@ -1029,6 +1059,7 @@ function renderNodeIO(
       snap.attemptIO?.[latestAttempt(activity)?.attemptId ?? ''],
       openBlocks,
       approval,
+      focusAttemptId,
     ));
   }
 
@@ -1036,6 +1067,7 @@ function renderNodeIO(
     ? cards.join('')
     : `<div class="empty">${escapeHtml(t('workflow.detail.noNodeIO'))}</div>`;
   restoreIOBlockScroll(el, scrollTops);
+  scrollFocusedAttemptIntoView(el, focusAttemptId);
   attachIOBlockToggleTracking(el, openBlocks);
   attachIOBlockScrollTracking(el, scrollTops);
   attachApprovalControls(el, approval);
@@ -1058,12 +1090,15 @@ function renderIOCard(
   io: AttemptIO | undefined,
   openBlocks: Set<string>,
   approval: ApprovalRenderState,
+  focusAttemptId?: string,
 ): string {
   const attempt = latestAttempt(activity);
   const title = node?.nodeId ?? activity?.ownerNodeId ?? activity?.activityId ?? 'unknown';
   const keyPrefix = attempt?.attemptId ?? activity?.activityId ?? node?.nodeId ?? 'unknown';
   const controls = renderApprovalControls(attempt, approval);
-  return `<article class="wf-io-card">
+  const focusClass = attempt?.attemptId === focusAttemptId ? ' is-focused' : '';
+  const attemptAttr = attempt ? ` data-wf-attempt-card="${escapeHtml(attempt.attemptId)}"` : '';
+  return `<article class="wf-io-card${focusClass}"${attemptAttr}>
     <header>
       <div>
         <strong><code>${escapeHtml(title)}</code></strong>
@@ -1076,6 +1111,7 @@ function renderIOCard(
     </div>
     ${controls}
     <div class="wf-io-grid">
+      ${renderTerminalBlock(keyPrefix, attempt, io?.terminal, openBlocks)}
       ${renderPreviewBlock(keyPrefix, t('workflow.detail.authoredInput'), io?.input, openBlocks)}
       ${renderPreviewBlock(keyPrefix, t('workflow.detail.resolvedInput'), io?.resolvedInput, openBlocks)}
       ${renderPreviewBlock(keyPrefix, t('workflow.detail.output'), io?.output, openBlocks)}
@@ -1083,6 +1119,56 @@ function renderIOCard(
       ${io?.waitPrompt ? renderPreviewBlock(keyPrefix, t('workflow.detail.waitPrompt'), io.waitPrompt, openBlocks) : ''}
     </div>
   </article>`;
+}
+
+function renderTerminalBlock(
+  keyPrefix: string,
+  attempt: AttemptState | undefined,
+  terminal: AttemptTerminal | undefined,
+  openBlocks: Set<string>,
+): string {
+  if (!terminal) return '';
+  const label = t('workflow.detail.liveTerminal');
+  const key = ioBlockKey(keyPrefix, label);
+  const meta = terminalMeta(attempt, terminal);
+  return `<details class="wf-io-block wf-terminal-block" data-io-key="${escapeHtml(key)}"${openBlocks.has(key) ? ' open' : ''}>
+    <summary>${escapeHtml(label)} ${meta}</summary>
+    ${renderTerminal(attempt, terminal)}
+  </details>`;
+}
+
+function terminalMeta(attempt: AttemptState | undefined, terminal: AttemptTerminal): string {
+  const bits: string[] = [];
+  if (terminal.error) bits.push(t('workflow.detail.error'));
+  else bits.push(terminal.status === 'live' ? t('workflow.detail.terminalLive') : t('workflow.detail.terminalClosedShort'));
+  if (attempt?.status) bits.push(attempt.status);
+  if (terminal.webPort > 0) bits.push(`:${terminal.webPort}`);
+  return `<span class="muted">${escapeHtml(bits.join(' · '))}</span>`;
+}
+
+function renderTerminal(attempt: AttemptState | undefined, terminal: AttemptTerminal): string {
+  if (terminal.error) {
+    return `<div class="muted error wf-io-empty">${escapeHtml(terminal.error)}</div>`;
+  }
+  if (!isLiveTerminal(attempt, terminal)) {
+    return `<div class="muted wf-io-empty">${escapeHtml(t('workflow.detail.terminalClosed'))}</div>`;
+  }
+  const url = terminalReadOnlyUrl(terminal);
+  return `<div class="wf-terminal-actions">
+      <a class="btn-link" href="${escapeHtml(url)}" target="_blank" rel="noreferrer">${escapeHtml(t('workflow.detail.openTerminalNewTab'))}</a>
+    </div>
+    <iframe class="wf-terminal-frame" src="${escapeHtml(url)}" title="${escapeHtml(t('workflow.detail.liveTerminal'))}" loading="lazy"></iframe>`;
+}
+
+function isLiveTerminal(attempt: AttemptState | undefined, terminal: AttemptTerminal): boolean {
+  return terminal.status === 'live' &&
+    terminal.webPort > 0 &&
+    (attempt?.status === 'pending' || attempt?.status === 'running' || attempt?.status === 'effectAttempting');
+}
+
+function terminalReadOnlyUrl(terminal: AttemptTerminal): string {
+  const host = window.location.hostname || '127.0.0.1';
+  return `http://${host}:${terminal.webPort}`;
 }
 
 function renderApprovalControls(
@@ -1148,11 +1234,24 @@ function renderPreviewBlock(
   preview: BlobPreview | undefined,
   openBlocks: Set<string>,
 ): string {
-  const key = `${keyPrefix}:${label}`;
+  const key = ioBlockKey(keyPrefix, label);
   return `<details class="wf-io-block" data-io-key="${escapeHtml(key)}"${openBlocks.has(key) ? ' open' : ''}>
     <summary>${escapeHtml(label)} ${previewMeta(preview)}</summary>
     ${renderPreview(preview)}
   </details>`;
+}
+
+function ioBlockKey(keyPrefix: string, label: string): string {
+  return `${keyPrefix}:${label}`;
+}
+
+function scrollFocusedAttemptIntoView(root: HTMLElement, focusAttemptId?: string): void {
+  if (!focusAttemptId) return;
+  for (const card of root.querySelectorAll<HTMLElement>('[data-wf-attempt-card]')) {
+    if (card.dataset.wfAttemptCard !== focusAttemptId) continue;
+    card.scrollIntoView({ block: 'center' });
+    return;
+  }
 }
 
 function syncIOBlockState(

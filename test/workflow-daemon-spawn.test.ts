@@ -283,6 +283,7 @@ describe('createWorkflowDaemonSpawn', () => {
             turnId: 'turn-1',
           });
           s.emit({ type: 'screen_update', content: '', status: 'idle' });
+          s.emitExit(0);
         }),
       });
 
@@ -294,6 +295,22 @@ describe('createWorkflowDaemonSpawn', () => {
       expect(log).toContain('system worker ready port=1');
       expect(log).toContain('final_output:turn-1');
       expect(log).toContain(WORKFLOW_OUTPUT_BEGIN);
+
+      const terminal = JSON.parse(readFileSync(join(tmp, 'terminal.json'), 'utf-8'));
+      expect(terminal).toMatchObject({
+        schemaVersion: 1,
+        sessionId: result.session.sessionId,
+        webPort: 1,
+        status: 'closed',
+        larkAppId: 'cli_x',
+        botName: 'claude-loopy',
+        cliId: 'claude-code',
+        workingDir: '/tmp',
+        logPath: attemptLogPath,
+      });
+      expect(typeof terminal.startedAt).toBe('number');
+      expect(typeof terminal.updatedAt).toBe('number');
+      expect(typeof terminal.closedAt).toBe('number');
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }

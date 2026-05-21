@@ -21,7 +21,7 @@
 
 import { fork, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { appendFileSync, existsSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -33,6 +33,12 @@ import type {
 } from './spawn-bot.js';
 import { WorkflowSpawnCancelledError } from './spawn-bot.js';
 import type { AbortCancelReason, WorkerSessionInfo } from './runtime.js';
+import {
+  ATTEMPT_TERMINAL_SCHEMA_VERSION,
+  ATTEMPT_TERMINAL_SIDECAR,
+  type AttemptTerminalSidecar,
+  type AttemptTerminalStatus,
+} from './attempt-terminal.js';
 import { logger } from '../utils/logger.js';
 
 // ─── IPC payloads (subset of WorkerToDaemon we care about) ────────────────
@@ -414,6 +420,7 @@ async function runOneShotImpl(
           if (settled) break;
           webPort = event.port;
           appendAttemptLog(input, 'system', `worker ready port=${event.port}`);
+          writeAttemptTerminalSidecar(input, makeSessionSnapshot(), 'live');
           logOneShotMemory(input, 'worker-ready-before-init-send');
           try {
             worker.send(init);
@@ -472,6 +479,9 @@ async function runOneShotImpl(
 
     worker.on('exit', (code) => {
       appendAttemptLog(input, 'system', `worker process exit code=${code ?? 'null'}`);
+      if (webPort !== undefined) {
+        writeAttemptTerminalSidecar(input, makeSessionSnapshot(), 'closed');
+      }
       // Worker is gone — we don't need to SIGKILL it anymore.
       if (sigkillTimer) {
         clearTimeout(sigkillTimer);
@@ -510,6 +520,44 @@ async function runOneShotImpl(
       logOneShotMemory(input, 'eager-init-send-failed');
     }
   });
+}
+
+function writeAttemptTerminalSidecar(
+  input: DaemonRunOneShotInput,
+  session: WorkerSessionInfo,
+  status: AttemptTerminalStatus,
+): void {
+  if (!input.attemptLogPath || session.webPort === undefined || session.webPort <= 0) return;
+  try {
+    const dir = dirname(input.attemptLogPath);
+    mkdirSync(dir, { recursive: true });
+    const now = Date.now();
+    const sidecar: AttemptTerminalSidecar = {
+      schemaVersion: ATTEMPT_TERMINAL_SCHEMA_VERSION,
+      sessionId: session.sessionId,
+      webPort: session.webPort,
+      status,
+      larkAppId: session.larkAppId,
+      botName: session.botName,
+      cliId: session.cliId,
+      workingDir: session.workingDir,
+      logPath: session.logPath,
+      startedAt: session.startedAt,
+      updatedAt: now,
+      ...(status === 'closed' ? { closedAt: now } : {}),
+    };
+    writeFileSync(
+      join(dir, ATTEMPT_TERMINAL_SIDECAR),
+      JSON.stringify(sidecar, null, 2),
+      'utf-8',
+    );
+  } catch (err) {
+    appendAttemptLog(
+      input,
+      'system',
+      `failed to write terminal sidecar: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
 }
 
 // Per-spawn memory diagnostics. Gated by the same env flag the periodic

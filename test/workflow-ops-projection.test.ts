@@ -239,6 +239,23 @@ describe('readRunSnapshot', () => {
       '[2026-05-20T00:00:00.000Z] stdout running step\n',
       'utf-8',
     );
+    writeFileSync(
+      join(attemptDir, 'terminal.json'),
+      JSON.stringify({
+        schemaVersion: 1,
+        sessionId: 'wf-r-io-only',
+        webPort: 32123,
+        status: 'live',
+        larkAppId: 'cli_x',
+        botName: 'bot-x',
+        cliId: 'claude-code',
+        workingDir: '/repo',
+        logPath: join(attemptDir, 'terminal.log'),
+        startedAt: 100,
+        updatedAt: 200,
+      }),
+      'utf-8',
+    );
     const snap = await readRunSnapshot(runsDir, 'r-io');
 
     expect(snap?.attemptIO[attemptId]?.input?.value).toEqual({
@@ -253,6 +270,19 @@ describe('readRunSnapshot', () => {
     });
     expect(snap?.attemptIO[attemptId]?.output?.value).toEqual({ ok: true });
     expect(snap?.attemptIO[attemptId]?.log?.text).toContain('stdout running step');
+    expect(snap?.attemptIO[attemptId]?.terminal).toEqual({
+      sessionId: 'wf-r-io-only',
+      webPort: 32123,
+      status: 'live',
+      larkAppId: 'cli_x',
+      botName: 'bot-x',
+      cliId: 'claude-code',
+      workingDir: '/repo',
+      logPath: join(attemptDir, 'terminal.log'),
+      startedAt: 100,
+      updatedAt: 200,
+      closedAt: undefined,
+    });
   });
 
   it('shows interpolated prompt in resolved input preview', async () => {

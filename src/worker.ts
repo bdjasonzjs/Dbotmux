@@ -3116,7 +3116,12 @@ process.on('message', async (raw: unknown) => {
           startScreenUpdates();
           startScreenAnalyzer();
         } else {
-          log('Workflow worker mode: skipping web terminal, screen updates, and screen analyzer');
+          // Workflow attempts still expose a read-only web terminal so the
+          // workflow dashboard can observe in-flight subagents.  Keep the
+          // chat-side features disabled: no screen cards, no analyzer, no
+          // sessionStore writes.
+          port = await startWebServer('0.0.0.0', msg.webPort);
+          log('Workflow worker mode: web terminal enabled; skipping screen updates and screen analyzer');
         }
         spawnCli(msg);
 
