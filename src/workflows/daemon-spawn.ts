@@ -31,7 +31,7 @@ import type {
   DaemonSpawnDeps,
 } from './spawn-bot.js';
 import { WorkflowSpawnCancelledError } from './spawn-bot.js';
-import type { AbortCancelReason } from './runtime.js';
+import type { AbortCancelReason, WorkerSessionInfo } from './runtime.js';
 import { logger } from '../utils/logger.js';
 
 // ─── IPC payloads (subset of WorkerToDaemon we care about) ────────────────
@@ -243,27 +243,31 @@ async function runOneShotImpl(
   return new Promise<DaemonRunOneShotResult>((resolve, reject) => {
     let settled = false;
     let sigkillTimer: NodeJS.Timeout | undefined;
+    let cancelRequested = false;
+    let cancelOriginEventId = '';
     const timeoutMs = input.timeoutMs ?? deps.defaultTimeoutMs;
     const hardDeadline = setTimeout(() => {
       fail(new Error(`workflow worker timeout after ${timeoutMs} ms`));
     }, timeoutMs);
 
-    const cleanup = (): void => {
+    const cleanup = (opts: { skipSigterm?: boolean } = {}): void => {
       clearTimeout(hardDeadline);
       if (quiesceTimer) clearTimeout(quiesceTimer);
-      // NOTE: do NOT clear `sigkillTimer` here.  cleanup() is called from
-      // `fail()` which is what cancel itself triggers — clearing the
-      // grace timer would cancel our own SIGKILL escalation and a stuck
-      // CLI worker would keep eating CPU.  The sigkillTimer is cleared
-      // only on the worker's `exit` event below.
+      // sigkillTimer is cleared only on the worker's `exit` event so the
+      // grace escalation isn't cancelled by our own cleanup path.
       input.cancelSignal?.removeEventListener('abort', onCancelAbort);
       try {
         worker.send({ type: 'close' });
       } catch {
         /* worker may already be gone */
       }
-      // Give close a moment to land before SIGTERM.
-      setTimeout(() => worker.kill('SIGTERM'), 250);
+      // Cancel path manages its own SIGINT + grace + SIGKILL.  Sending
+      // an extra SIGTERM 250ms after abort would race with the 5s grace
+      // and potentially kill a CLI mid-flush.  The success path still
+      // wants SIGTERM to make sure idle workers exit promptly.
+      if (!opts.skipSigterm) {
+        setTimeout(() => worker.kill('SIGTERM'), 250);
+      }
     };
 
     /**
@@ -274,19 +278,22 @@ async function runOneShotImpl(
      *      conventionally honor (Ctrl-C semantics).
      *   3. Arm a SIGKILL fallback after `cancelGraceMs` in case the CLI
      *      is stuck (rare but real — e.g. mid-network call).
-     *   4. Reject the outer Promise with `WorkflowSpawnCancelledError`;
-     *      `createDaemonSpawnFn` maps it to `kind: 'cancelled'` so
-     *      `dispatchWork` writes `activityCanceled` with the right
-     *      `cancelOriginEventId`.
+     *   4. **Wait for the worker's `exit` event** before rejecting the
+     *      outer Promise.  This guarantees `activityCanceled` (written
+     *      by dispatchWork on `kind: 'cancelled'`) is only appended
+     *      after the worker process is actually gone — otherwise we'd
+     *      mark the activity terminal while the worker could still be
+     *      writing files or invoking tools (codex round 4 B1).
      *
-     * If the worker had already produced final_output and we're inside
-     * the quiesce window, success-wins: we DON'T cancel. The `settled`
-     * guard in `fail` enforces that.
+     * success-wins: if the worker already produced final_output and the
+     * quiesce window is running, the `settled` guard in `finish`
+     * prevents this from overriding.
      */
     function onCancelAbort(): void {
-      if (settled) return;
+      if (settled || cancelRequested) return;
+      cancelRequested = true;
       const reason = input.cancelSignal!.reason as AbortCancelReason | undefined;
-      const cancelOriginEventId = typeof reason?.cancelOriginEventId === 'string'
+      cancelOriginEventId = typeof reason?.cancelOriginEventId === 'string'
         ? reason.cancelOriginEventId
         : '';
       appendAttemptLog(
@@ -300,22 +307,9 @@ async function runOneShotImpl(
         appendAttemptLog(input, 'system', `cancel grace expired; escalating to SIGKILL`);
         try { worker.kill('SIGKILL'); } catch { /* already gone */ }
       }, deps.cancelGraceMs);
-      // Snapshot session info so the cancel result still tells the
-      // dashboard who/what was cancelled.
-      const sessionSnapshot = {
-        sessionId: synthetic.sessionId,
-        larkAppId: creds.larkAppId,
-        botName: input.botName,
-        cliId,
-        workingDir: cwd,
-        webPort,
-        logPath: input.attemptLogPath,
-        startedAt,
-        endedAt: Date.now(),
-      };
-      // Reject via the sentinel error.  cleanup() will fire from `fail`
-      // and stop further worker output from racing.
-      fail(new WorkflowSpawnCancelledError(cancelOriginEventId, sessionSnapshot));
+      // NB: don't reject here.  The worker's `exit` handler below
+      // finalizes the WorkflowSpawnCancelledError once the process is
+      // truly gone.
     }
     if (input.cancelSignal) {
       if (input.cancelSignal.aborted) {
@@ -326,6 +320,20 @@ async function runOneShotImpl(
       } else {
         input.cancelSignal.addEventListener('abort', onCancelAbort);
       }
+    }
+
+    function makeSessionSnapshot(): WorkerSessionInfo {
+      return {
+        sessionId: synthetic.sessionId,
+        larkAppId: creds.larkAppId,
+        botName: input.botName,
+        cliId,
+        workingDir: cwd,
+        webPort,
+        logPath: input.attemptLogPath,
+        startedAt,
+        endedAt: Date.now(),
+      };
     }
 
     const fail = (err: Error): void => {
@@ -433,6 +441,15 @@ async function runOneShotImpl(
       if (sigkillTimer) {
         clearTimeout(sigkillTimer);
         sigkillTimer = undefined;
+      }
+      // Cancel path: worker has actually stopped, NOW we can settle as
+      // cancelled (codex round 4 B1 — activityCanceled must not land
+      // while the worker is still alive and possibly still writing).
+      if (cancelRequested && !settled) {
+        settled = true;
+        cleanup({ skipSigterm: true });
+        reject(new WorkflowSpawnCancelledError(cancelOriginEventId, makeSessionSnapshot()));
+        return;
       }
       // If we already resolved, the cleanup() already killed the worker;
       // ignore the exit.  If we're still waiting for output, treat as fail.
