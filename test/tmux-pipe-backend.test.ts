@@ -38,7 +38,7 @@ vi.mock('node:fs', async () => {
 });
 
 import { execSync, execFileSync, spawnSync } from 'node:child_process';
-import { unlinkSync } from 'node:fs';
+import { unlinkSync, createReadStream } from 'node:fs';
 import { TmuxPipeBackend, normaliseCaptureLineEndings } from '../src/adapters/backend/tmux-pipe-backend.js';
 
 const mockedExecSync = vi.mocked(execSync);
@@ -130,6 +130,12 @@ describe('TmuxPipeBackend input addressing', () => {
     expect(pasteArgs).toContain('paste-buffer');
     const tIdx = pasteArgs.indexOf('-t');
     expect(pasteArgs[tIdx + 1]).toBe('0:5.0');
+    // -p forces bracketed-paste markers, REQUIRED for CoCo/Ink to treat the
+    // content as one paste and accept the trailing Enter as a submit. Without
+    // it the Enter is swallowed as a soft-newline and the message strands in
+    // the input box (replies-to-previous-message off-by-one). Regression guard
+    // for PR #25, which added -p only to the unused TmuxBackend.
+    expect(pasteArgs).toContain('-p');
   });
 
   it('write delegates to sendText (literal send-keys)', () => {
@@ -395,6 +401,92 @@ describe('TmuxPipeBackend lifecycle watcher', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe('TmuxPipeBackend send failure handling', () => {
+  // Regression: a CLI that exits mid-write destroys its tmux session, so the
+  // next `tmux send-keys` returns exit 1. Previously execFileSync's throw
+  // propagated through writeInput → flushPending (fire-and-forget async) →
+  // unhandledRejection and killed the whole worker. The send methods must
+  // never throw: pane-gone is converted to a normal onExit, a transient
+  // failure on a live pane is logged and dropped.
+  it('fires onExit (does NOT throw) when send-keys fails and the pane is gone', () => {
+    const be = new TmuxPipeBackend('bmx-dead', { ownsSession: true });
+    const exits: Array<[number | null, string | null]> = [];
+    be.onExit((c, s) => exits.push([c, s]));
+    be.spawn('', [], spawnOpts());
+
+    // The actual send-keys (execFileSync) fails…
+    mockedExecFileSync.mockImplementation((_bin: any, args: any) => {
+      if ((args as string[]).includes('send-keys')) throw new Error('no server running');
+      return '' as any;
+    });
+    // …and the liveness probe (execSync display-message) also fails ⇒ pane GONE.
+    mockedExecSync.mockImplementation(() => { throw new Error('no server running'); });
+
+    expect(() => be.sendSpecialKeys('Enter')).not.toThrow();
+    expect(exits).toEqual([[1, null]]);
+  });
+
+  it('drops the write (no throw, no exit) when send-keys fails but the pane is alive', () => {
+    const be = new TmuxPipeBackend('bmx-live', { ownsSession: true });
+    const exits: Array<[number | null, string | null]> = [];
+    be.onExit((c, s) => exits.push([c, s]));
+    be.spawn('', [], spawnOpts());
+
+    mockedExecFileSync.mockImplementation((_bin: any, args: any) => {
+      if ((args as string[]).includes('send-keys')) throw new Error('transient tmux error');
+      return '' as any;
+    });
+    // Liveness probe succeeds ⇒ pane ALIVE ⇒ transient error, just dropped.
+    mockedExecSync.mockReturnValue('' as any);
+
+    expect(() => be.sendText('hi')).not.toThrow();
+    expect(exits).toEqual([]);
+  });
+
+  it('dumps the piped output tail (CLI final stdout/stderr) when the pane is gone', () => {
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      const be = new TmuxPipeBackend('bmx-dead3', { ownsSession: true });
+      be.spawn('', [], spawnOpts());
+      // Drive the fifo data handler so recentOutput holds the CLI's last bytes.
+      const stream: any = vi.mocked(createReadStream).mock.results.at(-1)!.value;
+      stream.emit('data', Buffer.from('Error: gateway 502 — model unavailable\n'));
+
+      mockedExecFileSync.mockImplementation((_bin: any, args: any) => {
+        if ((args as string[]).includes('send-keys')) throw new Error('no server running');
+        return '' as any;
+      });
+      mockedExecSync.mockImplementation(() => { throw new Error('no server running'); });
+
+      be.sendSpecialKeys('Enter');
+
+      const dumped = errSpy.mock.calls.map(c => String(c[0])).join('');
+      expect(dumped).toContain('CLI last output before exit');
+      expect(dumped).toContain('gateway 502 — model unavailable');
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  it('paste failure with a gone pane fires onExit instead of throwing', () => {
+    const be = new TmuxPipeBackend('bmx-dead2', { ownsSession: true });
+    const exits: Array<[number | null, string | null]> = [];
+    be.onExit((c, s) => exits.push([c, s]));
+    be.spawn('', [], spawnOpts());
+
+    mockedExecFileSync.mockImplementation((_bin: any, args: any) => {
+      if ((args as string[]).includes('load-buffer') || (args as string[]).includes('paste-buffer')) {
+        throw new Error('no server running');
+      }
+      return '' as any;
+    });
+    mockedExecSync.mockImplementation(() => { throw new Error('no server running'); });
+
+    expect(() => be.pasteText('hello')).not.toThrow();
+    expect(exits).toEqual([[1, null]]);
   });
 });
 

@@ -6,7 +6,7 @@
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { getBot, getAllBots, isChatOncallBoundForAnyBot, type BotState } from '../../bot-registry.js';
+import { getBot, getAllBots, isChatOncallBoundForAnyBot, getOwnerOpenId, type BotState } from '../../bot-registry.js';
 import { config } from '../../config.js';
 import { getChatInfo, getChatMode, listChatBotMembers, replyMessage, sendUserMessage } from './client.js';
 import { logger } from '../../utils/logger.js';
@@ -14,6 +14,10 @@ import { parseForceTopicInvocation } from '../../core/command-handler.js';
 import { stripLeadingMentions } from './message-parser.js';
 import { recordObservedBots } from '../../services/observed-bots-store.js';
 import { BOTMUX_REQUIRED_SCOPES, buildScopeDeepLink } from '../../setup/verify-permissions.js';
+import { tryHandleGrantCommand } from './grant-command.js';
+import { buildGrantCard } from './card-builder.js';
+import { openPending, isThrottled } from './grant-pending.js';
+import { localeForBot } from '../../i18n/index.js';
 
 // ─── Bot identity ─────────────────────────────────────────────────────────
 
@@ -483,9 +487,15 @@ export function isBotMentioned(larkAppId: string, message: any, _senderOpenId: s
 // so an unbound sibling doesn't fall back to allowedUsers and reply
 // "⚠️ 无操作权限" when @-mentioned in a shared oncall workspace.
 
+/** per-chat per-user 授权命中判断（仅用于 canTalk —— 不给管理命令权）。 */
+function hasChatGrant(larkAppId: string, chatId: string | undefined, openId: string | undefined): boolean {
+  return !!chatId && !!openId && !!getBot(larkAppId).config.chatGrants?.[chatId]?.includes(openId);
+}
+
 export function canTalk(larkAppId: string, chatId: string | undefined, senderOpenId: string | undefined): boolean {
   if (chatId && isChatOncallBoundForAnyBot(chatId)) return true;
   if (isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId)) return true;
+  if (hasChatGrant(larkAppId, chatId, senderOpenId)) return true;
   const allowedUsers = getBot(larkAppId).resolvedAllowedUsers;
   if (allowedUsers.length === 0) return true;
   return !!senderOpenId && allowedUsers.includes(senderOpenId);
@@ -495,6 +505,27 @@ export function canOperate(larkAppId: string, _chatId: string | undefined, sende
   const allowedUsers = getBot(larkAppId).resolvedAllowedUsers;
   if (allowedUsers.length === 0) return true;
   return !!senderOpenId && allowedUsers.includes(senderOpenId);
+}
+
+/**
+ * 入口 A：无权限者 @bot 时弹授权申请卡（正文 @owner，由 owner 处置）。
+ * 受 grant-pending 节流：pending 中 / deny 冷却期内静默不发。开放模式（无 owner）兜底不发。
+ */
+async function maybeSendGrantRequestCard(
+  larkAppId: string, message: any, chatId: string, requesterOpenId: string | undefined,
+): Promise<void> {
+  const owner = getOwnerOpenId(larkAppId);
+  if (!owner || !requesterOpenId) return;
+  if (isThrottled(larkAppId, chatId, requesterOpenId)) return;
+  const name = (message?.mentions ?? []).find((m: any) => m?.id?.open_id === requesterOpenId)?.name
+    ?? requesterOpenId;
+  const nonce = openPending(larkAppId, chatId, requesterOpenId);
+  const card = buildGrantCard(
+    { ownerOpenId: owner, requesterOpenId, requesterName: String(name), chatId, nonce, mode: 'request' },
+    localeForBot(larkAppId),
+  );
+  await replyMessage(larkAppId, message.message_id, card, 'interactive')
+    .catch(err => logger.debug(`grant request card send failed: ${err}`));
 }
 
 // ─── Group message access check ──────────────────────────────────────────
@@ -700,10 +731,14 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
   const eventDispatcher = new Lark.EventDispatcher({}).register({
     'card.action.trigger': async (data: any) => {
       try {
-        const cardBody = await handlers.handleCardAction(data, larkAppId);
-        // If the handler returns a card body (e.g. toggle_stream), return it
-        // so Lark renders the update immediately without waiting for an API PATCH.
-        if (cardBody) return { card: { type: 'raw', data: cardBody } };
+        const result = await handlers.handleCardAction(data, larkAppId);
+        // The handler may return:
+        //   - an already-shaped Lark response ({toast} and/or {card}) → pass through
+        //     so toasts (e.g. "仅 owner 可操作") and explicit card payloads render;
+        //   - a raw card body (e.g. toggle_stream) → wrap as an in-place card patch
+        //     so Lark updates the clicked card without waiting for an API PATCH.
+        if (result && (result.toast || result.card)) return result;
+        if (result) return { card: { type: 'raw', data: result } };
       } catch (err) {
         logger.error(`Error handling card action: ${err}`);
       }
@@ -761,7 +796,17 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           // keeps random Lark bots from silently spawning chat-scope sessions
           // in 普通群/p2p, while letting Bot A → Bot B handoffs in 普通群 work
           // (handleThreadReply auto-create + chat-scope inheritance below).
-          if (ctx.scope === 'chat') {
+          //
+          // 注意 isKnownPeerBot 查的是 cross-ref（bot-openids-<appId>.json），它只
+          // 收录 bots-info.json 里有名字的 bot，即本机 daemon 自己配置的 bot
+          // （getAllBots）。"别人的 bot" 永远进不了这个 cross-ref，所以 isKnownPeerBot
+          // 对外部 bot 恒为 false——这跟 /introduce 是两套独立存储：/introduce 写的是
+          // observed-bots-store，只负责让发送方"发现并能 @ 到"对方，过不了这道接收闸。
+          //
+          // Oncall 群是显式部署的协作工作区，canTalk 已对任何成员（含真人）放行；这里
+          // 对 bot 同等放行，跳过 cross-ref vetting。否则 oncall 群里外部 bot 互相 @
+          // 会被静默丢弃、只有真人能拉起会话，与 oncall「全员可对话」语义不符。
+          if (ctx.scope === 'chat' && !isChatOncallBoundForAnyBot(chatId)) {
             const ownsSession = handlers.isSessionOwner?.(ctx.anchor, larkAppId) ?? false;
             if (!ownsSession && !isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId)) {
               return;
@@ -780,6 +825,12 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         // so the command never reaches a CLI session (each @ed bot's daemon
         // independently records the mentions[] open_ids + names).
         if (await tryHandleIntroduceCommand(larkAppId, message, senderOpenId, isAllowed)) {
+          return;
+        }
+
+        // /grant、/revoke — 群内授权元命令。在路由/spawn 之前拦截（仅 owner，需明确 @ 本 bot），
+        // 否则会被当成 prompt 喂给 CLI 会话。
+        if (await tryHandleGrantCommand(larkAppId, message, senderOpenId)) {
           return;
         }
 
@@ -882,11 +933,10 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           if (!relax) {
             const access = await checkGroupMessageAccess(larkAppId, message, chatId, senderOpenId);
             if (access === 'not_allowed') {
-              if (!ownsSession) {
-                replyMessage(larkAppId, messageId, JSON.stringify({ text: '⚠️ 无操作权限' }))
-                  .catch(err => logger.debug(`Failed to send permission denied: ${err}`));
-              }
-              logger.debug(`Ignoring group message from non-allowed user: ${senderOpenId}`);
+              // 入口 A：无权限者 @bot → 弹授权申请卡（@owner），代替「无操作权限」。
+              // 覆盖 ownsSession 真假两种情况，但绝不把该消息喂进已有 session。
+              await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId);
+              logger.debug(`Ignoring group message from non-allowed user: ${senderOpenId} (grant request card path)`);
               return;
             }
             if (access === 'ignore') {

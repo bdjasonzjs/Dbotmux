@@ -5,10 +5,12 @@
  */
 import { execSync } from 'node:child_process';
 import { config } from '../../config.js';
-import { getBot, getAllBots } from '../../bot-registry.js';
+import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { canOperate } from './event-dispatcher.js';
-import { sendUserMessage, updateMessage, deleteMessage } from './client.js';
-import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, buildSessionClosedCard, getCliDisplayName, truncateContent } from './card-builder.js';
+import { sendUserMessage, updateMessage, deleteMessage, replyMessage } from './client.js';
+import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, buildSessionClosedCard, buildGrantResultCard, buildGrantNotifyCard, getCliDisplayName, truncateContent } from './card-builder.js';
+import { addChatGrant, addGlobalGrant } from '../../services/grant-store.js';
+import { checkNonce, clearPending, markDenied } from './grant-pending.js';
 import {
   handleWorkflowApprovalAction,
   isWorkflowApprovalAction,
@@ -134,6 +136,58 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   // Use the receiving bot's allowedUsers — the operator open_id in card actions
   // is scoped to the app that received the callback.
   const operatorOpenId = data?.operator?.open_id;
+
+  // ─── 群内授权卡片动作（grant_chat / grant_global / grant_deny）─────────────
+  // 不绑定 session，必须在 session 解析之前处理。owner 强闸门 + nonce 校验。
+  if (value?.action && (value.action === 'grant_chat' || value.action === 'grant_global' || value.action === 'grant_deny') && larkAppId) {
+    const loc = localeForBot(larkAppId);
+    const owner = getOwnerOpenId(larkAppId);
+    // owner 强闸门：必须是当前 app 的 owner 本人（比 canOperate 更严）
+    if (!operatorOpenId || operatorOpenId !== owner) {
+      logger.info(`Grant action "${value.action}" blocked for non-owner: ${operatorOpenId}`);
+      return { toast: { type: 'error', content: t('card.grant.toast_owner_only', undefined, loc) } };
+    }
+    const target = value.target_open_id;
+    const grantChatId = value.chat_id;
+    const nonce = value.nonce;
+    if (!target || !grantChatId || !nonce || !checkNonce(larkAppId, grantChatId, target, nonce)) {
+      return { toast: { type: 'error', content: t('card.grant.toast_expired', undefined, loc) } };
+    }
+    // 拒绝：只把卡更新成「已拒绝」+ 进 deny 冷却，绝不触碰 grant-store。
+    // 返回原始卡 body，由 dispatcher 包成 in-place patch（不再走 updateMessage 双写）。
+    if (value.action === 'grant_deny') {
+      markDenied(larkAppId, grantChatId, target);
+      return JSON.parse(buildGrantResultCard('deny', loc));
+    }
+    // 授权：先落库。落库失败不撤卡、保留 pending（owner 可重试），给 toast。
+    const res = value.action === 'grant_chat'
+      ? await addChatGrant(larkAppId, grantChatId, target)
+      : await addGlobalGrant(larkAppId, target);
+    if (!res.ok) {
+      logger.warn(`Grant action "${value.action}" store failed: ${res.reason}`);
+      return { toast: { type: 'error', content: t('card.grant.toast_failed', { reason: res.reason }, loc) } };
+    }
+    clearPending(larkAppId, grantChatId, target);
+    const kind = value.action === 'grant_chat' ? 'chat' : 'global';
+    // 授权成功后：在原线程 @ 被授权人发通知 + 撤回授权卡（用户要求）。
+    // 这两步失败不回滚授权（已落库），仅记日志，并兜底用 in-place patch 让 owner 看到结果。
+    if (cardMessageId) {
+      // 通知是 best-effort（@被授权人）；失败不影响主流程，只记日志。
+      try {
+        await replyMessage(larkAppId, cardMessageId, buildGrantNotifyCard(kind, target, loc), 'interactive', true);
+      } catch (err) {
+        logger.warn(`grant notify failed (grant still applied): ${err}`);
+      }
+      // 撤回授权卡。deleteMessage 返回 boolean——只有确认撤回成功才不返回 patch；
+      // 否则（SDK 吞错/非 0 code）落到 in-place patch，避免卡片留在原地无终态。
+      const withdrawn = await deleteMessage(larkAppId, cardMessageId);
+      if (withdrawn) return;
+      logger.warn(`grant card withdraw failed (grant still applied); falling back to in-place patch`);
+    }
+    // 兜底（无 card message_id，或撤回失败）：靠 callback 返回 patch 原地更新卡。
+    return JSON.parse(buildGrantResultCard(kind, loc));
+  }
+
   const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'get_write_link', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
@@ -155,8 +209,13 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       : undefined;
     const effectiveAppId = larkAppId ?? ds?.larkAppId ?? closedForCtx?.larkAppId;
     const chatId = ds?.chatId ?? closedForCtx?.chatId;
+    // pendingRepo 阶段，会话发起人（含 chat-granted 用户）可以 skip_repo 起会话——
+    // 与 repo 下拉选择同款例外，否则被授权人连自己的首次会话都启动不了。
+    const pendingRepoOwnerException =
+      value.action === 'skip_repo' && !!ds?.pendingRepo &&
+      !!operatorOpenId && operatorOpenId === ds.session.ownerOpenId;
     if (effectiveAppId) {
-      if (!canOperate(effectiveAppId, chatId, operatorOpenId)) {
+      if (!pendingRepoOwnerException && !canOperate(effectiveAppId, chatId, operatorOpenId)) {
         logger.info(`Card action "${value.action}" blocked for non-operator user: ${operatorOpenId} (chat=${chatId})`);
         return;
       }
@@ -699,6 +758,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const ds = activeSessions.get(sKey);
     if (!ds) return;
 
+    // /adopt 是管理动作：下拉入口同样要求 canOperate（命令路径已在 daemon 层 gate）。
+    if (!canOperate(ds.larkAppId, ds.chatId, operatorOpenId)) {
+      logger.info(`adopt_select blocked for non-operator user: ${operatorOpenId} (chat=${ds.chatId})`);
+      return { toast: { type: 'error', content: t('card.grant.toast_no_repo_perm', undefined, localeForBot(ds.larkAppId)) } };
+    }
+
     // Parse selected session info
     let selected: { tmuxTarget: string; cliPid: number };
     try { selected = JSON.parse(option); } catch { return; }
@@ -734,6 +799,17 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   if (!targetDs) {
     logger.warn(`Card action: no active session found for root ${rootId}`);
     return;
+  }
+
+  // 权限边界：pendingRepo（首次选 repo 才能 spawn）放行「会话发起人 或 canOperate」，
+  // 让本群授权用户能完成自己的首次使用；非 pending 的 mid-session 切换是管理动作，要 canOperate。
+  const isSessionOwnerOp = !!operatorOpenId && operatorOpenId === targetDs.session.ownerOpenId;
+  const allowRepo = targetDs.pendingRepo
+    ? (isSessionOwnerOp || canOperate(targetDs.larkAppId, targetDs.chatId, operatorOpenId))
+    : canOperate(targetDs.larkAppId, targetDs.chatId, operatorOpenId);
+  if (!allowRepo) {
+    logger.info(`Repo card action blocked for ${operatorOpenId} (pending=${targetDs.pendingRepo})`);
+    return { toast: { type: 'error', content: t('card.grant.toast_no_repo_perm', undefined, localeForBot(targetDs.larkAppId)) } };
   }
 
   // Resolve the project name from cached scan

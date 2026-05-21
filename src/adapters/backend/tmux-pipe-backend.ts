@@ -50,6 +50,15 @@ export class TmuxPipeBackend implements SessionBackend {
   private readonly fifoPath: string;
   private readStream: fs.ReadStream | null = null;
   private readonly dataCbs: Array<(d: string) => void> = [];
+  /** Bounded tail of the decoded output tmux most recently replicated from the
+   *  pane (kept to the last RECENT_OUTPUT_MAX UTF-16 code units, not an exact
+   *  byte count — fine for a diagnostic). Crash diagnostic: when a send fails
+   *  because the pane vanished, capture-pane can no longer read the (now-gone)
+   *  screen — but this text was already received over the pipe and is the
+   *  CLI's actual final stdout/stderr (e.g. a gateway/API error) right before
+   *  it exited. */
+  private recentOutput = '';
+  private static readonly RECENT_OUTPUT_MAX = 4096;
   private readonly exitCbs: Array<(code: number | null, signal: string | null) => void> = [];
   private lifecycleTimer: NodeJS.Timeout | null = null;
   private cols = 200;
@@ -126,6 +135,9 @@ export class TmuxPipeBackend implements SessionBackend {
 
     this.readStream.on('data', (chunk) => {
       const data = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+      if (data) {
+        this.recentOutput = (this.recentOutput + data).slice(-TmuxPipeBackend.RECENT_OUTPUT_MAX);
+      }
       for (const cb of this.dataCbs) {
         try { cb(data); } catch { /* listener crash shouldn't kill the stream */ }
       }
@@ -161,37 +173,102 @@ export class TmuxPipeBackend implements SessionBackend {
   sendText(text: string): void {
     if (this.exited) return;
     this.exitCopyModeIfNeeded();
-    execFileSync('tmux', ['send-keys', '-t', this.paneTarget, '-l', '--', text], {
-      stdio: 'ignore',
-      timeout: 5000,
-      env: tmuxEnv(),
+    this.guardedSend('send-keys (text)', () => {
+      execFileSync('tmux', ['send-keys', '-t', this.paneTarget, '-l', '--', text], {
+        stdio: 'ignore',
+        timeout: 5000,
+        env: tmuxEnv(),
+      });
     });
   }
 
   sendSpecialKeys(...keys: string[]): void {
     if (this.exited) return;
     this.exitCopyModeIfNeeded();
-    execFileSync('tmux', ['send-keys', '-t', this.paneTarget, ...keys], {
-      stdio: 'ignore',
-      timeout: 5000,
-      env: tmuxEnv(),
+    this.guardedSend(`send-keys ${keys.join(' ')}`, () => {
+      execFileSync('tmux', ['send-keys', '-t', this.paneTarget, ...keys], {
+        stdio: 'ignore',
+        timeout: 5000,
+        env: tmuxEnv(),
+      });
     });
   }
 
+  /**
+   * Paste text into the pane via load-buffer + paste-buffer.
+   * The -p flag asks tmux to wrap the buffer in bracketed-paste markers
+   * (\e[200~ … \e[201~) when the application has requested bracketed paste.
+   * This is REQUIRED for CoCo/Ink: without the markers the TUI treats the
+   * paste as a rapid input burst and swallows the trailing Enter as a soft
+   * newline, stranding the message in the input box (it then gets submitted
+   * by the *next* paste — the "replies to the previous message" off-by-one).
+   * NB: TmuxPipeBackend is the only backend used at runtime (see
+   * selectSessionBackend), so this is the path that actually matters.
+   */
   pasteText(text: string): void {
     if (this.exited) return;
     this.exitCopyModeIfNeeded();
-    execFileSync('tmux', ['load-buffer', '-'], {
-      input: text,
-      stdio: ['pipe', 'ignore', 'ignore'],
-      timeout: 5000,
-      env: tmuxEnv(),
+    this.guardedSend('paste-buffer', () => {
+      execFileSync('tmux', ['load-buffer', '-'], {
+        input: text,
+        stdio: ['pipe', 'ignore', 'ignore'],
+        timeout: 5000,
+        env: tmuxEnv(),
+      });
+      execFileSync('tmux', ['paste-buffer', '-t', this.paneTarget, '-d', '-p'], {
+        stdio: 'ignore',
+        timeout: 5000,
+        env: tmuxEnv(),
+      });
     });
-    execFileSync('tmux', ['paste-buffer', '-t', this.paneTarget, '-d'], {
-      stdio: 'ignore',
-      timeout: 5000,
-      env: tmuxEnv(),
-    });
+  }
+
+  /**
+   * Run a tmux write (send-keys / load-buffer / paste-buffer) that must never
+   * crash the worker on failure.
+   *
+   * Background: when the CLI process exits mid-write its tmux session/pane is
+   * destroyed, so the very next `tmux send-keys` returns exit 1. The 1s
+   * lifecycle watcher hasn't fired yet, so `this.exited` is still false and the
+   * guard above doesn't help. Previously execFileSync's synchronous throw
+   * propagated through writeInput → flushPending (a fire-and-forget async with
+   * no .catch) → unhandledRejection, which killed the entire worker process
+   * (and with it every Lark session it served).
+   *
+   * Classify the failure instead of letting it escape:
+   *   - pane GONE  → the CLI exited; convert to a normal onExit so the worker
+   *                  tears the session down and tells the user "CLI exited",
+   *                  exactly like the lifecycle watcher would have.
+   *   - pane ALIVE → a transient tmux hiccup; log and drop the keystroke. The
+   *                  claude-code adapter's JSONL retry/verify loop will catch a
+   *                  non-submission and surface a submit-failure notice.
+   *
+   * Either way this method never throws — every send-keys caller (web-terminal
+   * keys, TUI input, the typing loop) stays crash-safe without its own guard.
+   */
+  private guardedSend(op: string, run: () => void): void {
+    try {
+      run();
+    } catch (err: any) {
+      // A kill()/handlePaneExit() may have flipped exited between the guard
+      // and here; if so the teardown already happened.
+      if (this.exited) return;
+      const alive = this.isPaneAlive();
+      process.stderr.write(
+        `[tmux-pipe-backend] ${op} failed (pane ${alive ? 'ALIVE' : 'GONE'}): ${err?.message ?? err}\n`,
+      );
+      if (!alive) {
+        // Diagnostic: the pane is gone, so capture-pane can't read the final
+        // screen. Instead dump the tail tmux already replicated over the pipe
+        // — the CLI's real last stdout/stderr before it exited, which often
+        // explains WHY it exited (e.g. a gateway/API error line).
+        const tail = this.recentOutput.trim();
+        if (tail) {
+          process.stderr.write(`[tmux-pipe-backend] CLI last output before exit (tail):\n${tail}\n`);
+        }
+        this.handlePaneExit();
+      }
+    }
   }
 
   private exitCopyModeIfNeeded(): void {

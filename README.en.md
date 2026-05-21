@@ -39,7 +39,7 @@
 
 ### Design Philosophy
 
-Core philosophy: **Bridge CLIs, don't rebuild them**. botmux doesn't reimplement Agent capabilities — it bridges existing AI coding CLIs (Claude Code, Codex, Cursor, Gemini, OpenCode) directly. Memory, context management, tool use, permission systems — these capabilities are evolving rapidly within the CLIs themselves. botmux rides on top of that evolution rather than rebuilding in parallel. Every CLI upgrade benefits botmux automatically with zero adaptation.
+Core philosophy: **Bridge CLIs, don't rebuild them**. botmux doesn't reimplement Agent capabilities — it bridges existing AI coding CLIs (Claude Code, Codex, Cursor, Gemini, OpenCode, Antigravity) directly. Memory, context management, tool use, permission systems — these capabilities are evolving rapidly within the CLIs themselves. botmux rides on top of that evolution rather than rebuilding in parallel. Every CLI upgrade benefits botmux automatically with zero adaptation.
 
 ### Key Advantages
 
@@ -51,7 +51,7 @@ Compared to OpenClaw-style approaches built on Agent SDKs:
 | CLI Capabilities | Full runtime (hooks, memory, plan mode, skills, `/` commands) | SDK API subset, missing features must be reimplemented |
 | CLI Upgrades | Zero-adaptation automatic benefit | Must track SDK version changes |
 | Memory / Context | Reuses CLI's built-in memory system, improves as the CLI evolves | Must build custom memory system, duplicating CLI-native capabilities |
-| Multi-CLI Support | 5 CLIs, switch with one config (Claude Code / Codex / Cursor / Gemini / OpenCode) | Tied to a single SDK, cannot switch CLIs |
+| Multi-CLI Support | 6 CLIs, switch with one config (Claude Code / Codex / Cursor / Gemini / OpenCode / Antigravity) | Tied to a single SDK, cannot switch CLIs |
 | Web Terminal | Interactive full terminal, mobile shortcut toolbar, phone/desktop/Lark tri-screen sync | Usually web chat UI or read-only output |
 | Multi-Bot Collaboration | Multiple bots in same group via @mention routing, isolated processes, different CLIs sparring | Usually single bot |
 | Terminal Access | tmux attach directly into the CLI process, same as local dev experience | No direct terminal access |
@@ -62,7 +62,7 @@ Compared to OpenClaw-style approaches built on Agent SDKs:
 ## Prerequisites
 
 - **Node.js** >= 20
-- **AI coding CLI** installed and authenticated (`claude`, `codex`, `cursor-agent`, `gemini`, or `opencode` in PATH)
+- **AI coding CLI** installed and authenticated (`claude`, `codex`, `cursor-agent`, `gemini`, `opencode`, or `agy` (Antigravity) in PATH)
 - **tmux** >= 3.x (optional — auto-enabled when installed for persistent CLI sessions)
 - **CJK fonts** (only needed for screenshot rendering of Chinese text / emoji):
   - macOS: ships with PingFang / Hiragino, no action needed
@@ -196,7 +196,7 @@ On mobile/tablet, a floating shortcut toolbar provides Esc, Ctrl+C, Tab, arrow k
 
 ### Multi-Bot Collaboration
 
-Run multiple Lark bots on a single machine, each mapped to a different CLI. In the same group chat, messages are routed via @mention — each bot gets its own isolated CLI process. With a single bot in the group, it responds automatically without @. In a regular (non-topic) group, `@<bot1> @<bot2> /t xxx` spawns one independent thread per mentioned bot anchored at the same message.
+Run multiple Lark bots on a single machine, each mapped to a different CLI. In the same group chat, messages are routed via @mention — each bot gets its own isolated CLI process. With a single bot in the group, it responds automatically without @. In a regular (non-topic) group, `@<bot1> @<bot2> /t xxx` spawns one independent thread per mentioned bot anchored at the same message. Send `@<bot1> @<bot2> /introduce` once so they register each other's open_id; afterwards each bot can explicitly @-mention the others from within its own session (see [§ Slash Commands](#slash-commands)).
 
 ### Tmux Persistence
 
@@ -267,7 +267,7 @@ Anthropic's official Telegram channel — which exposes each action as an
 MCP tool — the Skill + CLI combo skips the MCP handshake on every CLI
 launch, doesn't burn tool-list tokens, and works across every CLI that
 can read a system prompt and shell out (Claude Code / Codex / Cursor /
-Gemini / OpenCode), with no MCP protocol support required.
+Gemini / OpenCode / Antigravity), with no MCP protocol support required.
 
 ### Dashboard
 
@@ -296,23 +296,76 @@ Gemini / OpenCode), with no MCP protocol support required.
 
 ### Slash Commands
 
+Send these straight into a topic — the daemon intercepts them (no clash with the underlying CLI's own slash commands: any `/xxx` botmux doesn't recognize is forwarded verbatim to the CLI). Send `/help` anytime to see the same list inside the topic.
+
+**📌 Session management**
+
 | Command | Description |
 |---------|-------------|
-| `/repo` | Show project selector card |
+| `/repo` | Show project selector card (interactive dropdown + text list) |
 | `/repo <N>` | Switch to Nth project from last scan |
-| `/skip` | Skip repo selection, start session directly |
-| `/cd <path>` | Change working directory |
+| `/skip` | Skip the repo selector card, start the session in the default dir |
+| `/cd <path>` | Change working directory and restart the CLI process |
 | `/status` | Show session info (uptime, terminal URL, etc.) |
-| `/restart` | Restart CLI process |
+| `/restart` | Restart CLI process (keeps the session context) |
 | `/close` | Close session and send a resumable card (with the CLI's native resume command) |
 | `/t <prompt>` / `/topic <prompt>` | Force-open a new topic from a non-topic group (shows the repo selector); empty prompt is allowed — fill it in after picking the repo |
+
+**🔀 Forwarded to the underlying CLI**
+
+| Command | Description |
+|---------|-------------|
+| `/compact` `/model` `/clear` `/plugin` `/usage` `/code-review` `/security-review` `/review` | Sent verbatim to the underlying CLI for its own built-in slash commands (e.g. Claude Code's `/compact`) |
+
+**⏰ Scheduled tasks** (syntax & examples in [§ Scheduled Task Management](#scheduled-task-management))
+
+| Command | Description |
+|---------|-------------|
+| `/schedule <natural language / cron>` | Create a task, e.g. `/schedule 每日17:50 check AI news` |
+| `/schedule list` | List all scheduled tasks |
+| `/schedule remove\|enable\|disable\|run <id>` | Remove / enable / disable / run once |
+
+**📡 Session adoption**
+
+| Command | Description |
+|---------|-------------|
+| `/adopt` | Scan local tmux and pop a card to adopt a running CLI session |
+| `/adopt <tmux_pane>` | Adopt a specific tmux pane directly (e.g. `/adopt 0:2.0`) |
+
+**🔐 User authorization**
+
+| Command | Description |
+|---------|-------------|
+| `/login` | Lark user OAuth — afterwards you can download third-party card images and call cloud-doc/calendar APIs as yourself |
+| `/login status` | Show current OAuth status |
+
+**🛎️ Oncall mode (group chats)**
+
+| Command | Description |
+|---------|-------------|
 | `/oncall bind <path>` | Bind current chat to a project dir, skip the repo card (any group member can @ the bot; buttons / daemon commands still gated by `allowedUsers`) |
-| `/oncall unbind` / `/oncall status` | Unbind / inspect oncall binding |
-| `/adopt` | Adopt a running CLI session (tmux) |
-| `/schedule` | Manage scheduled tasks |
-| `/login` / `/login status` | Lark user OAuth (e.g. to download images from third-party cards) / show OAuth status |
-| `/help` | Show available commands |
-| `/compact` `/model` `/clear` `/plugin` `/usage` | Forwarded verbatim to the underlying CLI (e.g. Claude Code's built-in slash commands) |
+| `/oncall unbind` | Unbind the current chat |
+| `/oncall status` | Inspect the current chat's oncall binding |
+
+**🔑 Access grants (owner only)**
+
+| Command | Description |
+|---------|-------------|
+| `@bot /grant @someone` | Pop an authorization card to add the user to the "this chat" or "global" allowlist; also auto-pops (and @s the owner) when an unauthorized user @-mentions the bot |
+| `@bot /revoke @someone` | Revoke the user's this-chat + global access |
+
+**👥 Multi-bot collaboration**
+
+| Command | Description |
+|---------|-------------|
+| `@botA @botB /t <prompt>` | With multiple bots, each @-mentioned bot opens its own independent topic from the same message |
+| `@botA @botB /introduce` | Bots register each other's open_id so they can later explicitly @-mention one another across sessions (any @ order, extra text allowed) |
+
+**❓ Help**
+
+| Command | Description |
+|---------|-------------|
+| `/help` | Show the full command list above, inside the topic |
 
 ### Scheduled Task Management
 
@@ -379,7 +432,7 @@ When `~/.botmux/bots.json` already exists, `botmux setup` can add a bot, reconfi
 | `larkAppId` | Yes | Lark app ID |
 | `larkAppSecret` | Yes | Lark app secret |
 | `name` | No | Process name suffix shown by `botmux status`; e.g. `claude-main` appears as `botmux-claude-main`, defaults to `botmux-<index>` |
-| `cliId` | No | CLI adapter, defaults to `claude-code` (options: `aiden`, `coco`, `codex`, `cursor`, `gemini`, `opencode`) |
+| `cliId` | No | CLI adapter, defaults to `claude-code` (options: `aiden`, `coco`, `codex`, `cursor`, `gemini`, `opencode`, `antigravity`) |
 | `cliPathOverride` | No | Absolute path to the CLI entry, for wrappers / routers; typical use: `ccr`, `claude-w`, `aiden-x-claude`, etc. |
 | `backendType` | No | Session backend: `pty` or `tmux` (auto-detected by default) |
 | `workingDir` | No | Default working directory, supports comma-separated |

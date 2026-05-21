@@ -5,7 +5,7 @@
  */
 import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { homedir } from 'node:os';
+import { expandHome } from './working-dir.js';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
 import * as messageQueue from '../services/message-queue.js';
@@ -25,6 +25,7 @@ import { sessionKey, sessionAnchorId } from './types.js';
 import type { DaemonSession } from './types.js';
 import { markSessionActivity } from './session-activity.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
+import { parseWorkingDirList } from '../utils/working-dir.js';
 
 function sessionCreatedAtMs(session: { createdAt?: string }): number {
   return session.createdAt ? (Date.parse(session.createdAt) || Date.now()) : Date.now();
@@ -36,9 +37,7 @@ function sessionLastMessageAtMs(session: { createdAt?: string; lastMessageAt?: s
 
 // ─── Path helpers ────────────────────────────────────────────────────────────
 
-export function expandHome(p: string): string {
-  return p.startsWith('~') ? join(homedir(), p.slice(1)) : p;
-}
+export { expandHome };
 
 export function getSessionWorkingDir(ds?: DaemonSession): string {
   if (ds?.workingDir) return expandHome(ds.workingDir);
@@ -64,7 +63,10 @@ export function getProjectScanDirs(ds?: DaemonSession): string[] {
   if (ds?.larkAppId) {
     const bot = getBot(ds.larkAppId);
     const dirs = new Set<string>();
-    for (const wd of bot.config.workingDirs ?? [bot.config.workingDir ?? '~']) {
+    const workingDirs = bot.config.workingDirs?.length
+      ? bot.config.workingDirs
+      : parseWorkingDirList(bot.config.workingDir ?? '~');
+    for (const wd of workingDirs) {
       dirs.add(resolve(expandHome(wd), '..'));
     }
     if (ds.workingDir) {

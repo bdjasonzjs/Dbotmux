@@ -259,12 +259,24 @@ export async function getChatMode(
   return mode;
 }
 
-export async function deleteMessage(larkAppId: string, messageId: string): Promise<void> {
+/**
+ * Recall (delete) a message. Returns `true` only when Lark confirms success,
+ * `false` on SDK throw or a non-zero response code — so callers that need to
+ * know whether the withdraw actually happened (e.g. grant-card withdraw) can
+ * fall back instead of assuming success. Fire-and-forget callers can ignore it.
+ */
+export async function deleteMessage(larkAppId: string, messageId: string): Promise<boolean> {
   const c = getBotClient(larkAppId);
   try {
-    await c.im.v1.message.delete({ path: { message_id: messageId } });
+    const res: any = await c.im.v1.message.delete({ path: { message_id: messageId } });
+    if (res && typeof res.code === 'number' && res.code !== 0) {
+      logger.debug(`Delete message ${messageId} returned non-zero code: ${res.code} ${res.msg ?? ''}`);
+      return false;
+    }
+    return true;
   } catch (err) {
     logger.debug(`Failed to delete message ${messageId}: ${err}`);
+    return false;
   }
 }
 
@@ -423,17 +435,30 @@ export async function uploadFile(larkAppId: string, filePath: string): Promise<s
  * must be a full email address (e.g. "alice@example.com") and is looked up.
  * Returns an array of open_ids (unresolvable entries are dropped with a warning).
  */
-export async function resolveAllowedUsers(larkAppId: string, raw: string[]): Promise<string[]> {
+/**
+ * Resolve a raw allowedUsers list (mix of `ou_*` open_ids and emails) into
+ * open_ids, AND return a `raw entry → resolved open_id` map. The map lets
+ * `/revoke` delete the correct raw entry (email OR open_id) from bots.json so
+ * the revocation survives a restart. open_id entries map to themselves;
+ * resolved emails are keyed by the EXACT raw email string from the config
+ * (matched case-insensitively against the API's returned email) so the map key
+ * always equals what's in `allowedUsers`. Unresolvable emails are dropped.
+ */
+export async function resolveAllowedUsersWithMap(
+  larkAppId: string, raw: string[],
+): Promise<{ resolved: string[]; map: Map<string, string> }> {
+  const map = new Map<string, string>();
   const openIds: string[] = [];
   const emails: string[] = [];
   for (const v of raw) {
     if (v.startsWith('ou_')) {
       openIds.push(v);
+      map.set(v, v);
     } else {
       emails.push(v);
     }
   }
-  if (emails.length === 0) return openIds;
+  if (emails.length === 0) return { resolved: openIds, map };
 
   const c = getBotClient(larkAppId);
   try {
@@ -443,21 +468,32 @@ export async function resolveAllowedUsers(larkAppId: string, raw: string[]): Pro
     });
     if (res.code !== 0) {
       logger.warn(`Failed to resolve emails to open_ids: ${res.msg} (code: ${res.code})`);
-      return openIds;
+      return { resolved: openIds, map };
     }
     const userList: any[] = res.data?.user_list ?? [];
+    // 先按 normalized(email) → user_id 建查找表，再对原始请求的 raw email 逐个回填 map，
+    // 保证 map 的 key 与 allowedUsers 里的字面值完全一致（防 API 大小写/规范化错配）。
+    const byNorm = new Map<string, string>();
     for (const item of userList) {
-      if (item.user_id) {
-        openIds.push(item.user_id);
-        logger.info(`Resolved ${item.email} → ${item.user_id}`);
-      } else {
-        logger.warn(`Could not resolve email: ${item.email}`);
+      if (item.user_id && item.email) byNorm.set(String(item.email).toLowerCase(), item.user_id);
+      else if (!item.user_id) logger.warn(`Could not resolve email: ${item.email}`);
+    }
+    for (const rawEmail of emails) {
+      const uid = byNorm.get(rawEmail.toLowerCase());
+      if (uid) {
+        openIds.push(uid);
+        map.set(rawEmail, uid);
+        logger.info(`Resolved ${rawEmail} → ${uid}`);
       }
     }
   } catch (err: any) {
     logger.warn(`resolveAllowedUsers failed: ${err.message}`);
   }
-  return openIds;
+  return { resolved: openIds, map };
+}
+
+export async function resolveAllowedUsers(larkAppId: string, raw: string[]): Promise<string[]> {
+  return (await resolveAllowedUsersWithMap(larkAppId, raw)).resolved;
 }
 
 
@@ -562,6 +598,61 @@ export async function listChatMessages(
 
   // Cap to pageSize newest, then reverse to chronological for the caller.
   return allMessages.slice(0, pageSize).reverse();
+}
+
+export interface AmbientChatMessageOptions {
+  /**
+   * Exclude messages at/after this timestamp (Lark create_time, milliseconds as
+   * a string). Used by `/t` thread sessions to fetch the chat tail that existed
+   * before the thread was opened, avoiding bot cards/replies from the new
+   * thread polluting the context.
+   */
+  beforeCreateTime?: string;
+  /** Exclude the current thread root and its replies from the chat tail. */
+  excludeRootMessageId?: string;
+  /** How many chat-container messages to scan before filtering. */
+  scanLimit?: number;
+}
+
+export function filterAmbientChatMessages(
+  messages: any[],
+  pageSize: number,
+  options: Pick<AmbientChatMessageOptions, 'beforeCreateTime' | 'excludeRootMessageId'> = {},
+): any[] {
+  const beforeMs = options.beforeCreateTime ? Number(options.beforeCreateTime) : undefined;
+  const root = options.excludeRootMessageId;
+
+  const filtered = messages.filter((m: any) => {
+    if (root && (m.message_id === root || m.root_id === root)) return false;
+    if (Number.isFinite(beforeMs)) {
+      const createdMs = Number(m.create_time);
+      // If create_time is malformed, keep the message rather than silently
+      // dropping potentially useful context. Lark normally returns epoch ms.
+      if (Number.isFinite(createdMs) && createdMs >= (beforeMs as number)) return false;
+    }
+    return true;
+  });
+
+  return filtered.slice(Math.max(0, filtered.length - pageSize));
+}
+
+/**
+ * List recent chat-container messages as ambient context for a thread session.
+ *
+ * This intentionally differs from `listChatMessages`: callers want the newest
+ * `pageSize` messages AFTER filtering out the current thread and (optionally)
+ * messages created after the thread root. We therefore may scan more than
+ * `pageSize` items and cap only after filtering.
+ */
+export async function listAmbientChatMessages(
+  larkAppId: string,
+  chatId: string,
+  pageSize: number = 50,
+  options: AmbientChatMessageOptions = {},
+): Promise<any[]> {
+  const scanLimit = Math.max(pageSize, options.scanLimit ?? Math.min(Math.max(pageSize * 4, 50), 200));
+  const raw = await listChatMessages(larkAppId, chatId, scanLimit);
+  return filterAmbientChatMessages(raw, pageSize, options);
 }
 
 /** Fallback: scan chat messages and filter by root_id. */

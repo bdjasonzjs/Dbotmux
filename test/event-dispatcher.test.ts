@@ -403,6 +403,75 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
+  it('routes unknown-peer cross-bot @mention in oncall chat-scope (auto-create, no /introduce needed)', async () => {
+    // oncall 群是显式部署的协作工作区：canTalk 已对真人全员放行，bot→bot 接收侧
+    // 同等放行 —— 即使发送方不在 cross-ref（isKnownPeerBot=false），oncall 也跳过
+    // 这道 vetting，让外部 bot 直接拉起 chat-scope session。对照上面的非 oncall
+    // 用例：同样的 unknown peer 会被 drop。
+    // 注意 /introduce 写的是 observed-bots-store（发现/能 @ 到对方），跟这道接收侧
+    // cross-ref vetting 是两套独立存储，不是这里放行的前提。
+    mockGetChatMode.mockResolvedValueOnce('group');
+    mockIsChatOncallBoundForAnyBot.mockReturnValue(true);
+    mockReadFileSync.mockReturnValue('{}');  // empty cross-ref → unknown peer
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({
+        zh_cn: { content: [[{ tag: 'at', user_id: MY_OPEN_ID }]] },
+      }),
+      rootId: undefined,
+    });
+    event.message.root_id = undefined as any;
+    handlers.isSessionOwner.mockReturnValue(false);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-001',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('does not let oncall exemption resurrect self-message routing beyond exact /close', async () => {
+    // oncall 豁免只放在 foreign-bot chat-scope gate 上，位于 self-message 特判
+    // (787-799) 之后。所以即便 chat 是 oncall-bound，本 bot 自己发的非 /close
+    // 消息仍在 self 分支被 drop，不会因为 oncall 而被路由。
+    // （self 非 /close 在 decideRouting 之前就 return，故无需 stub getChatMode。）
+    mockIsChatOncallBoundForAnyBot.mockReturnValue(true);
+    const event = makeBotMessageEvent({
+      senderOpenId: MY_OPEN_ID,  // own message
+      content: JSON.stringify({ text: 'I just finished the task' }),
+      rootId: undefined,
+    });
+    event.message.root_id = undefined as any;
+
+    await capturedHandlers['im.message.receive_v1'](event);
+
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('still processes self /close even when chat is oncall-bound', async () => {
+    // 镜像上一条：oncall 不应改变 self /close 的既有行为 —— 精确 /close 仍进入
+    // handleThreadReply 走关闭流程。
+    mockIsChatOncallBoundForAnyBot.mockReturnValue(true);
+    const event = makeBotMessageEvent({
+      senderOpenId: MY_OPEN_ID,  // own message
+      content: JSON.stringify({ text: '/close' }),
+      rootId: 'root-thread-oncall-close',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      anchor: 'root-thread-oncall-close',
+      scope: 'thread',
+      larkAppId: MY_APP_ID,
+    }));
+  });
+
   it('treats oncall as chat-level: relaxes canTalk even when THIS bot is not the one bound', async () => {
     // Regression: /oncall bind is per-bot, but oncall is meant to be a
     // chat-level concept. In multi-bot deployments the user often only binds

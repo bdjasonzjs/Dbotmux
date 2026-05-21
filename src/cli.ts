@@ -24,6 +24,7 @@ import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { createRequire } from 'node:module';
 import { createHmac, randomBytes } from 'node:crypto';
+import { validateWorkingDir } from './core/working-dir.js';
 import { enableAutostart, disableAutostart, autostartStatus, refreshAutostart } from './autostart.js';
 import { tmuxEnv } from './setup/ensure-tmux.js';
 import { writeBotsJsonAtomic as writeBotsAtomic } from './setup/bots-store.js';
@@ -40,6 +41,7 @@ import {
 } from './setup/bot-config-editor.js';
 import type { CliId } from './adapters/cli/types.js';
 import { logger } from './utils/logger.js';
+import { invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional } from './cli/arg-utils.js';
 import {
   formatBotInfoEntriesForCli,
@@ -182,6 +184,15 @@ function loadBotsJson(): any[] {
     }
   }
   return [];
+}
+
+function ensureBotWorkingDirsExist(bot: Record<string, any>, context = 'workingDir'): boolean {
+  const invalid = invalidWorkingDirs(bot);
+  if (invalid.length === 0) return true;
+  console.log(`\n❌ ${context} 指向的目录不存在或不是目录:`);
+  for (const dir of invalid) console.log(`   - ${dir}`);
+  console.log('   请先创建目录，或重新填写一个已存在的工作目录。');
+  return false;
 }
 
 function ensureUniqueBotProcessNames(bots: any[]): void {
@@ -465,7 +476,7 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
   }
   console.log('✅ 凭证有效（tenant_access_token 已成功获取）\n');
 
-  console.log('支持的 CLI: 1) claude-code  2) aiden  3) coco  4) codex  5) cursor  6) gemini  7) opencode');
+  console.log('支持的 CLI: 1) claude-code  2) aiden  3) coco  4) codex  5) cursor  6) gemini  7) opencode  8) antigravity');
   const cliChoice = await ask(rl, 'CLI 适配器 [1]: ');
   let cliId: CliId;
   try {
@@ -493,6 +504,8 @@ async function promptBotConfig(rl: ReturnType<typeof createInterface>): Promise<
   // 想改成多人共用 / 不限制, 用户后续手动编辑 ~/.botmux/bots.json 的 allowedUsers
   // 字段即可. 手动 fallback 场景没 open_id, 字段直接不写 (== 不限制).
   if (creds.userOpenId) bot.allowedUsers = [creds.userOpenId];
+
+  if (!ensureBotWorkingDirsExist(bot, '默认工作目录')) return null;
 
   return normalizeBotConfig(bot);
 }
@@ -552,7 +565,7 @@ async function promptEditBotConfig(
   ]);
   input.larkAppSecret = await ask(rl, `LARK_APP_SECRET [保留当前值]: `);
 
-  console.log('\n支持的 CLI: 1) claude-code  2) aiden  3) coco  4) codex  5) cursor  6) gemini  7) opencode');
+  console.log('\n支持的 CLI: 1) claude-code  2) aiden  3) coco  4) codex  5) cursor  6) gemini  7) opencode  8) antigravity');
   printInputHelp('CLI 适配器', [
     '选择 botmux 需要套用哪一种 CLI 参数协议和会话恢复方式。',
     '留空保留当前值；可以输入序号，也可以直接输入适配器 ID。',
@@ -701,6 +714,11 @@ async function cmdSetup(): Promise<void> {
       } catch (err: any) {
         rl.close();
         console.log(`\n❌ 编辑失败: ${err?.message ?? String(err)}`);
+        return;
+      }
+      if (!ensureBotWorkingDirsExist(edited, '默认工作目录')) {
+        rl.close();
+        console.log('   配置未修改。');
         return;
       }
 
@@ -2044,7 +2062,9 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        --top-level                     发顶层消息（不回复进当前话题）
        --chat-id <oc_xxx>              指定目标群（默认当前话题所在群）
   bots list                            列出当前群聊中的机器人（含 open_id）
-  history [--limit N]                  拉取当前会话的消息历史 (JSON)，话题群 → 话题内，普通群 → 整群
+  history [--limit N] [--scope session|thread|chat|ambient]
+                                       拉取当前会话的消息历史 (JSON)。默认按 session scope：话题/话题群 → 话题内，普通群 → 整群；
+                                       thread 会话里可用 --scope ambient 读取 thread 外的群聊上下文
   quoted <message_id>                  拉取被引用的单条消息 (JSON)，message_id 取自 daemon 注入的引用提示行
 
 新建飞书群:
@@ -2311,25 +2331,76 @@ async function resolveSessionAppId(sessionIdArg: string | undefined): Promise<{ 
 
 async function cmdHistory(rest: string[]): Promise<void> {
   const limit = parseInt(argValue(rest, '--limit') ?? '50', 10);
+  const scopeArg = argValue(rest, '--scope') ?? 'session';
   const sessionIdArg = argValue(rest, '--session-id');
   const { sid, larkAppId: appId, session: s } = await resolveSessionAppId(sessionIdArg);
 
-  const { listThreadMessages, listChatMessages } = await import('./im/lark/client.js');
-  const { parseApiMessage } = await import('./im/lark/message-parser.js');
+  const validScopes = new Set(['session', 'thread', 'chat', 'ambient']);
+  if (!validScopes.has(scopeArg)) {
+    console.error(`无效 --scope: ${scopeArg}。可用: session | thread | chat | ambient`);
+    process.exit(1);
+  }
+
+  const { getMessageDetail, listAmbientChatMessages, listThreadMessages, listChatMessages } = await import('./im/lark/client.js');
+  const { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent } = await import('./im/lark/message-parser.js');
   const { expandMergeForward } = await import('./im/lark/merge-forward.js');
   try {
     // Chat-scope sessions (普通群整群一会话) have no thread to walk — list the
     // chat container directly and let the caller cap with --limit. Thread-scope
-    // sessions walk the thread container by root_id.
+    // sessions walk the thread container by root_id. `--scope chat|ambient`
+    // lets a thread-scope session intentionally read outside its thread when
+    // it needs the surrounding group conversation (for example `/t` spawned
+    // from an ongoing 普通群 discussion).
     const isChatScope = s.scope === 'chat';
-    const raw = isChatScope
+    const effectiveScope = scopeArg === 'session'
+      ? (isChatScope ? 'chat' : 'thread')
+      : scopeArg;
+
+    if (effectiveScope === 'thread' && isChatScope) {
+      console.error('当前 session 是 chat-scope，没有 thread 历史可读取。请使用 --scope chat。');
+      process.exit(1);
+    }
+
+    if (effectiveScope === 'ambient' && isChatScope) {
+      console.error('当前 session 是 chat-scope，没有 thread root 可作为 ambient 边界。请使用 --scope chat。');
+      process.exit(1);
+    }
+
+    let ambientBeforeCreateTime: string | undefined;
+    if (effectiveScope === 'ambient') {
+      try {
+        const detail = await getMessageDetail(appId, s.rootMessageId, { userCardContent: false });
+        ambientBeforeCreateTime = detail?.items?.[0]?.create_time;
+      } catch {
+        // Best-effort only: ambient history should still work if the root
+        // message was withdrawn or is otherwise unavailable; it will then fall
+        // back to the chat tail with current-thread messages filtered out.
+      }
+    }
+
+    const raw = effectiveScope === 'chat'
       ? await listChatMessages(appId, s.chatId, limit)
-      : await listThreadMessages(appId, s.chatId, s.rootMessageId, limit);
+      : effectiveScope === 'ambient'
+        ? await listAmbientChatMessages(appId, s.chatId, limit, {
+            beforeCreateTime: ambientBeforeCreateTime,
+            excludeRootMessageId: s.rootMessageId,
+          })
+        : await listThreadMessages(appId, s.chatId, s.rootMessageId, limit);
     // Expand merge_forward to <forwarded_messages> XML, mirroring the live event
     // path in daemon.ts. Each merge_forward gets its own numberer (we don't
     // download resources here — only [图片 N] placeholders matter).
     const messages = await Promise.all(raw.map(async (m: any) => {
-      const parsed = parseApiMessage(m);
+      let parsed = parseApiMessage(m);
+      // `im.v1.message.list` returns Lark's simplified "请升级客户端" fallback for
+      // complex cards — the whole body (user-forwarded) or nested sub-cards
+      // buried mid-body (Argos alarms). Those are the cards where the list view
+      // alone is incomplete, so resolve them by unioning both `im.message.get`
+      // representations (server-rendered + full structured). Failures keep the
+      // list text. Simple cards (no fallback) already render fully here.
+      if (parsed.msgType === 'interactive' && cardContentHasUpgradeFallback(parsed.content)) {
+        const merged = await resolveMergedCardContent(appId, parsed.messageId).catch(() => null);
+        if (merged) parsed.content = merged.text;
+      }
       if (parsed.msgType === 'merge_forward') {
         await expandMergeForward(appId, parsed.messageId, parsed);
       }
@@ -2338,8 +2409,16 @@ async function cmdHistory(rest: string[]): Promise<void> {
     console.log(JSON.stringify({
       sessionId: sid,
       chatId: s.chatId,
-      scope: isChatScope ? 'chat' : 'thread',
+      scope: effectiveScope,
+      sessionScope: isChatScope ? 'chat' : 'thread',
       ...(isChatScope ? {} : { rootMessageId: s.rootMessageId }),
+      ...(effectiveScope === 'ambient' ? {
+        ambient: {
+          source: 'chat',
+          beforeCreateTime: ambientBeforeCreateTime,
+          excludeRootMessageId: s.rootMessageId,
+        },
+      } : {}),
       messages,
       total: messages.length,
     }, null, 2));
@@ -2368,6 +2447,7 @@ async function cmdQuoted(rest: string[]): Promise<void> {
   const { getMessageDetail } = await import('./im/lark/client.js');
   const { expandMergeForward } = await import('./im/lark/merge-forward.js');
   const { renderQuotedMessage } = await import('./cli/quoted-render.js');
+  const { resolveMergedCardContent } = await import('./im/lark/message-parser.js');
   try {
     const detail = await getMessageDetail(appId, messageId);
     const msg = detail?.items?.[0];
@@ -2376,6 +2456,15 @@ async function cmdQuoted(rest: string[]): Promise<void> {
       process.exit(1);
     }
     const rendered = await renderQuotedMessage(appId, msg, expandMergeForward);
+    // Interactive cards: union both im.message.get representations so the quoted
+    // view matches history/live (recovers names + sub-card content + options).
+    // This single-message path always merges — unlike history (which starts
+    // from the hole-bearing list view), the quoted base is the hole-free B view
+    // so there's no cheap local signal that a merge would add anything.
+    if (rendered.msgType === 'interactive') {
+      const merged = await resolveMergedCardContent(appId, messageId).catch(() => null);
+      if (merged) rendered.content = merged.text;
+    }
     console.log(JSON.stringify(rendered, null, 2));
   } catch (err: any) {
     console.error(`获取被引用消息失败: ${err.message}`);
@@ -2794,6 +2883,7 @@ botmux create-group — 用一组机器人新建飞书群
 
 用法:
   botmux create-group --bot <name|larkAppId> [--bot ...] [--name "群名"]
+                      [--working-dir <path>]
 
 参数:
   --bot <ref>     至少一个，可多次。ref 推荐用 bot 显示名（同 botmux send 的 @<name>）或完整 larkAppId；
@@ -2801,12 +2891,16 @@ botmux create-group — 用一组机器人新建飞书群
                   bots.json 中第一个。重名 → 取 bots.json 中第一个匹配，stderr 打 warning。
                   重复 ref → 自动去重保留首次顺序。
   --name <群名>   可选；不传则用飞书默认无名群。
+  --working-dir <path>
+                 可选；创建成功后，把新群为所有成功入群的 bot 绑定到该目录（等价于逐个 /oncall bind），
+                 下次在群里开新话题时直接使用该目录，跳过仓库选择卡片。也可写作 --cwd / --dir。
 
 行为:
   - 第一个解析到的 bot 作为 creator（决定建群身份 + 初始群主 + open_id app scope）。
   - 邀请用户 / 转让群主 / @通知 对象都从 creator 的 resolvedAllowedUsers 取首个 open_id（email 自动转换；
     转不出来或为空则跳过对应步骤，stderr warning）。
   - 不依赖 botmux 会话，任何环境都能跑。
+  - --working-dir 会先校验路径存在且是目录；绑定失败不会重复建群，会在 stderr 给出逐 bot 结果。
 
 输出协议（skill 友好）:
   - 成功（即使 transfer/notify 部分失败）：stdout 单行 chatId，exit 0；stderr 打人类提示 + applink。
@@ -2819,6 +2913,26 @@ botmux create-group — 用一组机器人新建飞书群
 
   const botRefs = argValues(rest, '--bot');
   const name = argValue(rest, '--name');
+  const workingDirArg = argValue(rest, '--working-dir', '--cwd', '--dir');
+
+  let bindWorkingDir: string | undefined;
+  let bindWorkingDirResolved: string | undefined;
+  if (workingDirArg !== undefined) {
+    const trimmed = workingDirArg.trim();
+    if (!trimmed) {
+      console.error('--working-dir 不能为空。');
+      process.exit(1);
+    }
+    const validation = validateWorkingDir(trimmed);
+    if (!validation.ok) {
+      console.error(`--working-dir ${validation.error}`);
+      process.exit(1);
+    }
+    // Keep the user's spelling in bots.json, matching `/oncall bind`, while
+    // still showing the resolved path in CLI output for typo diagnostics.
+    bindWorkingDir = trimmed;
+    bindWorkingDirResolved = validation.resolvedPath;
+  }
 
   if (botRefs.length === 0) {
     console.error('用法: botmux create-group --bot <name|larkAppId> [--bot ...] [--name "群名"]');
@@ -2901,6 +3015,7 @@ botmux create-group — 用一组机器人新建飞书群
       userOpenIds: targetOpenId ? [targetOpenId] : [],
       transferOwnerTo: targetOpenId,
       notifyOwnerOpenId: targetOpenId,
+      bindWorkingDir,
     });
   } catch (err: any) {
     console.error(`建群失败: ${err?.message ?? err}`);
@@ -2929,6 +3044,14 @@ botmux create-group — 用一组机器人新建飞书群
     console.error(`⚠️  @通知发送失败: ${result.notifyError}`);
   } else if (result.notifyMessageId) {
     console.error(`✅ @通知已发送 (msg ${result.notifyMessageId})`);
+  }
+  if (bindWorkingDir) {
+    const ok = result.oncallBindings.filter(b => b.ok).length;
+    const failed = result.oncallBindings.filter(b => !b.ok);
+    console.error(`✅ oncall 绑定目录：${bindWorkingDir} → ${bindWorkingDirResolved}（成功 ${ok}/${result.oncallBindings.length}）`);
+    for (const b of failed) {
+      console.error(`⚠️  ${b.larkAppId} 绑定失败: ${b.error ?? 'unknown'}`);
+    }
   }
 }
 

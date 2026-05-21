@@ -1,0 +1,63 @@
+#!/usr/bin/env expect -f
+#
+# Integration smoke for the upgraded Antigravity adapter.
+# Mirrors the actual writeInput key sequence (text + alt+Enter soft newline
+# + plain Enter to submit), then verifies history.jsonl received our line
+# with the expected JSON-encoded multi-line `display`.
+#
+# Run:  expect test/antigravity-integration.expect
+
+set timeout 25
+log_user 0
+
+set hist "$env(HOME)/.gemini/antigravity-cli/history.jsonl"
+if {[file exists $hist]} {
+    set base [file size $hist]
+} else {
+    set base 0
+}
+
+# (1) Spawn agy with the *upgraded* adapter.buildArgs() output for a fresh
+#     session. -i is omitted here because we want to test writeInput's
+#     own multi-line flow on a freshly-mounted prompt.
+spawn agy --dangerously-skip-permissions
+sleep 6
+
+# (2) Reproduce writeInput's tmux path: each line via send-text, M-Enter
+#     between lines, plain Enter at the end.
+send "alpha"
+sleep 1
+send "\x1b\r"
+sleep 1
+send "beta gamma"
+sleep 1
+send "\r"
+sleep 5
+
+# (3) Quit.
+send "\x03"
+sleep 1
+send "\x03"
+sleep 1
+catch { close }
+catch { wait }
+
+# (4) Read the delta and check our marker. JSON encodes \n as the two-char
+#     escape, so the marker we look for is the JSON-stringified prefix
+#     minus surrounding quotes.
+set fp [open $hist r]
+seek $fp $base
+set delta [read $fp]
+close $fp
+
+# JSON-encoded form of "alpha\nbeta gamma" (first 40 chars).
+# In Tcl/expect we just match the literal substring as it appears in the file.
+if {[string first {"display":"alpha\nbeta gamma"} $delta] >= 0} {
+    puts "PASS: history.jsonl recorded multi-line submit with literal \\n"
+    exit 0
+} else {
+    puts "FAIL: did not find expected display in history.jsonl delta"
+    puts "delta:"
+    puts $delta
+    exit 1
+}

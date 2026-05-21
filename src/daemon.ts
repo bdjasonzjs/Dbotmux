@@ -8,8 +8,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 import { config } from './config.js';
 import { statSync } from 'node:fs';
-import { getChatMode, replyMessage, resolveAllowedUsers, sendMessage } from './im/lark/client.js';
-import { loadBotConfigs, registerBot, getBot, getAllBots, findOncallChatForAnyBot, isChatOncallBoundForAnyBot, type BotState, type OncallChat } from './bot-registry.js';
+import { getChatMode, replyMessage, resolveAllowedUsersWithMap, sendMessage } from './im/lark/client.js';
+import { loadBotConfigs, registerBot, getBot, getAllBots, findOncallChatForAnyBot, type BotState, type OncallChat } from './bot-registry.js';
 import * as sessionStore from './services/session-store.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { autoBindOncallFromDefault } from './services/oncall-store.js';
@@ -20,6 +20,7 @@ import { expandMergeForward } from './im/lark/merge-forward.js';
 import { buildQuoteHint } from './im/lark/quote-hint.js';
 import { logger } from './utils/logger.js';
 import { ensureCjkFontsInstalled } from './utils/font-installer.js';
+import { invalidWorkingDirs } from './utils/working-dir.js';
 import type { DaemonToWorker, LarkMessage } from './types.js';
 export type { DaemonSession } from './core/types.js';
 import type { DaemonSession } from './core/types.js';
@@ -1259,6 +1260,29 @@ async function maybeAutoBindDefaultOncall(
   return r.entry;
 }
 
+async function replyInvalidWorkingDirs(
+  anchor: string,
+  larkAppId: string,
+  ds: DaemonSession,
+): Promise<boolean> {
+  const bot = getBot(larkAppId);
+  const invalid = invalidWorkingDirs({
+    workingDir: ds.workingDir ?? bot.config.workingDir ?? '~',
+    workingDirs: ds.workingDir ? undefined : bot.config.workingDirs,
+  });
+  if (invalid.length === 0) return false;
+
+  ds.pendingRepo = false;
+  activeSessions.delete(sessionKey(anchor, larkAppId));
+  sessionStore.closeSession(ds.session.sessionId);
+  const msg = tr('cmd.repo.working_dir_not_exist', {
+    dirs: invalid.map(d => `\`${d}\``).join(', '),
+  }, localeForBot(larkAppId));
+  await sessionReply(anchor, msg, 'text', larkAppId);
+  logger.warn(`[${tag(ds)}] configured workingDir missing: ${invalid.join(', ')}`);
+  return true;
+}
+
 async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const { chatId, messageId, chatType, larkAppId } = ctx;
   // scope/anchor are mutable here: `/t` / `/topic` may flip a 普通群 chat-scope
@@ -1319,12 +1343,12 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
       return;
     }
     if (DAEMON_COMMANDS.has(cmd)) {
-      // Oncall groups: anyone can chat with the bot, but daemon commands
-      // (including /oncall itself) require allowedUsers. Treat the chat as
-      // oncall when ANY bot has it bound — sibling bots in multi-bot
-      // deployments inherit the same gate so /cd /restart /close don't slip
-      // past allowedUsers just because this bot wasn't the one that bound.
-      if (isChatOncallBoundForAnyBot(chatId) && !canOperate(larkAppId, chatId, senderOpenId)) {
+      // Daemon commands (incl. /oncall) ALWAYS require canOperate, in every chat.
+      // No-op for allowedUsers (they pass canOperate anyway); the point is to deny
+      // chat-granted users (who only pass canTalk) management commands like
+      // /cd /restart /oncall bind. Previously this gate only fired in oncall chats,
+      // which left a hole once per-chat grants flow through canTalk.
+      if (!canOperate(larkAppId, chatId, senderOpenId)) {
         await sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return;
       }
@@ -1458,6 +1482,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
 
   // Pinned (oncall binding or inherited from sibling bot): spawn CLI immediately.
   if (pinnedWorkingDir) {
+    if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
     const selfBot = getBot(larkAppId);
     const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender);
     forkWorker(ds, prompt);
@@ -1469,6 +1494,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   }
 
   // Show repo selection card
+  if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
   const scanDirs = getProjectScanDirs(ds).filter(d => existsSync(d));
   let projects: import('./services/project-scanner.js').ProjectInfo[] = [];
   if (scanDirs.length > 0) {
@@ -1619,6 +1645,13 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   if (invocation) {
     const { cmd, content: commandContent } = invocation;
     if (PASSTHROUGH_COMMANDS.has(cmd)) {
+      // 语义边界（刻意保留，非疏漏）：passthrough（/model /clear /compact 等）按
+      // “发给 CLI 的对话输入”处理，因此不过下面 DAEMON_COMMANDS 的 oncall
+      // canOperate 闸 —— oncall 放行的就是对话输入，canOperate 只管 botmux
+      // daemon/card 层操作。副作用：oncall 群里被放行的成员（含外部 bot）能对
+      // 已存在的 session 发这些命令（清上下文/换模型，需已有活跃 worker，无法凭空
+      // 拉起）。TODO（后续产品决策）：是否把 CLI passthrough 也纳入 canOperate，
+      // 收紧到与 daemon 命令同档；这会同时改变真人 oncall 成员的现有行为，应单独评估。
       const ds = activeSessions.get(sessionKey(anchor, larkAppId));
       if (ds?.worker && !ds.worker.killed) {
         // Mark a new turn so the CLI's response to /model, /clear, /compact, etc.
@@ -1634,11 +1667,12 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       return;
     }
     if (DAEMON_COMMANDS.has(cmd)) {
-      // Oncall allowedUsers gate for thread-reply daemon commands
+      // canOperate gate for thread-reply daemon commands — required in every chat
+      // (see spawn-path gate above). Denies chat-granted users management commands.
       const existingDs = activeSessions.get(sessionKey(anchor, larkAppId));
       const threadChatId = existingDs?.chatId ?? ctxChatId ?? data?.message?.chat_id;
       const threadSenderOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
-      if (threadChatId && isChatOncallBoundForAnyBot(threadChatId) && !canOperate(larkAppId, threadChatId, threadSenderOpenId)) {
+      if (!canOperate(larkAppId, threadChatId, threadSenderOpenId)) {
         sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return;
       }
@@ -1807,6 +1841,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     // Pinned (oncall binding or inherited from peer bot in same thread):
     // spawn CLI immediately, skip repo selection.
     if (pinnedWorkingDir) {
+      if (await replyInvalidWorkingDirs(anchor, larkAppId, newDs)) return;
       const selfBot = getBot(larkAppId);
       const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender);
       forkWorker(newDs, prompt);
@@ -1818,6 +1853,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     }
 
     // Show repo selection card (same as handleNewTopic)
+    if (await replyInvalidWorkingDirs(anchor, larkAppId, newDs)) return;
     const scanDirs2 = getProjectScanDirs(newDs).filter(d => existsSync(d));
     let projects: import('./services/project-scanner.js').ProjectInfo[] = [];
     if (scanDirs2.length > 0) {
@@ -2007,7 +2043,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       const hasEmails = bot.resolvedAllowedUsers.some(u => u.includes('@'));
       if (hasEmails) {
         try {
-          bot.resolvedAllowedUsers = await resolveAllowedUsers(cfg.larkAppId, bot.resolvedAllowedUsers);
+          // 同时拿到 raw→open_id 映射，供 /revoke 反查删除 email 形式的 raw 条目（R2#2）。
+          const { resolved, map } = await resolveAllowedUsersWithMap(cfg.larkAppId, bot.resolvedAllowedUsers);
+          bot.resolvedAllowedUsers = resolved;
+          bot.rawAllowedUserResolution = map;
           logger.info(`[${cfg.larkAppId}] Resolved allowedUsers: ${bot.resolvedAllowedUsers.join(', ')}`);
         } catch (err: any) {
           logger.warn(`[${cfg.larkAppId}] Failed to resolve allowedUsers: ${err.message}`);

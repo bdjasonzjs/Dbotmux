@@ -2,8 +2,7 @@
  * Command handler — processes /slash commands from users.
  * Extracted from daemon.ts for modularity.
  */
-import { existsSync, statSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { existsSync } from 'node:fs';
 import { config } from '../config.js';
 import { getBot, getAllBots } from '../bot-registry.js';
 import * as sessionStore from '../services/session-store.js';
@@ -16,9 +15,11 @@ import { deleteMessage } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
 import { killWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion } from './worker-pool.js';
 import { expandHome, getSessionWorkingDir, getProjectScanDir, getProjectScanDirs } from './session-manager.js';
+import { validateWorkingDir } from './working-dir.js';
 import { discoverAdoptableSessions, validateAdoptTarget, type AdoptableSession } from './session-discovery.js';
 import { generateAuthUrl, getTokenStatus } from '../utils/user-token.js';
 import { bindOncall, unbindOncall, getOncallStatus } from '../services/oncall-store.js';
+import { invalidWorkingDirs } from '../utils/working-dir.js';
 import type { LarkMessage, DaemonToWorker } from '../types.js';
 import { sessionKey, sessionAnchorId } from './types.js';
 import type { DaemonSession } from './types.js';
@@ -35,7 +36,7 @@ export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help'
  * bypassing the normal prompt-wrapping and bracketed-paste path so the CLI's
  * own slash-command parser sees them.
  */
-export const PASSTHROUGH_COMMANDS = new Set(['/compact', '/model', '/clear', '/plugin', '/usage']);
+export const PASSTHROUGH_COMMANDS = new Set(['/compact', '/model', '/clear', '/plugin', '/usage', '/code-review', '/security-review', '/review']);
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -46,26 +47,9 @@ export interface SlashCommandInvocation {
 
 const MULTILINE_COMMANDS = new Set(['/schedule']);
 
-/**
- * Validate a user-supplied path for `/cd` and `/oncall bind`. Trust model is
- * "owner explicitly chose a directory" — the daemon already runs CLI prompts
- * with full filesystem access, so an allowlist would be theater. We only do
- * the typo guards: exists and is a directory.
- */
-export function validateWorkingDir(input: string, locale?: Locale): { ok: true; resolvedPath: string } | { ok: false; error: string } {
-  const resolvedPath = resolve(expandHome(input));
-  if (!existsSync(resolvedPath)) {
-    return { ok: false, error: t('cmd.cd.dir_not_exist', { path: resolvedPath }, locale) };
-  }
-  let isDir = false;
-  try { isDir = statSync(resolvedPath).isDirectory(); } catch (e: any) {
-    return { ok: false, error: t('cmd.cd.cannot_read', { path: resolvedPath, msg: e?.message ?? String(e) }, locale) };
-  }
-  if (!isDir) {
-    return { ok: false, error: t('cmd.cd.not_a_directory', { path: resolvedPath }, locale) };
-  }
-  return { ok: true, resolvedPath };
-}
+// `validateWorkingDir` now lives in ./working-dir.js (leaf module the CLI can
+// import without the daemon graph); re-exported here for existing callers.
+export { validateWorkingDir };
 
 /**
  * Parse a force-topic invocation: `/t [prompt]` or `/topic [prompt]`.
@@ -130,6 +114,21 @@ function formatUptime(ms: number): string {
   if (m < 60) return `${m}m${s % 60}s`;
   const h = Math.floor(m / 60);
   return `${h}h${m % 60}m`;
+}
+
+function invalidConfiguredWorkingDirs(ds: DaemonSession | undefined, larkAppId: string | undefined): string[] {
+  if (ds?.workingDir) return invalidWorkingDirs({ workingDir: ds.workingDir });
+  if (larkAppId) {
+    const bot = getBot(larkAppId);
+    return invalidWorkingDirs({
+      workingDir: bot.config.workingDir ?? '~',
+      workingDirs: bot.config.workingDirs,
+    });
+  }
+  return invalidWorkingDirs({
+    workingDir: config.daemon.workingDir ?? '~',
+    workingDirs: config.daemon.workingDirs,
+  });
 }
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -435,6 +434,11 @@ export async function handleCommand(
         }
 
         const scanDirs = getProjectScanDirs(ds);
+        const invalidDirs = invalidConfiguredWorkingDirs(ds, ds?.larkAppId ?? larkAppId);
+        if (invalidDirs.length > 0) {
+          await sessionReply(rootId, t('cmd.repo.working_dir_not_exist', { dirs: invalidDirs.map(d => `\`${d}\``).join(', ') }, loc));
+          break;
+        }
         const validDirs = scanDirs.filter(d => existsSync(d));
         if (validDirs.length === 0) {
           await sessionReply(rootId, t('cmd.repo.scan_dir_not_exist', { dirs: scanDirs.join(', ') }, loc));
@@ -675,7 +679,7 @@ export async function handleCommand(
           t('help.status', undefined, loc),
           '',
           t('help.heading_passthrough', { cliName }, loc),
-          '/compact /model /clear /plugin /usage',
+          '/compact /model /clear /plugin /usage /code-review /security-review /review',
           '',
           t('help.heading_schedule', undefined, loc),
           t('help.schedule_create', undefined, loc),
@@ -698,6 +702,10 @@ export async function handleCommand(
           t('help.oncall_bind', undefined, loc),
           t('help.oncall_unbind', undefined, loc),
           t('help.oncall_status', undefined, loc),
+          '',
+          t('help.heading_grant', undefined, loc),
+          t('help.grant', undefined, loc),
+          t('help.revoke', undefined, loc),
           '',
           t('help.help', undefined, loc),
         ];

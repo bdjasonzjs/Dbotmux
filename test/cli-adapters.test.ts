@@ -22,13 +22,14 @@ import { createCocoAdapter } from '../src/adapters/cli/coco.js';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
+import { createAntigravityAdapter } from '../src/adapters/cli/antigravity.js';
 import type { CliAdapter, CliId } from '../src/adapters/cli/types.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-const ALL_CLI_IDS: CliId[] = ['claude-code', 'aiden', 'coco', 'codex', 'gemini', 'opencode'];
+const ALL_CLI_IDS: CliId[] = ['claude-code', 'aiden', 'coco', 'codex', 'gemini', 'opencode', 'antigravity'];
 
 // ---------------------------------------------------------------------------
 // 1. Factory: createCliAdapterSync
@@ -214,6 +215,68 @@ describe('opencode buildArgs', () => {
   });
 });
 
+describe('antigravity buildArgs', () => {
+  const adapter = createAntigravityAdapter('/usr/local/bin/agy');
+
+  it('fresh session passes --dangerously-skip-permissions only', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-7', resume: false });
+    expect(args).toEqual(['--dangerously-skip-permissions']);
+  });
+
+  it('does NOT inject initialPrompt via -i (agy -i does not auto-submit)', () => {
+    // Empirically: agy's -i deposits a prompt that is neither auto-submitted
+    // nor finishable with a follow-up Enter, AND the deposit isn't logged to
+    // history.jsonl — we'd lose submit verification. Worker stdin-injects
+    // via writeInput instead.
+    const args = adapter.buildArgs({ sessionId: 'sess-7', resume: false, initialPrompt: 'do the thing' });
+    expect(args).not.toContain('-i');
+    expect(args).not.toContain('--prompt-interactive');
+    expect(args).not.toContain('do the thing');
+  });
+
+  it('passesInitialPromptViaArgs is falsy (worker enqueues for stdin path)', () => {
+    expect(adapter.passesInitialPromptViaArgs).toBeFalsy();
+  });
+
+  it('resume with cli-native conversation id passes --conversation <id>', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'bm-7',
+      resume: true,
+      resumeSessionId: 'eb4cabea-3060-4b76-8e85-5778cc7ddb49',
+    });
+    expect(args).toContain('--conversation');
+    const idx = args.indexOf('--conversation');
+    expect(args[idx + 1]).toBe('eb4cabea-3060-4b76-8e85-5778cc7ddb49');
+  });
+
+  it('resume without resumeSessionId starts fresh (no --continue, no random id)', () => {
+    // We deliberately don't fall back to --continue: "most recent" is racy
+    // across parallel botmux sessions, and we never map botmux sessionId
+    // into Antigravity's id space (it would be ignored anyway).
+    const args = adapter.buildArgs({ sessionId: 'bm-7', resume: true });
+    expect(args).not.toContain('--conversation');
+    expect(args).not.toContain('--continue');
+    expect(args).not.toContain('bm-7');
+  });
+
+  it('never bakes initial prompt into args (resume or fresh)', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'bm-7',
+      resume: true,
+      resumeSessionId: 'cid',
+      initialPrompt: 'this should not appear',
+    });
+    expect(args).not.toContain('-i');
+    expect(args).not.toContain('this should not appear');
+  });
+
+  it('does not include botmux session id (Antigravity self-generates conversation id)', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-7', resume: false });
+    expect(args).not.toContain('sess-7');
+    expect(args).not.toContain('--session-id');
+  });
+});
+
 // ---------------------------------------------------------------------------
 // 3. completionPattern and readyPattern
 // ---------------------------------------------------------------------------
@@ -262,6 +325,10 @@ describe('completionPattern', () => {
   it('opencode has no completionPattern', () => {
     expect(createOpenCodeAdapter('/bin/opencode').completionPattern).toBeUndefined();
   });
+
+  it('antigravity has no completionPattern', () => {
+    expect(createAntigravityAdapter('/bin/agy').completionPattern).toBeUndefined();
+  });
 });
 
 describe('readyPattern', () => {
@@ -297,6 +364,10 @@ describe('readyPattern', () => {
   it('opencode has no readyPattern', () => {
     expect(createOpenCodeAdapter('/bin/opencode').readyPattern).toBeUndefined();
   });
+
+  it('antigravity has no readyPattern', () => {
+    expect(createAntigravityAdapter('/bin/agy').readyPattern).toBeUndefined();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -314,6 +385,7 @@ describe('systemHints', () => {
     ['codex', () => createCodexAdapter('/bin/codex')],
     ['gemini', () => createGeminiAdapter('/bin/gemini')],
     ['opencode', () => createOpenCodeAdapter('/bin/opencode')],
+    ['antigravity', () => createAntigravityAdapter('/bin/agy')],
   ];
 
   it.each(nonClaudeAdapters)('%s systemHints include botmux send routing guidance', (_name, factory) => {
@@ -335,6 +407,7 @@ describe('id property', () => {
     ['codex', () => createCodexAdapter('/bin/codex')],
     ['gemini', () => createGeminiAdapter('/bin/gemini')],
     ['opencode', () => createOpenCodeAdapter('/bin/opencode')],
+    ['antigravity', () => createAntigravityAdapter('/bin/agy')],
   ];
 
   it.each(expected)('adapter id is "%s"', (expectedId, factory) => {
@@ -369,6 +442,10 @@ describe('altScreen property', () => {
 
   it('codex does not use alt screen', () => {
     expect(createCodexAdapter('/bin/codex').altScreen).toBe(false);
+  });
+
+  it('antigravity uses alt screen (TUI)', () => {
+    expect(createAntigravityAdapter('/bin/agy').altScreen).toBe(true);
   });
 });
 
@@ -420,5 +497,12 @@ describe('buildResumeCommand', () => {
   it('opencode does not implement buildResumeCommand', () => {
     const a = createOpenCodeAdapter('/bin/opencode');
     expect(a.buildResumeCommand).toBeUndefined();
+  });
+
+  it('antigravity emits `agy --conversation <cliSessionId>` when known, null otherwise', () => {
+    const a = createAntigravityAdapter('/bin/agy');
+    expect(a.buildResumeCommand?.({ sessionId: 'bm-ag', cliSessionId: 'cid-uuid' }))
+      .toBe('agy --conversation cid-uuid');
+    expect(a.buildResumeCommand?.({ sessionId: 'bm-ag' })).toBeNull();
   });
 });

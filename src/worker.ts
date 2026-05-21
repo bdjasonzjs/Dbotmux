@@ -85,7 +85,7 @@ const writeToken = randomBytes(16).toString('hex');
 
 let sessionId = '';
 let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
-const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', cursor: 'Cursor', gemini: 'Gemini', opencode: 'OpenCode' };
+const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', cursor: 'Cursor', gemini: 'Gemini', opencode: 'OpenCode', antigravity: 'Antigravity' };
 function cliName(): string { return CLI_DISPLAY_NAMES[lastInitConfig?.cliId ?? ''] ?? 'CLI'; }
 let isPromptReady = false;
 /** Mutex for async flushPending — prevents concurrent flush loops. */
@@ -2090,8 +2090,26 @@ function scheduleSubmitFailureNotify(
   recheck: (() => boolean | Promise<boolean>) | undefined,
   transcriptLabel: string,
   bridgeTurnId?: string,
+  failureReason?: string,
 ): void {
   const preview = msg.length > 60 ? msg.slice(0, 60) + '…' : msg;
+  const dropBridgeMark = (): void => {
+    if (!bridgeTurnId) return;
+    const dropped = bridgeQueue.dropPendingTurn(bridgeTurnId);
+    if (dropped) {
+      if (dropped.contentFingerprint) bridgeFingerprintScanLastMs.delete(dropped.contentFingerprint);
+      log(`Bridge mark dropped after submit failure (turnId=${bridgeTurnId}) — rotation-fallback scan will stop spinning on this fingerprint.`);
+    }
+  };
+  if (failureReason) {
+    dropBridgeMark();
+    log(`writeInput: submit impossible — notifying user immediately. reason="${failureReason}" preview="${preview}"`);
+    send({
+      type: 'user_notify',
+      message: `⚠️ 刚才那条消息没有写入 ${cliName()}，因为当前按键配置无法从终端自动提交。\n原因：${failureReason}\n请调整 Claude Code Chat keybinding 后重发。\n开头：${preview}`,
+    });
+    return;
+  }
   log(`writeInput: submit not confirmed after retries — deferred ${SUBMIT_DEFERRED_RECHECK_MS}ms recheck queued. preview="${preview}"`);
   setTimeout(async () => {
     if (recheck) {
@@ -2104,13 +2122,7 @@ function scheduleSubmitFailureNotify(
         log(`Deferred recheck threw (${err?.message ?? err}); falling through to warning.`);
       }
     }
-    if (bridgeTurnId) {
-      const dropped = bridgeQueue.dropPendingTurn(bridgeTurnId);
-      if (dropped) {
-        if (dropped.contentFingerprint) bridgeFingerprintScanLastMs.delete(dropped.contentFingerprint);
-        log(`Bridge mark dropped after submit failure (turnId=${bridgeTurnId}) — rotation-fallback scan will stop spinning on this fingerprint.`);
-      }
-    }
+    dropBridgeMark();
     log(`Deferred recheck still missing — notifying user. preview="${preview}"`);
     send({
       type: 'user_notify',
@@ -2171,7 +2183,24 @@ async function flushPending(): Promise<void> {
         codexBridgeMarkPendingTurn(msg);
       }
       log(`Writing to PTY (flush): "${msg.substring(0, 80)}"`);
-      const result = await cliAdapter.writeInput(backend, msg);
+      // Defense in depth: TmuxPipeBackend's send methods no longer throw on a
+      // dead pane (they fire onExit instead), but writeInput can still throw
+      // for other reasons (fs errors while resolving the JSONL, a future
+      // backend regression). flushPending is invoked fire-and-forget, so an
+      // escaping rejection would become an unhandledRejection and crash the
+      // worker — exactly the failure mode this change is closing. Contain it.
+      let result: Awaited<ReturnType<typeof cliAdapter.writeInput>> | undefined;
+      try {
+        result = await cliAdapter.writeInput(backend, msg);
+      } catch (err: any) {
+        log(`writeInput threw: ${err?.message ?? err}`);
+        // If the CLI exited mid-write the backend already fired onExit (which
+        // nulled `backend` and told the user the CLI exited) — nothing more to
+        // do. Otherwise surface it as a submit failure so the message isn't
+        // silently lost.
+        if (backend) scheduleSubmitFailureNotify(msg, undefined, '会话 JSONL', bridgeTurnId);
+        break;
+      }
       // Persist any sessionId the adapter observed via authoritative sources
       // (Claude's pid file, Codex's history). Done independently of submit
       // outcome — the rotation is real even when the current Enter didn't
@@ -2183,8 +2212,11 @@ async function flushPending(): Promise<void> {
         // attributed to this turn.
         if (codexBridgeActive) codexBridgeNotifyCliSessionId(result.cliSessionId);
       }
-      if (result && result.submitted === false) {
-        scheduleSubmitFailureNotify(msg, result.recheck, '会话 JSONL', bridgeTurnId);
+      // `&& backend`: if the CLI exited during this write (pane gone → onExit
+      // nulled backend) the user already got a "CLI exited" notice; don't also
+      // nag that the submit wasn't confirmed.
+      if (result && result.submitted === false && backend) {
+        scheduleSubmitFailureNotify(msg, result.recheck, '会话 JSONL', bridgeTurnId, result.failureReason);
       }
       // Codex bridge: stop after one writeInput per idle cycle. Codex's
       // bridge queue doesn't yet attribute queued_command-equivalents, so
@@ -3151,7 +3183,7 @@ process.on('message', async (raw: unknown) => {
                 codexBridgeNotifyCliSessionId(result.cliSessionId);
               }
               if (result && result.submitted === false) {
-                scheduleSubmitFailureNotify(content, result.recheck, 'Codex history');
+                scheduleSubmitFailureNotify(content, result.recheck, 'Codex history', undefined, result.failureReason);
               }
             } catch (err: any) {
               log(`Codex adopt writeInput error: ${err.message}`);

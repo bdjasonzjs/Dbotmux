@@ -47,6 +47,36 @@ export const messages: Record<string, string> = {
   'card.repo.current_marker': ' ← 当前',
   'card.repo.note': '也可以回复 `/repo <编号>` 切换，例如：`/repo 1`',
 
+  // 群内授权卡片
+  'card.grant.title': '🔑 使用授权',
+  'card.grant.body_request': '用户 **{name}** 申请在本群使用我。<at id={owner}></at> 请选择授权范围：',
+  'card.grant.body_owner': '请选择对 **{name}** 的授权范围（<at id={owner}></at>）：',
+  'card.grant.btn_chat': '授权本群',
+  'card.grant.btn_global': '全局授权',
+  'card.grant.btn_deny': '拒绝',
+  'card.grant.note': '「授权本群」仅允许其在本群与我对话；管理命令（/cd、/oncall 等）仍仅限 owner。',
+  'card.grant.toast_owner_only': '仅 owner 可操作',
+  'card.grant.toast_expired': '该授权请求已失效',
+  'card.grant.toast_no_repo_perm': '无操作权限',
+  'card.grant.toast_failed': '授权失败：{reason}',
+  'card.grant.result_chat': '✅ 已授权本群使用',
+  'card.grant.result_global': '✅ 已全局授权',
+  'card.grant.result_deny': '🚫 已拒绝该申请',
+  'card.grant.notify_chat': '✅ {at} 已获授权在本群使用我，发消息 @ 我即可。',
+  'card.grant.notify_global': '✅ {at} 已获全局授权，在任意群发消息 @ 我即可。',
+
+  // /grant、/revoke 命令回执
+  'cmd.grant.owner_only': '仅 owner 可使用 /grant。',
+  'cmd.grant.usage': '用法：@机器人 /grant @某人 —— 弹出授权卡片，由 owner 选择授权范围（本群 / 全局）。',
+  'cmd.revoke.owner_only': '仅 owner 可使用 /revoke。',
+  'cmd.revoke.usage': '用法：@机器人 /revoke @某人 —— 撤销该用户的本群与全局授权。',
+  'cmd.revoke.done': '已撤销 {name} 的权限（范围：{scope}）。',
+  'cmd.revoke.would_open': '⚠️ 撤销失败：该用户是最后一个全局授权用户 / owner，撤销会让机器人对所有人开放，已阻止。',
+  'cmd.revoke.failed': '⚠️ 撤销失败：{reason}',
+  'cmd.revoke.scope_chat': '本群 ',
+  'cmd.revoke.scope_global': '全局',
+  'cmd.revoke.scope_none': '无',
+
   // ─── Adopt card ──────────────────────────────────────────────────────────
   'card.adopt.title': '📡 选择要接入的 CLI 会话',
   'card.adopt.placeholder_select': '选择 CLI 会话',
@@ -70,6 +100,7 @@ export const messages: Record<string, string> = {
   'cmd.repo.switched_to': '🔄 已切换到 {name}',
   'cmd.repo.warning_running': '⚠️ 当前会话已在运行中，切换仓库将关闭当前会话并创建新会话。\n如需切换，请在下方卡片中选择新仓库。',
   'cmd.repo.scan_dir_not_exist': '扫描目录不存在：{dirs}\n请检查 bots.json 中的 workingDir 是否指向有效目录。',
+  'cmd.repo.working_dir_not_exist': '❌ 配置的工作目录不存在或不是目录：{dirs}\n请检查 ~/.botmux/bots.json 中的 workingDir / workingDirs，或重新运行 `botmux setup` 修改为已存在的目录。',
   'cmd.repo.no_git_repos': '在 {dirs} 下未找到 git 仓库。',
   'cmd.skip.opened': '▶️ 已直接开启会话（工作目录：{cwd}）',
   'cmd.skip.no_pending': '当前没有待选择的仓库。',
@@ -141,6 +172,9 @@ export const messages: Record<string, string> = {
   'help.oncall_bind': '/oncall bind <path>  - 把当前群绑到某个项目，跳过仓库选择卡片',
   'help.oncall_unbind': '/oncall unbind       - 解绑当前群',
   'help.oncall_status': '/oncall status       - 查看当前群的 oncall 绑定',
+  'help.heading_grant': '🔑 使用授权（owner 专用）：',
+  'help.grant': '@机器人 /grant @某人   - 弹授权卡片，授权对方「本群使用」或「全局」',
+  'help.revoke': '@机器人 /revoke @某人  - 撤销对方的本群 + 全局授权',
   'help.help': '/help       - 显示此帮助',
 
   // ─── AI system prompt (Claude Code: --append-system-prompt) ──────────────

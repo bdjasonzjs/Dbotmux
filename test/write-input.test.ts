@@ -16,7 +16,8 @@
  *   off the per-line typing model that claude-code uses: Trae CLI 0.120.31
  *   fresh-spawn treated the rapid send-keys -l burst as an open-ended paste
  *   and swallowed the trailing Enter as a soft-newline, stranding the
- *   message in the input box. Submit is verified via ~/.cache/coco/history.jsonl.
+ *   message in the input box. Submit is verified via CoCo's platform-specific
+ *   history.jsonl.
  * - CoCo (raw PTY): same explicit \x1b[200~...\x1b[201~ wrap as claude-code.
  * - Other adapters (Aiden/Codex/Gemini/OpenCode): use plain sendText + Enter
  *   in tmux, or write(content) + \r in raw mode. The whole content (including
@@ -43,8 +44,8 @@ import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
 import type { CliAdapter, PtyHandle } from '../src/adapters/cli/types.js';
-import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { appendFileSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, platform } from 'node:os';
 import { dirname, join } from 'node:path';
 
 // ---------------------------------------------------------------------------
@@ -52,7 +53,10 @@ import { dirname, join } from 'node:path';
 // ---------------------------------------------------------------------------
 
 const CODEX_HISTORY_PATH = join(homedir(), '.codex', 'history.jsonl');
-const COCO_HISTORY_PATH = join(homedir(), '.cache', 'coco', 'history.jsonl');
+const COCO_HISTORY_PATH = platform() === 'darwin'
+  ? join(homedir(), 'Library', 'Caches', 'coco', 'history.jsonl')
+  : join(homedir(), '.cache', 'coco', 'history.jsonl');
+const CLAUDE_KEYBINDINGS_PATH = join(homedir(), '.claude', 'keybindings.json');
 
 function appendCodexHistory(content: string, sessionId?: string): void {
   mkdirSync(dirname(CODEX_HISTORY_PATH), { recursive: true });
@@ -72,6 +76,17 @@ function appendCocoHistory(content: string): void {
 function resetCocoHistory(): void {
   mkdirSync(dirname(COCO_HISTORY_PATH), { recursive: true });
   writeFileSync(COCO_HISTORY_PATH, '');
+}
+
+function writeClaudeKeybindings(bindings: Record<string, string>): void {
+  mkdirSync(dirname(CLAUDE_KEYBINDINGS_PATH), { recursive: true });
+  writeFileSync(CLAUDE_KEYBINDINGS_PATH, JSON.stringify({
+    bindings: [{ context: 'Chat', bindings }],
+  }));
+}
+
+function removeClaudeKeybindings(): void {
+  try { rmSync(CLAUDE_KEYBINDINGS_PATH); } catch { /* absent */ }
 }
 
 function makeTmuxPty(opts?: { confirmCodexSubmit?: boolean; codexSessionId?: string }) {
@@ -216,6 +231,112 @@ describe('writeInput: multiline, tmux mode', () => {
     const backslashCalls = pty.sendText.mock.calls.filter(c => c[0] === '\\').length;
     expect(backslashCalls).toBe(2);
     expect(pty.sendSpecialKeys).toHaveBeenLastCalledWith('Enter');
+  });
+
+  it('claude-code: respects custom chat keybindings where Enter is newline and Meta+Enter submits', async () => {
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    writeClaudeKeybindings({
+      'cmd+enter': 'chat:submit',
+      'meta+enter': 'chat:submit',
+      enter: 'chat:newline',
+    });
+    try {
+      const pty = makeTmuxPty();
+      await adapter.writeInput(pty, MULTILINE);
+
+      expect(pty.pasteText).not.toHaveBeenCalled();
+      expect(pty.sendText).toHaveBeenCalledWith('first line');
+      expect(pty.sendText).toHaveBeenCalledWith('Session ID: abc-123');
+      expect(pty.sendText).not.toHaveBeenCalledWith('\\');
+      expect(pty.sendSpecialKeys.mock.calls).toEqual([
+        ['Enter'],
+        ['Enter'],
+        ['M-Enter'],
+      ]);
+    } finally {
+      removeClaudeKeybindings();
+    }
+  });
+
+  it('claude-code: fails before typing when only unsupported Cmd+Enter can submit', async () => {
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    writeClaudeKeybindings({
+      'cmd+enter': 'chat:submit',
+      enter: 'chat:newline',
+    });
+    try {
+      const pty = makeTmuxPty();
+      const result = await adapter.writeInput(pty, MULTILINE);
+
+      expect(pty.pasteText).not.toHaveBeenCalled();
+      expect(pty.sendText).not.toHaveBeenCalled();
+      expect(pty.sendSpecialKeys).not.toHaveBeenCalled();
+      expect(result).toMatchObject({
+        submitted: false,
+        failureReason: expect.stringContaining('terminal-sendable'),
+      });
+    } finally {
+      removeClaudeKeybindings();
+    }
+  });
+
+  it('claude-code: fails before typing when only unsendable Ctrl+Enter can submit', async () => {
+    // Terminals cannot distinguish Ctrl+Enter from Enter, so it must NOT be
+    // treated as a sendable submit key — fail fast instead of phantom-submitting.
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    writeClaudeKeybindings({
+      'ctrl+enter': 'chat:submit',
+      enter: 'chat:newline',
+    });
+    try {
+      const pty = makeTmuxPty();
+      const result = await adapter.writeInput(pty, MULTILINE);
+
+      expect(pty.sendText).not.toHaveBeenCalled();
+      expect(pty.sendSpecialKeys).not.toHaveBeenCalled();
+      expect(result).toMatchObject({
+        submitted: false,
+        failureReason: expect.stringContaining('terminal-sendable'),
+      });
+    } finally {
+      removeClaudeKeybindings();
+    }
+  });
+
+  it('claude-code: fails before typing when Enter is newline and no submit key is bound', async () => {
+    // A config that remaps Enter to newline without binding any chat:submit key
+    // would otherwise type the message and emit newlines forever — fail fast.
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    writeClaudeKeybindings({ enter: 'chat:newline' });
+    try {
+      const pty = makeTmuxPty();
+      const result = await adapter.writeInput(pty, MULTILINE);
+
+      expect(pty.sendText).not.toHaveBeenCalled();
+      expect(pty.sendSpecialKeys).not.toHaveBeenCalled();
+      expect(result).toMatchObject({
+        submitted: false,
+        failureReason: expect.stringContaining('terminal-sendable'),
+      });
+    } finally {
+      removeClaudeKeybindings();
+    }
+  });
+
+  it('claude-code: CLAUDE_CODE_SUBMIT_KEY env overrides the submit key', async () => {
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    removeClaudeKeybindings();
+    process.env.CLAUDE_CODE_SUBMIT_KEY = 'meta+enter';
+    try {
+      const pty = makeTmuxPty();
+      await adapter.writeInput(pty, MULTILINE);
+
+      // Enter still submits by default here, so soft-newlines stay backslashed;
+      // only the final submit honours the override.
+      expect(pty.sendSpecialKeys.mock.calls.at(-1)).toEqual(['M-Enter']);
+    } finally {
+      delete process.env.CLAUDE_CODE_SUBMIT_KEY;
+    }
   });
 
   it.each(PASTE_BUFFER_ADAPTERS)('%s: single pasteText(whole) + delayed Enter, no sendText', async (_name, adapter) => {
@@ -881,5 +1002,46 @@ describe('coco writeInput submission confirmation', () => {
     const pty = makeCocoPasteTmuxPty({ confirmCocoSubmit: false });
     const result = await adapter.writeInput(pty, 'hello');
     expect(result).toBeUndefined();
+  });
+
+  it('confirms submit when baseByte lands mid-line (non-atomic history append)', async () => {
+    // CoCo/Trae 0.120.32 appends history.jsonl non-atomically, so the file size
+    // captured as baseByte can fall in the MIDDLE of the JSONL line that ends up
+    // carrying our marker. Reading straight from baseByte yields a mid-line
+    // fragment that fails JSON.parse, so the old scanner skipped the marker line
+    // and false-warned even though CoCo received and replied. The fix backs up
+    // to the line boundary before parsing.
+    resetCocoHistory();
+    appendCocoHistory('an older complete record');
+    const prompt = '<user_message>\n@CoCo midline test\n</user_message>';
+    // Simulate CoCo having written only the HEAD of this submit's line (no
+    // trailing newline yet) at the moment the adapter samples baseByte.
+    const partialHead = '{"content":"\\u003cuser_message\\u003e\\n@CoCo midline test';
+    appendFileSync(COCO_HISTORY_PATH, partialHead);
+    // baseByte is now mid-line, inside the marker line.
+
+    let completedOnce = false;
+    const pty: PtyHandle = {
+      write: vi.fn(),
+      sendText: vi.fn(),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key !== 'Enter' || completedOnce) return;
+        completedOnce = true;
+        // CoCo finishes the rest of the SAME line + newline.
+        appendFileSync(
+          COCO_HISTORY_PATH,
+          '\\n\\u003c/user_message\\u003e","mode":"user","timestamp":"2026-05-21T09:00:00Z"}\n',
+        );
+      }),
+      pasteText: vi.fn(),
+    };
+
+    const adapter = createCocoAdapter('/bin/coco');
+    const result = await adapter.writeInput(pty, prompt);
+
+    // Confirmed → no warning, and no spurious retry Enters.
+    expect(result).toBeUndefined();
+    const enterCalls = (pty.sendSpecialKeys as any).mock.calls.filter((c: string[]) => c[0] === 'Enter').length;
+    expect(enterCalls).toBe(1);
   });
 });

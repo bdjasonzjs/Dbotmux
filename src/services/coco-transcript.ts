@@ -15,15 +15,11 @@
  */
 import { existsSync, statSync, openSync, readSync, closeSync, readdirSync, readlinkSync } from 'node:fs';
 import { execSync } from 'node:child_process';
-import { homedir, platform } from 'node:os';
+import { platform } from 'node:os';
 import { join } from 'node:path';
+import { cocoCacheRoot } from './coco-paths.js';
 
-// macOS 上 Rust `dirs` crate 把 cache 放在 ~/Library/Caches/，跟 Linux 的
-// ~/.cache 不同。这里硬编码两条平台路径，对不上的话 adopt 完全读不到
-// events.jsonl（user-visible: Lark 收不到模型回复）。
-const COCO_SESSIONS_ROOT = platform() === 'darwin'
-  ? join(homedir(), 'Library', 'Caches', 'coco', 'sessions')
-  : join(homedir(), '.cache', 'coco', 'sessions');
+const COCO_SESSIONS_ROOT = join(cocoCacheRoot(), 'sessions');
 const SESSION_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const IS_LINUX = platform() === 'linux';
 // substring anchor —— 同时匹配 Linux 的 `/.cache/coco/sessions/` 和 macOS 的

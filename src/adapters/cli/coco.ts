@@ -1,8 +1,8 @@
 import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
+import { cocoCacheRoot } from '../../services/coco-paths.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 
 /** Global submit log — CoCo appends one JSON line here on every successful
@@ -11,7 +11,7 @@ import type { CliAdapter, PtyHandle } from './types.js';
  *  the Codex adapter uses ~/.codex/history.jsonl: write → poll for our
  *  marker → retry Enter if missing → return {submitted:false, recheck}
  *  on final failure so worker can surface a Lark warning. */
-const HISTORY_PATH = join(homedir(), '.cache', 'coco', 'history.jsonl');
+const HISTORY_PATH = join(cocoCacheRoot(), 'history.jsonl');
 
 function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -27,31 +27,68 @@ function currentFileSize(path: string): number {
  *  with JSON.parse — substring match on the raw bytes is unreliable here
  *  because CoCo's Go marshaller HTML-escapes `<`, `>`, `&` into `<`,
  *  `>`, `&`, which our string-form prefix won't match. Decoding
- *  the field and comparing JS strings sidesteps all of that. */
+ *  the field and comparing JS strings sidesteps all of that.
+ *
+ *  `fromByte` is captured as the file size at submit time, but CoCo/Trae
+ *  0.120.32 appends to history.jsonl NON-ATOMICALLY, so that baseline can land
+ *  in the MIDDLE of a JSONL line — including the very line that ends up
+ *  carrying our marker. Reading straight from `fromByte` would yield a mid-line
+ *  fragment (`...sender type=\"user\"...`) that fails JSON.parse, so the marker
+ *  line gets skipped and we falsely report "not submitted" — the user sees a
+ *  spurious submit-failure warning even though CoCo received and replied.
+ *
+ *  Fix: back up to the start of the line that contains `fromByte` and parse
+ *  whole lines, but only accept lines whose END is past `fromByte` (newly
+ *  written / spanning the baseline) so a stale earlier record that happens to
+ *  share the prefix can't produce a false positive. */
 function historyDeltaContains(path: string, fromByte: number, prefix: string): boolean {
   if (!existsSync(path)) return false;
   let size: number;
   try { size = statSync(path).size; } catch { return false; }
   if (size <= fromByte) return false;
-  const len = size - fromByte;
+
+  // Read from a little before `fromByte` so the line straddling the baseline is
+  // captured whole. A single chat-prompt JSONL line stays far under 64 KiB.
+  const LOOKBACK = 64 * 1024;
+  const readStart = Math.max(0, fromByte - LOOKBACK);
+  const len = size - readStart;
   const buf = Buffer.alloc(len);
   const fd = openSync(path, 'r');
   try {
-    readSync(fd, buf, 0, len, fromByte);
+    readSync(fd, buf, 0, len, readStart);
   } finally {
     closeSync(fd);
   }
-  const delta = buf.toString('utf8');
-  for (const line of delta.split('\n')) {
-    if (!line || !line.includes('"mode":"user"')) continue;
-    try {
-      const parsed = JSON.parse(line);
-      if (typeof parsed.content === 'string' && parsed.content.startsWith(prefix)) {
-        return true;
+
+  // Walk complete lines, tracking each line's absolute end offset in the file.
+  let lineStart = 0;
+  if (readStart > 0) {
+    // We may have started mid-line; the bytes before the first newline belong
+    // to a line whose head we can't see — skip that partial fragment.
+    const firstNl = buf.indexOf(0x0a);
+    if (firstNl === -1) return false;
+    lineStart = firstNl + 1;
+  }
+  while (lineStart < buf.length) {
+    const nl = buf.indexOf(0x0a, lineStart);
+    const lineEnd = nl === -1 ? buf.length : nl;
+    const absLineEnd = readStart + lineEnd;
+    // Only lines that extend past the baseline are this submit's; skip the rest.
+    if (absLineEnd > fromByte) {
+      const line = buf.toString('utf8', lineStart, lineEnd);
+      if (line.includes('"mode":"user"')) {
+        try {
+          const parsed = JSON.parse(line);
+          if (typeof parsed.content === 'string' && parsed.content.startsWith(prefix)) {
+            return true;
+          }
+        } catch {
+          // Truncated tail / non-JSON line — keep scanning the rest.
+        }
       }
-    } catch {
-      // Truncated tail / non-JSON line — keep scanning the rest.
     }
+    if (nl === -1) break;
+    lineStart = nl + 1;
   }
   return false;
 }
@@ -108,10 +145,12 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
       //   2. The old adapter had no verification, so the worker never knew
       //      and the user stared at Lark waiting for a reply that never came.
       //
-      // Fix: use tmux `load-buffer` + `paste-buffer -d` (the `pasteText` path)
-      // which automatically wraps the content in bracketed-paste markers
-      // (`\e[200~...\e[201~`) when the Ink TUI has bracketed paste enabled —
-      // Ink does by default on fresh spawn. CoCo sees an explicit START/END
+      // Fix: use tmux `load-buffer` + `paste-buffer -d -p` (the `pasteText`
+      // path). The `-p` flag is what makes tmux wrap the content in
+      // bracketed-paste markers (`\e[200~...\e[201~`) when the Ink TUI has
+      // bracketed paste enabled — Ink does by default on fresh spawn. WITHOUT
+      // `-p` tmux pastes raw bytes (no markers) and we're back to the burst
+      // bug below. CoCo sees an explicit START/END
       // pair, so embedded `\n` stay as content (no per-line submits) and the
       // trailing Enter after submitDelay is unambiguously a submit (not part
       // of an "ongoing paste burst" the way send-keys -l rapid input was).
@@ -128,7 +167,7 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
       // OFF after slash commands; CoCo on a fresh-spawn message doesn't have
       // that concern.
       //
-      // Verification (unchanged): poll ~/.cache/coco/history.jsonl for the
+      // Verification (unchanged): poll CoCo's platform-specific history.jsonl for the
       // user-submit line whose decoded `content` starts with our prefix.
       // Retry Enter up to 3 times, then return {submitted:false, recheck}
       // for the worker's deferred recheck + Lark warning path.
@@ -152,10 +191,12 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
 
       try {
         if (pty.pasteText) {
-          // tmux mode: load-buffer + paste-buffer -d. Tmux wraps in bracketed
-          // paste automatically when the pane has it on (Ink default). The
-          // trailing `-d` deletes the buffer after pasting so it doesn't
-          // accumulate across writes.
+          // tmux mode: load-buffer + paste-buffer -d -p. The `-p` flag (added
+          // in TmuxPipeBackend.pasteText — the real runtime backend) makes tmux
+          // emit bracketed-paste markers when the pane has them on (Ink
+          // default); without it the trailing Enter is swallowed as a soft
+          // newline and the message strands. `-d` deletes the buffer after
+          // pasting so it doesn't accumulate across writes.
           pty.pasteText(content);
         } else {
           // Non-tmux fallback (raw PTY): wrap markers ourselves.
