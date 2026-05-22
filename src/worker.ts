@@ -13,7 +13,7 @@
  *   7. On 'restart', kills CLI and re-spawns with --resume
  */
 import { randomBytes } from 'node:crypto';
-import { mkdirSync, writeFileSync, unlinkSync, existsSync, statSync, readdirSync, readlinkSync, readFileSync, watch as fsWatch, type FSWatcher } from 'node:fs';
+import { mkdirSync, writeFileSync, unlinkSync, existsSync, statSync, readdirSync, readlinkSync, readFileSync, watch as fsWatch, createWriteStream, type FSWatcher, type WriteStream } from 'node:fs';
 import { join } from 'node:path';
 import { drainTranscript, joinAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
@@ -1666,7 +1666,41 @@ function isWorkflowWorker(): boolean {
   return process.env.BOTMUX_WORKFLOW === '1';
 }
 
+/**
+ *  Raw PTY byte stream writer — independent of the IPC `final_output` path.
+ *  Powers the dashboard "terminal replay" view: bytes flow straight through
+ *  without splitting on `\n` or prefixing each line, so ANSI cursor moves /
+ *  status bars / alt-screen toggles all survive and `xterm.write()` on the
+ *  client renders an actual recording of the live session.
+ *
+ *  Lazily opened on first PTY chunk so attempts that never produce data
+ *  don't leave empty `pty.log` files behind.  Closed at worker exit by the
+ *  process-shutdown hook below.
+ */
+let workflowPtyLogStream: WriteStream | undefined;
+let workflowPtyLogOpenFailed = false;
+function appendWorkflowPtyLog(data: string): void {
+  if (!isWorkflowWorker() || workflowPtyLogOpenFailed) return;
+  const path = process.env.BOTMUX_WORKFLOW_PTY_LOG_PATH;
+  if (!path) return;
+  if (!workflowPtyLogStream) {
+    try {
+      mkdirSync(dirname(path), { recursive: true });
+      workflowPtyLogStream = createWriteStream(path, { flags: 'a' });
+      workflowPtyLogStream.on('error', (err) => {
+        log(`workflow pty log write error: ${err.message}`);
+      });
+    } catch (err: any) {
+      workflowPtyLogOpenFailed = true;
+      log(`workflow pty log open failed (${path}): ${err.message}`);
+      return;
+    }
+  }
+  workflowPtyLogStream.write(data);
+}
+
 function captureWorkflowTranscript(data: string): void {
+  appendWorkflowPtyLog(data);
   if (!isWorkflowWorker() || workflowFinalOutputSent) return;
   workflowTranscript += data;
   if (workflowTranscript.length > WORKFLOW_TRANSCRIPT_MAX) {
@@ -3408,6 +3442,10 @@ function cleanup(): void {
   wsClients.clear();
   if (wss) { wss.close(); wss = null; }
   if (httpServer) { httpServer.close(); httpServer = null; }
+  if (workflowPtyLogStream) {
+    try { workflowPtyLogStream.end(); } catch { /* already closed */ }
+    workflowPtyLogStream = undefined;
+  }
 }
 
 process.on('SIGTERM', () => { stopScreenshotLoop(); killCli(); cleanup(); process.exit(0); });

@@ -284,7 +284,59 @@ describe('readRunSnapshot', () => {
       startedAt: 100,
       updatedAt: 200,
       closedAt: undefined,
+      hasPtyLog: false,
     });
+  });
+
+  it('projects hasPtyLog=true when a non-empty pty.log sits alongside the sidecar', async () => {
+    await seedSucceeded('r-pty');
+    const activityId = workActivityId('r-pty', 'only');
+    const attemptId = 'r-pty::work::only::att-1';
+    const attemptDir = join(runsDir, 'r-pty', 'attempts', activityId, attemptId);
+    mkdirSync(attemptDir, { recursive: true });
+    writeFileSync(
+      join(attemptDir, 'terminal.json'),
+      JSON.stringify({
+        schemaVersion: 1,
+        sessionId: 'wf-r-pty-only',
+        webPort: 32124,
+        status: 'closed',
+        cliId: 'aiden',
+        startedAt: 100,
+        updatedAt: 200,
+      }),
+      'utf-8',
+    );
+    // Raw PTY bytes — projection must report hasPtyLog=true so the dashboard
+    // defaults the replay viewer to the cinema mode.
+    writeFileSync(join(attemptDir, 'pty.log'), '\x1b[32mhello\x1b[0m\r\n', 'utf-8');
+    const snap = await readRunSnapshot(runsDir, 'r-pty');
+    expect(snap?.attemptIO[attemptId]?.terminal?.hasPtyLog).toBe(true);
+  });
+
+  it('projects hasPtyLog=false when pty.log is missing or empty', async () => {
+    await seedSucceeded('r-nopty');
+    const activityId = workActivityId('r-nopty', 'only');
+    const attemptId = 'r-nopty::work::only::att-1';
+    const attemptDir = join(runsDir, 'r-nopty', 'attempts', activityId, attemptId);
+    mkdirSync(attemptDir, { recursive: true });
+    writeFileSync(
+      join(attemptDir, 'terminal.json'),
+      JSON.stringify({
+        schemaVersion: 1,
+        sessionId: 'wf-r-nopty-only',
+        webPort: 32125,
+        status: 'closed',
+        cliId: 'aiden',
+        startedAt: 100,
+        updatedAt: 200,
+      }),
+      'utf-8',
+    );
+    // Empty pty.log → projection treats as absent so the toggle stays diag-only.
+    writeFileSync(join(attemptDir, 'pty.log'), '', 'utf-8');
+    const snap = await readRunSnapshot(runsDir, 'r-nopty');
+    expect(snap?.attemptIO[attemptId]?.terminal?.hasPtyLog).toBe(false);
   });
 
   it('shows interpolated prompt in resolved input preview', async () => {

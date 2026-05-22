@@ -219,6 +219,12 @@ async function runOneShotImpl(
       BOTMUX_WORKFLOW: '1',
       BOTMUX_WORKFLOW_RUN_ID: input.runId,
       BOTMUX_WORKFLOW_NODE_ID: input.nodeId,
+      // Raw PTY byte stream sink for the dashboard "terminal replay" view.
+      // Worker lazily opens this on first PTY chunk; absent → worker skips
+      // the write (older daemon → older sidecar layout still works).
+      ...(input.attemptLogPath
+        ? { BOTMUX_WORKFLOW_PTY_LOG_PATH: join(dirname(input.attemptLogPath), 'pty.log') }
+        : {}),
     },
   });
   logOneShotMemory(input, `after-worker-spawn pid=${worker.pid ?? 'unknown'}`);

@@ -17,7 +17,7 @@
  *     runDir + blobDir, which is wrong for a read-only API.
  */
 import { promises as fs } from 'node:fs';
-import { relative, resolve, sep, join } from 'node:path';
+import { relative, resolve, sep, join, dirname } from 'node:path';
 
 import {
   parseWorkflowDefinition,
@@ -91,6 +91,20 @@ export function attemptTerminalLogPath(
   attemptId: string,
 ): string {
   return join(runsDir, runId, 'attempts', activityId, attemptId, 'terminal.log');
+}
+
+/**
+ * Resolve the on-disk raw `pty.log` path for a given attempt sidecar.
+ * Same validation contract as `attemptTerminalLogPath` — callers MUST
+ * pre-validate ids and re-check `isPathInsideDir` after joining.
+ */
+export function attemptPtyLogPath(
+  runsDir: string,
+  runId: string,
+  activityId: string,
+  attemptId: string,
+): string {
+  return join(runsDir, runId, 'attempts', activityId, attemptId, 'pty.log');
 }
 
 // ─── list ──────────────────────────────────────────────────────────────────
@@ -286,6 +300,10 @@ export type AttemptTerminalDTO = {
   updatedAt: number;
   closedAt?: number;
   error?: string;
+  /** True when a raw PTY byte log (`pty.log`) exists alongside the sidecar.
+   *  Drives the replay viewer's "terminal cinema" vs "diagnostic log"
+   *  toggle.  Older attempts predate this file and project as `false`. */
+  hasPtyLog?: boolean;
 };
 
 const BLOB_PREVIEW_MAX_BYTES = 64 * 1024;
@@ -384,6 +402,12 @@ async function readAttemptTerminal(
     ) {
       return { sessionId: '', webPort: 0, status: 'closed', startedAt: 0, updatedAt: 0, error: 'invalid terminal sidecar' };
     }
+    const ptyLog = join(dirname(path), 'pty.log');
+    let hasPtyLog = false;
+    try {
+      const st = await fs.stat(ptyLog);
+      hasPtyLog = st.isFile() && st.size > 0;
+    } catch { /* ENOENT or other — treat as absent */ }
     return {
       sessionId: parsed.sessionId,
       cliSessionId: typeof parsed.cliSessionId === 'string' ? parsed.cliSessionId : undefined,
@@ -397,6 +421,7 @@ async function readAttemptTerminal(
       startedAt: parsed.startedAt,
       updatedAt: parsed.updatedAt,
       closedAt: parsed.closedAt,
+      hasPtyLog,
     };
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return undefined;

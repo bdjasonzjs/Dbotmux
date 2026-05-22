@@ -16,6 +16,7 @@ import {
   isValidPathSegment,
   isPathInsideDir,
   attemptTerminalLogPath,
+  attemptPtyLogPath,
   TERMINAL_RUN_STATUSES,
 } from '../workflows/ops-projection.js';
 
@@ -244,7 +245,14 @@ export async function handleWorkflowApi(
       jsonRes(res, 400, { error: 'bad_id' });
       return true;
     }
-    const logPath = attemptTerminalLogPath(deps.runsDir, runId, activityId, attemptId);
+    // ?stream=pty selects the raw PTY byte log (terminal cinema); default is
+    // the diagnostic `terminal.log` for back-compat — older clients that
+    // omit the param keep their existing behavior.
+    const streamParam = url.searchParams.get('stream');
+    const stream: 'pty' | 'diag' = streamParam === 'pty' ? 'pty' : 'diag';
+    const logPath = stream === 'pty'
+      ? attemptPtyLogPath(deps.runsDir, runId, activityId, attemptId)
+      : attemptTerminalLogPath(deps.runsDir, runId, activityId, attemptId);
     if (!isPathInsideDir(deps.runsDir, logPath)) {
       // Defense-in-depth — `isValidPathSegment` already rejects `..` and `/`,
       // but the path guard keeps us honest if the regex is ever relaxed.

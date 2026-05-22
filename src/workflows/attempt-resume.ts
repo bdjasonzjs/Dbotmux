@@ -221,6 +221,7 @@ export class AttemptResumeManager {
     }
     mkdirSync(resumeDir, { recursive: true });
     const logPath = join(resumeDir, 'terminal.log');
+    const ptyLogPath = join(resumeDir, 'pty.log');
     const sidecarPath = join(resumeDir, 'resume.json');
     const workingDir = expandWorkflowWorkingDir(terminal.terminal.workingDir) ?? process.cwd();
     const sessionId = syntheticSessionUuid(
@@ -240,6 +241,7 @@ export class AttemptResumeManager {
         BOTMUX_WORKFLOW_RUN_ID: input.runId,
         BOTMUX_WORKFLOW_ACTIVITY_ID: input.activityId,
         BOTMUX_WORKFLOW_ATTEMPT_ID: input.attemptId,
+        BOTMUX_WORKFLOW_PTY_LOG_PATH: ptyLogPath,
       },
     });
 

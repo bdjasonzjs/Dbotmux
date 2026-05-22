@@ -596,6 +596,42 @@ describe('dashboard workflow API attempt terminal-log raw', () => {
     expect(res.status).toBe(400);
     expect(await res.json()).toEqual({ error: 'bad_id' });
   });
+
+  it('?stream=pty serves the raw pty.log payload', async () => {
+    const dir = join(runsDir, runId, 'attempts', activityId, attemptId);
+    await mkdir(dir, { recursive: true });
+    // Seed a terminal.log with placeholder text and a distinct pty.log so a
+    // pass-through bug (still reading terminal.log under ?stream=pty) is
+    // caught by the body comparison rather than passing trivially.
+    await writeFile(join(dir, 'terminal.log'), 'diag-payload');
+    const ptyPayload = '\x1b[32mPTY\x1b[0m';
+    await writeFile(join(dir, 'pty.log'), ptyPayload);
+    const res = await fetch(rawUrl('?stream=pty'));
+    expect(res.status).toBe(200);
+    expect(res.headers.get('x-botmux-log-bytes')).toBe(String(Buffer.byteLength(ptyPayload)));
+    expect(await res.text()).toBe(ptyPayload);
+  });
+
+  it('?stream=pty 404s when pty.log is absent (older attempt)', async () => {
+    // Only terminal.log on disk — the diag fallback is the client's job, the
+    // endpoint must report missing pty.log honestly so the UI can disable
+    // the terminal toggle.
+    await seedTerminalLog('only-diag');
+    const res = await fetch(rawUrl('?stream=pty'));
+    expect(res.status).toBe(404);
+  });
+
+  it('omitted ?stream= keeps the legacy terminal.log behavior', async () => {
+    const dir = join(runsDir, runId, 'attempts', activityId, attemptId);
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, 'terminal.log'), 'diag-only');
+    await writeFile(join(dir, 'pty.log'), 'pty-only');
+    // No stream= param → must serve terminal.log (back-compat with older
+    // dashboard bundles that don't know about ?stream=).
+    const res = await fetch(rawUrl());
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe('diag-only');
+  });
 });
 
 async function startWorkflowApiServer(deps: WorkflowApiDeps): Promise<{

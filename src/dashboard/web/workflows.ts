@@ -63,6 +63,7 @@ type AttemptTerminal = {
   updatedAt: number;
   closedAt?: number;
   error?: string;
+  hasPtyLog?: boolean;
 };
 
 type AttemptState = {
@@ -1394,7 +1395,7 @@ function computeTerminalUrl(
   }
   return {
     kind: 'replay',
-    url: terminalReplayPageUrl(runId, activity.activityId, attempt.attemptId),
+    url: terminalReplayPageUrl(runId, activity.activityId, attempt.attemptId, !!terminal.hasPtyLog),
     downloadUrl: terminalLogDownloadUrl(runId, activity.activityId, attempt.attemptId),
   };
 }
@@ -1616,8 +1617,10 @@ function terminalReplayPageUrl(
   runId: string,
   activityId: string,
   attemptId: string,
+  hasPtyLog: boolean,
 ): string {
   const qs = new URLSearchParams({ runId, activityId, attemptId });
+  if (hasPtyLog) qs.set('hasPtyLog', '1');
   return `/assets/terminal-replay.html?${qs.toString()}`;
 }
 
