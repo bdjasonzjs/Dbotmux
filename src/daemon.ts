@@ -29,7 +29,7 @@ import type { CliId } from './adapters/cli/types.js';
 import * as scheduler from './core/scheduler.js';
 import { scanProjects, scanMultipleProjects } from './services/project-scanner.js';
 import { buildRepoSelectCard, buildStreamingCard, getCliDisplayName } from './im/lark/card-builder.js';
-import { t as tr, localeForBot } from './i18n/index.js';
+import { t as tr, botLocale, localeForBot } from './i18n/index.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
 import {
   initWorkerPool,
@@ -111,6 +111,7 @@ import { requestCancel } from './workflows/cancel.js';
 import { resolveWait } from './workflows/wait.js';
 import { replay } from './workflows/events/replay.js';
 import { isValidRunId, readRunSnapshot } from './workflows/ops-projection.js';
+import { AttemptResumeManager } from './workflows/attempt-resume.js';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -160,6 +161,27 @@ const workflowRunCards = new Map<string, {
    */
   updateChain: Promise<void>;
 }>();
+const workflowAttemptResumes = new AttemptResumeManager({
+  runsDir: getRunsDir(),
+  externalHost: config.web.externalHost,
+  resolveBot: (larkAppId, terminal) => {
+    try {
+      const bot = getBot(larkAppId);
+      return {
+        larkAppId: bot.config.larkAppId,
+        larkAppSecret: bot.config.larkAppSecret,
+        cliId: terminal.cliId ?? bot.config.cliId,
+        cliPathOverride: bot.config.cliPathOverride,
+        backendType: bot.config.backendType,
+        botName: bot.botName ?? terminal.botName,
+        botOpenId: bot.botOpenId,
+        locale: botLocale(bot.config),
+      };
+    } catch {
+      return undefined;
+    }
+  },
+});
 // Cache last /repo scan results per chat for /repo <number> fallback
 const lastRepoScan = new Map<string, import('./services/project-scanner.js').ProjectInfo[]>();
 const cliVersionCache = new Map<string, { version: string; lastCheckAt: number }>();
@@ -1241,6 +1263,62 @@ for (const [path, resolution] of [
     return jsonRes(res, 200, result);
   });
 }
+
+function attemptResumeStatus(error: { error: string }): number {
+  switch (error.error) {
+    case 'bad_run_id':
+    case 'bad_attempt_id':
+    case 'bad_json':
+      return 400;
+    case 'no_terminal_sidecar':
+    case 'resume_not_running':
+      return 404;
+    case 'missing_cli_session_id':
+    case 'missing_lark_app_id':
+    case 'bot_not_registered':
+      return 409;
+    default:
+      return 500;
+  }
+}
+
+ipcRoute(
+  'POST',
+  '/api/workflows/runs/:runId/attempts/:activityId/:attemptId/resume',
+  async (_req, res, params) => {
+    const result = await workflowAttemptResumes.start({
+      runId: params.runId,
+      activityId: params.activityId,
+      attemptId: params.attemptId,
+    });
+    if (!result.ok) return jsonRes(res, attemptResumeStatus(result), result);
+    return jsonRes(res, 200, result);
+  },
+);
+
+ipcRoute(
+  'POST',
+  '/api/workflows/runs/:runId/attempts/:activityId/:attemptId/resume/end',
+  async (req, res, params) => {
+    let body: { reason?: unknown };
+    try {
+      body = await readJsonBody<{ reason?: unknown }>(req);
+    } catch {
+      return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+    }
+    const result = await workflowAttemptResumes.end({
+      runId: params.runId,
+      activityId: params.activityId,
+      attemptId: params.attemptId,
+      reason:
+        typeof body.reason === 'string' && body.reason.trim()
+          ? body.reason.trim()
+          : 'ended_by_dashboard',
+    });
+    if (!result.ok) return jsonRes(res, attemptResumeStatus(result), result);
+    return jsonRes(res, 200, result);
+  },
+);
 
 ipcRoute('POST', '/api/workflows/runs/:runId/cancel', async (req, res, params) => {
   let body: { reason?: unknown };

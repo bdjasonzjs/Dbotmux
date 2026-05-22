@@ -316,6 +316,47 @@ describe('dashboard workflow API routes', () => {
     );
   });
 
+  it('proxies attempt resume start/end to the owner daemon from chat-binding', async () => {
+    await seedWaitingRun('api-owned-resume', WAIT_DEF, {
+      chatId: 'oc_owner_chat',
+      larkAppId: 'cli_owner',
+    });
+    const activityId = 'api-owned-resume::work::approve';
+    const attemptId = 'api-owned-resume::work::approve::att-1';
+
+    const start = await fetch(
+      `${baseUrl}/api/workflows/runs/api-owned-resume/attempts/${encodeURIComponent(activityId)}/${encodeURIComponent(attemptId)}/resume`,
+      { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' },
+    );
+    expect(start.status).toBe(202);
+    expect(proxyToDaemon).toHaveBeenCalledWith(
+      'cli_owner',
+      `/api/workflows/runs/api-owned-resume/attempts/${encodeURIComponent(activityId)}/${encodeURIComponent(attemptId)}/resume`,
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ reason: undefined }),
+      }),
+    );
+
+    const end = await fetch(
+      `${baseUrl}/api/workflows/runs/api-owned-resume/attempts/${encodeURIComponent(activityId)}/${encodeURIComponent(attemptId)}/resume/end`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ reason: 'operator done' }),
+      },
+    );
+    expect(end.status).toBe(202);
+    expect(proxyToDaemon).toHaveBeenCalledWith(
+      'cli_owner',
+      `/api/workflows/runs/api-owned-resume/attempts/${encodeURIComponent(activityId)}/${encodeURIComponent(attemptId)}/resume/end`,
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ reason: 'operator done' }),
+      }),
+    );
+  });
+
   // ─── Catalog: definitions list / detail / trigger ─────────────────────────
 
   it('lists workflow definitions via injected catalog dep', async () => {

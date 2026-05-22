@@ -327,6 +327,64 @@ export async function handleWorkflowApi(
     return true;
   }
 
+  m = url.pathname.match(
+    /^\/api\/workflows\/runs\/([^/]+)\/attempts\/([^/]+)\/([^/]+)\/resume(\/end)?$/,
+  );
+  if (req.method === 'POST' && m) {
+    const runId = decodeURIComponent(m[1]);
+    const activityId = decodeURIComponent(m[2]);
+    const attemptId = decodeURIComponent(m[3]);
+    const end = m[4] === '/end';
+    if (
+      !isValidRunId(runId) ||
+      !isValidPathSegment(activityId) ||
+      !isValidPathSegment(attemptId)
+    ) {
+      jsonRes(res, 400, { ok: false, error: 'bad_id' });
+      return true;
+    }
+    let body: { reason?: unknown } = {};
+    try {
+      body = await readJsonBody<{ reason?: unknown }>(req);
+    } catch {
+      jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      return true;
+    }
+    const snap = await readRunSnapshot(deps.runsDir, runId);
+    if (!snap) {
+      jsonRes(res, 404, { ok: false, error: 'unknown_run' });
+      return true;
+    }
+    const owner = snap.chatBinding?.larkAppId;
+    if (!owner) {
+      jsonRes(res, 409, {
+        ok: false,
+        error: 'needs_lark_owner',
+        hint: 'Attempt resume is routed through the workflow owner daemon; this run has no chat binding.',
+      });
+      return true;
+    }
+    const upstream = await deps.proxyToDaemon(
+      owner,
+      `/api/workflows/runs/${encodeURIComponent(runId)}` +
+        `/attempts/${encodeURIComponent(activityId)}` +
+        `/${encodeURIComponent(attemptId)}/resume${end ? '/end' : ''}`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          reason:
+            typeof body.reason === 'string' && body.reason.trim()
+              ? body.reason.trim()
+              : undefined,
+        }),
+      },
+    );
+    res.writeHead(upstream.status, { 'content-type': 'application/json' });
+    res.end(await upstream.text());
+    return true;
+  }
+
   if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/workflows\/runs\/([^/]+)\/cancel$/))) {
     const runId = decodeURIComponent(m[1]);
     if (!isValidRunId(runId)) {
