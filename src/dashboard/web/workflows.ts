@@ -1197,28 +1197,33 @@ function updateCardEntry(
     ${controls}
   `;
   // Terminal slot: only re-render when the URL changes (worker
-  // restart / attempt-id flip).  The iframe DOM node stays live
-  // through every same-URL poll so its WebSocket isn't torn down.
-  const desiredUrl = computeTerminalUrl(attempt, desc.io?.terminal);
+  // restart / attempt-id flip / live → replay handoff).  The iframe
+  // DOM node stays live through every same-URL poll so its WebSocket
+  // (live) / streaming xterm parser (replay) isn't torn down.
+  const desiredSurface = computeTerminalUrl(attempt, desc.activity, desc.io?.terminal);
+  const desiredUrl = desiredSurface?.url ?? null;
   if (desiredUrl !== entry.currentTerminalUrl) {
-    if (desiredUrl === null) {
+    if (desiredSurface === null) {
       entry.terminalSlot.innerHTML = '';
     } else {
       entry.terminalSlot.innerHTML = renderTerminalBlockHtml(
         desc.key,
         attempt,
         desc.io?.terminal,
-        desiredUrl,
+        desiredSurface,
         openBlocks,
       );
     }
     entry.currentTerminalUrl = desiredUrl;
-  } else if (desiredUrl !== null && desc.io?.terminal) {
+  } else if (desiredSurface !== null && desc.io?.terminal) {
     // Same URL — refresh only the summary meta (status badge text)
     // inline to avoid touching the iframe.
     const summary = entry.terminalSlot.querySelector<HTMLElement>('details.wf-terminal-block > summary');
     if (summary) {
-      summary.innerHTML = `${escapeHtml(t('workflow.detail.liveTerminal'))} ${terminalMeta(attempt, desc.io.terminal)}`;
+      const label = desiredSurface.kind === 'live'
+        ? t('workflow.detail.liveTerminal')
+        : t('workflow.detail.terminalReplay');
+      summary.innerHTML = `${escapeHtml(label)} ${terminalMeta(attempt, desc.io.terminal)}`;
     }
   }
   // Grid: previews other than terminal.  Wipe + rebuild — no live
@@ -1233,33 +1238,57 @@ function updateCardEntry(
   `;
 }
 
+type TerminalSurface =
+  | { kind: 'live'; url: string }
+  | { kind: 'replay'; url: string; downloadUrl: string };
+
 function computeTerminalUrl(
   attempt: AttemptState | undefined,
+  activity: ActivityState | undefined,
   terminal: AttemptTerminal | undefined,
-): string | null {
+): TerminalSurface | null {
   if (!terminal) return null;
   if (terminal.error) return null;
-  if (!isLiveTerminal(attempt, terminal)) return null;
-  return terminalReadOnlyUrl(terminal);
+  if (isLiveTerminal(attempt, terminal)) {
+    return { kind: 'live', url: terminalReadOnlyUrl(terminal) };
+  }
+  if (!attempt || !activity) return null;
+  if (!isReplayableTerminal(attempt, terminal)) return null;
+  const runId = currentRunIdFromHash();
+  if (!runId) return null;
+  return {
+    kind: 'replay',
+    url: terminalReplayPageUrl(runId, activity.activityId, attempt.attemptId),
+    downloadUrl: terminalLogDownloadUrl(runId, activity.activityId, attempt.attemptId),
+  };
 }
 
 function renderTerminalBlockHtml(
   keyPrefix: string,
   attempt: AttemptState | undefined,
   terminal: AttemptTerminal | undefined,
-  url: string,
+  surface: TerminalSurface,
   openBlocks: Set<string>,
 ): string {
   if (!terminal) return '';
-  const label = t('workflow.detail.liveTerminal');
+  const label = surface.kind === 'live'
+    ? t('workflow.detail.liveTerminal')
+    : t('workflow.detail.terminalReplay');
   const key = ioBlockKey(keyPrefix, label);
   const meta = terminalMeta(attempt, terminal);
+  const openInTabLabel = surface.kind === 'live'
+    ? t('workflow.detail.openTerminalNewTab')
+    : t('workflow.detail.openReplayNewTab');
+  const downloadAction = surface.kind === 'replay'
+    ? `<a class="btn-link" href="${escapeHtml(surface.downloadUrl)}" download>${escapeHtml(t('workflow.detail.downloadFullLog'))}</a>`
+    : '';
   return `<details class="wf-io-block wf-terminal-block" data-io-key="${escapeHtml(key)}"${openBlocks.has(key) ? ' open' : ''}>
     <summary>${escapeHtml(label)} ${meta}</summary>
     <div class="wf-terminal-actions">
-      <a class="btn-link" href="${escapeHtml(url)}" target="_blank" rel="noreferrer">${escapeHtml(t('workflow.detail.openTerminalNewTab'))}</a>
+      <a class="btn-link" href="${escapeHtml(surface.url)}" target="_blank" rel="noreferrer">${escapeHtml(openInTabLabel)}</a>
+      ${downloadAction}
     </div>
-    <iframe class="wf-terminal-frame" src="${escapeHtml(url)}" title="${escapeHtml(label)}" loading="lazy"></iframe>
+    <iframe class="wf-terminal-frame" src="${escapeHtml(surface.url)}" title="${escapeHtml(label)}" loading="lazy"></iframe>
   </details>`;
 }
 
@@ -1279,9 +1308,9 @@ function renderIOCardHtml(
   const controls = renderApprovalControls(attempt, approval);
   const focusClass = attempt?.attemptId === focusAttemptId ? ' is-focused' : '';
   const attemptAttr = attempt ? ` data-wf-attempt-card="${escapeHtml(attempt.attemptId)}"` : '';
-  const terminalUrl = computeTerminalUrl(attempt, desc.io?.terminal);
-  const terminalHtml = terminalUrl
-    ? renderTerminalBlockHtml(keyPrefix, attempt, desc.io?.terminal, terminalUrl, openBlocks)
+  const terminalSurface = computeTerminalUrl(attempt, desc.activity, desc.io?.terminal);
+  const terminalHtml = terminalSurface
+    ? renderTerminalBlockHtml(keyPrefix, attempt, desc.io?.terminal, terminalSurface, openBlocks)
     : '';
   return `<article class="wf-io-card${focusClass}" data-wf-card-key="${escapeHtml(desc.key)}"${attemptAttr}>
     <div class="wf-io-card-head">
@@ -1334,9 +1363,58 @@ function isLiveTerminal(attempt: AttemptState | undefined, terminal: AttemptTerm
     (attempt?.status === 'pending' || attempt?.status === 'running' || attempt?.status === 'effectAttempting');
 }
 
+/**
+ * Replay-eligibility: attempt has reached a terminal state and a worker
+ * actually started (sessionId / startedAt non-empty) — meaning a
+ * `terminal.log` file likely exists on disk for the replay HTML to fetch.
+ * The replay page itself handles a 404 gracefully, but gating here keeps
+ * us from rendering an iframe that's guaranteed to show "no log".
+ */
+function isReplayableTerminal(attempt: AttemptState, terminal: AttemptTerminal): boolean {
+  const isAttemptTerminal =
+    attempt.status === 'succeeded' ||
+    attempt.status === 'failed' ||
+    attempt.status === 'cancelled' ||
+    attempt.status === 'timedOut';
+  if (!isAttemptTerminal) return false;
+  const hadWorker = !!(terminal.sessionId || terminal.startedAt);
+  return hadWorker;
+}
+
 function terminalReadOnlyUrl(terminal: AttemptTerminal): string {
   const host = window.location.hostname || '127.0.0.1';
   return `http://${host}:${terminal.webPort}`;
+}
+
+function terminalReplayPageUrl(
+  runId: string,
+  activityId: string,
+  attemptId: string,
+): string {
+  const qs = new URLSearchParams({ runId, activityId, attemptId });
+  return `/assets/terminal-replay.html?${qs.toString()}`;
+}
+
+function terminalLogDownloadUrl(
+  runId: string,
+  activityId: string,
+  attemptId: string,
+): string {
+  return (
+    `/api/workflows/runs/${encodeURIComponent(runId)}` +
+    `/attempts/${encodeURIComponent(activityId)}` +
+    `/${encodeURIComponent(attemptId)}/terminal-log/raw?download=1`
+  );
+}
+
+function currentRunIdFromHash(): string | null {
+  const m = window.location.hash.match(/^#\/workflows\/([^/?#]+)/);
+  if (!m) return null;
+  try {
+    return decodeURIComponent(m[1]);
+  } catch {
+    return null;
+  }
 }
 
 function renderApprovalControls(
