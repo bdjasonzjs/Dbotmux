@@ -482,6 +482,9 @@ function renderWorkflowDetailPage(
   const approvalComments = new Map<string, string>();
   const approvalStatuses = new Map<string, { kind: 'ok' | 'error'; text: string }>();
   const resolvingWaits = new Set<string>();
+  const resumeSessions = new Map<string, { resumeId: string; url: string }>();
+  const resumePending = new Set<string>();
+  const resumeErrors = new Map<string, string>();
   // Per-card surgical update state.  innerHTML-wiping the whole IO
   // list every 2s polls causes terminal iframes inside to be torn off
   // the document — the browser then discards the iframe's browsing
@@ -636,6 +639,101 @@ function renderWorkflowDetailPage(
     }
   }
 
+  async function startResumeSession(
+    attemptId: string,
+    activityId: string,
+  ): Promise<void> {
+    if (resumePending.has(attemptId)) return;
+    resumePending.add(attemptId);
+    resumeErrors.delete(attemptId);
+    rerender();
+    try {
+      const res = await fetch(
+        `/api/workflows/runs/${encodeURIComponent(runId)}` +
+          `/attempts/${encodeURIComponent(activityId)}` +
+          `/${encodeURIComponent(attemptId)}/resume`,
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({}),
+        },
+      );
+      if (res.status === 401) {
+        throw new Error(t('workflow.detail.writeAccessResume'));
+      }
+      const body = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        resumeId?: string;
+        url?: string;
+        error?: string;
+        hint?: string;
+        message?: string;
+      };
+      if (!res.ok || !body.ok || !body.resumeId || !body.url) {
+        throw new Error(
+          body.hint ?? body.message ?? body.error ?? t('workflow.detail.resumeStartFailed', { status: res.status }),
+        );
+      }
+      resumeSessions.set(attemptId, { resumeId: body.resumeId, url: body.url });
+    } catch (err: any) {
+      const message = err?.message ?? String(err);
+      resumeErrors.set(attemptId, message);
+    } finally {
+      resumePending.delete(attemptId);
+      rerender();
+    }
+  }
+
+  async function endResumeSession(
+    attemptId: string,
+    activityId: string,
+  ): Promise<void> {
+    if (resumePending.has(attemptId)) return;
+    resumePending.add(attemptId);
+    resumeErrors.delete(attemptId);
+    rerender();
+    try {
+      const res = await fetch(
+        `/api/workflows/runs/${encodeURIComponent(runId)}` +
+          `/attempts/${encodeURIComponent(activityId)}` +
+          `/${encodeURIComponent(attemptId)}/resume/end`,
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ reason: 'ended_by_dashboard' }),
+        },
+      );
+      if (res.status === 401) {
+        throw new Error(t('workflow.detail.writeAccessResume'));
+      }
+      const body = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        error?: string;
+        hint?: string;
+        message?: string;
+      };
+      if (!res.ok || !body.ok) {
+        // `resume_not_running` after a manual server-side end is benign —
+        // drop the local session so the iframe reverts to replay.
+        if (body.error === 'resume_not_running') {
+          resumeSessions.delete(attemptId);
+        } else {
+          throw new Error(
+            body.hint ?? body.message ?? body.error ?? t('workflow.detail.resumeEndFailed', { status: res.status }),
+          );
+        }
+      } else {
+        resumeSessions.delete(attemptId);
+      }
+    } catch (err: any) {
+      const message = err?.message ?? String(err);
+      resumeErrors.set(attemptId, message);
+    } finally {
+      resumePending.delete(attemptId);
+      rerender();
+    }
+  }
+
   async function resolveHumanGate(
     attemptId: string,
     action: 'approve' | 'reject',
@@ -700,12 +798,27 @@ function renderWorkflowDetailPage(
     renderDangling(danglingEl, snapshot);
     renderParallelTimeline(parallelEl, parallelMeta, snapshot, events);
     renderNodeActivityRows(nodeTbody, snapshot);
-    const focusConsumed = renderNodeIO(ioList, snapshot, openIOBlocks, ioScrollTops, {
-      comments: approvalComments,
-      statuses: approvalStatuses,
-      resolving: resolvingWaits,
-      onResolve: resolveHumanGate,
-    }, focusAttemptId, cardElements);
+    const focusConsumed = renderNodeIO(
+      ioList,
+      snapshot,
+      openIOBlocks,
+      ioScrollTops,
+      {
+        comments: approvalComments,
+        statuses: approvalStatuses,
+        resolving: resolvingWaits,
+        onResolve: resolveHumanGate,
+      },
+      {
+        sessions: resumeSessions,
+        pending: resumePending,
+        errors: resumeErrors,
+        onStart: startResumeSession,
+        onEnd: endResumeSession,
+      },
+      focusAttemptId,
+      cardElements,
+    );
     if (focusConsumed) focusAttemptId = undefined;
     renderEvents(eventTbody, events);
     timelineScroll.scrollTop = timelineScrollTop;
@@ -1039,6 +1152,7 @@ function renderNodeIO(
   openBlocks: Set<string>,
   scrollTops: Map<string, number>,
   approval: ApprovalRenderState,
+  resume: ResumeRenderState,
   focusAttemptId?: string,
   cardElements?: Map<string, CardEntry>,
 ): boolean {
@@ -1067,7 +1181,7 @@ function renderNodeIO(
         cardElements.set(desc.key, entry);
         el.appendChild(entry.article);
       }
-      updateCardEntry(entry, desc, openBlocks, approval, focusAttemptId);
+      updateCardEntry(entry, desc, openBlocks, approval, resume, focusAttemptId);
     }
     for (const [key, entry] of Array.from(cardElements)) {
       if (seenKeys.has(key)) continue;
@@ -1092,7 +1206,7 @@ function renderNodeIO(
     // No cache provided (unit tests etc.): fall back to bulk innerHTML.
     const cards: string[] = [];
     for (const desc of descriptors) {
-      cards.push(renderIOCardHtml(desc, openBlocks, approval, focusAttemptId));
+      cards.push(renderIOCardHtml(desc, openBlocks, approval, resume, focusAttemptId));
     }
     el.innerHTML = cards.length > 0
       ? cards.join('')
@@ -1103,6 +1217,7 @@ function renderNodeIO(
   attachIOBlockToggleTracking(el, openBlocks);
   attachIOBlockScrollTracking(el, scrollTops);
   attachApprovalControls(el, approval);
+  attachResumeControls(el, resume);
   // Keep the deeplink focus active until terminal.json is visible.  The
   // progress card link can appear at activityRunning, a little before the
   // worker emits ready and writes the terminal sidecar; a later poll should
@@ -1169,6 +1284,7 @@ function updateCardEntry(
   desc: CardDescriptor,
   openBlocks: Set<string>,
   approval: ApprovalRenderState,
+  resume: ResumeRenderState,
   focusAttemptId: string | undefined,
 ): void {
   const attempt = latestAttempt(desc.activity);
@@ -1197,10 +1313,11 @@ function updateCardEntry(
     ${controls}
   `;
   // Terminal slot: only re-render when the URL changes (worker
-  // restart / attempt-id flip / live → replay handoff).  The iframe
-  // DOM node stays live through every same-URL poll so its WebSocket
-  // (live) / streaming xterm parser (replay) isn't torn down.
-  const desiredSurface = computeTerminalUrl(attempt, desc.activity, desc.io?.terminal);
+  // restart / attempt-id flip / live → replay handoff / resume start
+  // or end).  The iframe DOM node stays live through every same-URL
+  // poll so its WebSocket (live / resume) / streaming xterm parser
+  // (replay) isn't torn down.
+  const desiredSurface = computeTerminalUrl(attempt, desc.activity, desc.io?.terminal, resume);
   const desiredUrl = desiredSurface?.url ?? null;
   if (desiredUrl !== entry.currentTerminalUrl) {
     if (desiredSurface === null) {
@@ -1209,21 +1326,25 @@ function updateCardEntry(
       entry.terminalSlot.innerHTML = renderTerminalBlockHtml(
         desc.key,
         attempt,
+        desc.activity,
         desc.io?.terminal,
         desiredSurface,
         openBlocks,
+        resume,
       );
     }
     entry.currentTerminalUrl = desiredUrl;
   } else if (desiredSurface !== null && desc.io?.terminal) {
     // Same URL — refresh only the summary meta (status badge text)
-    // inline to avoid touching the iframe.
+    // and resume action button state (pending / error) inline.  The
+    // iframe itself is left alone to preserve its browsing context.
     const summary = entry.terminalSlot.querySelector<HTMLElement>('details.wf-terminal-block > summary');
     if (summary) {
-      const label = desiredSurface.kind === 'live'
-        ? t('workflow.detail.liveTerminal')
-        : t('workflow.detail.terminalReplay');
+      const label = terminalSurfaceLabel(desiredSurface.kind);
       summary.innerHTML = `${escapeHtml(label)} ${terminalMeta(attempt, desc.io.terminal)}`;
+    }
+    if (attempt) {
+      refreshResumeActions(entry.terminalSlot, attempt, desc.activity, desc.io.terminal, desiredSurface, resume);
     }
   }
   // Grid: previews other than terminal.  Wipe + rebuild — no live
@@ -1240,12 +1361,14 @@ function updateCardEntry(
 
 type TerminalSurface =
   | { kind: 'live'; url: string }
-  | { kind: 'replay'; url: string; downloadUrl: string };
+  | { kind: 'replay'; url: string; downloadUrl: string }
+  | { kind: 'resume'; url: string; resumeId: string; downloadUrl: string };
 
 function computeTerminalUrl(
   attempt: AttemptState | undefined,
   activity: ActivityState | undefined,
   terminal: AttemptTerminal | undefined,
+  resume?: ResumeRenderState,
 ): TerminalSurface | null {
   if (!terminal) return null;
   if (terminal.error) return null;
@@ -1256,6 +1379,19 @@ function computeTerminalUrl(
   if (!isReplayableTerminal(attempt, terminal)) return null;
   const runId = currentRunIdFromHash();
   if (!runId) return null;
+  // Active resume session for this attempt swaps the iframe to the
+  // resume worker's write-token PTY URL — keep the download link
+  // pointing at the original terminal.log so users can still grab the
+  // pre-resume transcript.
+  const active = resume?.sessions.get(attempt.attemptId);
+  if (active) {
+    return {
+      kind: 'resume',
+      url: active.url,
+      resumeId: active.resumeId,
+      downloadUrl: terminalLogDownloadUrl(runId, activity.activityId, attempt.attemptId),
+    };
+  }
   return {
     kind: 'replay',
     url: terminalReplayPageUrl(runId, activity.activityId, attempt.attemptId),
@@ -1266,30 +1402,98 @@ function computeTerminalUrl(
 function renderTerminalBlockHtml(
   keyPrefix: string,
   attempt: AttemptState | undefined,
+  activity: ActivityState | undefined,
   terminal: AttemptTerminal | undefined,
   surface: TerminalSurface,
   openBlocks: Set<string>,
+  resume?: ResumeRenderState,
 ): string {
   if (!terminal) return '';
-  const label = surface.kind === 'live'
-    ? t('workflow.detail.liveTerminal')
-    : t('workflow.detail.terminalReplay');
+  const label = terminalSurfaceLabel(surface.kind);
   const key = ioBlockKey(keyPrefix, label);
   const meta = terminalMeta(attempt, terminal);
-  const openInTabLabel = surface.kind === 'live'
-    ? t('workflow.detail.openTerminalNewTab')
-    : t('workflow.detail.openReplayNewTab');
-  const downloadAction = surface.kind === 'replay'
+  const openInTabLabel = terminalOpenInTabLabel(surface.kind);
+  const downloadAction = (surface.kind === 'replay' || surface.kind === 'resume')
     ? `<a class="btn-link" href="${escapeHtml(surface.downloadUrl)}" download>${escapeHtml(t('workflow.detail.downloadFullLog'))}</a>`
     : '';
+  const resumeAction = attempt
+    ? renderResumeButtonHtml(attempt, activity, terminal, surface, resume)
+    : '';
+  const resumeStatus = attempt ? renderResumeStatusHtml(attempt.attemptId, resume) : '';
   return `<details class="wf-io-block wf-terminal-block" data-io-key="${escapeHtml(key)}"${openBlocks.has(key) ? ' open' : ''}>
     <summary>${escapeHtml(label)} ${meta}</summary>
     <div class="wf-terminal-actions">
       <a class="btn-link" href="${escapeHtml(surface.url)}" target="_blank" rel="noreferrer">${escapeHtml(openInTabLabel)}</a>
       ${downloadAction}
+      ${resumeAction}
     </div>
+    ${resumeStatus}
     <iframe class="wf-terminal-frame" src="${escapeHtml(surface.url)}" title="${escapeHtml(label)}" loading="lazy"></iframe>
   </details>`;
+}
+
+function terminalSurfaceLabel(kind: TerminalSurface['kind']): string {
+  if (kind === 'live') return t('workflow.detail.liveTerminal');
+  if (kind === 'resume') return t('workflow.detail.terminalResume');
+  return t('workflow.detail.terminalReplay');
+}
+
+function terminalOpenInTabLabel(kind: TerminalSurface['kind']): string {
+  if (kind === 'live') return t('workflow.detail.openTerminalNewTab');
+  if (kind === 'resume') return t('workflow.detail.openResumeNewTab');
+  return t('workflow.detail.openReplayNewTab');
+}
+
+/**
+ * CLI ids whose adapters expose a working `--resume <sessionId>` flow
+ * (`buildArgs({ resume:true, resumeSessionId })`).  Opencode explicitly
+ * documents resume as unsupported, and gemini's `--resume` only takes
+ * "latest" so we can't deterministically target an attempt's session.
+ */
+const RESUME_CAPABLE_CLI_IDS = new Set<string>([
+  'claude-code', 'coco', 'codex', 'aiden', 'antigravity', 'cursor',
+]);
+function isResumeCapableCli(cliId: string | undefined): boolean {
+  return !!cliId && RESUME_CAPABLE_CLI_IDS.has(cliId);
+}
+
+function renderResumeButtonHtml(
+  attempt: AttemptState,
+  activity: ActivityState | undefined,
+  terminal: AttemptTerminal,
+  surface: TerminalSurface,
+  resume: ResumeRenderState | undefined,
+): string {
+  if (!resume) return '';
+  if (surface.kind === 'live') return '';
+  if (!activity) return '';
+  const active = surface.kind === 'resume';
+  const pending = resume.pending.has(attempt.attemptId);
+  const dataAttrs =
+    `data-wf-resume-attempt="${escapeHtml(attempt.attemptId)}" ` +
+    `data-wf-resume-activity="${escapeHtml(activity.activityId)}"`;
+  if (active) {
+    return `<button type="button" class="btn-link" data-wf-resume-action="end" ${dataAttrs}${pending ? ' disabled' : ''}>${escapeHtml(pending ? t('workflow.detail.resumeEnding') : t('workflow.detail.endResumeSession'))}</button>`;
+  }
+  if (!isResumeCapableCli(terminal.cliId)) {
+    return `<button type="button" class="btn-link" disabled title="${escapeHtml(t('workflow.detail.resumeUnsupportedCli', { cliId: terminal.cliId ?? '?' }))}">${escapeHtml(t('workflow.detail.resumeSession'))}</button>`;
+  }
+  if (!terminal.cliSessionId) {
+    return `<button type="button" class="btn-link" disabled title="${escapeHtml(t('workflow.detail.resumeMissingCliSession'))}">${escapeHtml(t('workflow.detail.resumeSession'))}</button>`;
+  }
+  return `<button type="button" class="btn-link" data-wf-resume-action="start" ${dataAttrs}${pending ? ' disabled' : ''}>${escapeHtml(pending ? t('workflow.detail.resumeStarting') : t('workflow.detail.resumeSession'))}</button>`;
+}
+
+function renderResumeStatusHtml(
+  attemptId: string,
+  resume: ResumeRenderState | undefined,
+): string {
+  if (!resume) return '';
+  const err = resume.errors.get(attemptId);
+  if (err) {
+    return `<div class="hint-warn wf-resume-status" data-wf-resume-status="${escapeHtml(attemptId)}">${escapeHtml(err)}</div>`;
+  }
+  return '';
 }
 
 /**
@@ -1300,6 +1504,7 @@ function renderIOCardHtml(
   desc: CardDescriptor,
   openBlocks: Set<string>,
   approval: ApprovalRenderState,
+  resume: ResumeRenderState,
   focusAttemptId: string | undefined,
 ): string {
   const attempt = latestAttempt(desc.activity);
@@ -1308,9 +1513,9 @@ function renderIOCardHtml(
   const controls = renderApprovalControls(attempt, approval);
   const focusClass = attempt?.attemptId === focusAttemptId ? ' is-focused' : '';
   const attemptAttr = attempt ? ` data-wf-attempt-card="${escapeHtml(attempt.attemptId)}"` : '';
-  const terminalSurface = computeTerminalUrl(attempt, desc.activity, desc.io?.terminal);
+  const terminalSurface = computeTerminalUrl(attempt, desc.activity, desc.io?.terminal, resume);
   const terminalHtml = terminalSurface
-    ? renderTerminalBlockHtml(keyPrefix, attempt, desc.io?.terminal, terminalSurface, openBlocks)
+    ? renderTerminalBlockHtml(keyPrefix, attempt, desc.activity, desc.io?.terminal, terminalSurface, openBlocks, resume)
     : '';
   return `<article class="wf-io-card${focusClass}" data-wf-card-key="${escapeHtml(desc.key)}"${attemptAttr}>
     <div class="wf-io-card-head">
@@ -1342,6 +1547,14 @@ type ApprovalRenderState = {
   statuses: Map<string, { kind: 'ok' | 'error'; text: string }>;
   resolving: Set<string>;
   onResolve: (attemptId: string, action: 'approve' | 'reject') => Promise<void>;
+};
+
+type ResumeRenderState = {
+  sessions: Map<string, { resumeId: string; url: string }>;
+  pending: Set<string>;
+  errors: Map<string, string>;
+  onStart: (attemptId: string, activityId: string) => Promise<void>;
+  onEnd: (attemptId: string, activityId: string) => Promise<void>;
 };
 
 function latestAttempt(activity?: ActivityState): AttemptState | undefined {
@@ -1454,6 +1667,58 @@ function syncApprovalComments(root: HTMLElement, comments: Map<string, string>):
     if (!key) return;
     comments.set(key, el.value);
   });
+}
+
+function attachResumeControls(root: HTMLElement, resume: ResumeRenderState): void {
+  root.querySelectorAll<HTMLButtonElement>(
+    'button[data-wf-resume-action][data-wf-resume-attempt][data-wf-resume-activity]',
+  ).forEach((button) => {
+    if (button.dataset.wfResumeBound === '1') return;
+    button.dataset.wfResumeBound = '1';
+    button.addEventListener('click', () => {
+      const attemptId = button.dataset.wfResumeAttempt;
+      const activityId = button.dataset.wfResumeActivity;
+      const action = button.dataset.wfResumeAction;
+      if (!attemptId || !activityId) return;
+      if (action === 'start') void resume.onStart(attemptId, activityId);
+      else if (action === 'end') void resume.onEnd(attemptId, activityId);
+    });
+  });
+}
+
+function refreshResumeActions(
+  slot: HTMLElement,
+  attempt: AttemptState,
+  activity: ActivityState | undefined,
+  terminal: AttemptTerminal,
+  surface: TerminalSurface,
+  resume: ResumeRenderState,
+): void {
+  const actions = slot.querySelector<HTMLElement>('.wf-terminal-actions');
+  if (!actions) return;
+  // Re-render the resume button area in-place so the surrounding
+  // anchors (open-in-tab + download) stay stable.  We tag-select the
+  // existing button (if any) and replace its outerHTML so the new
+  // listener pickup goes through the same data-wf-resume-bound gate.
+  const existingButton = actions.querySelector<HTMLButtonElement>('button[data-wf-resume-attempt]');
+  const html = renderResumeButtonHtml(attempt, activity, terminal, surface, resume);
+  if (existingButton) {
+    existingButton.outerHTML = html;
+  } else if (html) {
+    actions.insertAdjacentHTML('beforeend', html);
+  }
+  // Update / clear inline error hint.
+  const details = slot.querySelector<HTMLElement>('details.wf-terminal-block');
+  if (details) {
+    const existingStatus = details.querySelector<HTMLElement>('.wf-resume-status');
+    const statusHtml = renderResumeStatusHtml(attempt.attemptId, resume);
+    if (existingStatus) {
+      existingStatus.outerHTML = statusHtml;
+    } else if (statusHtml) {
+      actions.insertAdjacentHTML('afterend', statusHtml);
+    }
+  }
+  attachResumeControls(slot, resume);
 }
 
 function attachApprovalControls(root: HTMLElement, approval: ApprovalRenderState): void {
