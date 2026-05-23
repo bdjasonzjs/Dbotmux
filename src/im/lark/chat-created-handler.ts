@@ -27,10 +27,29 @@
  * created (we re-read after create() to detect newness), so a bot
  * re-entering an existing chat doesn't spam the card again.
  */
+import { readFileSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
 import { create, read, type OriginType } from '../../services/chat-context-store.js';
 import { getBot, getAllBots } from '../../bot-registry.js';
+import { config } from '../../config.js';
 import { logger } from '../../utils/logger.js';
 import { sendContextCard } from './chat-context-card.js';
+
+/** Cross-app peer bot detection. event-dispatcher.ts maintains a per-app
+ *  `bot-openids-<larkAppId>.json` cross-ref (learned from @mentions in
+ *  messages); it maps botName → open_id as seen by larkAppId's app.
+ *  We read it directly here (instead of importing from event-dispatcher)
+ *  to avoid a circular import — event-dispatcher imports us. */
+function isCrossAppBotOpenId(operatorOpenId: string, larkAppId: string): boolean {
+  try {
+    const fp = join(config.session.dataDir, `bot-openids-${larkAppId}.json`);
+    if (!existsSync(fp)) return false;
+    const data: Record<string, string> = JSON.parse(readFileSync(fp, 'utf-8'));
+    return Object.values(data).includes(operatorOpenId);
+  } catch {
+    return false;
+  }
+}
 
 /** Subset of Lark's `im.chat.member.bot.added_v1` event payload we use.
  *  The Lark SDK types these loosely, so we re-declare the bits we care
@@ -57,10 +76,13 @@ export interface ChatMemberBotAddedEvent {
 
 /**
  * Decide originType from operator open_id by reverse-lookup against the
- * bot-registry:
+ * bot registry + cross-app peers:
  *
- *   - operator matches a registered bot's open_id → `bot_spawned`
- *   - operator open_id unknown or absent → `human_created`
+ *   1. operator matches the current daemon's own bot open_id → `bot_spawned`
+ *   2. operator matches one of getAllBots() (same-app sibling) → `bot_spawned`
+ *   3. operator matches `bot-openids-<larkAppId>.json` cross-ref
+ *      (cross-app peer learned from prior @mentions) → `bot_spawned`
+ *   4. otherwise → `human_created`
  *
  * Note: we don't try to detect 'p2p' from this event because
  * `im.chat.member.bot.added_v1` only fires for groups (Lark p2p chats are
@@ -71,7 +93,7 @@ export function inferOriginType(event: ChatMemberBotAddedEvent, larkAppId: strin
   const opOpenId = event.operator_id?.open_id;
   if (!opOpenId) return 'human_created';
 
-  // Same-app bot check (the daemon for larkAppId may be the operator).
+  // 1. Same-app bot check (the daemon for larkAppId may be the operator).
   try {
     const selfBot = getBot(larkAppId);
     if (selfBot.botOpenId && selfBot.botOpenId === opOpenId) return 'bot_spawned';
@@ -79,10 +101,17 @@ export function inferOriginType(event: ChatMemberBotAddedEvent, larkAppId: strin
     // larkAppId not registered in this daemon — fall through
   }
 
-  // Cross-app sibling bot check (other botmux-registered bots).
+  // 2. Same-app sibling bots (getAllBots returns this-daemon-registered bots).
   for (const bot of getAllBots()) {
     if (bot.botOpenId === opOpenId) return 'bot_spawned';
   }
+
+  // 3. Cross-app peer bot check via bot-openids cross-ref file. Critical
+  //    for the common case where 克劳德 (cli_a97 app) creates a chat and
+  //    invites 蔻黛克斯 (cli_a974 app): the bot.added event arrives at
+  //    蔻黛克斯's daemon, where getAllBots() only sees 蔻黛克斯 herself —
+  //    but the cross-ref file knows 克劳德's open_id from prior @mentions.
+  if (isCrossAppBotOpenId(opOpenId, larkAppId)) return 'bot_spawned';
 
   return 'human_created';
 }

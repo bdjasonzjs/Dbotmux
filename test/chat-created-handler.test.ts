@@ -35,6 +35,22 @@ vi.mock('../src/bot-registry.js', () => ({
   getAllBots: (...args: any[]) => getAllBotsMock(...args),
 }));
 
+// Mock fs.readFileSync/existsSync for the cross-app bot openids file check.
+const existsSyncMock = vi.fn();
+const readFileSyncMock = vi.fn();
+vi.mock('node:fs', async (importOriginal) => {
+  const orig = await importOriginal<typeof import('node:fs')>();
+  return {
+    ...orig,
+    existsSync: (...args: any[]) => existsSyncMock(...args),
+    readFileSync: (...args: any[]) => readFileSyncMock(...args),
+  };
+});
+
+vi.mock('../src/config.js', () => ({
+  config: { session: { dataDir: '/tmp/test-data-dir' } },
+}));
+
 // Silence logger.
 vi.mock('../src/utils/logger.js', () => ({
   logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
@@ -53,6 +69,10 @@ beforeEach(() => {
   getAllBotsMock.mockReset();
   sendContextCardSpy.mockReset();
   sendContextCardSpy.mockResolvedValue(null);
+  existsSyncMock.mockReset();
+  readFileSyncMock.mockReset();
+  // Default: no cross-app bot openids file
+  existsSyncMock.mockReturnValue(false);
   // Default: no bots registered → human_created
   getBotMock.mockImplementation(() => mockBotState(undefined));
   getAllBotsMock.mockReturnValue([]);
@@ -92,6 +112,41 @@ describe('inferOriginType', () => {
     expect(inferOriginType(
       { chat_id: 'oc', operator_id: { open_id: 'ou_real_human' } },
       'app_test',
+    )).toBe('human_created');
+  });
+
+  it('returns bot_spawned when operator matches cross-app peer (from bot-openids file)', async () => {
+    existsSyncMock.mockReturnValue(true);
+    readFileSyncMock.mockReturnValue(JSON.stringify({
+      '克劳德': 'ou_kelaode_in_codex_app',
+      '缇蕾': 'ou_tilei_in_codex_app',
+    }));
+    const { inferOriginType } = await freshImport();
+    expect(inferOriginType(
+      { chat_id: 'oc', operator_id: { open_id: 'ou_kelaode_in_codex_app' } },
+      'app_codex',
+    )).toBe('bot_spawned');
+  });
+
+  it('returns human_created when cross-app file exists but operator not in it', async () => {
+    existsSyncMock.mockReturnValue(true);
+    readFileSyncMock.mockReturnValue(JSON.stringify({
+      '克劳德': 'ou_kelaode',
+    }));
+    const { inferOriginType } = await freshImport();
+    expect(inferOriginType(
+      { chat_id: 'oc', operator_id: { open_id: 'ou_some_human' } },
+      'app_codex',
+    )).toBe('human_created');
+  });
+
+  it('survives malformed bot-openids file', async () => {
+    existsSyncMock.mockReturnValue(true);
+    readFileSyncMock.mockImplementation(() => { throw new Error('JSON parse'); });
+    const { inferOriginType } = await freshImport();
+    expect(inferOriginType(
+      { chat_id: 'oc', operator_id: { open_id: 'ou_x' } },
+      'app_codex',
     )).toBe('human_created');
   });
 
