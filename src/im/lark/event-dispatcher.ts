@@ -18,7 +18,7 @@ import { tryHandleGrantCommand } from './grant-command.js';
 import { buildGrantCard } from './card-builder.js';
 import { openPending, isThrottled } from './grant-pending.js';
 import { localeForBot } from '../../i18n/index.js';
-import { handleChatCreated } from './chat-created-handler.js';
+import { handleChatMemberBotAdded } from './chat-created-handler.js';
 
 // ─── Bot identity ─────────────────────────────────────────────────────────
 
@@ -959,16 +959,21 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         logger.error(`Error handling message event: ${err}`);
       }
     },
-    'im.chat.created_v1': async (data: any) => {
-      // Main-bot mode P0 hook: write ChatContext for the new chat.
-      // Card rendering + send lands in P0/3; group-creator manual trigger
-      // fallback lands in P0/4. We accept both `data.event` and `data` as
-      // the event payload because Lark SDK occasionally varies the wrap.
+    'im.chat.member.bot.added_v1': async (data: any) => {
+      // Main-bot mode P0 hook: write ChatContext when our bot is added
+      // to a chat (covers both newly created groups and being added to
+      // pre-existing ones). Lark doesn't publish a public im.chat.created
+      // event subscription, so this is the canonical event source for
+      // "the bot has a new chat to onboard into". The welcome card only
+      // goes out on first dispatch (handled inside dispatchChatCreated),
+      // so re-additions don't spam. We accept both `data.event` and `data`
+      // as the event payload because the Lark SDK occasionally varies the
+      // wrap.
       try {
         const event = data.event ?? data;
-        await handleChatCreated(event, larkAppId);
+        await handleChatMemberBotAdded(event, larkAppId);
       } catch (err) {
-        logger.error(`Error handling im.chat.created event: ${err}`);
+        logger.error(`Error handling im.chat.member.bot.added event: ${err}`);
       }
     },
   });
