@@ -15,6 +15,7 @@ import { DaemonRegistry } from './dashboard/registry.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
 import { pickCreatorForGroup } from './dashboard/operator-selector.js';
 import { handleWorkflowApi, jsonRes } from './dashboard/workflow-api.js';
+import { readJsonBody } from './core/dashboard-ipc-server.js';
 import { getRunsDir } from './workflows/runs-dir.js';
 import { BotOnboardingManager } from './dashboard/bot-onboarding.js';
 
@@ -254,6 +255,45 @@ const server = createServer(async (req, res) => {
     }
     if (req.method === 'GET' && url.pathname === '/api/schedules') {
       return jsonRes(res, 200, { schedules: aggregator.getSchedules() });
+    }
+
+    // ─── Main-bot mode API (P4) ───────────────────────────────────────────
+    if (req.method === 'GET' && url.pathname === '/api/topology') {
+      const { readTopology } = await import('./services/chat-topology-store.js');
+      const filterOrigin = url.searchParams.get('originType') as 'p2p' | 'human_created' | 'bot_spawned' | null;
+      const topo = readTopology();
+      const nodes = filterOrigin ? topo.nodes.filter(n => n.originType === filterOrigin) : topo.nodes;
+      return jsonRes(res, 200, { ...topo, nodes });
+    }
+    let mCtx: RegExpMatchArray | null;
+    if (req.method === 'GET' && (mCtx = url.pathname.match(/^\/api\/contexts\/(.+)$/))) {
+      const chatId = decodeURIComponent(mCtx[1]);
+      const { read } = await import('./services/chat-context-store.js');
+      const ctx = read(chatId);
+      if (!ctx) return jsonRes(res, 404, { ok: false, error: 'context_not_found' });
+      return jsonRes(res, 200, ctx);
+    }
+    if (req.method === 'POST' && url.pathname === '/api/topology/edges') {
+      const { addEdge } = await import('./services/chat-topology-store.js');
+      const body = await readJsonBody<{ type?: string; fromChatId?: string; toChatId?: string; rationale?: string }>(req);
+      if (!body?.type || !body?.fromChatId || !body?.toChatId) {
+        return jsonRes(res, 400, { ok: false, error: 'missing_fields' });
+      }
+      addEdge({
+        type: body.type as any,
+        fromChatId: body.fromChatId,
+        toChatId: body.toChatId,
+        rationale: body.rationale ?? '',
+      });
+      return jsonRes(res, 200, { ok: true });
+    }
+    if (req.method === 'GET' && url.pathname === '/api/digest') {
+      const { readDigest, isStale } = await import('./services/main-bot-digest-store.js');
+      return jsonRes(res, 200, { digest: readDigest(), stale: isStale() });
+    }
+    if (req.method === 'GET' && url.pathname === '/api/scout-inbox') {
+      const { readInbox } = await import('./services/main-bot-digest-store.js');
+      return jsonRes(res, 200, readInbox());
     }
 
     if (req.method === 'POST' && url.pathname === '/api/bot-onboarding/start') {
