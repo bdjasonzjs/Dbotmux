@@ -103,8 +103,14 @@
 - 🟢 **P0 完成**（4 commits · 50 个新增单测全 pass · tsc --noEmit 通过）
 - **2026-05-24 00:18** · regression fix: group-creator.test.ts 加 dispatch mock (a10e1bf)
 - **2026-05-24 00:25** · 121 个相关测试（main-bot 触及的 6 个 file）全 pass
-- ⚠️ 完整 pnpm test 有 22 files / 27 tests fail，但 grep 看是 workflow-cli 等无关 file，**可能 pre-existing**。需要 baseline diff 确认（下次 session）
-- 🟡 **下一步** · 汇报松松 P0 done + 验收清单 → 等他验收 / 决定 P1 起点
+- ⚠️ 完整 pnpm test 有 22 files / 27 tests fail，但 grep 看是 workflow-cli 等无关 file，**可能 pre-existing**
+- **2026-05-24 00:37** · e2e cli path 跑通：实际建群 + ChatContext 写入 + 上下文卡片真发送
+- **2026-05-24 01:00** · e2e daemon event path 调查：Lark 不发 chat.created event（必须 chat.member.bot.added_v1）
+- **2026-05-24 01:05** · fix(p0): 切换 event 源到 im.chat.member.bot.added_v1 (a043c4c) + isFirstDispatch 防重复发卡片
+- **2026-05-24 01:21** · fix(p0): inferOriginType 加 cross-app peer 检测 (4c8095b)
+- **2026-05-24 01:23** · e2e daemon event path 跑通：删/加 bot → daemon 接 event → ChatContext 写入 origin=bot_spawned + 卡片发送
+- 🟢 **P0 真·完成** · 8 commits · cli path + daemon event path 全 e2e 跑通 · 完成清理
+- 🟡 **下一步** · 汇报松松 + 等下次 session 续 P1
 
 ---
 
