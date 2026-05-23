@@ -49,11 +49,18 @@ export function runEscalationRules(input: RulesInput): Escalation[] {
     if (input.inbox.pending.some(
       it => it.escalation.ruleId === ruleId && it.escalation.chatId === chatId,
     )) return true;
-    // Check most-recent processed item per (ruleId, chatId) — if its
-    // enqueuedAt is within cooldown, suppress.
-    const recent = input.inbox.processed.find(
-      it => it.escalation.ruleId === ruleId && it.escalation.chatId === chatId,
-    );
+    // Find the **most-recent** processed item per (ruleId, chatId) — scan
+    // from the end since markResolved appends. Using Array.find would
+    // grab the first (oldest) match and let a stale resolved item slip
+    // past the cooldown when a newer one also exists.
+    let recent: typeof input.inbox.processed[number] | undefined;
+    for (let i = input.inbox.processed.length - 1; i >= 0; i--) {
+      const it = input.inbox.processed[i];
+      if (it.escalation.ruleId === ruleId && it.escalation.chatId === chatId) {
+        recent = it;
+        break;
+      }
+    }
     if (recent) {
       const enqueuedMs = new Date(recent.enqueuedAt).getTime();
       if (input.now - enqueuedMs < cooldownMs) return true;

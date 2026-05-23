@@ -197,6 +197,32 @@ describe('escalation-rules', () => {
       expect(out.find(e => e.ruleId === 'R3')).toBeUndefined();
     });
 
+    it('cooldown: picks MOST-RECENT processed item, not first (regression: array.find grabbed oldest)', () => {
+      const node = mkNode({ chatId: 'oc_multi', originType: 'bot_spawned', metrics: { lastMessageAt: new Date(NOW - 2 * 60 * 60 * 1000).toISOString(), messages24h: 0, hasUnansweredPing: false } });
+      // processed has BOTH an old (>1h) and a recent (<1h) resolved item
+      // for the same (R3, oc_multi). MUST suppress because the recent
+      // one is within cooldown.
+      const inbox = {
+        pending: [],
+        processed: [
+          {
+            id: 'old',
+            enqueuedAt: new Date(NOW - 3 * 60 * 60 * 1000).toISOString(),  // 3h ago
+            status: 'resolved' as const, resolvedBy: 'x', resolution: 'old',
+            escalation: { ruleId: 'R3' as const, triggeredAt: 'x', chatId: 'oc_multi', context: 'c', payload: {} },
+          },
+          {
+            id: 'recent',
+            enqueuedAt: new Date(NOW - 10 * 60 * 1000).toISOString(),  // 10 min ago
+            status: 'resolved' as const, resolvedBy: 'x', resolution: 'recent',
+            escalation: { ruleId: 'R3' as const, triggeredAt: 'x', chatId: 'oc_multi', context: 'c', payload: {} },
+          },
+        ],
+      };
+      const out = runEscalationRules({ nodes: [node], inbox, now: NOW, cooldownMs: 60 * 60 * 1000 });
+      expect(out.find(e => e.ruleId === 'R3')).toBeUndefined();
+    });
+
     it('cooldown: re-fires once past cooldownMs', () => {
       const node = mkNode({ chatId: 'oc_past', originType: 'bot_spawned', metrics: { lastMessageAt: new Date(NOW - 2 * 60 * 60 * 1000).toISOString(), messages24h: 0, hasUnansweredPing: false } });
       const inbox = {
