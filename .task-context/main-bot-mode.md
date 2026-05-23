@@ -109,8 +109,15 @@
 - **2026-05-24 01:05** · fix(p0): 切换 event 源到 im.chat.member.bot.added_v1 (a043c4c) + isFirstDispatch 防重复发卡片
 - **2026-05-24 01:21** · fix(p0): inferOriginType 加 cross-app peer 检测 (4c8095b)
 - **2026-05-24 01:23** · e2e daemon event path 跑通：删/加 bot → daemon 接 event → ChatContext 写入 origin=bot_spawned + 卡片发送
-- 🟢 **P0 真·完成** · 8 commits · cli path + daemon event path 全 e2e 跑通 · 完成清理
-- 🟡 **下一步** · 汇报松松 + 等下次 session 续 P1
+- 🟢 **P0 真·完成** · 8 commits · cli path + daemon event path 全 e2e 跑通
+- **2026-05-24 01:32** · P1 onSessionSpawn 注入 ChatContext 到 prompt (15b8053) — buildNewTopicPrompt 加 chatId 参数
+- **2026-05-24 01:35** · P0.5 新需求：群置顶 dashboard 链接 (613b261) — sendContextCard pin 卡片 + 卡片含 dashboard URL
+- **2026-05-24 01:39** · P2/6 ChatTopology store + L1 metrics (9d34f16)
+- **2026-05-24 01:40** · P2/7 MainBotDigest + ScoutInbox stores + stale tracking (5ab2e9e)
+- **2026-05-24 01:45** · P2/8a L1 onMessage hook 接通 (f0843c6) — event-dispatcher 接入 bumpMessage + markStale
+- ⚠️ P2/8a e2e 部分验证：单测 156 pass；真 daemon e2e onMessage 触发受 Lark 推送规则限制（只 @bot 触发）需要松松醒来手动 @ 蔻黛克斯发消息才能 e2e
+- 🟢 **本 session 完成 14 commits**：P0 (4) + regression fix + P0.5 + P1 + P2/6 + P2/7 + P2/8a + task-context 更新
+- 🟡 **剩余下次 session**：P2/8b (scout-spawner) · P2/9 (缇蕾 prompt) · P2/10-11 (escalation 5 规则) · P3 (L3 consume) · P4 (Dashboard) · P5 (跨群边)
 
 ---
 
