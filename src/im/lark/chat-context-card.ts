@@ -19,6 +19,17 @@ import { read, type ChatContext } from '../../services/chat-context-store.js';
 import { buildMarkdownCard } from './md-card.js';
 import { sendMessage } from './client.js';
 import { logger } from '../../utils/logger.js';
+import { config } from '../../config.js';
+import { getBot } from '../../bot-registry.js';
+
+/** Build the dashboard URL with a chat fragment so clicking opens directly
+ *  to that chat's topology node. The fragment shape (#/topology?chat=...)
+ *  is what the P4 dashboard topology tab will parse. */
+export function buildDashboardChatUrl(chatId: string): string {
+  const host = config.dashboard.externalHost;
+  const port = config.dashboard.port;
+  return `http://${host}:${port}/#/topology?chat=${encodeURIComponent(chatId)}`;
+}
 
 /** Render the ChatContext as markdown body (no card wrapping). Exposed
  *  separately for tests and for callers that want to embed the body in a
@@ -70,6 +81,8 @@ export function renderContextCardMarkdown(ctx: ChatContext): string {
   }
 
   lines.push('');
+  lines.push(`📊 [**Dashboard 拓扑节点**](${buildDashboardChatUrl(ctx.chatId)}) · 点击查看该群在 main-bot 拓扑中的位置`);
+  lines.push('');
   lines.push(`<font color='grey'>· chat-context · written at ${ctx.updatedAt} ·</font>`);
 
   return lines.join('\n');
@@ -82,15 +95,17 @@ export function renderContextCard(ctx: ChatContext): string {
 }
 
 /**
- * Send the chat-context card to the given chat. Best-effort:
+ * Send the chat-context card to the given chat **and pin it** so the
+ * dashboard link stays in the chat header for easy access. Best-effort:
  *
  *   - No ChatContext for this chat → log warn, return null
  *   - injectionPolicy != 'eager' → log info, return null (manual /
  *     on_first_mention paths will dispatch elsewhere)
- *   - send fails (network / Lark error) → log error, return null (does NOT
- *     throw, so callers like onChatCreated can keep going)
+ *   - send fails (network / Lark error) → log error, return null
+ *   - pin fails → log warn, still return the messageId (card is sent;
+ *     pin is a nice-to-have)
  *
- * Returns the message_id on success, null on any skip/failure.
+ * Returns the message_id on success, null on any skip/send-failure.
  */
 export async function sendContextCard(larkAppId: string, chatId: string): Promise<string | null> {
   const ctx = read(chatId);
@@ -104,13 +119,38 @@ export async function sendContextCard(larkAppId: string, chatId: string): Promis
     );
     return null;
   }
+  let messageId: string;
   try {
     const cardJson = renderContextCard(ctx);
-    const messageId = await sendMessage(larkAppId, chatId, cardJson, 'interactive');
+    messageId = await sendMessage(larkAppId, chatId, cardJson, 'interactive');
     logger.info(`[chat-context-card] sent context card ${messageId} to chat ${chatId}`);
-    return messageId;
   } catch (err) {
     logger.error(`[chat-context-card] failed to send card to chat ${chatId}: ${err}`);
     return null;
+  }
+
+  // Best-effort pin so the dashboard link is always visible in the chat
+  // header. Pin failure shouldn't surface as a card-send failure.
+  try {
+    await pinMessage(larkAppId, messageId);
+    logger.info(`[chat-context-card] pinned context card ${messageId} in chat ${chatId}`);
+  } catch (err) {
+    logger.warn(`[chat-context-card] pin failed for ${messageId} (card still sent): ${err}`);
+  }
+
+  return messageId;
+}
+
+/** Pin a message in its chat via Lark im.v1.pins.create. Throws on failure
+ *  (caller is responsible for best-effort handling). */
+async function pinMessage(larkAppId: string, messageId: string): Promise<void> {
+  // Use the per-bot Lark Client directly so we don't ship a new client
+  // helper for this single call. The pin API is straightforward enough.
+  const c = getBot(larkAppId).client as any;
+  const res = await c.im.v1.pin.create({
+    data: { message_id: messageId },
+  });
+  if (res.code !== 0) {
+    throw new Error(`pin failed: ${res.msg} (code: ${res.code})`);
   }
 }

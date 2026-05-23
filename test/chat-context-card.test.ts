@@ -20,6 +20,23 @@ vi.mock('../src/utils/logger.js', () => ({
   logger: { info: () => {}, warn: () => {}, error: () => {} },
 }));
 
+vi.mock('../src/config.js', () => ({
+  config: { dashboard: { externalHost: 'localhost', port: 7891 } },
+}));
+
+const pinCreateSpy = vi.fn().mockResolvedValue({ code: 0 });
+vi.mock('../src/bot-registry.js', () => ({
+  getBot: (larkAppId: string) => ({
+    client: {
+      im: {
+        v1: {
+          pin: { create: pinCreateSpy },
+        },
+      },
+    },
+  }),
+}));
+
 async function freshImport() {
   vi.resetModules();
   return await import('../src/im/lark/chat-context-card.js');
@@ -28,6 +45,8 @@ async function freshImport() {
 beforeEach(() => {
   readSpy.mockReset();
   sendMessageSpy.mockReset();
+  pinCreateSpy.mockReset();
+  pinCreateSpy.mockResolvedValue({ code: 0 });
 });
 
 const baseCtx = {
@@ -111,6 +130,20 @@ describe('renderContextCardMarkdown', () => {
     const md = renderContextCardMarkdown(baseCtx);
     expect(md).toContain('2026-05-23T22:00:00Z');
   });
+
+  it('includes dashboard topology link with chatId fragment', async () => {
+    const { renderContextCardMarkdown } = await freshImport();
+    const md = renderContextCardMarkdown(baseCtx);
+    expect(md).toContain('Dashboard 拓扑节点');
+    expect(md).toContain('http://localhost:7891/#/topology?chat=oc_test');
+  });
+});
+
+describe('buildDashboardChatUrl', () => {
+  it('builds URL with chat fragment and url-encodes chatId', async () => {
+    const { buildDashboardChatUrl } = await freshImport();
+    expect(buildDashboardChatUrl('oc_abc')).toBe('http://localhost:7891/#/topology?chat=oc_abc');
+  });
 });
 
 describe('renderContextCard', () => {
@@ -167,5 +200,32 @@ describe('sendContextCard', () => {
     sendMessageSpy.mockRejectedValue(new Error('Lark API 503'));
     const { sendContextCard } = await freshImport();
     expect(await sendContextCard('app_a', 'oc_test')).toBeNull();
+    expect(pinCreateSpy).not.toHaveBeenCalled();
+  });
+
+  it('pins the context card after sending (P0.5 dashboard pin)', async () => {
+    readSpy.mockReturnValue(baseCtx);
+    sendMessageSpy.mockResolvedValue('msg_42');
+    const { sendContextCard } = await freshImport();
+    const result = await sendContextCard('app_a', 'oc_test');
+    expect(result).toBe('msg_42');
+    expect(pinCreateSpy).toHaveBeenCalledTimes(1);
+    expect(pinCreateSpy).toHaveBeenCalledWith({ data: { message_id: 'msg_42' } });
+  });
+
+  it('still returns messageId even if pin fails (best-effort)', async () => {
+    readSpy.mockReturnValue(baseCtx);
+    sendMessageSpy.mockResolvedValue('msg_77');
+    pinCreateSpy.mockRejectedValue(new Error('pin 403'));
+    const { sendContextCard } = await freshImport();
+    expect(await sendContextCard('app_a', 'oc_test')).toBe('msg_77');
+  });
+
+  it('logs warn (no throw) when pin returns non-zero code', async () => {
+    readSpy.mockReturnValue(baseCtx);
+    sendMessageSpy.mockResolvedValue('msg_88');
+    pinCreateSpy.mockResolvedValue({ code: 230009, msg: 'already pinned' });
+    const { sendContextCard } = await freshImport();
+    expect(await sendContextCard('app_a', 'oc_test')).toBe('msg_88');
   });
 });
