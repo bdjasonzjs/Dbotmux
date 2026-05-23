@@ -22,6 +22,11 @@ export interface RulesInput {
   /** chatId → ISO timestamp of the earliest unanswered ping (kept across
    *  ticks so R1 can compute "> 30 min" correctly). */
   unansweredPings?: Map<string, string>;
+  /** Cooldown for "recently resolved" dedup. If the same (ruleId, chatId)
+   *  was resolved within this many ms, don't re-enqueue. Default 1h.
+   *  Critical for persistent-state rules (R3/R5) — without it scout would
+   *  re-fire every tick. */
+  cooldownMs?: number;
 }
 
 const STUCK_KEYWORDS = ['error', 'blocked', 'stuck', '卡住', '解不开', '不会做'];
@@ -34,32 +39,46 @@ const BOT_ROUND_THRESHOLD = 20;
 /** Run all 5 rules. Returns the list of new escalations (caller persists). */
 export function runEscalationRules(input: RulesInput): Escalation[] {
   const out: Escalation[] = [];
+  const cooldownMs = input.cooldownMs ?? 60 * 60 * 1000;  // default 1h
 
-  // Dedup helper: skip when an inbox item for (ruleId, chatId) is already pending.
-  const isAlreadyPending = (ruleId: Escalation['ruleId'], chatId: string): boolean => {
-    return input.inbox.pending.some(
+  // Dedup helper: skip when an inbox item for (ruleId, chatId) is
+  // already pending OR was resolved within cooldownMs. The latter
+  // prevents persistent-state rules (R3 idle group / R5 stuck keyword)
+  // from re-firing every scout tick.
+  const isRecentOrPending = (ruleId: Escalation['ruleId'], chatId: string): boolean => {
+    if (input.inbox.pending.some(
+      it => it.escalation.ruleId === ruleId && it.escalation.chatId === chatId,
+    )) return true;
+    // Check most-recent processed item per (ruleId, chatId) — if its
+    // enqueuedAt is within cooldown, suppress.
+    const recent = input.inbox.processed.find(
       it => it.escalation.ruleId === ruleId && it.escalation.chatId === chatId,
     );
+    if (recent) {
+      const enqueuedMs = new Date(recent.enqueuedAt).getTime();
+      if (input.now - enqueuedMs < cooldownMs) return true;
+    }
+    return false;
   };
 
   for (const node of input.nodes) {
     // R1: unanswered ping > 30 min
     const r1 = checkR1(node, input.now, input.unansweredPings);
-    if (r1 && !isAlreadyPending('R1', node.chatId)) out.push(r1);
+    if (r1 && !isRecentOrPending('R1', node.chatId)) out.push(r1);
 
     // R3: new bot_spawned chat > 1h no activity
     const r3 = checkR3(node, input.now);
-    if (r3 && !isAlreadyPending('R3', node.chatId)) out.push(r3);
+    if (r3 && !isRecentOrPending('R3', node.chatId)) out.push(r3);
 
     // R5: stuck keywords in node summary
     const r5 = checkR5(node);
-    if (r5 && !isAlreadyPending('R5', node.chatId)) out.push(r5);
+    if (r5 && !isRecentOrPending('R5', node.chatId)) out.push(r5);
   }
 
   // R2: cross-chat same-topic with no convergence (24h)
   const r2 = checkR2(input.nodes, input.now);
   for (const esc of r2) {
-    if (!isAlreadyPending('R2', esc.chatId)) out.push(esc);
+    if (!isRecentOrPending('R2', esc.chatId)) out.push(esc);
   }
 
   // R4: bot-to-bot ping > 20 rounds. We don't have direct round-count
@@ -69,7 +88,7 @@ export function runEscalationRules(input: RulesInput): Escalation[] {
   // engine surface area complete.
   const r4 = checkR4Stub(input.nodes);
   for (const esc of r4) {
-    if (!isAlreadyPending('R4', esc.chatId)) out.push(esc);
+    if (!isRecentOrPending('R4', esc.chatId)) out.push(esc);
   }
 
   return out;

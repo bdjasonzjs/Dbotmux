@@ -179,6 +179,41 @@ describe('escalation-rules', () => {
       expect(out.find(e => e.ruleId === 'R1')).toBeUndefined();
     });
 
+    it('cooldown: suppresses re-fire when same (rule, chat) was resolved within cooldownMs', () => {
+      const node = mkNode({ chatId: 'oc_cooldown', originType: 'bot_spawned', metrics: { lastMessageAt: new Date(NOW - 2 * 60 * 60 * 1000).toISOString(), messages24h: 0, hasUnansweredPing: false } });
+      // simulate that R3 was already resolved 10 min ago
+      const inbox = {
+        pending: [],
+        processed: [{
+          id: 'resolved-1',
+          enqueuedAt: new Date(NOW - 10 * 60 * 1000).toISOString(),
+          status: 'resolved' as const,
+          resolvedBy: 'x',
+          resolution: 'sent nudge',
+          escalation: { ruleId: 'R3' as const, triggeredAt: 'x', chatId: 'oc_cooldown', context: 'c', payload: {} },
+        }],
+      };
+      const out = runEscalationRules({ nodes: [node], inbox, now: NOW, cooldownMs: 60 * 60 * 1000 });
+      expect(out.find(e => e.ruleId === 'R3')).toBeUndefined();
+    });
+
+    it('cooldown: re-fires once past cooldownMs', () => {
+      const node = mkNode({ chatId: 'oc_past', originType: 'bot_spawned', metrics: { lastMessageAt: new Date(NOW - 2 * 60 * 60 * 1000).toISOString(), messages24h: 0, hasUnansweredPing: false } });
+      const inbox = {
+        pending: [],
+        processed: [{
+          id: 'old-1',
+          enqueuedAt: new Date(NOW - 2 * 60 * 60 * 1000).toISOString(),  // 2h ago, past 1h cooldown
+          status: 'resolved' as const,
+          resolvedBy: 'x',
+          resolution: 'old',
+          escalation: { ruleId: 'R3' as const, triggeredAt: 'x', chatId: 'oc_past', context: 'c', payload: {} },
+        }],
+      };
+      const out = runEscalationRules({ nodes: [node], inbox, now: NOW, cooldownMs: 60 * 60 * 1000 });
+      expect(out.find(e => e.ruleId === 'R3')).toBeTruthy();
+    });
+
     it('does NOT dedup across different chats', () => {
       const nodeA = mkNode({ chatId: 'oc_a', metrics: { lastMessageAt: null, messages24h: 0, hasUnansweredPing: true } });
       const nodeB = mkNode({ chatId: 'oc_b', metrics: { lastMessageAt: null, messages24h: 0, hasUnansweredPing: true } });

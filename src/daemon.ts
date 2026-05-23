@@ -2494,5 +2494,28 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     flushIdentityCacheSync();
   });
 
+  // P5/integration: register main-bot mode scout tick — every 15 min check
+  // if digest is stale, run runScoutTick to refresh metrics + dispatch
+  // escalations + infer same_topic edges. Only the first registered bot's
+  // daemon runs the global tick (others would race on the shared
+  // chat-topology.json / main-bot-digest.json files).
+  if (botIndex === undefined || botIndex === 0) {
+    const SCOUT_TICK_INTERVAL_MS = 15 * 60 * 1000;
+    const tickHandle = setInterval(async () => {
+      try {
+        const { isStale } = await import('./services/main-bot-digest-store.js');
+        if (!isStale()) return;
+        const { runScoutTick } = await import('./core/scout-spawner.js');
+        const result = await runScoutTick(cfg.larkAppId);
+        logger.info(`[main-bot/scout] tick ran: ${JSON.stringify(result)}`);
+      } catch (err) {
+        logger.error(`[main-bot/scout] tick failed: ${err}`);
+      }
+    }, SCOUT_TICK_INTERVAL_MS);
+    process.on('SIGTERM', () => clearInterval(tickHandle));
+    process.on('SIGINT', () => clearInterval(tickHandle));
+    logger.info(`[main-bot/scout] cron registered (every ${SCOUT_TICK_INTERVAL_MS / 1000}s, stale gate on)`);
+  }
+
   logger.info('Daemon is running. Press Ctrl+C to stop.');
 }

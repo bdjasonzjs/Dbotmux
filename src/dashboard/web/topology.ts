@@ -96,10 +96,15 @@ function renderTopologyTree(topo: Topology, activeChatId: string | null): string
   if (botSpawned.length === 0) {
     return '<div class="topo-empty">(还没有 bot 派生的群)</div>';
   }
-  // Group by parentChatId (null → root level)
+  // Group by parentChatId. botSpawnedIds is the set of valid parents in
+  // the tree; any bot_spawned node whose parent isn't in that set (or
+  // is null) is treated as a **root-level** node — otherwise it would
+  // be orphaned in `byParent` and never rendered.
+  const botSpawnedIds = new Set(botSpawned.map(n => n.chatId));
   const byParent = new Map<string | null, ChatNode[]>();
   for (const n of botSpawned) {
-    const key = n.parentChatId;
+    const isOrphan = n.parentChatId !== null && !botSpawnedIds.has(n.parentChatId);
+    const key = (n.parentChatId === null || isOrphan) ? null : n.parentChatId;
     const list = byParent.get(key) ?? [];
     list.push(n);
     byParent.set(key, list);

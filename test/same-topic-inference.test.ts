@@ -43,9 +43,20 @@ beforeEach(() => { tempDir = mkdtempSync(join(tmpdir(), 'same-topic-test-')); })
 afterEach(() => { rmSync(tempDir, { recursive: true, force: true }); });
 
 describe('inferSameTopicEdges', () => {
-  it('returns 0 when topology empty', async () => {
+  it('returns 0 (attempts, not "newly added") when topology empty', async () => {
     const { infer } = await freshImports();
     expect(infer.inferSameTopicEdges()).toBe(0);
+  });
+
+  it('returns attempt count, NOT newly-added count (dedup happens at addEdge)', async () => {
+    const { topo, infer } = await freshImports();
+    topo.upsertNode(mkNode('a', { tags: ['x'] }));
+    topo.upsertNode(mkNode('b', { tags: ['x'] }));
+    expect(infer.inferSameTopicEdges()).toBe(1);
+    expect(topo.readTopology().edges.length).toBe(1);
+    // 2nd call: addEdge dedups but counter still increments → return is attempts
+    expect(infer.inferSameTopicEdges()).toBe(1);
+    expect(topo.readTopology().edges.length).toBe(1);  // no new edges actually added
   });
 
   it('emits same_topic edge for 2 chats sharing a tag', async () => {
