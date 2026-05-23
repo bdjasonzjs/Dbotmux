@@ -10,7 +10,10 @@ import { logger } from './utils/logger.js';
 import { config } from './config.js';
 import {
   generateToken, parseCookie, buildSetCookie, verifyHmac, decideDashboardAuth,
+  parseUserCookie, buildUserSetCookie, buildUserClearCookie,
 } from './dashboard/auth.js';
+import { isAllowed as isUserAllowed, initOwnerIfMissing as initAllowlistOwner } from './dashboard/allowlist.js';
+import { startDeviceAuth, pollDeviceToken, fetchUserInfo, pollIntervalSeconds } from './dashboard/lark-device-flow.js';
 import { DaemonRegistry } from './dashboard/registry.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
 import { pickCreatorForGroup } from './dashboard/operator-selector.js';
@@ -24,6 +27,150 @@ const BOTS_JSON_PATH = join(homedir(), '.botmux', 'bots.json');
 const REGISTRY_DIR = join(homedir(), '.botmux', 'data', 'dashboard-daemons');
 
 let activeToken: string | null = null;
+
+// In-memory device flow sessions, keyed by user_code. The user_code is what
+// the browser shows to the user and what the poll endpoint accepts. We never
+// expose device_code over the wire. TTL = 10min (Lark device_authorization
+// expires_in is 600s).
+interface DeviceFlowSession {
+  deviceCode: string;
+  clientId: string;
+  clientSecret: string;
+  expiresAt: number;
+  interval: number;
+}
+const deviceFlowSessions = new Map<string, DeviceFlowSession>();
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, s] of deviceFlowSessions) if (s.expiresAt < now) deviceFlowSessions.delete(k);
+}, 60_000).unref();
+
+function renderLoginPage(next: string): string {
+  // Single-file login page. Inline JS handles the device flow polling.
+  // Kept dependency-free so it works without bundler/router awareness.
+  return `<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><title>botmux dashboard · 登录</title>
+<style>
+  body { font-family: -apple-system, "Helvetica Neue", Arial, sans-serif; background: #f4f6f8; margin: 0; padding: 0; }
+  .wrap { max-width: 480px; margin: 80px auto; background: #fff; border-radius: 12px; padding: 32px; box-shadow: 0 2px 12px rgba(0,0,0,0.06); }
+  h1 { margin: 0 0 8px; font-size: 20px; }
+  p { color: #475569; font-size: 14px; line-height: 1.6; }
+  .code { font-family: monospace; font-size: 28px; letter-spacing: 4px; background: #f1f5f9; padding: 12px 16px; border-radius: 8px; text-align: center; margin: 16px 0; user-select: all; }
+  .url { word-break: break-all; background: #f8fafc; padding: 10px; border-radius: 6px; font-family: monospace; font-size: 12px; }
+  .btn { display: inline-block; background: #3b82f6; color: white; padding: 10px 18px; border-radius: 6px; text-decoration: none; font-size: 14px; cursor: pointer; border: none; }
+  .btn:hover { background: #2563eb; }
+  .status { font-size: 13px; padding: 10px; border-radius: 6px; margin: 12px 0; }
+  .status.pending { background: #fef3c7; color: #78350f; }
+  .status.success { background: #d1fae5; color: #065f46; }
+  .status.denied  { background: #fee2e2; color: #991b1b; }
+  .status.error   { background: #fee2e2; color: #991b1b; }
+  details { font-size: 12px; color: #64748b; margin-top: 16px; }
+</style>
+</head><body>
+<div class="wrap">
+  <h1>🔒 botmux dashboard 登录</h1>
+  <p>本 dashboard 仅允许白名单上的飞书账号访问。点下方按钮启动飞书扫码登录，授权完成后自动跳回。</p>
+  <button class="btn" id="start-btn">🚀 启动飞书扫码登录</button>
+  <div id="step2" style="display:none;">
+    <p>请在飞书或浏览器打开下面的链接，输入下面的验证码完成授权：</p>
+    <div class="code" id="user-code">—</div>
+    <div class="url"><a id="verify-url" href="#" target="_blank">—</a></div>
+    <div class="status pending" id="status">等待授权...</div>
+  </div>
+  <details><summary>看不到登录？</summary>
+    <p>1. 确保你的飞书账号在 dashboard 白名单：<code>~/.botmux/dashboard-allowlist.json</code></p>
+    <p>2. 如果是别的账号，让 dashboard owner 把你的飞书 open_id 加进去</p>
+    <p>3. 启动失败 / 链接打不开 → 看 daemon log</p>
+  </details>
+</div>
+<script>
+(function(){
+  const next = ${JSON.stringify(next)};
+  const btn = document.getElementById('start-btn');
+  const step2 = document.getElementById('step2');
+  const userCodeEl = document.getElementById('user-code');
+  const verifyUrlEl = document.getElementById('verify-url');
+  const statusEl = document.getElementById('status');
+
+  let pollHandle = null;
+
+  btn.addEventListener('click', async () => {
+    btn.disabled = true;
+    btn.textContent = '启动中...';
+    try {
+      const r = await fetch('/api/auth/device/start', { method: 'POST' });
+      const data = await r.json();
+      if (!data.ok) throw new Error(data.error || 'start failed');
+      userCodeEl.textContent = data.user_code;
+      verifyUrlEl.href = data.verification_uri_complete || data.verification_uri;
+      verifyUrlEl.textContent = data.verification_uri_complete || data.verification_uri;
+      step2.style.display = 'block';
+      const interval = (data.interval || 5) * 1000;
+      pollHandle = setInterval(() => poll(data.user_code, interval), interval);
+      poll(data.user_code, interval);
+    } catch (e) {
+      btn.disabled = false;
+      btn.textContent = '🚀 启动飞书扫码登录';
+      alert('启动失败：' + e.message);
+    }
+  });
+
+  async function poll(userCode, interval) {
+    try {
+      const r = await fetch('/api/auth/device/poll', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ user_code: userCode, next }),
+      });
+      const data = await r.json();
+      if (!data.ok) {
+        setStatus('error', '请求失败：' + (data.detail || data.error));
+        clearInterval(pollHandle);
+        return;
+      }
+      if (data.status === 'pending') {
+        setStatus('pending', '等待你在飞书完成授权...');
+        return;
+      }
+      clearInterval(pollHandle);
+      if (data.status === 'success') {
+        setStatus('success', '✅ 登录成功，欢迎 ' + (data.name || '') + '。跳转中...');
+        setTimeout(() => location.href = data.redirect || '/', 600);
+        return;
+      }
+      if (data.status === 'denied') {
+        setStatus('denied', '❌ 你拒绝了授权');
+        return;
+      }
+      if (data.status === 'denied_not_in_allowlist') {
+        setStatus('denied', '❌ 你的飞书账号 (' + (data.open_id || 'unknown') + ') 不在 dashboard 白名单');
+        return;
+      }
+      if (data.status === 'expired') {
+        setStatus('error', '⏱️ 二维码已过期，请重新启动登录');
+        return;
+      }
+    } catch (e) {
+      setStatus('error', '请求失败：' + e.message);
+      clearInterval(pollHandle);
+    }
+  }
+
+  function setStatus(cls, text) {
+    statusEl.className = 'status ' + cls;
+    statusEl.textContent = text;
+  }
+})();
+</script>
+</body></html>`;
+}
+
+function renderLoginDeniedPage(): string {
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>无权访问</title>
+<style>body{font-family:sans-serif;background:#f4f6f8;text-align:center;padding-top:80px;}h1{color:#991b1b;}</style>
+</head><body><h1>403 无权访问</h1><p>你的飞书账号不在 dashboard 白名单。</p><p><a href="/login">重新登录</a></p></body></html>`;
+}
 
 function loadOrCreateSecret(): string {
   if (existsSync(SECRET_PATH)) return readFileSync(SECRET_PATH, 'utf8').trim();
@@ -216,17 +363,27 @@ const server = createServer(async (req, res) => {
     }
 
     const presentedToken = authedToken(req, url);
+    const userOpenId = parseUserCookie(req.headers['cookie']);
     const decision = decideDashboardAuth({
       method: req.method ?? 'GET',
       pathname: url.pathname,
       hasTokenParam: url.searchParams.has('t'),
       presentedToken,
       activeToken: activeToken ?? '',
+      userOpenId,
+      isUserAllowed,
     });
 
     if (decision.kind === 'deny401') {
       res.writeHead(401, { 'content-type': 'text/html; charset=utf-8' });
       res.end('<h1>Token expired</h1><p>Run <code>botmux dashboard</code> to get a fresh URL.</p>');
+      return;
+    }
+
+    if (decision.kind === 'redirect-login') {
+      const next = encodeURIComponent(decision.pathname + url.search);
+      res.writeHead(302, { 'location': `/login?next=${next}` });
+      res.end();
       return;
     }
 
@@ -237,6 +394,99 @@ const server = createServer(async (req, res) => {
       });
       res.end();
       return;
+    }
+
+    // ─── Auth: /login page + device flow API ────────────────────────────────
+    if (req.method === 'GET' && url.pathname === '/login') {
+      const next = url.searchParams.get('next') || '/';
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end(renderLoginPage(next));
+      return;
+    }
+    if (req.method === 'GET' && url.pathname === '/login-denied') {
+      res.writeHead(403, { 'content-type': 'text/html; charset=utf-8' });
+      res.end(renderLoginDeniedPage());
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/api/auth/logout') {
+      res.writeHead(302, { 'set-cookie': buildUserClearCookie(), 'location': '/login' });
+      res.end();
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/api/auth/device/start') {
+      try {
+        // dashboard runs as a sibling process to bot daemons, so we read
+        // bots.json directly instead of going through bot-registry (which
+        // wants to instantiate Lark clients we don't need here).
+        const botsCfg = JSON.parse(readFileSync(BOTS_JSON_PATH, 'utf-8')) as Array<{ larkAppId: string; larkAppSecret: string }>;
+        const ownerBot = botsCfg[0];
+        if (!ownerBot?.larkAppId) return jsonRes(res, 500, { ok: false, error: 'no_bot_configured' });
+        const start = await startDeviceAuth(ownerBot.larkAppId);
+        // Stash the device_code in-memory keyed by user_code so the poll
+        // endpoint can find it without trusting the client to echo back
+        // the device_code (which it shouldn't see).
+        deviceFlowSessions.set(start.user_code, {
+          deviceCode: start.device_code,
+          clientId: ownerBot.larkAppId,
+          clientSecret: ownerBot.larkAppSecret,
+          expiresAt: Date.now() + start.expires_in * 1000,
+          interval: pollIntervalSeconds(start) * 1000,
+        });
+        // Return user-facing fields only (no device_code to the client).
+        return jsonRes(res, 200, {
+          ok: true,
+          user_code: start.user_code,
+          verification_uri: start.verification_uri,
+          verification_uri_complete: start.verification_uri_complete,
+          expires_in: start.expires_in,
+          interval: pollIntervalSeconds(start),
+        });
+      } catch (err: any) {
+        logger.error(`[dashboard/login] device start failed: ${err?.message ?? err}`);
+        return jsonRes(res, 500, { ok: false, error: 'device_start_failed', detail: String(err?.message ?? err) });
+      }
+    }
+    if (req.method === 'POST' && url.pathname === '/api/auth/device/poll') {
+      const body = await readJsonBody<{ user_code?: string; next?: string }>(req);
+      const userCode = body?.user_code;
+      if (!userCode) return jsonRes(res, 400, { ok: false, error: 'missing_user_code' });
+      const session = deviceFlowSessions.get(userCode);
+      if (!session) return jsonRes(res, 404, { ok: false, error: 'unknown_user_code' });
+      if (Date.now() > session.expiresAt) {
+        deviceFlowSessions.delete(userCode);
+        return jsonRes(res, 410, { ok: false, error: 'expired', status: 'expired' });
+      }
+      try {
+        const poll = await pollDeviceToken(session.clientId, session.clientSecret, session.deviceCode);
+        if (poll.status === 'pending') return jsonRes(res, 200, { ok: true, status: 'pending' });
+        if (poll.status === 'denied') {
+          deviceFlowSessions.delete(userCode);
+          return jsonRes(res, 200, { ok: true, status: 'denied' });
+        }
+        if (poll.status === 'expired') {
+          deviceFlowSessions.delete(userCode);
+          return jsonRes(res, 200, { ok: true, status: 'expired' });
+        }
+        if (poll.status === 'error') {
+          return jsonRes(res, 500, { ok: false, error: 'poll_error', detail: poll.detail });
+        }
+        // success: fetch user info → allowlist check → issue cookie
+        const info = await fetchUserInfo(poll.token.access_token);
+        deviceFlowSessions.delete(userCode);
+        if (!isUserAllowed(info.open_id)) {
+          return jsonRes(res, 200, { ok: true, status: 'denied_not_in_allowlist', open_id: info.open_id });
+        }
+        const next = (body?.next && body.next.startsWith('/')) ? body.next : '/';
+        res.writeHead(200, {
+          'content-type': 'application/json',
+          'set-cookie': buildUserSetCookie(info.open_id),
+        });
+        res.end(JSON.stringify({ ok: true, status: 'success', open_id: info.open_id, name: info.name, redirect: next }));
+        return;
+      } catch (err: any) {
+        logger.error(`[dashboard/login] device poll failed: ${err?.message ?? err}`);
+        return jsonRes(res, 500, { ok: false, error: 'poll_failed', detail: String(err?.message ?? err) });
+      }
     }
 
     // ─── Static frontend (index.html + /assets/*) ──────────────────────────
@@ -719,6 +969,13 @@ const server = createServer(async (req, res) => {
 
 server.listen(config.dashboard.port, config.dashboard.host, () => {
   logger.info(`[dashboard] listening on ${config.dashboard.host}:${config.dashboard.port}`);
+  // First-run allowlist init: if BOTMUX_DASHBOARD_OWNER_OPEN_ID is set
+  // (typically by `botmux dashboard` first invocation), seed the allowlist
+  // with this owner so they don't get locked out.
+  const ownerId = process.env.BOTMUX_DASHBOARD_OWNER_OPEN_ID;
+  if (ownerId) {
+    initAllowlistOwner(ownerId, process.env.BOTMUX_DASHBOARD_OWNER_NAME);
+  }
 });
 
 // Graceful shutdown

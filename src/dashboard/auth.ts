@@ -69,6 +69,31 @@ export function buildSetCookie(token: string): string {
   return `botmux_dashboard_token=${token}; HttpOnly; SameSite=Lax; Path=/`;
 }
 
+const USER_COOKIE_NAME = 'botmux_dashboard_user';
+
+/** Extract `botmux_dashboard_user` (the Lark open_id) from a Cookie header. */
+export function parseUserCookie(header: string | undefined): string | undefined {
+  if (!header) return undefined;
+  for (const part of header.split(';')) {
+    const [k, v] = part.trim().split('=');
+    if (k === USER_COOKIE_NAME) return v;
+  }
+  return undefined;
+}
+
+/** Build the `Set-Cookie` header for a freshly-authed user. Persists for
+ *  `maxAgeSec` seconds (default 8h). HttpOnly + SameSite=Strict + Path=/
+ *  so the cookie can't be read by JS, sent cross-site, or scoped narrower
+ *  than the dashboard. */
+export function buildUserSetCookie(openId: string, maxAgeSec: number = 8 * 60 * 60): string {
+  return `${USER_COOKIE_NAME}=${openId}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${maxAgeSec}`;
+}
+
+/** Cookie value indicating the user logged out — overwrites with Max-Age=0. */
+export function buildUserClearCookie(): string {
+  return `${USER_COOKIE_NAME}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0`;
+}
+
 // ─── Per-request auth decision ──────────────────────────────────────────────
 
 /**
@@ -94,7 +119,8 @@ export function buildSetCookie(token: string): string {
 export type AuthDecision =
   | { kind: 'allow' }
   | { kind: 'allow+set-cookie'; token: string; redirectTo: string }
-  | { kind: 'deny401' };
+  | { kind: 'deny401' }
+  | { kind: 'redirect-login'; pathname: string };  // user-cookie missing/invalid → /login
 
 export function decideDashboardAuth(opts: {
   method: string;
@@ -102,26 +128,50 @@ export function decideDashboardAuth(opts: {
   hasTokenParam: boolean;
   presentedToken: string | undefined;
   activeToken: string;
+  /** User cookie (Lark open_id) and allowlist-based predicate. Both
+   *  optional for backward-compat with single-token deployments. */
+  userOpenId?: string | undefined;
+  isUserAllowed?: (openId: string) => boolean;
 }): AuthDecision {
-  const { method, pathname, hasTokenParam, presentedToken, activeToken } = opts;
+  const { method, pathname, hasTokenParam, presentedToken, activeToken, userOpenId, isUserAllowed } = opts;
 
   // Workflow read-only paths + static SPA shell are public — the dashboard
-  // must be linkable from Lark cards without forcing a `botmux dashboard`
-  // round-trip.  Write actions still need a cookie / token.
+  // must be linkable from Lark cards without forcing a login round-trip.
   const isWorkflowReadOnly =
     method === 'GET' && pathname.startsWith('/api/workflows/');
   const isStaticShell =
     method === 'GET' && (pathname === '/' || pathname.startsWith('/assets/'));
+  // Login flow itself must be publicly reachable so users can authenticate.
+  const isLoginSurface =
+    method === 'GET' && (pathname === '/login' || pathname === '/login-denied');
+  const isAuthApi =
+    pathname === '/api/auth/device/start' ||
+    pathname === '/api/auth/device/poll' ||
+    pathname === '/api/auth/logout';
 
-  const authed = !!presentedToken && presentedToken === activeToken;
+  // User-cookie identity gate (preferred over token cookie when both
+  // present): if the user-cookie names an allowlisted open_id, allow.
+  const userAuthed = !!userOpenId && !!isUserAllowed && isUserAllowed(userOpenId);
 
-  if (!authed && !isWorkflowReadOnly && !isStaticShell) {
+  // Legacy token-cookie auth (preserved so existing magic-link URLs and
+  // single-host deployments don't break).
+  const tokenAuthed = !!presentedToken && presentedToken === activeToken;
+
+  const authed = userAuthed || tokenAuthed;
+
+  if (!authed && !isWorkflowReadOnly && !isStaticShell && !isLoginSurface && !isAuthApi) {
+    // User-cookie deployments redirect to /login (friendly); legacy
+    // token-cookie deployments still return deny401 for non-browser
+    // clients. Heuristic: if isUserAllowed predicate is provided
+    // (allowlist mode active), prefer redirect.
+    if (isUserAllowed) {
+      return { kind: 'redirect-login', pathname };
+    }
     return { kind: 'deny401' };
   }
 
-  // First hit with `?t=<correct token>` sets the cookie + redirects to the
-  // clean URL.  Only reached when the token matched (`authed === true`).
-  if (hasTokenParam && authed && presentedToken) {
+  // First hit with `?t=<correct token>` sets the legacy cookie + redirects.
+  if (hasTokenParam && tokenAuthed && presentedToken) {
     return {
       kind: 'allow+set-cookie',
       token: presentedToken,
