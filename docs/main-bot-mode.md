@@ -1,8 +1,8 @@
 # Dbotmux: Main-Bot Mode + Chat Topology + 新群上下文自动注入
 
-> Status: 设计阶段（v0.1） · Branch: `feat/main-bot-mode` · Author: 克劳德 + 松松（pair design）
+> Status: 设计 v1.0（已决策） · Branch: `feat/main-bot-mode` · Authors: 克劳德 + 松松（pair design）
 >
-> 这是一份**设计提案**，落地节奏由松松决定。代码尚未变更。
+> 这是基于 v0.1 经 6 个决策点 pair-review 得到的**已决策**版本。代码尚未变更，可开 P0 PR。
 
 ---
 
@@ -25,14 +25,14 @@
 
 ## 2. 非目标（non-goals，先不做）
 
-- LLM 摘要质量优化（先用最朴素的"近 24h 关键消息 + 任务关联"，质量留给后续迭代）
+- LLM 摘要质量优化的极致打磨（v1.0 已选 LLM 摘要由缇蕾跑，质量调优留后续迭代）
 - 跨 tenant / 跨 lark app 的拓扑（暂只覆盖单 app 内的 chat）
-- 自动 sender 验证 / 反 social-engineering（之前 5/21 sender 混淆教训记忆里有，那是独立模块，不在本期）
+- 自动 sender 验证 / 反 social-engineering（5/21 sender 混淆教训记忆里有，独立模块，不在本期）
 - Mobile / 小尺寸屏适配（先做桌面 dashboard）
 
 ## 3. 数据模型
 
-新增 3 个核心实体，落到 `~/.botmux/data/`：
+新增 4 个核心实体，落到 `~/.botmux/data/`：
 
 ### 3.1 `ChatTopology`（持久化文件：`chat-topology.json`）
 
@@ -42,7 +42,6 @@ interface ChatTopology {
   rootChatId: string;
   nodes: ChatNode[];
   edges: ChatEdge[];
-  /** 最后一次更新时间 */
   updatedAt: string;
 }
 
@@ -50,86 +49,68 @@ interface ChatNode {
   chatId: string;
   name: string;
   chatType: 'group' | 'topic_group' | 'p2p';
-  /** 父 chat（null 表示是 root；多父 → edges 表达） */
+  /** 出生来源（Q1 决策）：决定是否进入 main-bot 拓扑体系 */
+  originType: 'p2p' | 'human_created' | 'bot_spawned';
+  /** 父群（仅 bot_spawned 时可非 null；私聊触发建群时为 null） */
   parentChatId: string | null;
   /** 业务标签：议题 / PRD / 任务 # / "已 stale" 等 */
   tags: string[];
-  /** 派生指标 */
+  /** 派生指标（L1 daemon 维护） */
   metrics: {
-    /** 最近消息时间戳 */
     lastMessageAt: string | null;
-    /** 24h 消息数 */
     messages24h: number;
-    /** 我是否还有未回的 ping */
     hasUnansweredPing: boolean;
   };
-  /** 群在做的事的一句话摘要（由 main-bot 维护，10-50 字） */
+  /** 群在做的事的一句话摘要（L2 缇蕾维护，10-50 字） */
   summary: string;
 }
 
 interface ChatEdge {
-  /** 边类型 */
   type: 'parent_child' | 'same_topic' | 'spawned_from' | 'cross_ref';
   fromChatId: string;
   toChatId: string;
-  /** 关联依据（PRD 链接 / 任务编号 / 群创建命令等） */
   rationale: string;
 }
 ```
 
-### 3.2 `ChatContext`（持久化文件：`chat-contexts/<chat_id>.json`）
+⚠️ 关键约束：**只有 `originType: 'bot_spawned'` 的节点进入父子拓扑树**。`p2p` 和 `human_created` 在 dashboard 上单独成列展示，不入拓扑。
 
-每个 chat 单独一个文件，记录"这群是干嘛的"——给新进群的 bot 即时拉取：
+### 3.2 `ChatContext`（持久化文件：`chat-contexts/<chat_id>.json`）
 
 ```typescript
 interface ChatContext {
   chatId: string;
-  /** 群目的（松松创建时填 / main-bot 自动推断） */
   purpose: string;
-  /** 关联任务 / PRD / wiki 链接 */
   relatedRefs: string[];
-  /** 关键参与者 + role（人 + bot） */
   participants: Array<{ openId: string; role: string }>;
-  /** 父群继承的关键信息（可裁剪） */
   inheritedFrom: {
     parentChatId: string;
-    /** 摘要：父群最近 24h 相关讨论 */
     parentDigest: string;
   } | null;
-  /** 当前任务清单（来自 Flumy 主 todo 子文档 N# 引用） */
   activeTodoRefs: string[];
-  /** 红线 / 特别约定（如 "不公开伴侣标签" / "群进度须 @ 魏旭" ） */
   rules: string[];
-  /** 自动生成时的注入策略 */
+  /** Q2 决策：默认 'eager' — 新群一建立刻发卡片 */
   injectionPolicy: 'eager' | 'on_first_mention' | 'manual';
 }
 ```
 
 ### 3.3 `MainBotDigest`（持久化文件：`main-bot-digest.json`）
 
-每隔 N 分钟由 main-bot daemon 重新计算一次：
-
 ```typescript
 interface MainBotDigest {
   generatedAt: string;
-  /** 全局快照：所有活跃 chat 的 1 行状态 */
   chats: Array<{
     chatId: string;
     name: string;
-    /** 'hot' = 1h 内有消息；'warm' = 24h；'cold' = 更早 */
-    heat: 'hot' | 'warm' | 'cold';
-    /** 一行话当前状态 */
+    heat: 'hot' | 'warm' | 'cold';  // 1h / 24h / older
     oneLineStatus: string;
-    /** 是否有需要松松决策的事 */
     needsAttention: boolean;
   }>;
-  /** 跨群议题（同 PRD / 同任务在多群讨论） */
   crossChatThreads: Array<{
     theme: string;
     chatIds: string[];
     summary: string;
   }>;
-  /** Pending：松松未回的 ping + 别人对他的请求 */
   pendingForJason: Array<{
     chatId: string;
     messageId: string;
@@ -137,42 +118,84 @@ interface MainBotDigest {
     request: string;
     sinceMinutes: number;
   }>;
+  /** v1.0 新增：本次扫描触发的 escalation 列表 */
+  escalations: Escalation[];
+}
+
+interface Escalation {
+  ruleId: 'R1' | 'R2' | 'R3' | 'R4' | 'R5';
+  triggeredAt: string;
+  chatId: string;
+  context: string;
+  payload: unknown;
 }
 ```
 
-## 4. 架构 & Hook 点
+### 3.4 `ScoutInbox`（v1.0 新增 · 持久化文件：`scout-inbox.json`）
 
-不写新 daemon，**在 botmux 现有 daemon 上加 hook**——理由：现有 daemon 已经监听 Lark event stream（`src/im/lark/event-dispatcher.ts`），所有消息已经过这里。
+缇蕾 → 克劳德 的待处理队列。缇蕾每次 digest 计算完写入新 escalation 项，克劳德 spawn 时拉取处理。
 
-### 4.1 Hook 注入点
+```typescript
+interface ScoutInbox {
+  pending: ScoutInboxItem[];
+  processed: ScoutInboxItem[];  // 保留近 N 天，过期清理
+}
+
+interface ScoutInboxItem {
+  id: string;            // uuid
+  enqueuedAt: string;
+  escalation: Escalation;
+  status: 'pending' | 'in_progress' | 'resolved' | 'dismissed';
+  resolvedBy: string | null;   // 克劳德 session id
+  resolution: string | null;   // 一句话总结
+}
+```
+
+## 4. 架构（三层 + 5 个 Hook）
+
+### 4.1 三层架构（Q3+Q4 决策）
+
+| 层 | 干啥 | 谁跑 | 触发 |
+|---|---|---|---|
+| **L1 数据聚合** | 群指标、消息数、stale 检测、按 chat 算指标 | botmux daemon (JS, 无 LLM) | 每条消息 `onMessage` 增量更新 + 标 digest stale |
+| **L2 LLM 摘要 + Escalation** | 群一句话摘要、跨群议题识别、写 `MainBotDigest` + 写 `ScoutInbox` | **缇蕾**（token 量大、低成本） | 每 15 min cron 自检 stale 才跑 + on-demand 强制刷 |
+| **L3 决策行动** | consume digest + ScoutInbox → 推进 / escalate / 通知松松 | 克劳德（主 bot） | 缇蕾 escalation 触发 spawn / 松松主动叫 / dashboard 操作 |
+
+**为啥分层**：
+- 成本分层：reduce 工作 token 多但低 stake → 缇蕾便宜跑；决策低频高 stake → 克劳德跑
+- 上下文隔离：克劳德 session 不被"扫读全部消息"占用，决策时上下文是干净的
+- 天然 escalation：缇蕾遇决策不了的事 → ping 克劳德 → 克劳德决策或转给松松
+- fail-safe：缇蕾摘要错了，克劳德/松松看 digest 时能纠错
+
+### 4.2 Hook 注入点（5 个）
+
+不写新 daemon，**在 botmux 现有 daemon 上加 hook**：
 
 | Hook | 文件 | 触发时机 | 干啥 |
 |---|---|---|---|
-| `onChatCreated` | `src/im/lark/event-dispatcher.ts` | 检测到 `im.chat.created` 事件 | 自动给新 chat 写 `ChatContext`（默认父群 = 创建者所在的 chat）+ 给进群的每个 bot 发一条"上下文卡片"消息 |
-| `onSessionSpawn` | `src/core/session-manager.ts` | bot session 启动 | 读取 `ChatContext` → 注入到该 session 的 system prompt 前缀 |
-| `onMessage` | `src/im/lark/event-dispatcher.ts` | 每条消息 | 增量更新 `ChatNode.metrics`（消息数 / 时间）+ 触发 `MainBotDigest` 标记为 stale（懒重算） |
-| `onScheduleTick` | `src/services/schedule-store.ts` | 每 N 分钟 cron | 如果 `MainBotDigest` stale，重算（按需调 LLM 写群一句话摘要） |
+| `onChatCreated` | `src/im/lark/event-dispatcher.ts` | 检测到 `im.chat.created` | 推断 originType；如是 bot_spawned 写 `ChatContext` + 给群发上下文卡片 |
+| `onSessionSpawn` | `src/core/session-manager.ts` | bot session 启动 | 读 `ChatContext` → 注入 system prompt 前缀 |
+| `onMessage` | `src/im/lark/event-dispatcher.ts` | 每条消息 | L1：增量更新 `ChatNode.metrics` + 标 digest stale |
+| `onScoutTick` | `src/services/schedule-store.ts` | 每 15 min cron | 触发缇蕾 spawn → L2：跑 digest + escalation 5 规则 → 写 `ScoutInbox` |
+| `onScoutEscalation` | `src/im/lark/scout-dispatcher.ts`（新增） | 缇蕾写新 ScoutInboxItem | 触发克劳德 spawn 处理该 item |
 
-### 4.2 新群上下文自动注入流程
+### 4.3 新群上下文自动注入流程
 
 ```
-松松在群 A (Flumy 主话题) 里说 "克劳德建群讨论 X 议题，把 4 个 bot 都拉进来"
+松松在群 A (Flumy 主话题) 里说 "克劳德建群讨论 X 议题，拉 4 个 bot"
    ↓
 克劳德 spawn 一次 session，调 lark-cli im +chat-create 建群 B
    ↓
 botmux daemon 监听到 im.chat.created（chatId = B, 创建者 = 克劳德 bot）
    ↓
 onChatCreated hook 触发：
-   1. 推断 parentChatId = 创建会话所在的群 A
-   2. 从松松的最近 N 条消息 + 主 todo 文档抽出 X 议题的关联信息
-   3. 生成 ChatContext 写入 ~/.botmux/data/chat-contexts/<B>.json
-   4. 给群 B 发一条 markdown 上下文卡片：
-        ┌─ 群目的：讨论 X 议题
-        ├─ 派生自：Flumy 主话题
-        ├─ 关联任务：N6 / N8（链接到主 todo doc 行）
-        ├─ 关键参与者：@松松 @克劳德 @寇黛克斯 @缇蕾
-        ├─ 红线提醒：写操作只松松能授权 / 不复述伴侣标签
-        └─ 父群最近 24h 关联讨论摘要（200 字）
+   1. 推断 originType = 'bot_spawned'
+   2. 推断 parentChatId = 创建命令所在的群 A（Q1 决策）
+      - 若 A 是 p2p，parentChatId = null（仍记 originType='bot_spawned'，但拓扑不画此边）
+   3. 从松松最近 N 条消息 + 主 todo 抽出 X 议题关联信息
+   4. 生成 ChatContext 写入 ~/.botmux/data/chat-contexts/<B>.json
+   5. 给群 B 发 markdown 上下文卡片（Q2 决策 = eager）：
+        群目的 / 派生自 / 关联任务 / 关键参与者 / 红线 / 父群最近 24h 摘要
    ↓
 后续任何 bot session 在群 B spawn 时：
    onSessionSpawn hook 读 ChatContext → 注入 system prompt
@@ -180,65 +203,72 @@ onChatCreated hook 触发：
 bot 不需要松松再人肉解释
 ```
 
-### 4.3 Dashboard `Topology` Tab
+### 4.4 Dashboard `Topology` Tab（Q5 决策 = drawer）
 
 在 `src/dashboard/web/` 新增 `topology.ts`：
 
-- 顶部 toolbar：search / filter（按 tag / heat / hasUnansweredPing）
+- 顶部 toolbar：search / filter（按 tag / heat / hasUnansweredPing / originType）
 - 主区：用 **vis-network** 或 **cytoscape.js** 渲染节点 + 边
-- 节点点击 → 抽屉显示 `ChatContext` 全文 + 最近 N 条消息 link
+- 节点点击 → **drawer**（右侧抽屉滑出）显示 `ChatContext` 全文 + 最近 N 条消息 link
+  - drawer 而非 modal / 新页：不丢失拓扑全局视角，点不同节点抽屉切换
 - 边右键 → "解除关联" / "标记为相同议题"
+- `p2p` 和 `human_created` 群在右侧"无拓扑群"侧栏列出，不入主拓扑画布
 
 后端新增 API：
-- `GET /api/topology` → 整张 `ChatTopology`
+- `GET /api/topology` → 整张 `ChatTopology`（含 originType 过滤参数）
 - `GET /api/contexts/:chatId` → 单 chat ChatContext
-- `POST /api/topology/edges` → 手动加边（拓扑关系不能完全自动推断时）
-- `GET /api/digest` → MainBotDigest（main-bot 的全局快照）
+- `POST /api/topology/edges` → 手动加边
+- `GET /api/digest` → MainBotDigest
+- `GET /api/scout-inbox` → 当前 ScoutInbox（dashboard 显示 pending 项）
 
-## 5. 落地路线图（按依赖排）
+## 5. 落地路线图（v1.0 已重排）
 
-| Phase | 目标 | 工程量估算 | 验收标准 |
+| Phase | 目标 | 工程量 | 验收标准 |
 |---|---|---|---|
-| **P0** | `ChatContext` 存储 + `onChatCreated` hook + 进群发上下文卡片 | 1.5 天 | 松松下次建群，bot 进群即收到上下文卡片，无须再解释 |
-| **P1** | `MainBotDigest` daemon 定时任务 + `/api/digest` API | 1 天 | dashboard 能拉到 `MainBotDigest` JSON |
-| **P2** | Dashboard `Topology` tab（v0：节点 + 父子边，不含 same_topic 跨议题） | 2 天 | 浏览器能看到拓扑图，节点点击展开 context |
-| **P3** | `onSessionSpawn` 注入 context 到 system prompt | 0.5 天 | spawn 的 bot session 上来就知道群在干嘛 |
-| **P4** | 跨议题边（`same_topic` 自动推断 from PRD/任务关联） | 1.5 天 | 同 PRD 的 2 个群在拓扑图上自动连线 |
-| **P5** | `MainBotDigest.pendingForJason` 重点提醒 | 1 天 | 松松登录 dashboard 就看到当前 N 条未回 ping |
+| **P0** | ChatContext 存储 + originType 字段 + onChatCreated hook + 上下文卡片 (eager) | 1.5 天 | 松松下次建群，5 秒内 bot 收到 markdown 上下文卡片 |
+| **P1** | onSessionSpawn 注入 ChatContext 到 system prompt | 0.5 天 | spawn 的 bot session 上来就知道群在干啥 |
+| **P2** | L1 + L2 缇蕾 scout：daemon 聚合 metrics + 缇蕾 cron 15 min 写 digest + R1-R5 escalation 规则 | 3 天 | digest 文件正确生成 + 5 类场景能触发 escalation |
+| **P3** | L3 克劳德 consume escalation：spawn handler 处理 ScoutInbox 项 | 1 天 | 克劳德能接到 escalation 项并执行响应动作 |
+| **P4** | Dashboard `Topology` Tab：节点 + 父子边 + drawer 详情 + 无拓扑群侧栏 | 2 天 | 浏览器能看到拓扑图，节点点击 drawer 展开 context |
+| **P5** | 跨群议题边（`same_topic` 自动推断 from PRD/任务编号） | 1 天 | 同 PRD 的 2 个群在拓扑图上自动连线 |
 
-**MVP = P0 + P3**（让"新群冷启动"自动化），其余可分批迭代。
+- **MVP = P0+P1+P2+P3 ≈ 6 天**（完整 main-bot 三层架构跑通）
+- **全部含 dashboard = P0-P5 ≈ 9 天**
 
-## 6. 关键决策点（需要松松拍板）
+## 6. 关键决策（已拍板 v1.0）
 
-| Q# | 问题 | 候选 | 默认建议 |
+| Q# | 问题 | 决议 | 备注 |
 |---|---|---|---|
-| Q1 | `parentChatId` 怎么定？| (a) 创建命令所在的 chat ｜ (b) 手动指定 ｜ (c) 自动从命令内容推断 | (a) — 简单可靠，特殊情况用 (b) 手动覆盖 |
-| Q2 | `ChatContext` 默认 `injectionPolicy`？| eager（进群立刻发）/ on_first_mention（bot 第一次被 @ 时再发）/ manual | eager — 痛点就是冷启动，要立刻有 |
-| Q3 | `MainBotDigest` 多久重算？| 每 5 min / 15 min / 60 min / on-demand | 默认 15 min；松松要看 overview 时 on-demand 强制刷 |
-| Q4 | 群一句话摘要由谁生成？| LLM 调用 / 规则模板 / 手动填 | 先规则模板（"近 24h N 条消息，最热议题 X，参与者 Y/Z"）；P4 后接 LLM |
-| Q5 | Topology 节点点击展开是 drawer 还是 modal？| drawer / modal / 跳转新页 | drawer — 不离开拓扑全局视图 |
-| Q6 | 上游 PR 还是 fork 自己维护？| PR / 自己维护 | 先 fork 自己维护跑通；P3+ 验证有价值后再考虑上游 PR |
+| Q1 | `parentChatId` 怎么定？ | bot 建群时所在 chat 自动推断；私聊触发 → null | ChatNode 加 originType 区分 3 类，仅 bot_spawned 进拓扑 |
+| Q2 | `ChatContext` 默认 `injectionPolicy`？ | **eager** | 新群一建立刻发上下文卡片（人审 + 透明纠错） |
+| Q3 | `MainBotDigest` 重算频率？ | **15 min cron stale 才跑 + on-demand 强制刷** | 5 min 太频繁（无感差异），60 min 太慢（错过紧急 ping） |
+| Q4 | 群摘要谁生成？ | **缇蕾跑 LLM 摘要**（一步到位三层架构） | 避免后续重构；松松决策"按最终版做"，不走规则模板分支 |
+| Q5 | Topology 节点展开形式？ | **drawer** | 不离开拓扑全局视图 |
+| Q6 | 上游 PR vs fork 自维护？ | **先 fork 自维护**；每周 rebase upstream/master | 个人 workflow 强假设；通用部分稳定后分模块 PR upstream |
 
 ## 7. 风险 / 已知坑
 
-1. **`im.chat.created` 事件可能不全**：Lark 不是所有客户端创建的群都触发这个事件。如果是 lark-cli 创建的 chat，要看 botmux 是否能监听到（需要测）。Fallback：在 `chat-create` 命令成功后**主动写入** `ChatContext`（不依赖 event）。
-2. **bot 不在新群 = 收不到 hook**：如果新群创建时没拉对应 bot，hook 走不到那个 bot 的 daemon。要求：onboarding 流程必须把至少一个 botmux-onboarded bot 加进新群，否则 ChatContext 写空。
-3. **跨 daemon 数据一致性**：3 个 bot daemon 各自跑，`chat-topology.json` 是共享文件——写入要加锁。已有 botmux session JSON 是怎么处理并发的？需要看 `session-store.ts`。
-4. **上下文注入会增加 token 成本**：每个 session spawn 都注入 200-500 token 的 context prefix——长期看是值得的（避免人肉解释 10-30 分钟），但要监控 token 用量。
-5. **冷启动 hook 死循环**：建群 → onChatCreated → 发卡片消息 → 触发 onMessage → 别再触发 onChatCreated。要确保 hook 不递归。
-6. **session 复活问题**（5/18 历史教训）：daemon 重启时把 closed session 复活回 active。我们的 hook 要识别"复活的 session"vs"全新 session"，避免重复发上下文卡片。
+1. **`im.chat.created` 事件可能不全**：Lark 不是所有客户端创建的群都触发这个事件。Fallback：在 `chat-create` 命令成功后**主动写入** ChatContext + 触发 onChatCreated hook（不依赖 event）
+2. **bot 不在新群 = 收不到 hook**：onboarding 流程必须把至少一个 botmux-onboarded bot 加进新群，否则 ChatContext 写空
+3. **跨 daemon 数据一致性**：3 个 bot daemon 各自跑，`chat-topology.json` 是共享文件——写入要加锁。已有 botmux session JSON 怎么处理并发的？需要看 `session-store.ts`
+4. **缇蕾 token 成本监控**：虽然缇蕾 token 量大，但 15 min 一次 + 全消息扫读仍是非零开销，需要监控
+5. **冷启动 hook 死循环**：建群 → onChatCreated → 发卡片 → 触发 onMessage → 别再触发 onChatCreated。要确保 hook 不递归
+6. **session 复活问题**（5/18 历史教训）：daemon 重启时把 closed session 复活回 active。hook 要识别"复活的 session" vs "全新 session"，避免重复发上下文卡片
+7. **缇蕾 escalation 误报 / 漏报**：R1-R5 都是硬规则（阈值 + 关键词），第一版要在 dogfood 阶段调阈值
+8. **R4 阈值的产品哲学**：bot-to-bot 讨论本身有价值（详见 §12），escalation 不是为"打断 bot 浪费"——20 轮才提示且只是温和提醒
 
 ## 8. 评测 / 验收
 
-写完 P0+P3 后跑这个 e2e：
+写完 P0+P1+P2+P3 后跑这个 e2e：
 
 1. 松松在 Flumy 主话题说："克劳德，建群讨论 Y 议题，把 4 个 bot 拉进来"
 2. 克劳德 spawn session → `lark-cli im +chat-create` 建群 → 加 bot
 3. **预期 5 秒内**：新群里出现一条 markdown 上下文卡片（自动）
 4. 松松在新群说："@克劳德 你知道我们在干嘛吗？"
 5. **预期克劳德回**：直接答出 Y 议题 + 相关任务（不需要松松再解释）
+6. 等 30+ min，松松在 CUA 群发个 @松松 的消息但不回 → **预期 R1 触发**，缇蕾把 pending 项写进 ScoutInbox → 克劳德按 R1 处理（飞书私信松松）
 
-如果第 3 步或第 5 步失败 → P0/P3 没达标，回头补。
+任一步失败 → MVP 没达标，回头补。
 
 ## 9. 与现有 botmux 模块的接口
 
@@ -246,20 +276,56 @@ bot 不需要松松再人肉解释
 |---|---|---|
 | `src/im/lark/event-dispatcher.ts` | 加 `onChatCreated` + `onMessage` hook 调用 | 加 2 个 if 分支，不改主流程 |
 | `src/core/session-manager.ts` | 加 `onSessionSpawn` 注入 context | 加 1 个 hook，可禁用 |
-| `src/dashboard.ts` | 加 3 个 API 路由：/api/topology, /api/contexts/:id, /api/digest | 新增，不改老 API |
+| `src/services/schedule-store.ts` | 加 `onScoutTick`（15 min cron 触发缇蕾 spawn） | 加 1 个 cron 注册 |
+| `src/im/lark/scout-dispatcher.ts`（新增） | 缇蕾 escalation → 克劳德 spawn 触发 | 全新文件 |
+| `src/dashboard.ts` | 加 5 个 API 路由 | 新增，不改老 API |
 | `src/dashboard/web/app.ts` | route 加 `#/topology` | 1 行 |
 | `src/dashboard/web/` | 新增 `topology.ts` | 全新文件 |
-| `~/.botmux/data/` | 新增 3 个持久化文件 + 1 个目录（chat-contexts/） | 全新数据 |
+| `~/.botmux/data/` | 新增 4 个持久化文件 + 1 个目录（chat-contexts/） | 全新数据 |
 
 **老功能 0 改动**，只加不改——降低 fork 维护成本，将来 upstream rebase 容易。
 
-## 10. 下一步行动
+## 10. 上游对齐策略（Q6 决策）
 
-等松松回 6 个决策点（Q1-Q6）后，我开 P0 PR：
-1. 实现 `ChatContext` 存储 + chat-create hook
-2. 加 ChatContext 写入逻辑（无 event 时 fallback）
+- Upstream: `deepcoldy/botmux`（主线 `master`，无 release 分支）
+- Fork: `bdjasonzjs/Dbotmux`
+- 基线：`feat/main-bot-mode` 已 rebase 到 `upstream/master@56d9d2c`
+- **周期对齐**：每周一次 `git fetch upstream && git rebase upstream/master` master 分支，再 rebase active feature 分支
+- **每个 Phase 起头前**：再 rebase 一次（避免在过时基线上写代码）
+- 通用部分（ChatTopology 数据模型 / dashboard topology tab / onChatCreated hook 基础）稳定后可拆出来单独 PR 给 upstream；强个性化部分（缇蕾、escalation 规则）留 fork
+
+## 11. Escalation 规则定义（缇蕾 → 克劳德）
+
+| # | 触发条件（缇蕾扫描） | 缇蕾动作 | 克劳德接到后动作 |
+|---|---|---|---|
+| **R1** | 你未回的 @松松 ping 累计 > 30 min | 写 ScoutInboxItem，payload = ping 列表（chatId, messageId, sender, request, sinceMinutes） | 判断紧急度：紧急 → 飞书私信松松；不紧急 → 攒到 dashboard pending 区 |
+| **R2** | 同议题（通过 tag / ticket 编号识别）在 ≥ 2 群讨论 + 24h 无收敛 | 写 ScoutInboxItem，payload = chatIds + theme | 判断要不要合群 / 主动同步信息 / 问松松"这事拍板了吧？" |
+| **R3** | 新群创建 > 1h 且 lastMessageAt 仍是创建时间（仅 originType=bot_spawned） | 写 ScoutInboxItem，payload = chatId | 进群看上下文卡片有没发对、ChatContext 是否写入、可能 @松松"这群要开干吗" |
+| **R4** | bot 之间互 ping > **20 轮** 仍无定论（消息流里只有 bot 互 @、无 user 介入、无 commitment 词） | 写 ScoutInboxItem，payload = chatId + 最后 5 轮摘要 | **倾向继续观察**——只有讨论明显在打转（同样论点重复 3 次）才主动介入或拉松松裁决 |
+| **R5** | digest 文本/最近消息出现 `error` / `blocked` / `stuck` / `卡住` / `解不开` / `不会做` 等关键词 | 在 ChatNode.summary 中标红 + needsAttention=true + 写 ScoutInboxItem | 进群看具体 blocker / 帮忙解 / 解不了上报松松 |
+
+**核心思想**：缇蕾只识别**客观信号**（消息时间差、关键词、群活跃度、ping 计数）——全是数得出来的硬指标，不需要她"理解"或"判断重要性"。是不是真重要、要做啥，全甩给克劳德。
+
+## 12. 设计哲学：鼓励 bot-to-bot 讨论
+
+bot-to-bot 讨论本身有价值——是**探索 + 碰撞 + 打磨**。
+
+任何 escalation / 中断规则**不是**为了"判定 bot 在浪费"，而是"给上限避免无限循环"的安全网。
+
+约束：
+- 评估 bot-to-bot 讨论时，默认假设 "still valuable, keep going"
+- 上限触发时（R4 / 出现疲态重复），通知措辞是"可以考虑收敛了"，不是"必须停"
+- 任何 AI 监控规则默认偏向 keep going；break 必须有强证据（不是 round count 单一指标）
+
+此哲学跨项目稳定，已落到克劳德 long-term memory（feedback 类）。
+
+## 13. 下一步行动
+
+P0 PR 实现清单：
+1. ChatContext 存储 + originType 推断 + chat-create hook
+2. ChatContext 写入 fallback（不依赖 event）
 3. 进群发 markdown 上下文卡片
-4. 单元测试（chat-create flow / context inject）
-5. 在新群跑 e2e 验收
+4. 单元测试（chat-create flow / context inject / originType 推断）
+5. 在新群跑 e2e 验收（验收 case 步骤 1-5）
 
-预计 P0 落地 1.5 天，跑通后再决定 P1-P5 节奏。
+预计 P0 落地 1.5 天，跑通后再走 P1。
