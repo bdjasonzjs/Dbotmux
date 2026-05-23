@@ -157,8 +157,9 @@ export function renderTopologyPage(root: HTMLElement): () => void {
 
   function renderOffTreeCard(g: GroupBrief): string {
     const name = g.name || g.chatId;
+    const active = g.chatId === state.activeChatId ? 'active' : '';
     return `
-      <article class="topo-v2-card status-idle topo-v2-offtree-card" data-chat-id="${escapeHtml(g.chatId)}">
+      <article class="topo-v2-card status-idle topo-v2-offtree-card ${active}" data-chat-id="${escapeHtml(g.chatId)}">
         <header class="topo-v2-card-head">
           <strong title="${escapeHtml(g.chatId)}">${escapeHtml(name)}</strong>
           <span class="topo-v2-status status-idle">${t('topo.status.idle')}</span>
@@ -224,11 +225,14 @@ export function renderTopologyPage(root: HTMLElement): () => void {
 
     streamEl.innerHTML = sections || `<div class="topo-v2-empty">${t('topo.empty')}</div>`;
 
-    // Topbar live counts
+    // Topbar live counts — idle includes both in-topology idle AND off-tree
+    // groups (semantics: "all idle items on the board"). When filter narrows
+    // the view we count what's actually visible, not the underlying total.
+    const idleCount = groups.idle.length + (showOffTree ? offTreeFiltered.length : 0);
     const parts: string[] = [];
     if (groups.needs_reply.length) parts.push(`<span class="topo-v2-stat urgent">${t('topo.topbar.needsReply', { n: groups.needs_reply.length })}</span>`);
     if (groups.bot_working.length) parts.push(`<span class="topo-v2-stat working">${t('topo.topbar.botWorking', { n: groups.bot_working.length })}</span>`);
-    if (groups.idle.length) parts.push(`<span class="topo-v2-stat idle">${t('topo.topbar.idle', { n: groups.idle.length })}</span>`);
+    if (idleCount) parts.push(`<span class="topo-v2-stat idle">${t('topo.topbar.idle', { n: idleCount })}</span>`);
     const refreshWhen = state.lastLoadedAt
       ? formatAge(new Date(state.lastLoadedAt).toISOString())
       : '-';
