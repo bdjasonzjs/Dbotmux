@@ -18,6 +18,7 @@ import { tryHandleGrantCommand } from './grant-command.js';
 import { buildGrantCard } from './card-builder.js';
 import { openPending, isThrottled } from './grant-pending.js';
 import { localeForBot } from '../../i18n/index.js';
+import { handleChatCreated } from './chat-created-handler.js';
 
 // ─── Bot identity ─────────────────────────────────────────────────────────
 
@@ -956,6 +957,18 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         promise.catch(err => logger.error(`Error handling message event: ${err}`));
       } catch (err) {
         logger.error(`Error handling message event: ${err}`);
+      }
+    },
+    'im.chat.created_v1': async (data: any) => {
+      // Main-bot mode P0 hook: write ChatContext for the new chat.
+      // Card rendering + send lands in P0/3; group-creator manual trigger
+      // fallback lands in P0/4. We accept both `data.event` and `data` as
+      // the event payload because Lark SDK occasionally varies the wrap.
+      try {
+        const event = data.event ?? data;
+        await handleChatCreated(event, larkAppId);
+      } catch (err) {
+        logger.error(`Error handling im.chat.created event: ${err}`);
       }
     },
   });
