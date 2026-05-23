@@ -83,15 +83,57 @@ export interface HandleChatCreatedOpts {
   purpose?: string;
 }
 
+export interface DispatchChatCreatedOpts {
+  chatId: string;
+  larkAppId: string;
+  originType: OriginType;
+  parentChatId?: string | null;
+  purpose?: string;
+  participants?: { openId: string; role: string }[];
+}
+
 /**
- * Handle `im.chat.created` — writes a ChatContext for the new chat.
+ * Shared "a chat was just created" dispatch — writes ChatContext + sends
+ * welcome card. Bypasses originType inference (caller passes it directly),
+ * so this works from both daemon and dashboard processes (dashboard doesn't
+ * have bot-registry state, can't run inferOriginType).
+ *
+ * Used by:
+ *   - [[handleChatCreated]] (Lark event path, after running inferOriginType)
+ *   - [[group-creator.createGroupWithBots]] (P0/4 manual trigger, originType
+ *     is always 'bot_spawned' since group-creator itself is the creator)
+ *
+ * Idempotent + best-effort card delivery (sendContextCard returns null on
+ * failure rather than throwing).
+ */
+export async function dispatchChatCreated(opts: DispatchChatCreatedOpts): Promise<void> {
+  if (!opts.chatId) {
+    logger.warn('[chat-created-handler] dispatch called with empty chatId, skipping');
+    return;
+  }
+  create(opts.chatId, {
+    purpose: opts.purpose ?? '（待 main-bot 自动推断）',
+    originType: opts.originType,
+    parentChatId: opts.parentChatId ?? null,
+    participants: opts.participants ?? [],
+  });
+  logger.info(
+    `[chat-created-handler] dispatchChatCreated wrote ChatContext for chat ${opts.chatId} ` +
+    `(origin=${opts.originType}, parent=${opts.parentChatId ?? 'null'})`
+  );
+  await sendContextCard(opts.larkAppId, opts.chatId);
+}
+
+/**
+ * Handle `im.chat.created` — Lark event-driven path. Runs originType
+ * inference (needs bot-registry, so daemon-process-only), then delegates
+ * to [[dispatchChatCreated]] for the actual work.
  *
  * - Writes the context **regardless of originType** (even p2p and
  *   human_created chats get a minimal record), so the dashboard's "无拓扑
  *   群" sidebar [[topology Q5 decision]] has the data.
  * - Idempotent via [[chat-context-store.create]] — repeat calls (dup events
  *   + manual trigger racing) are safe; the first writer wins.
- * - Does **not** send the welcome card here — that's P0/3.
  */
 export async function handleChatCreated(
   event: ChatCreatedEvent,
@@ -102,25 +144,12 @@ export async function handleChatCreated(
     logger.warn('[chat-created-handler] event missing chat_id, skipping');
     return;
   }
-
   const originType = inferOriginType(event, larkAppId);
-  const purpose = opts.purpose ?? '（待 main-bot 自动推断）';
-  const parentChatId = opts.parentChatId ?? null;
-
-  create(event.chat_id, {
-    purpose,
+  await dispatchChatCreated({
+    chatId: event.chat_id,
+    larkAppId,
     originType,
-    parentChatId,
-    participants: [],  // P0/2: enrichment in later commit
+    parentChatId: opts.parentChatId,
+    purpose: opts.purpose,
   });
-
-  logger.info(
-    `[chat-created-handler] wrote ChatContext for chat ${event.chat_id} ` +
-    `(origin=${originType}, parent=${parentChatId ?? 'null'})`
-  );
-
-  // P0/3: dispatch the welcome card (eager injection per Q2 decision).
-  // sendContextCard is best-effort — it logs but never throws, so a card
-  // delivery failure won't prevent the ChatContext from being recorded.
-  await sendContextCard(larkAppId, event.chat_id);
 }

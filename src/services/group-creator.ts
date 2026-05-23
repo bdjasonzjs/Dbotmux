@@ -20,6 +20,8 @@
 import { createChat, transferChatOwner, getChatOwner } from './groups-store.js';
 import { sendMessage } from '../im/lark/client.js';
 import { bindOncall } from './oncall-store.js';
+import { dispatchChatCreated } from '../im/lark/chat-created-handler.js';
+import { logger } from '../utils/logger.js';
 
 export interface CreateGroupOpts {
   creatorLarkAppId: string;
@@ -34,6 +36,13 @@ export interface CreateGroupOpts {
    *  every invited bot. The path is validated by callers; this service only
    *  persists the binding after chat.create succeeds. */
   bindWorkingDir?: string;
+  /** P0/4 main-bot mode: source chat the build-group command originated from.
+   *  Becomes the new chat's `parentChatId` for the topology tree. Pass null
+   *  if triggered from a p2p chat or system context (no parent edge drawn). */
+  sourceChatId?: string | null;
+  /** P0/4 main-bot mode: one-line purpose statement. Defaults to a placeholder
+   *  that the L2 缇蕾 scout replaces on its next tick. */
+  purpose?: string;
 }
 
 export interface CreateGroupResult {
@@ -126,6 +135,23 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
         oncallBindings.push({ larkAppId, ok: false, error: e?.message ?? String(e) });
       }
     }
+  }
+
+  // P0/4 main-bot mode fallback: write ChatContext + send welcome card.
+  // This runs **regardless of** whether Lark fires `im.chat.created` for
+  // this group — chat-context-store.create is idempotent, so if the event
+  // also fires later it's a no-op. Best-effort: failures are logged but
+  // never block group creation (which already succeeded at this point).
+  try {
+    await dispatchChatCreated({
+      chatId: r.chatId,
+      larkAppId: opts.creatorLarkAppId,
+      originType: 'bot_spawned',  // group-creator is always invoked by a bot
+      parentChatId: opts.sourceChatId ?? null,
+      purpose: opts.purpose,
+    });
+  } catch (err) {
+    logger.error(`[group-creator] main-bot dispatchChatCreated failed for chat ${r.chatId}: ${err}`);
   }
 
   return {
