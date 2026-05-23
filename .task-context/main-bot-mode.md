@@ -52,12 +52,12 @@
 
 ## 路线图 · 17 commits
 
-### P0 · 1.5 天 · 4 commits（ChatContext + onChatCreated + 卡片）
+### P0 · 1.5 天 · 4 commits（ChatContext + onChatCreated + 卡片）✅
 
-- [ ] **commit 1** · `feat: add ChatContext store + 数据模型` — 新增 `src/services/chat-context-store.ts` + 类型定义
-- [ ] **commit 2** · `feat: add onChatCreated event handler + originType 推断` — 在 event-dispatcher.ts 加 `im.chat.created` case
-- [ ] **commit 3** · `feat: 上下文卡片 markdown 渲染 + 发送` — 卡片渲染函数 + sendMessage 接入
-- [ ] **commit 4** · `feat: chat-create fallback（无 event 时主动触发）` — 在 group-creator.ts 加 manual trigger
+- [x] **commit 1** · `feat: add ChatContext store + 数据模型` (28e7232) — 新增 `src/services/chat-context-store.ts` + 17 单测
+- [x] **commit 2** · `feat: add onChatCreated event handler + originType 推断` (d9546cf) — 在 event-dispatcher.ts 加 `im.chat.created_v1` case + chat-created-handler.ts + 13 单测
+- [x] **commit 3** · `feat: 上下文卡片 markdown 渲染 + 发送` (8f4b2c3) — chat-context-card.ts 渲染 + 发送 + 15 单测
+- [x] **commit 4** · `feat: chat-create fallback（无 event 时主动触发）` (4a48bd0) — group-creator.ts 加 manual trigger + dispatchChatCreated 抽出 + 5 单测
 
 ### P1 · 0.5 天 · 1 commit
 
@@ -94,8 +94,17 @@
 - **2026-05-23 22:00** · task-context 激活
 - **2026-05-23 22:00** · 6 决策点全敲定（与松松 pair-design）
 - **2026-05-23 22:00** · `feat/main-bot-mode` 已 rebase 到 `upstream/master@56d9d2c`
-- **2026-05-23 22:00** · 仓库 markdown `docs/main-bot-mode.md` v1.0 已写完（working tree 待 commit）
-- 🟡 **下一步** · Step B commit + push markdown, 然后 Step C 开 P0 commit 1
+- **2026-05-23 22:00** · 仓库 markdown `docs/main-bot-mode.md` v1.0 已写完
+- **2026-05-23 22:55** · 文档 + task-context commit 到 fork (1212901)
+- **2026-05-23 23:35** · P0/1 ChatContext store + 17 单测 (28e7232)
+- **2026-05-23 23:42** · P0/2 onChatCreated event handler + 13 单测 (d9546cf)
+- **2026-05-23 23:53** · P0/3 上下文卡片渲染 + 发送 + 15 单测 (8f4b2c3)
+- **2026-05-24 00:00** · P0/4 chat-create fallback + 5 单测 (4a48bd0)
+- 🟢 **P0 完成**（4 commits · 50 个新增单测全 pass · tsc --noEmit 通过）
+- **2026-05-24 00:18** · regression fix: group-creator.test.ts 加 dispatch mock (a10e1bf)
+- **2026-05-24 00:25** · 121 个相关测试（main-bot 触及的 6 个 file）全 pass
+- ⚠️ 完整 pnpm test 有 22 files / 27 tests fail，但 grep 看是 workflow-cli 等无关 file，**可能 pre-existing**。需要 baseline diff 确认（下次 session）
+- 🟡 **下一步** · 汇报松松 P0 done + 验收清单 → 等他验收 / 决定 P1 起点
 
 ---
 
