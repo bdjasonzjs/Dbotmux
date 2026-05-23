@@ -34,6 +34,13 @@ vi.mock('../src/services/oncall-store.js', () => ({
   bindOncall: (...args: any[]) => mockBindOncall(...args),
 }));
 
+// Stub the main-bot dispatch added in P0/4 — these tests pre-date that hook
+// and don't want its sendMessage to leak into mockSendMessage counts.
+// dedicated test/group-creator-main-bot.test.ts covers dispatch behavior.
+vi.mock('../src/im/lark/chat-created-handler.js', () => ({
+  dispatchChatCreated: vi.fn().mockResolvedValue(undefined),
+}));
+
 import { createGroupWithBots } from '../src/services/group-creator.js';
 
 const CREATOR = 'cli_creator_app';
