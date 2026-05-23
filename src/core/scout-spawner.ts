@@ -24,6 +24,7 @@ import {
   type MainBotDigest, type MainBotDigestChat, type Escalation,
 } from '../services/main-bot-digest-store.js';
 import { runEscalationRules, type RulesInput } from './escalation-rules.js';
+import { dispatchPendingEscalations } from './escalation-playbook.js';
 import { logger } from '../utils/logger.js';
 
 /** State held in-process per-bot daemon so we can detect "first time we
@@ -36,8 +37,10 @@ const PER_DAEMON_STATE = {
 };
 
 /** Run a single scout tick — read topology + sessions, run rule engine,
- *  write digest + enqueue escalations. Safe to call from cron or on-demand. */
-export async function runScoutTick(): Promise<{ digest: MainBotDigest; escalationsAdded: number }> {
+ *  write digest + enqueue escalations, then immediately dispatch any
+ *  pending escalation items through the L3 playbook handlers. Safe to
+ *  call from cron or on-demand. */
+export async function runScoutTick(larkAppId?: string): Promise<{ digest: MainBotDigest; escalationsAdded: number; escalationsDispatched: number }> {
   const topo = readTopology();
   const inbox = readInbox();
   const now = Date.now();
@@ -75,8 +78,19 @@ export async function runScoutTick(): Promise<{ digest: MainBotDigest; escalatio
   writeDigest(digest);
   markFresh();
 
-  logger.info(`[scout-spawner] tick complete: ${chats.length} chats, ${newEscalations.length} new escalations`);
-  return { digest, escalationsAdded: newEscalations.length };
+  // P3: immediately dispatch any pending escalations through the L3
+  // playbook (v0.1: in-process; LLM-spawn upgrade can replace this).
+  let escalationsDispatched = 0;
+  if (larkAppId) {
+    try {
+      escalationsDispatched = await dispatchPendingEscalations(larkAppId);
+    } catch (err) {
+      logger.error(`[scout-spawner] dispatch failed: ${err}`);
+    }
+  }
+
+  logger.info(`[scout-spawner] tick complete: ${chats.length} chats, ${newEscalations.length} new escalations, ${escalationsDispatched} dispatched`);
+  return { digest, escalationsAdded: newEscalations.length, escalationsDispatched };
 }
 
 /** Build a fallback one-line summary when no LLM-generated summary exists
