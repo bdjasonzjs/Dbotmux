@@ -7,6 +7,7 @@ import { renderGroupsPage } from './groups.js';
 import { renderBotDefaultsPage } from './bot-defaults.js';
 import { renderWorkflowsPage } from './workflows.js';
 import { renderWorkflowCatalogPage } from './workflow-catalog.js';
+import { renderTopologyPage } from './topology.js';
 import { wireBotOnboardingButton } from './bot-onboarding.js';
 import { t, ui } from './ui.js';
 import type { DashboardLocale } from './i18n.js';
@@ -31,6 +32,7 @@ function route() {
   ) {
     pageDispose = renderWorkflowCatalogPage(root);
   } else if (hash.startsWith('#/workflows')) pageDispose = renderWorkflowsPage(root);
+  else if (hash.startsWith('#/topology')) renderTopologyPage(root);
   else if (hash.startsWith('#/groups')) renderGroupsPage(root);
   else if (hash.startsWith('#/bot-defaults')) renderBotDefaultsPage(root);
   else if (hash.startsWith('#/schedules')) renderSchedulesPage(root);
