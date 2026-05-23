@@ -30,6 +30,7 @@
 import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { create, read, type OriginType } from '../../services/chat-context-store.js';
+import { upsertNode as topologyUpsertNode, getNode as topologyGetNode } from '../../services/chat-topology-store.js';
 import { getBot, getAllBots } from '../../bot-registry.js';
 import { config } from '../../config.js';
 import { logger } from '../../utils/logger.js';
@@ -167,6 +168,21 @@ export async function dispatchChatCreated(opts: DispatchChatCreatedOpts): Promis
     originType: opts.originType,
     parentChatId: opts.parentChatId ?? null,
     participants: opts.participants ?? [],
+  });
+
+  // P4-fix: also write to ChatTopology so dashboard's topology page sees
+  // the new chat (otherwise topology only gets nodes via onMessage hook,
+  // which defaults to originType=human_created — losing the real type).
+  const existingTopoNode = topologyGetNode(opts.chatId);
+  topologyUpsertNode({
+    chatId: opts.chatId,
+    name: existingTopoNode?.name ?? opts.chatId,
+    chatType: 'group',
+    originType: opts.originType,
+    parentChatId: opts.parentChatId ?? null,
+    tags: existingTopoNode?.tags ?? [],
+    metrics: existingTopoNode?.metrics ?? { lastMessageAt: new Date().toISOString(), messages24h: 0, hasUnansweredPing: false },
+    summary: existingTopoNode?.summary ?? (opts.purpose ?? ''),
   });
 
   if (isFirstDispatch) {
