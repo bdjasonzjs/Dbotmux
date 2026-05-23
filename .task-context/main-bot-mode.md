@@ -116,8 +116,14 @@
 - **2026-05-24 01:40** · P2/7 MainBotDigest + ScoutInbox stores + stale tracking (5ab2e9e)
 - **2026-05-24 01:45** · P2/8a L1 onMessage hook 接通 (f0843c6) — event-dispatcher 接入 bumpMessage + markStale
 - ⚠️ P2/8a e2e 部分验证：单测 156 pass；真 daemon e2e onMessage 触发受 Lark 推送规则限制（只 @bot 触发）需要松松醒来手动 @ 蔻黛克斯发消息才能 e2e
-- 🟢 **本 session 完成 14 commits**：P0 (4) + regression fix + P0.5 + P1 + P2/6 + P2/7 + P2/8a + task-context 更新
-- 🟡 **剩余下次 session**：P2/8b (scout-spawner) · P2/9 (缇蕾 prompt) · P2/10-11 (escalation 5 规则) · P3 (L3 consume) · P4 (Dashboard) · P5 (跨群边)
+- **2026-05-24 02:01** · P2/8b scout-spawner + P2/10+11 escalation 5 规则 (6c44af2) — in-process v0.1，16 escalation 单测 pass
+- **2026-05-24 02:04** · P3/12+13 L3 escalation playbook (76e81b0) — 5 handler + dispatchPendingEscalations + 6 单测
+- **2026-05-24 02:06** · P4/14 dashboard 5 个 API routes + 6 smoke 单测 (d1d31cd)
+- **2026-05-24 02:09** · P4/15+16 dashboard topology page 前端 (7fd1f68) — vanilla TS 列表视图 + drawer + applink 反向跳
+- **2026-05-24 02:13** · P5/17 same-topic 跨群边推断 (f22bbed) — 共享 tag/任务ID → emit same_topic edge + 8 单测
+- 🎉 **全 17 commits 完成 · main-bot 模式 v1.0 实现 done**
+- ⚠️ v0.1 不 spawn 真 LLM：L2 缇蕾 scout 用规则模板 / L3 克劳德 consume 用 in-process handler；LLM 接入是 v1.1 升级
+- 🟡 **下一步** · 给松松完整验收清单 + 让他验证
 
 ---
 
