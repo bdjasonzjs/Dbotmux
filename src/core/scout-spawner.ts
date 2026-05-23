@@ -25,6 +25,7 @@ import {
 } from '../services/main-bot-digest-store.js';
 import { runEscalationRules, type RulesInput } from './escalation-rules.js';
 import { dispatchPendingEscalations } from './escalation-playbook.js';
+import { inferSameTopicEdges } from './same-topic-inference.js';
 import { logger } from '../utils/logger.js';
 
 /** State held in-process per-bot daemon so we can detect "first time we
@@ -78,6 +79,14 @@ export async function runScoutTick(larkAppId?: string): Promise<{ digest: MainBo
   writeDigest(digest);
   markFresh();
 
+  // P5: refresh cross-topic same_topic edges (idempotent — addEdge dedups).
+  let edgesAdded = 0;
+  try {
+    edgesAdded = inferSameTopicEdges();
+  } catch (err) {
+    logger.warn(`[scout-spawner] inferSameTopicEdges failed: ${err}`);
+  }
+
   // P3: immediately dispatch any pending escalations through the L3
   // playbook (v0.1: in-process; LLM-spawn upgrade can replace this).
   let escalationsDispatched = 0;
@@ -89,7 +98,7 @@ export async function runScoutTick(larkAppId?: string): Promise<{ digest: MainBo
     }
   }
 
-  logger.info(`[scout-spawner] tick complete: ${chats.length} chats, ${newEscalations.length} new escalations, ${escalationsDispatched} dispatched`);
+  logger.info(`[scout-spawner] tick complete: ${chats.length} chats, ${newEscalations.length} new escalations, ${escalationsDispatched} dispatched, ${edgesAdded} same_topic edges added`);
   return { digest, escalationsAdded: newEscalations.length, escalationsDispatched };
 }
 
