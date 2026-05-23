@@ -19,6 +19,8 @@ import { buildGrantCard } from './card-builder.js';
 import { openPending, isThrottled } from './grant-pending.js';
 import { localeForBot } from '../../i18n/index.js';
 import { handleChatMemberBotAdded } from './chat-created-handler.js';
+import { bumpMessage as topologyBumpMessage } from '../../services/chat-topology-store.js';
+import { markStale as digestMarkStale } from '../../services/main-bot-digest-store.js';
 
 // ─── Bot identity ─────────────────────────────────────────────────────────
 
@@ -760,6 +762,14 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         const chatId = message.chat_id;
         const chatType = (message.chat_type === 'p2p' ? 'p2p' : 'group') as 'group' | 'p2p';
         const messageId = message.message_id;
+
+        // P2/L1 main-bot mode: bump per-chat message metrics + mark
+        // global digest stale. Best-effort try/catch — never block real
+        // message dispatch. Only group chats enter the topology (Q1 decision).
+        if (chatType === 'group' && chatId) {
+          try { topologyBumpMessage(chatId); } catch (err) { logger.debug(`[main-bot/L1] topology bump failed: ${err}`); }
+          try { digestMarkStale(); } catch (err) { logger.debug(`[main-bot/L1] digest markStale failed: ${err}`); }
+        }
 
         // Bot-originated messages — bots historically only post inside threads
         // (their own thread replies). With chat-scope sessions a bot can also

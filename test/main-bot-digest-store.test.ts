@@ -74,15 +74,17 @@ describe('stale tracking', () => {
     expect(store.isStale()).toBe(false);
   });
 
-  it('writeDigest does not auto-clear stale (caller must markFresh)', async () => {
+  it('writeDigest implicitly invalidates stale (digest mtime > staleAt)', async () => {
     const store = await freshImport();
     store.markStale();
+    // sleep 5ms so digest write mtime is strictly newer than stale marker
+    await new Promise(r => setTimeout(r, 5));
     store.writeDigest({
       generatedAt: 'x', chats: [], crossChatThreads: [], pendingForJason: [], escalations: [],
     });
-    // stale marker still there until explicit markFresh
-    expect(store.isStale()).toBe(true);
-    store.markFresh();
+    // stale-marker mtime comparison: after writing digest its mtime is newer,
+    // so isStale() returns false even without explicit markFresh. markFresh
+    // still works to remove the sidecar file entirely (covered above).
     expect(store.isStale()).toBe(false);
   });
 });
