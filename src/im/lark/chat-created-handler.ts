@@ -18,6 +18,7 @@
 import { create, type OriginType } from '../../services/chat-context-store.js';
 import { getBot, getAllBots } from '../../bot-registry.js';
 import { logger } from '../../utils/logger.js';
+import { sendContextCard } from './chat-context-card.js';
 
 /** Subset of Lark's im.chat.created event payload we use. The Lark SDK
  *  types these loosely, so we re-declare the bits we care about. */
@@ -117,4 +118,9 @@ export async function handleChatCreated(
     `[chat-created-handler] wrote ChatContext for chat ${event.chat_id} ` +
     `(origin=${originType}, parent=${parentChatId ?? 'null'})`
   );
+
+  // P0/3: dispatch the welcome card (eager injection per Q2 decision).
+  // sendContextCard is best-effort — it logs but never throws, so a card
+  // delivery failure won't prevent the ChatContext from being recorded.
+  await sendContextCard(larkAppId, event.chat_id);
 }

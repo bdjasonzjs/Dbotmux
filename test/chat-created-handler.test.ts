@@ -19,6 +19,14 @@ const mockBotState = (botOpenId: string | undefined) => ({
 const createSpy = vi.fn();
 vi.mock('../src/services/chat-context-store.js', () => ({
   create: createSpy,
+  read: vi.fn(),  // for the transitive chat-context-card import
+}));
+
+// Mock the card sender so handleChatCreated doesn't try to touch Lark or
+// re-import chat-context-store (we just verify it gets called).
+const sendContextCardSpy = vi.fn().mockResolvedValue(null);
+vi.mock('../src/im/lark/chat-context-card.js', () => ({
+  sendContextCard: sendContextCardSpy,
 }));
 
 // Mock bot-registry.
@@ -44,6 +52,8 @@ beforeEach(() => {
   createSpy.mockReset();
   getBotMock.mockReset();
   getAllBotsMock.mockReset();
+  sendContextCardSpy.mockReset();
+  sendContextCardSpy.mockResolvedValue(null);
   // Default: no bots registered → human_created
   getBotMock.mockImplementation(() => mockBotState(undefined));
   getAllBotsMock.mockReturnValue([]);
@@ -144,5 +154,27 @@ describe('handleChatCreated', () => {
     await handleChatCreated({ chat_id: 'oc_p2p', chat_mode: 'p2p' }, 'app_test');
     const [, opts] = createSpy.mock.calls[0];
     expect(opts.originType).toBe('p2p');
+  });
+
+  it('dispatches the welcome card via sendContextCard (P0/3)', async () => {
+    const { handleChatCreated } = await freshImport();
+    await handleChatCreated(
+      { chat_id: 'oc_card_test', chat_mode: 'group', operator: { operator_type: 'app' } },
+      'app_test',
+    );
+    expect(sendContextCardSpy).toHaveBeenCalledTimes(1);
+    expect(sendContextCardSpy).toHaveBeenCalledWith('app_test', 'oc_card_test');
+  });
+
+  it('completes even when sendContextCard returns null (card delivery failed)', async () => {
+    sendContextCardSpy.mockResolvedValue(null);  // simulates skip / send failure
+    const { handleChatCreated } = await freshImport();
+    await handleChatCreated(
+      { chat_id: 'oc_no_card', chat_mode: 'group', operator: { operator_type: 'app' } },
+      'app_test',
+    );
+    // ChatContext still written even if card couldn't go out — this is the
+    // best-effort contract.
+    expect(createSpy).toHaveBeenCalledTimes(1);
   });
 });
