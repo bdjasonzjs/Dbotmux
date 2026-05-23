@@ -433,6 +433,7 @@ export async function handleCommand(
               { name: selfBot.botName, openId: selfBot.botOpenId },
               loc,
               ds.pendingSender,
+              ds.chatId,
             );
             rememberLastCliInput(ds, pendingPrompt, prompt);
             ds.pendingPrompt = undefined;
@@ -512,6 +513,7 @@ export async function handleCommand(
             { name: selfBot.botName, openId: selfBot.botOpenId },
             loc,
             ds.pendingSender,
+            ds.chatId,
           );
           rememberLastCliInput(ds, pendingPrompt, prompt);
           ds.pendingPrompt = undefined;

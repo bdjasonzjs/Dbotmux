@@ -27,6 +27,7 @@ import { markSessionActivity } from './session-activity.js';
 import { usageLimitStateKey } from '../utils/cli-usage-limit.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
 import { parseWorkingDirList } from '../utils/working-dir.js';
+import * as chatContextStore from '../services/chat-context-store.js';
 
 function sessionCreatedAtMs(session: { createdAt?: string }): number {
   return session.createdAt ? (Date.parse(session.createdAt) || Date.now()) : Date.now();
@@ -193,6 +194,38 @@ export function formatAttachmentsHint(attachments?: LarkAttachment[], locale?: L
   return `<attachments hint="${xmlEscape(t('ai.attach.hint', undefined, locale))}">\n${items.join('\n')}\n</attachments>`;
 }
 
+/** P1 main-bot mode: build the `<chat_context>` block to prepend to a
+ *  spawned bot's first user message. Returns empty string when no
+ *  ChatContext exists for this chat. */
+export function buildChatContextBlock(chatId: string): string {
+  try {
+    const ctx = chatContextStore.read(chatId);
+    if (!ctx) return '';
+    const lines: string[] = ['<chat_context>'];
+    lines.push(`  <chat_id>${chatId}</chat_id>`);
+    lines.push(`  <purpose>${xmlEscape(ctx.purpose)}</purpose>`);
+    lines.push(`  <origin_type>${ctx.originType}</origin_type>`);
+    if (ctx.inheritedFrom?.parentChatId) {
+      lines.push(`  <parent_chat_id>${ctx.inheritedFrom.parentChatId}</parent_chat_id>`);
+      if (ctx.inheritedFrom.parentDigest) {
+        lines.push(`  <parent_digest>${xmlEscape(ctx.inheritedFrom.parentDigest)}</parent_digest>`);
+      }
+    }
+    if (ctx.activeTodoRefs.length > 0) {
+      lines.push(`  <active_todo_refs>${ctx.activeTodoRefs.map(xmlEscape).join(' / ')}</active_todo_refs>`);
+    }
+    if (ctx.rules.length > 0) {
+      const ruleItems = ctx.rules.map(r => `    <rule>${xmlEscape(r)}</rule>`).join('\n');
+      lines.push(`  <rules>\n${ruleItems}\n  </rules>`);
+    }
+    lines.push('</chat_context>');
+    return lines.join('\n');
+  } catch (err) {
+    logger.warn(`[session-manager] buildChatContextBlock failed for chat ${chatId}: ${err}`);
+    return '';
+  }
+}
+
 export function buildNewTopicPrompt(
   userMessage: string,
   sessionId: string,
@@ -205,6 +238,10 @@ export function buildNewTopicPrompt(
   botIdentity?: { name?: string; openId?: string },
   locale?: Locale,
   sender?: ResolvedSender,
+  /** P1 main-bot mode: chatId for ChatContext lookup. When provided and a
+   *  ChatContext exists, a `<chat_context>` block is appended to the prompt
+   *  parts so the spawned bot knows what this chat is about. */
+  chatId?: string,
 ): string {
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
   // Non-Claude CLIs receive the botmux routing hints inline via the prompt
@@ -252,6 +289,14 @@ export function buildNewTopicPrompt(
 
   const userBlock = `<user_message>\n${userMessage}\n</user_message>`;
   const parts: string[] = [userBlock];
+
+  // P1 main-bot mode: append `<chat_context>` block when a ChatContext
+  // exists for this chat. Spawned session reads it from the first user
+  // message — no separate system prompt injection needed.
+  if (chatId) {
+    const ctxBlock = buildChatContextBlock(chatId);
+    if (ctxBlock) parts.push(ctxBlock);
+  }
 
   const senderBlock = renderSenderTag(sender);
   if (senderBlock) parts.push(senderBlock);
