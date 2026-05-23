@@ -32,7 +32,7 @@ function route() {
   ) {
     pageDispose = renderWorkflowCatalogPage(root);
   } else if (hash.startsWith('#/workflows')) pageDispose = renderWorkflowsPage(root);
-  else if (hash.startsWith('#/topology')) renderTopologyPage(root);
+  else if (hash.startsWith('#/topology')) pageDispose = renderTopologyPage(root);
   else if (hash.startsWith('#/groups')) renderGroupsPage(root);
   else if (hash.startsWith('#/bot-defaults')) renderBotDefaultsPage(root);
   else if (hash.startsWith('#/schedules')) renderSchedulesPage(root);
