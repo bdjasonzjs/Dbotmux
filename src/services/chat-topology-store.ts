@@ -102,6 +102,16 @@ export function writeTopology(topo: ChatTopology): void {
   renameSync(tmpFp, fp);
 }
 
+/** P1 (commit #2): set the topology's rootChatId (= mainTopicChatId).
+ *  Called by main-topic-config.setMainTopicChatId so the two stay
+ *  aligned — don't duplicate this rule elsewhere. */
+export function setRootChatId(chatId: string): void {
+  const topo = readTopology();
+  if (topo.rootChatId === chatId) return;
+  topo.rootChatId = chatId;
+  writeTopology(topo);
+}
+
 /** Upsert a node by chatId (replaces existing node with same chatId). */
 export function upsertNode(node: ChatNode): void {
   const topo = readTopology();

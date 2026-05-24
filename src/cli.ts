@@ -3285,6 +3285,36 @@ switch (command) {
     process.exit(1);
     break;
   }
+  case 'config': {
+    const sub = process.argv[3] ?? '';
+    const arg = process.argv[4];
+    const { getMainTopicChatId, setMainTopicChatId, MAIN_TOPIC_ENV_VAR } = await import('./services/main-topic-config.js');
+    if (sub === 'get-main-topic') {
+      const v = getMainTopicChatId();
+      console.log(v ?? '');
+      process.exit(v ? 0 : 2);
+    }
+    if (sub === 'set-main-topic') {
+      if (!arg) { console.error('用法: botmux config set-main-topic <chatId>'); process.exit(2); }
+      setMainTopicChatId(arg);
+      console.error(`✅ mainTopicChatId set to ${arg} (写入 ~/.botmux/config.json 并同步 ChatTopology.rootChatId)`);
+      process.exit(0);
+    }
+    if (sub === 'clear-main-topic') {
+      setMainTopicChatId(null);
+      console.error(`✅ mainTopicChatId cleared`);
+      process.exit(0);
+    }
+    console.error(`用法:
+  botmux config get-main-topic            打印当前 mainTopicChatId（env 优先，回落 config 文件）
+  botmux config set-main-topic <chatId>   写入 ~/.botmux/config.json 并同步 ChatTopology.rootChatId
+  botmux config clear-main-topic          清除文件配置（env 仍可能生效）
+
+主话题（mainTopicChatId）= 主 bot 可调用 \`botmux subtask-create\` 派活的 chat。
+env override: \`export ${MAIN_TOPIC_ENV_VAR}=oc_...\``);
+    process.exit(sub ? 1 : 0);
+    break;
+  }
   case 'autostart': {
     ensureConfigDir();
     const sub = process.argv[3] ?? 'status';
