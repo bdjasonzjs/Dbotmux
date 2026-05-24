@@ -1290,6 +1290,28 @@ function attemptResumeStatus(error: { error: string }): number {
   }
 }
 
+// P1 commit #6: MainBotPlaybook spawn-subtask IPC route.
+// Mounted on every daemon; authzCheck rejects sessions not on this
+// daemon (session-store partitioned per larkAppId) and non-main-bot
+// callers. CLI hits Claude daemon's port directly (looked up via
+// dashboard-daemons registry) — see commit #7 `botmux subtask-create`.
+ipcRoute('POST', '/api/spawn-subtask', async (req, res) => {
+  let body: import('./core/main-bot-playbook.js').SpawnSubTaskRequest;
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  try {
+    const { spawnSubTask } = await import('./core/main-bot-playbook.js');
+    const result = await spawnSubTask(body);
+    return jsonRes(res, 200, { ok: true, ...result });
+  } catch (err: any) {
+    const status = err && err.name === 'HttpError' ? err.status : 500;
+    return jsonRes(res, status, { ok: false, error: String(err?.message ?? err) });
+  }
+});
+
 ipcRoute(
   'POST',
   '/api/workflows/runs/:runId/attempts/:activityId/:attemptId/resume',
