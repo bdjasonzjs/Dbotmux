@@ -43,6 +43,33 @@ export interface CreateGroupOpts {
   /** P0/4 main-bot mode: one-line purpose statement. Defaults to a placeholder
    *  that the L2 缇蕾 scout replaces on its next tick. */
   purpose?: string;
+  /**
+   * P1 main-bot mode (spec v0.4.1 §1.1) — richer ChatContext fields,
+   * passed straight through to `dispatchChatCreated()` so the FIRST
+   * welcome card is complete (no "send empty card, then update" anti-
+   * pattern). Optional: callers that don't care (legacy `/group`,
+   * dashboard `build-group`) can omit and get current purpose-only
+   * behavior.
+   *
+   * Note: `participants` here is what caller already resolved
+   * (MainBotPlaybook is responsible for推导 bot ref → openId+role).
+   * group-creator does NOT auto-推导 — it只透传给 dispatchChatCreated.
+   *
+   * `idempotencyKey` is deliberately absent (v0.4 妹妹 #2): idempotency
+   * 主责完全在 MainBotPlaybook + spawn-idempotency-store, group-creator
+   * 不知道幂等概念。
+   *
+   * Wiring (commit #4): pass these into `dispatchChatCreated` opts.
+   * Commit #1 (this commit) is types-only — no body change yet.
+   */
+  chatContext?: {
+    taskType?: 'prd' | 'bug' | 'misc';
+    relatedRefs?: string[];
+    activeTodoRefs?: string[];
+    rules?: string[];
+    participants?: Array<{ openId: string; role: string }>;
+    parentDigest?: string;
+  };
 }
 
 export interface CreateGroupResult {

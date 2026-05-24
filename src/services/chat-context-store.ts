@@ -39,6 +39,12 @@ export interface ChatContextInherited {
  *  board and skip escalation rule evaluation (R1-R5 / R6). */
 export type ChatStatus = 'active' | 'archived';
 
+/** Task category for chats spawned by the main bot via
+ *  `MainBotPlaybook.spawnSubTask`. Drives dashboard filtering + template
+ *  selection (rules/welcome-card wording). undefined for non-task chats
+ *  (p2p / human-created / legacy bot_spawned without a task type). */
+export type TaskType = 'prd' | 'bug' | 'misc';
+
 export interface ChatContext {
   chatId: string;
   /** One-line summary of what this chat is for. */
@@ -62,6 +68,9 @@ export interface ChatContext {
   status?: ChatStatus;
   /** ISO timestamp when archived (null/undefined when status='active'). */
   archivedAt?: string | null;
+  /** P1: task category — set by MainBotPlaybook.spawnSubTask, used by
+   *  dashboard filter + template logic. undefined for non-task chats. */
+  taskType?: TaskType;
   /** ISO timestamp of last write (for cache invalidation). */
   updatedAt: string;
 }
@@ -126,6 +135,8 @@ export interface CreateOpts {
   activeTodoRefs?: string[];
   rules?: string[];
   injectionPolicy?: InjectionPolicy;
+  /** P1: optional task category for MainBotPlaybook-spawned chats. */
+  taskType?: TaskType;
 }
 
 /**
@@ -157,6 +168,7 @@ export function create(chatId: string, opts: CreateOpts): ChatContext {
     injectionPolicy: opts.injectionPolicy ?? 'eager',
     status: 'active',
     archivedAt: null,
+    taskType: opts.taskType,
     updatedAt: new Date().toISOString(),
   };
   write(ctx);

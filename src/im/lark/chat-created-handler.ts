@@ -134,6 +134,16 @@ export interface DispatchChatCreatedOpts {
   parentChatId?: string | null;
   purpose?: string;
   participants?: { openId: string; role: string }[];
+  /** P1 main-bot mode (spec v0.4.1 §1.3) — richer ChatContext fields
+   *  plumbed through from group-creator / Playbook so the FIRST welcome
+   *  card is complete. dispatchChatCreated body writes these straight
+   *  into ChatContext.create() (chat-context-store has承载位 already).
+   *  Implementation is wired in commit #5, here is types-only (commit #1). */
+  relatedRefs?: string[];
+  activeTodoRefs?: string[];
+  rules?: string[];
+  parentDigest?: string;
+  taskType?: 'prd' | 'bug' | 'misc';
 }
 
 /**
