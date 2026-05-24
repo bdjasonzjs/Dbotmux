@@ -20,12 +20,14 @@ const KIND_EMOJI: Record<rootInbox.RootInboxKind, string> = {
   escalation: '🔔',
   progress: '✅',
   request_decision: '❓',
+  tilly_digest: '🐶',
 };
 
 const KIND_LABEL: Record<rootInbox.RootInboxKind, string> = {
   escalation: '子群进展',
   progress: '子群阶段进展',
   request_decision: '需要松松决策',
+  tilly_digest: '缇蕾每日扫读',
 };
 
 /** Render a RootInbox item as a Lark v2 interactive-card JSON string. */
