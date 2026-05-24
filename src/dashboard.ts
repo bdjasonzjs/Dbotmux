@@ -542,6 +542,8 @@ const server = createServer(async (req, res) => {
           ...n,
           status: (ctx?.status ?? 'active') as 'active' | 'archived',
           archivedAt: ctx?.archivedAt ?? null,
+          // P1 commit #10: enrich taskType for dashboard filtering / display
+          taskType: ctx?.taskType,
         } as any;
       });
       return jsonRes(res, 200, { ...topo, nodes });

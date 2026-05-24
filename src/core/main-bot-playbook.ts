@@ -14,10 +14,12 @@
  *
  * 测试：test/main-bot-playbook-spawn-subtask.test.ts (P-S1~11)
  */
+import { existsSync, readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { createGroupWithBots, type CreateGroupOpts } from '../services/group-creator.js';
 import { getOrCompute, type IdempotencyEntry } from '../services/spawn-idempotency-store.js';
 import { getMainTopicChatId } from '../services/main-topic-config.js';
-import { getAllBots } from '../bot-registry.js';
 import * as sessionStore from '../services/session-store.js';
 import { logger } from '../utils/logger.js';
 
@@ -91,19 +93,51 @@ const BOT_KEY_TO_ROLE: Record<'claude' | 'codex' | 'tilly', string> = {
   tilly: 'scout',
 };
 
-/** Resolve 'claude' | 'codex' | 'tilly' → BotIdent via bot-registry. Throws
- *  HttpError(500) if the corresponding bot isn't configured. */
+/** Resolve 'claude' | 'codex' | 'tilly' → BotIdent.
+ *
+ *  Reads `~/.botmux/data/bots-info.json` for cliId → larkAppId + botName
+ *  (cross-app aware — covers ALL bot daemons, not just this process's own).
+ *  Then reads `bot-openids-<thisAppId>.json` cross-ref for botName → openId
+ *  in **this daemon's app scope** (so participants written to ChatContext
+ *  read correctly from the main-bot Claude perspective).
+ *
+ *  Falls back to bot-registry getAllBots() for own bot if file missing. */
 export function resolveBotIdent(key: 'claude' | 'codex' | 'tilly'): BotIdent {
   const targetCliId = BOT_KEY_TO_CLI_ID[key];
-  const matches = getAllBots().filter(b => b.config.cliId === targetCliId);
-  if (matches.length === 0) {
-    throw new HttpError(500, `bot key "${key}" (cliId=${targetCliId}) not in bot-registry`);
+  const dataDir = join(homedir(), '.botmux', 'data');
+  // 1. bots-info.json: cross-app catalog of all running bots
+  const botsInfoPath = join(dataDir, 'bots-info.json');
+  if (!existsSync(botsInfoPath)) {
+    throw new HttpError(500, `bots-info.json not found at ${botsInfoPath}`);
   }
-  const bot = matches[0];   // first match (bots.json deployment order)
-  if (!bot.botOpenId) {
-    throw new HttpError(500, `bot "${key}" has no botOpenId yet (waiting for first message)`);
+  let bots: Array<{ larkAppId: string; botName: string; cliId: string; botOpenId: string }>;
+  try {
+    bots = JSON.parse(readFileSync(botsInfoPath, 'utf-8'));
+  } catch (err) {
+    throw new HttpError(500, `failed to parse bots-info.json: ${err}`);
   }
-  return { larkAppId: bot.config.larkAppId, openId: bot.botOpenId };
+  const bot = bots.find(b => b.cliId === targetCliId);
+  if (!bot) {
+    throw new HttpError(500, `bot key "${key}" (cliId=${targetCliId}) not in bots-info.json`);
+  }
+  // 2. Resolve open_id in **this daemon's app scope** via cross-ref file.
+  //    This daemon's app id = process.env.LARK_APP_ID (set by daemon main)
+  //    or fall back to first bots-info entry (single-daemon dev).
+  const thisAppId = process.env.LARK_APP_ID ?? bots[0]?.larkAppId;
+  const crossRefPath = join(dataDir, `bot-openids-${thisAppId}.json`);
+  let openId: string | undefined;
+  if (existsSync(crossRefPath)) {
+    try {
+      const xref = JSON.parse(readFileSync(crossRefPath, 'utf-8')) as Record<string, string>;
+      openId = xref[bot.botName];
+    } catch { /* fall through to own openId */ }
+  }
+  // Fallback: bot's own openId (only correct when key === own bot's key)
+  if (!openId) openId = bot.botOpenId;
+  if (!openId) {
+    throw new HttpError(500, `bot "${key}" has no openId (xref missing + no botOpenId in bots-info)`);
+  }
+  return { larkAppId: bot.larkAppId, openId };
 }
 
 // ─── Templates ─────────────────────────────────────────────────────────────
