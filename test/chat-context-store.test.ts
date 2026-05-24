@@ -243,4 +243,119 @@ describe('chat-context-store', () => {
       expect(existsSync(tmpFp)).toBe(false);
     });
   });
+
+  // ─── Regression for P1 review finding: chatId path traversal ──────────
+  // The dashboard API decodes `%2E%2E%2F...` into `../...` before passing
+  // it to the store, and a typo / bad caller could equally hand the store
+  // a chatId with slashes. The store-layer assert must throw, so write
+  // never escapes chat-contexts/ even when callers forget to validate.
+  describe('chatId path-traversal guard', () => {
+    const BAD_IDS = [
+      '../oops',
+      '../../etc/passwd',
+      '/etc/passwd',
+      '..',
+      '.',
+      '',
+      'foo/bar',
+      'foo\\bar',
+      'foo\x00bar',
+      'has space',
+      'has\nnewline',
+      'has.dot',   // dots banned to avoid `..` smuggling via odd combinations
+    ];
+
+    for (const bad of BAD_IDS) {
+      it(`read() throws on chatId ${JSON.stringify(bad)}`, async () => {
+        const store = await freshImport();
+        expect(() => store.read(bad)).toThrow(/unsafe chatId/);
+      });
+      it(`archive() throws on chatId ${JSON.stringify(bad)}`, async () => {
+        const store = await freshImport();
+        expect(() => store.archive(bad)).toThrow(/unsafe chatId/);
+      });
+      it(`unarchive() throws on chatId ${JSON.stringify(bad)}`, async () => {
+        const store = await freshImport();
+        expect(() => store.unarchive(bad)).toThrow(/unsafe chatId/);
+      });
+    }
+
+    it('accepts the canonical Lark chat id shape', async () => {
+      const store = await freshImport();
+      const ctx = store.create('oc_3dabc5b37bca8301b12783ef684fc4a5', {
+        purpose: 'p', originType: 'p2p', parentChatId: null, participants: [],
+      });
+      expect(ctx.chatId).toBe('oc_3dabc5b37bca8301b12783ef684fc4a5');
+    });
+
+    it('isSafeChatId() agrees with the store assert (same rule, two surfaces)', async () => {
+      const store = await freshImport();
+      // The non-throwing predicate is exported so dashboard API routes can
+      // 400 instead of 500. Both must enforce the exact same rule, or
+      // the rules drift and the path-traversal guard fails open.
+      for (const bad of BAD_IDS) {
+        expect(store.isSafeChatId(bad)).toBe(false);
+      }
+      // Real Lark chat ids must pass.
+      expect(store.isSafeChatId('oc_3dabc5b37bca8301b12783ef684fc4a5')).toBe(true);
+      // Non-string inputs from a hostile caller must not throw, just reject.
+      expect(store.isSafeChatId(null as any)).toBe(false);
+      expect(store.isSafeChatId(undefined as any)).toBe(false);
+      expect(store.isSafeChatId(42 as any)).toBe(false);
+    });
+  });
+
+  // ─── archive() / unarchive() lifecycle (P5 feature) ────────────────────
+  describe('archive() / unarchive() / isArchived()', () => {
+    it('archive() auto-creates a stub when the chat has no ChatContext', async () => {
+      const store = await freshImport();
+      // No prior create() call.
+      expect(store.read('oc_archive_test_1')).toBeNull();
+      const r = store.archive('oc_archive_test_1');
+      expect(r.status).toBe('archived');
+      expect(r.archivedAt).toBeTruthy();
+      expect(r.originType).toBe('human_created');  // stub default
+      expect(store.isArchived('oc_archive_test_1')).toBe(true);
+    });
+
+    it('archive() flips an existing active chat to archived', async () => {
+      const store = await freshImport();
+      store.create('oc_archive_test_2', { purpose: 'p', originType: 'bot_spawned', parentChatId: 'oc_parent', participants: [] });
+      const r = store.archive('oc_archive_test_2');
+      expect(r.status).toBe('archived');
+      expect(store.isArchived('oc_archive_test_2')).toBe(true);
+      // Preserves originType
+      expect(r.originType).toBe('bot_spawned');
+    });
+
+    it('archive() is idempotent on already-archived chat', async () => {
+      const store = await freshImport();
+      store.archive('oc_archive_test_3');
+      const r1 = store.read('oc_archive_test_3')!;
+      const r2 = store.archive('oc_archive_test_3');
+      expect(r2.archivedAt).toBe(r1.archivedAt);  // no re-stamp
+    });
+
+    it('unarchive() flips archived back to active and clears archivedAt', async () => {
+      const store = await freshImport();
+      store.archive('oc_archive_test_4');
+      expect(store.isArchived('oc_archive_test_4')).toBe(true);
+      const r = store.unarchive('oc_archive_test_4');
+      expect(r?.status).toBe('active');
+      expect(r?.archivedAt).toBeNull();
+      expect(store.isArchived('oc_archive_test_4')).toBe(false);
+    });
+
+    it('unarchive() returns null when the chat has no ChatContext', async () => {
+      const store = await freshImport();
+      expect(store.unarchive('oc_does_not_exist')).toBeNull();
+    });
+
+    it('isArchived() defaults to false for missing or active contexts', async () => {
+      const store = await freshImport();
+      expect(store.isArchived('oc_nothing_here')).toBe(false);
+      store.create('oc_active_only', { purpose: 'p', originType: 'p2p', parentChatId: null, participants: [] });
+      expect(store.isArchived('oc_active_only')).toBe(false);
+    });
+  });
 });

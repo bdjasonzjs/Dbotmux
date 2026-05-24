@@ -83,11 +83,19 @@ const CHAT_CONTEXTS_DIR = 'chat-contexts';
  */
 const CHAT_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 
+/** Predicate version of the chatId validation — non-throwing, exported
+ *  so dashboard API routes can return 400 instead of relying on the
+ *  store-layer `assertSafeChatId` to throw a 500. Both rules must stay
+ *  in lockstep; the regex is the single source of truth. */
+export function isSafeChatId(chatId: unknown): chatId is string {
+  return typeof chatId === 'string' && CHAT_ID_RE.test(chatId);
+}
+
 /** Throws if `chatId` could escape the chat-contexts directory. Use at
  *  the public store boundary (every external entry point that turns a
  *  chatId into a filesystem path). */
 function assertSafeChatId(chatId: string): void {
-  if (typeof chatId !== 'string' || !CHAT_ID_RE.test(chatId)) {
+  if (!isSafeChatId(chatId)) {
     throw new Error(`[chat-context-store] refusing unsafe chatId: ${JSON.stringify(chatId).slice(0, 80)}`);
   }
 }

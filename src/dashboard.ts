@@ -551,8 +551,10 @@ const server = createServer(async (req, res) => {
     // so a request like `/api/contexts/%2E%2E%2Foops/archive` would
     // otherwise reach the store with `../oops` and write outside
     // `chat-contexts/`. The store also asserts, but failing early at the
-    // route gives a clean 400 instead of an unhandled-throw 500.
-    const isSafeChatId = (s: string): boolean => /^[A-Za-z0-9_-]{1,128}$/.test(s);
+    // route gives a clean 400 instead of an unhandled-throw 500. The
+    // predicate is exported by chat-context-store so the route + store
+    // rules can't drift.
+    const { isSafeChatId } = await import('./services/chat-context-store.js');
 
     let mCtx: RegExpMatchArray | null;
     if (req.method === 'GET' && (mCtx = url.pathname.match(/^\/api\/contexts\/([^/]+)$/))) {
