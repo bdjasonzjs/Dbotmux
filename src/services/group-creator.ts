@@ -176,6 +176,16 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
       originType: 'bot_spawned',  // group-creator is always invoked by a bot
       parentChatId: opts.sourceChatId ?? null,
       purpose: opts.purpose,
+      // P1 commit #4: forward richer ChatContext fields so the FIRST
+      // welcome card is complete (no "send empty card then update"
+      // anti-pattern). All optional — legacy callers (/group / dashboard
+      // create) pass none and get current purpose-only behavior.
+      participants: opts.chatContext?.participants,
+      relatedRefs: opts.chatContext?.relatedRefs,
+      activeTodoRefs: opts.chatContext?.activeTodoRefs,
+      rules: opts.chatContext?.rules,
+      parentDigest: opts.chatContext?.parentDigest,
+      taskType: opts.chatContext?.taskType,
     });
   } catch (err) {
     logger.error(`[group-creator] main-bot dispatchChatCreated failed for chat ${r.chatId}: ${err}`);
