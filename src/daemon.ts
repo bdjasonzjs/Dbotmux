@@ -1290,8 +1290,11 @@ function attemptResumeStatus(error: { error: string }): number {
   }
 }
 
-// P2 commit #5: progress-report / request_decision IPC route.
-// Body: { sessionId, summary, slug, kind?, subChatId?, subChatName? }
+// P2 commit #5 (rev1 妹妹 review): progress-report / request_decision IPC route.
+// Body: { sessionId, summary, slug, kind?, subChatName? }
+// (`subChatId` is intentionally NOT in body — daemon derives it from
+// session.chatId so caller can't ghost-report on behalf of other chats;
+// see P2-rev1 #4.)
 // authzCheck verifies session belongs to main bot Claude (any chat — not
 // limited to mainTopic, because progress reports legitimately come from
 // sub-chats), then publishes to RootInbox via root-inbox-publisher.
