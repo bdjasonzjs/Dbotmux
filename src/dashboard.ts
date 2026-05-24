@@ -582,6 +582,23 @@ const server = createServer(async (req, res) => {
       if (!r) return jsonRes(res, 404, { ok: false, error: 'context_not_found' });
       return jsonRes(res, 200, { ok: true, status: r.status });
     }
+    // P1 commit #9: dashboard "设为主话题" 按钮的后端写入路由。
+    // GET 返当前值，POST 写入（同时同步 ChatTopology.rootChatId via service）。
+    if (req.method === 'GET' && url.pathname === '/api/config/main-topic-chat-id') {
+      const { getMainTopicChatId } = await import('./services/main-topic-config.js');
+      return jsonRes(res, 200, { mainTopicChatId: getMainTopicChatId() ?? null });
+    }
+    if (req.method === 'POST' && url.pathname === '/api/config/main-topic-chat-id') {
+      const body = await readJsonBody<{ chatId?: string | null }>(req);
+      const isValidChatId = (s: unknown): s is string =>
+        typeof s === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(s);
+      if (body?.chatId !== null && !isValidChatId(body?.chatId)) {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id', hint: 'pass {"chatId": "oc_..."} or {"chatId": null} to clear' });
+      }
+      const { setMainTopicChatId, getMainTopicChatId } = await import('./services/main-topic-config.js');
+      setMainTopicChatId(body.chatId ?? null);
+      return jsonRes(res, 200, { ok: true, mainTopicChatId: getMainTopicChatId() ?? null });
+    }
     if (req.method === 'POST' && url.pathname === '/api/topology/edges') {
       const { addEdge } = await import('./services/chat-topology-store.js');
       const body = await readJsonBody<{ type?: string; fromChatId?: string; toChatId?: string; rationale?: string }>(req);

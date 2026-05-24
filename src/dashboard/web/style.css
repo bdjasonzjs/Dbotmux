@@ -1290,3 +1290,13 @@ input.row-select,
   cursor: pointer; padding: 2px 8px; font-weight: 600;
 }
 .topo-v2-stat.archived-toggle:hover { background: var(--bg-soft); }
+
+/* P1 commit #9 — 主话题 button in drawer */
+.topo-v2-drawer-actions { display: flex; gap: 8px; align-items: center; }
+.topo-v2-main-topic-btn {
+  background: #fef3c7; color: #92400e; border: 1px solid #fbbf24;
+  padding: 5px 10px; border-radius: 5px; font-size: 12px; cursor: pointer;
+}
+.topo-v2-main-topic-btn:hover:not([disabled]) { background: #fde68a; }
+.topo-v2-main-topic-btn[disabled] { opacity: 0.65; cursor: not-allowed; }
+.topo-v2-main-topic-status { font-size: 12px; margin: 6px 0 12px; }

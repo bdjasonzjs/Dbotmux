@@ -315,6 +315,7 @@ export function renderTopologyPage(root: HTMLElement): () => void {
       }
       const ctx: ChatContext = await r.json();
       drawerEl.innerHTML = renderDrawer(ctx);
+      wireMainTopicBtn();
     } catch (err) {
       drawerEl.innerHTML = `<div class="topo-v2-drawer-err">加载失败: ${escapeHtml(String(err))}</div>`;
     }
@@ -331,6 +332,9 @@ export function renderTopologyPage(root: HTMLElement): () => void {
       : '<em>-</em>';
     const rules = ctx.rules.length ? `<ul>${ctx.rules.map(r => `<li>${escapeHtml(r)}</li>`).join('')}</ul>` : '<em>-</em>';
     const refs = ctx.relatedRefs.length ? `<ul>${ctx.relatedRefs.map(r => `<li><a href="${escapeHtml(r)}" target="_blank">${escapeHtml(r)}</a></li>`).join('')}</ul>` : '<em>-</em>';
+    // P1 commit #9: main-topic 设置按钮，放 drawer 顶部，drawer 内有 chat
+    // 上下文最自然 (vs 全局顶栏没"当前 chat"概念)。
+    const mainTopicBtn = `<button class="topo-v2-main-topic-btn" data-chat-id="${escapeHtml(ctx.chatId)}" title="设为 main-bot 派子任务的主话题">🌟 设为主话题</button>`;
     return `
       <div class="topo-v2-drawer-content">
         <header class="topo-v2-drawer-head">
@@ -338,8 +342,12 @@ export function renderTopologyPage(root: HTMLElement): () => void {
             <h2>${escapeHtml(name)}</h2>
             <code class="topo-v2-drawer-id">${escapeHtml(ctx.chatId)}</code>
           </div>
-          <a href="${applink(ctx.chatId)}" target="_blank" class="topo-v2-applink">${t('topo.action.openInLark')}</a>
+          <div class="topo-v2-drawer-actions">
+            ${mainTopicBtn}
+            <a href="${applink(ctx.chatId)}" target="_blank" class="topo-v2-applink">${t('topo.action.openInLark')}</a>
+          </div>
         </header>
+        <div class="topo-v2-main-topic-status" id="topo-main-topic-status"></div>
         <dl>
           <dt>${t('topo.drawer.purpose')}</dt><dd>${escapeHtml(ctx.purpose)}</dd>
           <dt>${t('topo.drawer.originType')}</dt><dd><code>${escapeHtml(ctx.originType)}</code></dd>
@@ -352,6 +360,53 @@ export function renderTopologyPage(root: HTMLElement): () => void {
         </dl>
       </div>
     `;
+  }
+
+  // P1 commit #9: wire 主话题按钮点击。drawer re-renders 每次 loadContext，
+  // 所以在 loadContext 内调一次 wireMainTopicBtn().
+  function wireMainTopicBtn(): void {
+    const btn = document.querySelector<HTMLElement>('.topo-v2-main-topic-btn');
+    const statusEl = document.getElementById('topo-main-topic-status');
+    if (!btn || !statusEl) return;
+    // Show current main-topic status next to the button
+    fetch('/api/config/main-topic-chat-id').then(r => r.json()).then((d: { mainTopicChatId?: string | null }) => {
+      const myChat = btn.dataset.chatId;
+      if (d.mainTopicChatId === myChat) {
+        statusEl.innerHTML = '<em style="color:#15803d">✅ 已是当前主话题</em>';
+        btn.setAttribute('disabled', 'true');
+      } else if (d.mainTopicChatId) {
+        statusEl.innerHTML = `<em style="color:#94a3b8">当前主话题: <code>${escapeHtml(d.mainTopicChatId)}</code></em>`;
+      } else {
+        statusEl.innerHTML = '<em style="color:#94a3b8">尚未配置主话题</em>';
+      }
+    }).catch(() => { /* silent */ });
+    btn.addEventListener('click', async () => {
+      const cid = btn.dataset.chatId;
+      if (!cid) return;
+      if (!confirm(`确认把这个 chat (${cid}) 设为 main-bot 主话题？\n\n旧值会被覆盖；主 bot 只能从此 chat 调用 subtask-create 派子任务。`)) return;
+      btn.setAttribute('disabled', 'true');
+      btn.textContent = '保存中...';
+      try {
+        const r = await fetch('/api/config/main-topic-chat-id', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ chatId: cid }),
+        });
+        if (!r.ok) {
+          const err = await r.json().catch(() => ({}));
+          alert(`保存失败: ${(err as any).error ?? r.status}`);
+          btn.textContent = '🌟 设为主话题';
+          btn.removeAttribute('disabled');
+          return;
+        }
+        statusEl.innerHTML = '<em style="color:#15803d">✅ 已设为当前主话题</em>';
+        btn.textContent = '✅ 已是主话题';
+      } catch (e) {
+        alert('网络错误: ' + e);
+        btn.textContent = '🌟 设为主话题';
+        btn.removeAttribute('disabled');
+      }
+    });
   }
 
   async function loadTopology(): Promise<void> {
