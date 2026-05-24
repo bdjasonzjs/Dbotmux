@@ -3269,6 +3269,11 @@ switch (command) {
   }
   case 'send':     await cmdSend(process.argv.slice(3)); break;
   case 'create-group': await cmdCreateGroup(process.argv.slice(3)); break;
+  case 'subtask-create': {
+    const { cmdSubtaskCreate } = await import('./cli/subtask-create.js');
+    await cmdSubtaskCreate(process.argv.slice(3));
+    break;
+  }
   case 'bots':     await cmdBots(process.argv[3] ?? 'list', process.argv.slice(4)); break;
   case 'history':  await cmdHistory(process.argv.slice(3)); break;
   case 'quoted':   await cmdQuoted(process.argv.slice(3)); break;
