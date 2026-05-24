@@ -584,6 +584,22 @@ const server = createServer(async (req, res) => {
       if (!r) return jsonRes(res, 404, { ok: false, error: 'context_not_found' });
       return jsonRes(res, 200, { ok: true, status: r.status });
     }
+    // P2 commit #3: RootInbox manual close API + list.
+    if (req.method === 'GET' && url.pathname === '/api/root-inbox') {
+      const showClosed = url.searchParams.get('include_closed') === '1';
+      const root = await import('./services/root-inbox-store.js');
+      const items = showClosed ? root.listAll() : root.listOpen();
+      return jsonRes(res, 200, { items });
+    }
+    let mRootClose: RegExpMatchArray | null;
+    if (req.method === 'POST' && (mRootClose = url.pathname.match(/^\/api\/root-inbox\/([^/]+)\/close$/))) {
+      const id = decodeURIComponent(mRootClose[1]);
+      const root = await import('./services/root-inbox-store.js');
+      const r = root.close(id);
+      if (!r) return jsonRes(res, 404, { ok: false, error: 'item_not_found' });
+      return jsonRes(res, 200, { ok: true, status: r.status, lastUpdatedAt: r.lastUpdatedAt });
+    }
+
     // P1 commit #9: dashboard "设为主话题" 按钮的后端写入路由。
     // GET 返当前值，POST 写入（同时同步 ChatTopology.rootChatId via service）。
     if (req.method === 'GET' && url.pathname === '/api/config/main-topic-chat-id') {

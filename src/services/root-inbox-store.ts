@@ -204,6 +204,24 @@ export function close(id: string): RootInboxItem | null {
   return store.items[idx];
 }
 
+/** Close ALL open items for a given subChatId. Returns the count closed.
+ *  Used by chat-context-store.archive() hook so归档子群自动关掉所有
+ *  挂在它名下的 root-inbox 条目 (escalation / progress / request_decision)。 */
+export function closeAllForSubChat(subChatId: string): number {
+  const store = read();
+  let count = 0;
+  const now = new Date().toISOString();
+  for (let i = 0; i < store.items.length; i++) {
+    const it = store.items[i];
+    if (it.subChatId === subChatId && it.status !== 'closed') {
+      store.items[i] = { ...it, status: 'closed', lastUpdatedAt: now };
+      count++;
+    }
+  }
+  if (count > 0) write(store);
+  return count;
+}
+
 /** Test helper. */
 export function __clearForTesting(): void {
   write({ items: [] });

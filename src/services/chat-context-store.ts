@@ -178,7 +178,13 @@ export function create(chatId: string, opts: CreateOpts): ChatContext {
 /** Mark a chat archived. If no ChatContext exists yet (typical for
  *  p2p/human_created chats that never went through onChatCreated), a
  *  minimal stub is created so the archive lifecycle works uniformly across
- *  all chats surfaced in the dashboard topology. */
+ *  all chats surfaced in the dashboard topology.
+ *
+ *  P2 commit #3 side effect: also closes all open root-inbox items for
+ *  this chat (since the source chat is being archived, any lingering
+ *  escalations/progress reports about it are moot).
+ *  Best-effort: failure to close root-inbox items is logged but does not
+ *  block the archive write itself. */
 export function archive(chatId: string): ChatContext {
   let existing = read(chatId);
   if (!existing) {
@@ -191,7 +197,20 @@ export function archive(chatId: string): ChatContext {
     });
   }
   if (existing.status === 'archived') return existing;
-  return update(chatId, { status: 'archived', archivedAt: new Date().toISOString() })!;
+  const archived = update(chatId, { status: 'archived', archivedAt: new Date().toISOString() })!;
+  // Side effect — auto-close root-inbox items
+  try {
+    // Lazy import to avoid a circular dep on root-inbox-store (which may
+    // grow dependencies later).
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    import('./root-inbox-store.js').then(({ closeAllForSubChat }) => {
+      try { closeAllForSubChat(chatId); }
+      catch (err) { logger.warn(`[chat-context-store] archive→closeRootInbox failed for ${chatId}: ${err}`); }
+    }).catch(err => logger.warn(`[chat-context-store] archive→root-inbox import failed: ${err}`));
+  } catch (err) {
+    logger.warn(`[chat-context-store] archive→root-inbox dispatch failed for ${chatId}: ${err}`);
+  }
+  return archived;
 }
 
 /** Mark a chat active (unarchive). Returns null only if no ChatContext

@@ -152,6 +152,32 @@ describe('root-inbox-store (P2 commit #1)', () => {
     });
   });
 
+  describe('closeAllForSubChat — bulk close by subChatId (P2 commit #3)', () => {
+    it('closes only matching subChatId open items, returns count', async () => {
+      const s = await freshImport();
+      s.upsertOpen({ id: 'R5:oc_x', kind: 'escalation', subChatId: 'oc_x', subChatName: 'X', ruleId: 'R5', summary: 'a' });
+      s.upsertOpen({ id: 'progress:oc_x:m1', kind: 'progress', subChatId: 'oc_x', subChatName: 'X', summary: 'b' });
+      s.upsertOpen({ id: 'R3:oc_y', kind: 'escalation', subChatId: 'oc_y', subChatName: 'Y', ruleId: 'R3', summary: 'c' });
+      const count = s.closeAllForSubChat('oc_x');
+      expect(count).toBe(2);
+      const all = s.listAll();
+      expect(all.find(i => i.id === 'R5:oc_x')?.status).toBe('closed');
+      expect(all.find(i => i.id === 'progress:oc_x:m1')?.status).toBe('closed');
+      expect(all.find(i => i.id === 'R3:oc_y')?.status).toBe('open');
+    });
+    it('skips already-closed items, returns 0 when nothing to do', async () => {
+      const s = await freshImport();
+      s.upsertOpen({ id: 'R5:oc_z', kind: 'escalation', subChatId: 'oc_z', subChatName: 'Z', ruleId: 'R5', summary: 'a' });
+      s.close('R5:oc_z');
+      const count = s.closeAllForSubChat('oc_z');
+      expect(count).toBe(0);
+    });
+    it('returns 0 when subChatId has no items', async () => {
+      const s = await freshImport();
+      expect(s.closeAllForSubChat('oc_nothing')).toBe(0);
+    });
+  });
+
   describe('atomic file write', () => {
     it('no .tmp file leftover after successful upsert', async () => {
       const s = await freshImport();
