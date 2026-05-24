@@ -36,6 +36,9 @@ interface ChatNode {
   tags: string[];
   metrics: { lastMessageAt: string | null; messages24h: number; hasUnansweredPing: boolean };
   summary: string;
+  /** Lifecycle status enriched by /api/topology (P5 archive feature). */
+  status?: 'active' | 'archived';
+  archivedAt?: string | null;
 }
 
 interface GroupBrief { chatId: string; name?: string }
@@ -121,6 +124,7 @@ export function renderTopologyPage(root: HTMLElement): () => void {
     activeChatId: null as string | null,
     search: '',
     filter: 'all' as 'all' | CardStatus,
+    showArchived: false,  // P5: toggle archived section
     lastLoadedAt: 0,  // ms epoch when latest topology data landed
   };
 
@@ -137,10 +141,14 @@ export function renderTopologyPage(root: HTMLElement): () => void {
   function renderCard(n: ChatNode): string {
     const name = nameOf(n.chatId, n.name);
     const status = statusOf(n);
+    const isArchived = n.status === 'archived';
     const lastWhen = formatAge(n.metrics.lastMessageAt);
     const summary = n.summary || '(无摘要)';
+    const archiveBtn = isArchived
+      ? `<button class="topo-v2-archive-btn" data-action="unarchive" data-chat-id="${escapeHtml(n.chatId)}" title="恢复到活跃列表">↩️ 恢复</button>`
+      : `<button class="topo-v2-archive-btn" data-action="archive" data-chat-id="${escapeHtml(n.chatId)}" title="归档：从协作面板隐藏 + 停止 escalation">📦 归档</button>`;
     return `
-      <article class="topo-v2-card status-${status} ${n.chatId === state.activeChatId ? 'active' : ''}" data-chat-id="${escapeHtml(n.chatId)}">
+      <article class="topo-v2-card status-${status} ${isArchived ? 'archived' : ''} ${n.chatId === state.activeChatId ? 'active' : ''}" data-chat-id="${escapeHtml(n.chatId)}">
         <header class="topo-v2-card-head">
           <strong title="${escapeHtml(n.chatId)}">${escapeHtml(name)}</strong>
           <span class="topo-v2-status status-${status}">${t(statusKey(status))}</span>
@@ -149,6 +157,7 @@ export function renderTopologyPage(root: HTMLElement): () => void {
         <footer class="topo-v2-card-foot">
           <span>${t('topo.meta.messages24h', { n: n.metrics.messages24h })}</span>
           <span>${t('topo.meta.lastSeen', { when: lastWhen })}</span>
+          ${archiveBtn}
           <a class="topo-v2-applink" target="_blank" rel="noopener" href="${applink(n.chatId)}">${t('topo.action.openInLark')}</a>
         </footer>
       </article>
@@ -178,8 +187,16 @@ export function renderTopologyPage(root: HTMLElement): () => void {
   }
 
   function renderStream(): void {
-    // Filter
-    const filtered = state.nodes.filter(n => {
+    // Partition into archived vs active first.
+    const archivedNodes: ChatNode[] = [];
+    const activeNodes: ChatNode[] = [];
+    for (const n of state.nodes) {
+      if (n.status === 'archived') archivedNodes.push(n);
+      else activeNodes.push(n);
+    }
+
+    // Filter active nodes for the main sections
+    const filtered = activeNodes.filter(n => {
       if (state.filter !== 'all' && statusOf(n) !== state.filter) return false;
       if (state.search) {
         const needle = state.search.toLowerCase();
@@ -188,8 +205,18 @@ export function renderTopologyPage(root: HTMLElement): () => void {
       }
       return true;
     });
+    // Filter archived nodes (search applies; status filter doesn't to keep
+    // discovery flexible).
+    const archivedFiltered = archivedNodes.filter(n => {
+      if (state.search) {
+        const needle = state.search.toLowerCase();
+        const name = nameOf(n.chatId, n.name).toLowerCase();
+        if (!name.includes(needle) && !n.chatId.toLowerCase().includes(needle)) return false;
+      }
+      return true;
+    });
 
-    // Group by status + sort within by lastMessageAt desc
+    // Group active by status + sort within by lastMessageAt desc
     const groups: Record<CardStatus, ChatNode[]> = { needs_reply: [], bot_working: [], idle: [] };
     for (const n of filtered) groups[statusOf(n)].push(n);
     for (const s of ['needs_reply', 'bot_working', 'idle'] as CardStatus[]) {
@@ -216,11 +243,17 @@ export function renderTopologyPage(root: HTMLElement): () => void {
       ? `<section class="topo-v2-section topo-v2-offtree"><h3>${t('topo.section.offTree')} (${offTreeFiltered.length})</h3>${offTreeFiltered.map(renderOffTreeCard).join('')}</section>`
       : '';
 
+    // P5: archived section, gated by state.showArchived toggle.
+    const archivedSection = (state.showArchived && archivedFiltered.length)
+      ? `<section class="topo-v2-section topo-v2-archived"><h3>📦 已归档 (${archivedFiltered.length})</h3>${archivedFiltered.map(renderCard).join('')}</section>`
+      : '';
+
     const sections = [
       renderSectionList(t('topo.section.needsReply'), groups.needs_reply),
       renderSectionList(t('topo.section.botWorking'), groups.bot_working),
       renderSectionList(t('topo.section.idle'), groups.idle),
       offTreeSection,
+      archivedSection,
     ].filter(Boolean).join('');
 
     streamEl.innerHTML = sections || `<div class="topo-v2-empty">${t('topo.empty')}</div>`;
@@ -233,6 +266,10 @@ export function renderTopologyPage(root: HTMLElement): () => void {
     if (groups.needs_reply.length) parts.push(`<span class="topo-v2-stat urgent">${t('topo.topbar.needsReply', { n: groups.needs_reply.length })}</span>`);
     if (groups.bot_working.length) parts.push(`<span class="topo-v2-stat working">${t('topo.topbar.botWorking', { n: groups.bot_working.length })}</span>`);
     if (idleCount) parts.push(`<span class="topo-v2-stat idle">${t('topo.topbar.idle', { n: idleCount })}</span>`);
+    if (archivedFiltered.length) {
+      const label = state.showArchived ? '隐藏已归档' : '显示已归档';
+      parts.push(`<button class="topo-v2-stat archived-toggle" id="topo-archived-toggle">📦 ${archivedFiltered.length} ${label}</button>`);
+    }
     const refreshWhen = state.lastLoadedAt
       ? formatAge(new Date(state.lastLoadedAt).toISOString())
       : '-';
@@ -243,10 +280,37 @@ export function renderTopologyPage(root: HTMLElement): () => void {
   }
 
   function wireClicks(): void {
+    // Archive / unarchive button click — fire before card click handler.
+    streamEl.querySelectorAll<HTMLElement>('.topo-v2-archive-btn').forEach(el => {
+      el.addEventListener('click', async (ev) => {
+        ev.stopPropagation();  // don't propagate to card click → drawer open
+        const cid = el.dataset.chatId;
+        const action = el.dataset.action;
+        if (!cid || !action) return;
+        try {
+          const r = await fetch(`/api/contexts/${encodeURIComponent(cid)}/${action}`, { method: 'POST' });
+          if (!r.ok) { alert(`${action} failed: HTTP ${r.status}`); return; }
+          // Force reload to reflect new status
+          await loadTopology();
+        } catch (e) {
+          alert(`${action} 出错: ${e}`);
+        }
+      });
+    });
+    // Archived toggle button
+    const toggle = document.getElementById('topo-archived-toggle');
+    if (toggle) {
+      toggle.addEventListener('click', () => {
+        state.showArchived = !state.showArchived;
+        renderStream();
+      });
+    }
     streamEl.querySelectorAll<HTMLElement>('.topo-v2-card').forEach(el => {
       el.addEventListener('click', (ev) => {
         // Don't hijack the applink anchor click — let target=_blank work.
         if ((ev.target as HTMLElement).closest('.topo-v2-applink')) return;
+        // Same for archive button (already stopPropagation'd, but defensive).
+        if ((ev.target as HTMLElement).closest('.topo-v2-archive-btn')) return;
         const cid = el.dataset.chatId;
         if (!cid) return;
         state.activeChatId = cid;

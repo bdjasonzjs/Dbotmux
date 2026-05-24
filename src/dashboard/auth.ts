@@ -147,7 +147,9 @@ export function decideDashboardAuth(opts: {
   const isAuthApi =
     pathname === '/api/auth/device/start' ||
     pathname === '/api/auth/device/poll' ||
-    pathname === '/api/auth/logout';
+    pathname === '/api/auth/logout' ||
+    pathname === '/auth/lark/start' ||
+    pathname === '/auth/lark/callback';
 
   // User-cookie identity gate (preferred over token cookie when both
   // present): if the user-cookie names an allowlisted open_id, allow.

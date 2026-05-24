@@ -21,6 +21,7 @@ import { localeForBot } from '../../i18n/index.js';
 import { handleChatMemberBotAdded } from './chat-created-handler.js';
 import { bumpMessage as topologyBumpMessage } from '../../services/chat-topology-store.js';
 import { markStale as digestMarkStale } from '../../services/main-bot-digest-store.js';
+import { isArchived as ctxIsArchived, unarchive as ctxUnarchive } from '../../services/chat-context-store.js';
 
 // ─── Bot identity ─────────────────────────────────────────────────────────
 
@@ -769,6 +770,11 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         if (chatType === 'group' && chatId) {
           try { topologyBumpMessage(chatId); } catch (err) { logger.debug(`[main-bot/L1] topology bump failed: ${err}`); }
           try { digestMarkStale(); } catch (err) { logger.debug(`[main-bot/L1] digest markStale failed: ${err}`); }
+          // P5/archive: auto-unarchive a chat when a real new message arrives —
+          // any conversation activity means the work isn't done after all.
+          try {
+            if (ctxIsArchived(chatId)) ctxUnarchive(chatId);
+          } catch (err) { logger.debug(`[main-bot/L1] auto-unarchive failed: ${err}`); }
         }
 
         // Bot-originated messages — bots historically only post inside threads

@@ -35,6 +35,10 @@ export interface ChatContextInherited {
   parentDigest: string;
 }
 
+/** Lifecycle status — archived chats are hidden from the collaboration
+ *  board and skip escalation rule evaluation (R1-R5 / R6). */
+export type ChatStatus = 'active' | 'archived';
+
 export interface ChatContext {
   chatId: string;
   /** One-line summary of what this chat is for. */
@@ -54,6 +58,10 @@ export interface ChatContext {
   rules: string[];
   /** When to dispatch the context card. */
   injectionPolicy: InjectionPolicy;
+  /** Lifecycle status. Default 'active' for back-compat with v0.1 files. */
+  status?: ChatStatus;
+  /** ISO timestamp when archived (null/undefined when status='active'). */
+  archivedAt?: string | null;
   /** ISO timestamp of last write (for cache invalidation). */
   updatedAt: string;
 }
@@ -114,10 +122,46 @@ export function create(chatId: string, opts: CreateOpts): ChatContext {
     activeTodoRefs: opts.activeTodoRefs ?? [],
     rules: opts.rules ?? [],
     injectionPolicy: opts.injectionPolicy ?? 'eager',
+    status: 'active',
+    archivedAt: null,
     updatedAt: new Date().toISOString(),
   };
   write(ctx);
   return ctx;
+}
+
+/** Mark a chat archived. If no ChatContext exists yet (typical for
+ *  p2p/human_created chats that never went through onChatCreated), a
+ *  minimal stub is created so the archive lifecycle works uniformly across
+ *  all chats surfaced in the dashboard topology. */
+export function archive(chatId: string): ChatContext {
+  let existing = read(chatId);
+  if (!existing) {
+    existing = create(chatId, {
+      purpose: '(archive 时自动创建的占位 context)',
+      originType: 'human_created',
+      parentChatId: null,
+      participants: [],
+      injectionPolicy: 'manual',
+    });
+  }
+  if (existing.status === 'archived') return existing;
+  return update(chatId, { status: 'archived', archivedAt: new Date().toISOString() })!;
+}
+
+/** Mark a chat active (unarchive). Returns null only if no ChatContext
+ *  exists; otherwise returns the (possibly already-active) record. */
+export function unarchive(chatId: string): ChatContext | null {
+  const existing = read(chatId);
+  if (!existing) return null;
+  if (existing.status !== 'archived') return existing;
+  return update(chatId, { status: 'active', archivedAt: null });
+}
+
+/** True iff the chat is archived (false for missing context or active). */
+export function isArchived(chatId: string): boolean {
+  const ctx = read(chatId);
+  return !!ctx && ctx.status === 'archived';
 }
 
 /** Read the ChatContext for a chat, or null if it doesn't exist. */

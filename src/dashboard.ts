@@ -14,6 +14,14 @@ import {
 } from './dashboard/auth.js';
 import { isAllowed as isUserAllowed, initOwnerIfMissing as initAllowlistOwner } from './dashboard/allowlist.js';
 import { startDeviceAuth, pollDeviceToken, fetchUserInfo, pollIntervalSeconds } from './dashboard/lark-device-flow.js';
+import {
+  buildAuthorizeUrl,
+  signState,
+  verifyState,
+  exchangeCodeForToken,
+  fetchUserInfo as fetchUserInfoOAuth,
+  defaultRedirectUri,
+} from './dashboard/lark-oauth-flow.js';
 import { DaemonRegistry } from './dashboard/registry.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
 import { pickCreatorForGroup } from './dashboard/operator-selector.js';
@@ -45,9 +53,12 @@ setInterval(() => {
   for (const [k, s] of deviceFlowSessions) if (s.expiresAt < now) deviceFlowSessions.delete(k);
 }, 60_000).unref();
 
-function renderLoginPage(next: string): string {
-  // Single-file login page. Inline JS handles the device flow polling.
-  // Kept dependency-free so it works without bundler/router awareness.
+function renderLoginPage(next: string, errMsg?: string): string {
+  // Single-file login page. One-click → 302 to Lark /authorize → callback
+  // exchanges the code for user info → cookie set → 302 back here.
+  const errBlock = errMsg
+    ? `<div class="status error">❌ ${escapeHtmlAttr(errMsg)}</div>`
+    : '';
   return `<!doctype html>
 <html lang="zh-CN"><head>
 <meta charset="utf-8"><title>botmux dashboard · 登录</title>
@@ -56,114 +67,31 @@ function renderLoginPage(next: string): string {
   .wrap { max-width: 480px; margin: 80px auto; background: #fff; border-radius: 12px; padding: 32px; box-shadow: 0 2px 12px rgba(0,0,0,0.06); }
   h1 { margin: 0 0 8px; font-size: 20px; }
   p { color: #475569; font-size: 14px; line-height: 1.6; }
-  .code { font-family: monospace; font-size: 28px; letter-spacing: 4px; background: #f1f5f9; padding: 12px 16px; border-radius: 8px; text-align: center; margin: 16px 0; user-select: all; }
-  .url { word-break: break-all; background: #f8fafc; padding: 10px; border-radius: 6px; font-family: monospace; font-size: 12px; }
-  .btn { display: inline-block; background: #3b82f6; color: white; padding: 10px 18px; border-radius: 6px; text-decoration: none; font-size: 14px; cursor: pointer; border: none; }
+  .btn { display: inline-block; background: #3b82f6; color: white; padding: 12px 22px; border-radius: 6px; text-decoration: none; font-size: 14px; cursor: pointer; border: none; font-weight: 600; }
   .btn:hover { background: #2563eb; }
   .status { font-size: 13px; padding: 10px; border-radius: 6px; margin: 12px 0; }
-  .status.pending { background: #fef3c7; color: #78350f; }
-  .status.success { background: #d1fae5; color: #065f46; }
-  .status.denied  { background: #fee2e2; color: #991b1b; }
   .status.error   { background: #fee2e2; color: #991b1b; }
   details { font-size: 12px; color: #64748b; margin-top: 16px; }
+  code { background: #f1f5f9; padding: 2px 6px; border-radius: 4px; font-size: 12px; }
 </style>
 </head><body>
 <div class="wrap">
   <h1>🔒 botmux dashboard 登录</h1>
-  <p>本 dashboard 仅允许白名单上的飞书账号访问。点下方按钮启动飞书扫码登录，授权完成后自动跳回。</p>
-  <button class="btn" id="start-btn">🚀 启动飞书扫码登录</button>
-  <div id="step2" style="display:none;">
-    <p>请在飞书或浏览器打开下面的链接，输入下面的验证码完成授权：</p>
-    <div class="code" id="user-code">—</div>
-    <div class="url"><a id="verify-url" href="#" target="_blank">—</a></div>
-    <div class="status pending" id="status">等待授权...</div>
-  </div>
-  <details><summary>看不到登录？</summary>
+  <p>本 dashboard 仅允许白名单上的飞书账号访问。点下方按钮跳转到飞书完成授权，授权后自动跳回。</p>
+  ${errBlock}
+  <p><a class="btn" href="/auth/lark/start?next=${encodeURIComponent(next)}">🚀 用飞书账号登录</a></p>
+  <details><summary>登录失败 / 看不到按钮？</summary>
     <p>1. 确保你的飞书账号在 dashboard 白名单：<code>~/.botmux/dashboard-allowlist.json</code></p>
-    <p>2. 如果是别的账号，让 dashboard owner 把你的飞书 open_id 加进去</p>
-    <p>3. 启动失败 / 链接打不开 → 看 daemon log</p>
+    <p>2. 确保 Lark 应用后台已配置 redirect URL：<br><code>http://&lt;dashboard-host&gt;:&lt;port&gt;/auth/lark/callback</code></p>
+    <p>3. 如果是别的账号，让 dashboard owner 把你的飞书 open_id 加进去</p>
+    <p>4. 启动失败 → 看 daemon log: <code>~/.botmux/logs/</code></p>
   </details>
 </div>
-<script>
-(function(){
-  const next = ${JSON.stringify(next)};
-  const btn = document.getElementById('start-btn');
-  const step2 = document.getElementById('step2');
-  const userCodeEl = document.getElementById('user-code');
-  const verifyUrlEl = document.getElementById('verify-url');
-  const statusEl = document.getElementById('status');
-
-  let pollHandle = null;
-
-  btn.addEventListener('click', async () => {
-    btn.disabled = true;
-    btn.textContent = '启动中...';
-    try {
-      const r = await fetch('/api/auth/device/start', { method: 'POST' });
-      const data = await r.json();
-      if (!data.ok) throw new Error(data.error || 'start failed');
-      userCodeEl.textContent = data.user_code;
-      verifyUrlEl.href = data.verification_uri_complete || data.verification_uri;
-      verifyUrlEl.textContent = data.verification_uri_complete || data.verification_uri;
-      step2.style.display = 'block';
-      const interval = (data.interval || 5) * 1000;
-      pollHandle = setInterval(() => poll(data.user_code, interval), interval);
-      poll(data.user_code, interval);
-    } catch (e) {
-      btn.disabled = false;
-      btn.textContent = '🚀 启动飞书扫码登录';
-      alert('启动失败：' + e.message);
-    }
-  });
-
-  async function poll(userCode, interval) {
-    try {
-      const r = await fetch('/api/auth/device/poll', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ user_code: userCode, next }),
-      });
-      const data = await r.json();
-      if (!data.ok) {
-        setStatus('error', '请求失败：' + (data.detail || data.error));
-        clearInterval(pollHandle);
-        return;
-      }
-      if (data.status === 'pending') {
-        setStatus('pending', '等待你在飞书完成授权...');
-        return;
-      }
-      clearInterval(pollHandle);
-      if (data.status === 'success') {
-        setStatus('success', '✅ 登录成功，欢迎 ' + (data.name || '') + '。跳转中...');
-        setTimeout(() => location.href = data.redirect || '/', 600);
-        return;
-      }
-      if (data.status === 'denied') {
-        setStatus('denied', '❌ 你拒绝了授权');
-        return;
-      }
-      if (data.status === 'denied_not_in_allowlist') {
-        setStatus('denied', '❌ 你的飞书账号 (' + (data.open_id || 'unknown') + ') 不在 dashboard 白名单');
-        return;
-      }
-      if (data.status === 'expired') {
-        setStatus('error', '⏱️ 二维码已过期，请重新启动登录');
-        return;
-      }
-    } catch (e) {
-      setStatus('error', '请求失败：' + e.message);
-      clearInterval(pollHandle);
-    }
-  }
-
-  function setStatus(cls, text) {
-    statusEl.className = 'status ' + cls;
-    statusEl.textContent = text;
-  }
-})();
-</script>
 </body></html>`;
+}
+
+function escapeHtmlAttr(s: string): string {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
 function renderLoginDeniedPage(): string {
@@ -413,6 +341,94 @@ const server = createServer(async (req, res) => {
       res.end();
       return;
     }
+    // ─── Auth: OAuth Authorization Code flow (preferred) ───────────────────
+    if (req.method === 'GET' && url.pathname === '/auth/lark/start') {
+      try {
+        const botsCfg = JSON.parse(readFileSync(BOTS_JSON_PATH, 'utf-8')) as Array<{ larkAppId: string }>;
+        const ownerBot = botsCfg[0];
+        if (!ownerBot?.larkAppId) {
+          res.writeHead(500, { 'content-type': 'text/html; charset=utf-8' });
+          res.end(renderLoginPage('/', 'no_bot_configured: bots.json 里没有 larkAppId'));
+          return;
+        }
+        const next = url.searchParams.get('next') || '/';
+        const reqHost = req.headers.host;
+        const redirectUri = defaultRedirectUri({
+          publicBaseUrl: process.env.BOTMUX_DASHBOARD_PUBLIC_BASE_URL,
+          reqHost,
+        });
+        const state = signState(next, SECRET);
+        const authorizeUrl = buildAuthorizeUrl({
+          clientId: ownerBot.larkAppId,
+          redirectUri,
+          state,
+        });
+        res.writeHead(302, { location: authorizeUrl });
+        res.end();
+        return;
+      } catch (err: any) {
+        logger.error(`[dashboard/oauth] start failed: ${err?.message ?? err}`);
+        res.writeHead(500, { 'content-type': 'text/html; charset=utf-8' });
+        res.end(renderLoginPage('/', `oauth_start_failed: ${err?.message ?? err}`));
+        return;
+      }
+    }
+    if (req.method === 'GET' && url.pathname === '/auth/lark/callback') {
+      const code = url.searchParams.get('code');
+      const state = url.searchParams.get('state');
+      const oauthErr = url.searchParams.get('error');
+      if (oauthErr) {
+        logger.warn(`[dashboard/oauth] callback returned error: ${oauthErr}`);
+        res.writeHead(400, { 'content-type': 'text/html; charset=utf-8' });
+        res.end(renderLoginPage('/', `Lark 拒绝了授权: ${oauthErr}`));
+        return;
+      }
+      if (!code || !state) {
+        res.writeHead(400, { 'content-type': 'text/html; charset=utf-8' });
+        res.end(renderLoginPage('/', 'callback 缺少 code 或 state 参数'));
+        return;
+      }
+      const next = verifyState(state, SECRET);
+      if (next === null) {
+        res.writeHead(400, { 'content-type': 'text/html; charset=utf-8' });
+        res.end(renderLoginPage('/', 'state 验证失败 (可能过期或被篡改)'));
+        return;
+      }
+      try {
+        const botsCfg = JSON.parse(readFileSync(BOTS_JSON_PATH, 'utf-8')) as Array<{ larkAppId: string; larkAppSecret: string }>;
+        const ownerBot = botsCfg[0];
+        const redirectUri = defaultRedirectUri({
+          publicBaseUrl: process.env.BOTMUX_DASHBOARD_PUBLIC_BASE_URL,
+          reqHost: req.headers.host,
+        });
+        const token = await exchangeCodeForToken({
+          clientId: ownerBot.larkAppId,
+          clientSecret: ownerBot.larkAppSecret,
+          code,
+          redirectUri,
+        });
+        const info = await fetchUserInfoOAuth(token.access_token);
+        if (!isUserAllowed(info.open_id)) {
+          logger.warn(`[dashboard/oauth] denied (not in allowlist): open_id=${info.open_id} name=${info.name ?? '-'}`);
+          res.writeHead(403, { 'content-type': 'text/html; charset=utf-8' });
+          res.end(renderLoginPage('/', `你的飞书账号 (${info.name ?? info.open_id}) 不在白名单`));
+          return;
+        }
+        const safeNext = (next && next.startsWith('/')) ? next : '/';
+        res.writeHead(302, {
+          'set-cookie': buildUserSetCookie(info.open_id),
+          location: safeNext,
+        });
+        res.end();
+        return;
+      } catch (err: any) {
+        logger.error(`[dashboard/oauth] callback exchange failed: ${err?.message ?? err}`);
+        res.writeHead(500, { 'content-type': 'text/html; charset=utf-8' });
+        res.end(renderLoginPage('/', `token 兑换失败: ${err?.message ?? err}`));
+        return;
+      }
+    }
+
     if (req.method === 'POST' && url.pathname === '/api/auth/device/start') {
       try {
         // dashboard runs as a sibling process to bot daemons, so we read
@@ -510,18 +526,45 @@ const server = createServer(async (req, res) => {
     // ─── Main-bot mode API (P4) ───────────────────────────────────────────
     if (req.method === 'GET' && url.pathname === '/api/topology') {
       const { readTopology } = await import('./services/chat-topology-store.js');
+      const { read: readCtx } = await import('./services/chat-context-store.js');
       const filterOrigin = url.searchParams.get('originType') as 'p2p' | 'human_created' | 'bot_spawned' | null;
       const topo = readTopology();
-      const nodes = filterOrigin ? topo.nodes.filter(n => n.originType === filterOrigin) : topo.nodes;
+      let nodes = filterOrigin ? topo.nodes.filter(n => n.originType === filterOrigin) : topo.nodes;
+      // Enrich each node with lifecycle status from ChatContext so the
+      // frontend can render archived chats in a separate section.
+      nodes = nodes.map(n => {
+        const ctx = readCtx(n.chatId);
+        return {
+          ...n,
+          status: (ctx?.status ?? 'active') as 'active' | 'archived',
+          archivedAt: ctx?.archivedAt ?? null,
+        } as any;
+      });
       return jsonRes(res, 200, { ...topo, nodes });
     }
     let mCtx: RegExpMatchArray | null;
-    if (req.method === 'GET' && (mCtx = url.pathname.match(/^\/api\/contexts\/(.+)$/))) {
+    if (req.method === 'GET' && (mCtx = url.pathname.match(/^\/api\/contexts\/([^/]+)$/))) {
       const chatId = decodeURIComponent(mCtx[1]);
       const { read } = await import('./services/chat-context-store.js');
       const ctx = read(chatId);
       if (!ctx) return jsonRes(res, 404, { ok: false, error: 'context_not_found' });
       return jsonRes(res, 200, ctx);
+    }
+    let mArchive: RegExpMatchArray | null;
+    if (req.method === 'POST' && (mArchive = url.pathname.match(/^\/api\/contexts\/([^/]+)\/archive$/))) {
+      const chatId = decodeURIComponent(mArchive[1]);
+      const { archive } = await import('./services/chat-context-store.js');
+      const r = archive(chatId);
+      if (!r) return jsonRes(res, 404, { ok: false, error: 'context_not_found' });
+      return jsonRes(res, 200, { ok: true, status: r.status, archivedAt: r.archivedAt });
+    }
+    let mUnarchive: RegExpMatchArray | null;
+    if (req.method === 'POST' && (mUnarchive = url.pathname.match(/^\/api\/contexts\/([^/]+)\/unarchive$/))) {
+      const chatId = decodeURIComponent(mUnarchive[1]);
+      const { unarchive } = await import('./services/chat-context-store.js');
+      const r = unarchive(chatId);
+      if (!r) return jsonRes(res, 404, { ok: false, error: 'context_not_found' });
+      return jsonRes(res, 200, { ok: true, status: r.status });
     }
     if (req.method === 'POST' && url.pathname === '/api/topology/edges') {
       const { addEdge } = await import('./services/chat-topology-store.js');

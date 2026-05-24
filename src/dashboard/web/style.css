@@ -1274,3 +1274,19 @@ input.row-select,
 @media (max-width: 1024px) {
   .topo-v2-grid { grid-template-columns: 1fr; }
 }
+
+/* ─── P5 archive UI ──────────────────────────────────────────────── */
+.topo-v2-card.archived { opacity: 0.55; }
+.topo-v2-card.archived strong { text-decoration: line-through; }
+.topo-v2-archived h3 { color: #94a3b8; }
+.topo-v2-archive-btn {
+  background: transparent; border: 1px solid var(--border, #e0e0e0);
+  color: var(--text-soft, #666); padding: 3px 8px; border-radius: 4px;
+  font-size: 11px; cursor: pointer; margin-left: auto;
+}
+.topo-v2-archive-btn:hover { background: var(--bg-soft); color: #1a2332; }
+.topo-v2-stat.archived-toggle {
+  border: 1px solid var(--border, #e0e0e0); background: #fff;
+  cursor: pointer; padding: 2px 8px; font-weight: 600;
+}
+.topo-v2-stat.archived-toggle:hover { background: var(--bg-soft); }

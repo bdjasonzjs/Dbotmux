@@ -23,6 +23,7 @@ import {
   readDigest, writeDigest, markFresh, enqueueEscalation, readInbox,
   type MainBotDigest, type MainBotDigestChat, type Escalation,
 } from '../services/main-bot-digest-store.js';
+import { isArchived } from '../services/chat-context-store.js';
 import { runEscalationRules, type RulesInput } from './escalation-rules.js';
 import { dispatchPendingEscalations } from './escalation-playbook.js';
 import { inferSameTopicEdges } from './same-topic-inference.js';
@@ -55,9 +56,11 @@ export async function runScoutTick(larkAppId?: string): Promise<{ digest: MainBo
     needsAttention: node.metrics.hasUnansweredPing,
   }));
 
-  // 2. Run escalation rules. Each new escalation is enqueued to inbox.
+  // 2. Run escalation rules — skip archived chats so they stop firing
+  //    R1/R3/R5 reminders after being marked done.
+  const activeNodes = topo.nodes.filter(n => !isArchived(n.chatId));
   const rulesInput: RulesInput = {
-    nodes: topo.nodes,
+    nodes: activeNodes,
     inbox,
     now,
     unansweredPings: PER_DAEMON_STATE.unansweredPings,
