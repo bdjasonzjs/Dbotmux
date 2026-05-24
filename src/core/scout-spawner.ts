@@ -78,6 +78,37 @@ export async function runScoutTick(larkAppId?: string): Promise<{ digest: MainBo
     enqueueEscalation(esc);
   }
 
+  // P2 commit #4: scout "confirms condition gone" → auto-close RootInbox.
+  // For each open R1/R3/R5 item in RootInbox, check if the same
+  // (ruleId, subChatId) appears in newEscalations. If NOT, condition has
+  // resolved → close. (R2 and R4 are aggregate / count-based — skip auto-
+  // close to avoid false positives.)
+  try {
+    const root = await import('../services/root-inbox-store.js');
+    const stillFiring = new Set(
+      newEscalations
+        .filter(e => e.ruleId === 'R1' || e.ruleId === 'R3' || e.ruleId === 'R5')
+        .map(e => `${e.ruleId}:${e.chatId}`),
+    );
+    let autoClosed = 0;
+    for (const item of root.listOpen()) {
+      if (item.kind !== 'escalation') continue;
+      if (item.ruleId !== 'R1' && item.ruleId !== 'R3' && item.ruleId !== 'R5') continue;
+      // Skip if the underlying chat is itself archived (commit #3 already
+      // closed those; defensive check anyway).
+      if (isArchived(item.subChatId)) continue;
+      if (!stillFiring.has(item.id)) {
+        root.close(item.id);
+        autoClosed++;
+      }
+    }
+    if (autoClosed > 0) {
+      logger.info(`[scout-spawner] auto-closed ${autoClosed} root-inbox items (condition resolved)`);
+    }
+  } catch (err) {
+    logger.warn(`[scout-spawner] root-inbox auto-close pass failed: ${err}`);
+  }
+
   // 3. Compose + write fresh digest.
   const prevDigest = readDigest();
   const digest: MainBotDigest = {

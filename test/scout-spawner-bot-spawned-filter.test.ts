@@ -145,6 +145,52 @@ describe('scout-spawner originType filter (P6 regression)', () => {
     expect(chatIds.has('oc_human_with_ping')).toBe(true);
   });
 
+  it('P2 #4: scout auto-closes root-inbox when escalation condition stops firing', async () => {
+    const { scout, topo, digest } = await freshImports();
+    const root = await import('../src/services/root-inbox-store.js');
+    // 1) Setup: an R5-triggering chat with "stuck" in summary
+    topo.upsertNode({
+      chatId: 'oc_bot_stuck',
+      name: 'CUA Task',
+      chatType: 'group',
+      originType: 'bot_spawned',
+      parentChatId: 'oc_parent',
+      tags: [],
+      metrics: { lastMessageAt: new Date().toISOString(), messages24h: 5, hasUnansweredPing: false },
+      summary: 'CI build is blocked',
+    });
+    digest.writeInbox({ pending: [], processed: [] });
+    // 2) Simulate that we already have an open R5 root-inbox item from a
+    //    prior tick (manually inserted; in production it'd come from sink).
+    root.upsertOpen({
+      id: 'R5:oc_bot_stuck', kind: 'escalation', subChatId: 'oc_bot_stuck',
+      subChatName: 'CUA Task', ruleId: 'R5', summary: 'blocked',
+    });
+    expect(root.lookup('R5:oc_bot_stuck')?.status).toBe('open');
+
+    // 3) Tick 1: R5 still fires (summary still contains "blocked"). Item
+    //    should stay open (its dedup id matches stillFiring set).
+    await scout.runScoutTick(undefined);
+    expect(root.lookup('R5:oc_bot_stuck')?.status).toBe('open');
+
+    // 4) Now resolve the blocker: change summary to a non-stuck one.
+    topo.upsertNode({
+      chatId: 'oc_bot_stuck',
+      name: 'CUA Task',
+      chatType: 'group',
+      originType: 'bot_spawned',
+      parentChatId: 'oc_parent',
+      tags: [],
+      metrics: { lastMessageAt: new Date().toISOString(), messages24h: 6, hasUnansweredPing: false },
+      summary: 'CI fixed, ready to merge',
+    });
+    digest.writeInbox({ pending: [], processed: [] });
+
+    // 5) Tick 2: R5 should NOT fire → scout auto-closes the open item.
+    await scout.runScoutTick(undefined);
+    expect(root.lookup('R5:oc_bot_stuck')?.status).toBe('closed');
+  });
+
   it('digest still includes ALL chats (info-gathering link is untouched)', async () => {
     // 松松's explicit instruction: 信息搜集 (digest) for main-bot context
     // continues to include every chat the bot is in, even though the
