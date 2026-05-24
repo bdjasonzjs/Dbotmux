@@ -1300,3 +1300,16 @@ input.row-select,
 .topo-v2-main-topic-btn:hover:not([disabled]) { background: #fde68a; }
 .topo-v2-main-topic-btn[disabled] { opacity: 0.65; cursor: not-allowed; }
 .topo-v2-main-topic-status { font-size: 12px; margin: 6px 0 12px; }
+
+/* P2 commit #6 — RootInbox panel */
+.topo-v2-stat.root-inbox-toggle { cursor: pointer; background: #ecfeff; border: 1px solid #67e8f9; color: #0e7490; padding: 3px 8px; border-radius: 4px; }
+.topo-v2-stat.root-inbox-toggle:hover { background: #cffafe; }
+.topo-v2-root-inbox-panel { background: #fff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px 16px; margin: 8px 0; box-shadow: 0 1px 3px rgba(0,0,0,0.04); }
+.topo-v2-root-inbox-header { font-weight: 600; margin-bottom: 8px; color: #0e7490; }
+.topo-v2-root-inbox-row { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-bottom: 1px dashed #f1f5f9; font-size: 13px; }
+.topo-v2-root-inbox-row:last-child { border-bottom: none; }
+.topo-v2-root-inbox-summary { flex: 1; color: #475569; }
+.topo-v2-root-inbox-meta { color: #94a3b8; font-size: 12px; }
+.topo-v2-root-inbox-close { background: #f0fdf4; color: #15803d; border: 1px solid #86efac; padding: 3px 8px; border-radius: 4px; font-size: 12px; cursor: pointer; }
+.topo-v2-root-inbox-close:hover:not([disabled]) { background: #dcfce7; }
+.topo-v2-root-inbox-close[disabled] { opacity: 0.5; cursor: not-allowed; }

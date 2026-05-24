@@ -256,9 +256,82 @@ export function renderTopologyPage(root: HTMLElement): () => void {
       ? formatAge(new Date(state.lastLoadedAt).toISOString())
       : '-';
     parts.push(`<span class="topo-v2-stat last-refresh" id="topo-refresh-label">${t('topo.topbar.lastRefresh', { when: refreshWhen })}</span>`);
+    // P2 commit #6: RootInbox indicator + expand/collapse panel
+    parts.push(`<button class="topo-v2-stat root-inbox-toggle" id="topo-root-inbox-toggle" title="主话题待处理 root-inbox 项">📥 RootInbox</button>`);
     topbarEl.innerHTML = parts.join(' · ');
 
+    // RootInbox panel container (renders below topbar when expanded)
+    let panel = document.getElementById('topo-root-inbox-panel');
+    if (!panel) {
+      panel = document.createElement('div');
+      panel.id = 'topo-root-inbox-panel';
+      panel.className = 'topo-v2-root-inbox-panel';
+      panel.style.display = 'none';
+      topbarEl.parentElement?.insertBefore(panel, topbarEl.nextSibling);
+    }
+
     wireClicks();
+    wireRootInboxPanel();
+  }
+
+  async function loadRootInboxPanel(): Promise<void> {
+    const panel = document.getElementById('topo-root-inbox-panel');
+    if (!panel) return;
+    panel.innerHTML = '<em>加载中...</em>';
+    try {
+      const r = await fetch('/api/root-inbox');
+      const data: { items?: any[] } = await r.json();
+      const items = data.items ?? [];
+      if (items.length === 0) {
+        panel.innerHTML = '<em style="color:#94a3b8">📥 RootInbox 空 — 没有待处理项</em>';
+        return;
+      }
+      panel.innerHTML = `
+        <div class="topo-v2-root-inbox-header">📥 RootInbox · ${items.length} open</div>
+        ${items.map(it => {
+          const kindEmoji = it.kind === 'escalation' ? '🔔' : it.kind === 'progress' ? '✅' : '❓';
+          const ruleBadge = it.ruleId ? `[${it.ruleId}]` : `[${it.kind}]`;
+          const updates = it.updateCount > 1 ? `· 更新 ${it.updateCount} 次` : '';
+          return `<div class="topo-v2-root-inbox-row">
+            <span>${kindEmoji} ${escapeHtml(ruleBadge)}</span>
+            <code title="${escapeHtml(it.subChatId)}">${escapeHtml(it.subChatName || it.subChatId).slice(0, 20)}</code>
+            <span class="topo-v2-root-inbox-summary">${escapeHtml(it.summary)}</span>
+            <span class="topo-v2-root-inbox-meta">${updates}</span>
+            <button class="topo-v2-root-inbox-close" data-id="${escapeHtml(it.id)}">✅ 关闭</button>
+          </div>`;
+        }).join('')}
+      `;
+      // Wire close buttons
+      panel.querySelectorAll<HTMLElement>('.topo-v2-root-inbox-close').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          const id = btn.dataset.id;
+          if (!id) return;
+          btn.setAttribute('disabled', 'true');
+          btn.textContent = '关闭中...';
+          try {
+            const r = await fetch(`/api/root-inbox/${encodeURIComponent(id)}/close`, { method: 'POST' });
+            if (!r.ok) { alert(`关闭失败: HTTP ${r.status}`); btn.removeAttribute('disabled'); btn.textContent = '✅ 关闭'; return; }
+            void loadRootInboxPanel();
+          } catch (e) { alert(`关闭出错: ${e}`); btn.removeAttribute('disabled'); btn.textContent = '✅ 关闭'; }
+        });
+      });
+    } catch (err) {
+      panel.innerHTML = `<em style="color:#dc2626">加载 RootInbox 失败: ${escapeHtml(String(err))}</em>`;
+    }
+  }
+
+  function wireRootInboxPanel(): void {
+    const btn = document.getElementById('topo-root-inbox-toggle');
+    const panel = document.getElementById('topo-root-inbox-panel');
+    if (!btn || !panel) return;
+    btn.addEventListener('click', () => {
+      if (panel.style.display === 'none') {
+        panel.style.display = 'block';
+        void loadRootInboxPanel();
+      } else {
+        panel.style.display = 'none';
+      }
+    });
   }
 
   function wireClicks(): void {
