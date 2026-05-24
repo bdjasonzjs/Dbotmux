@@ -120,7 +120,6 @@ export function renderTopologyPage(root: HTMLElement): () => void {
   const state = {
     nodes: [] as ChatNode[],
     groupNameByChatId: new Map<string, string>(),
-    offTreeChats: [] as GroupBrief[],
     activeChatId: null as string | null,
     search: '',
     filter: 'all' as 'all' | CardStatus,
@@ -164,35 +163,35 @@ export function renderTopologyPage(root: HTMLElement): () => void {
     `;
   }
 
-  function renderOffTreeCard(g: GroupBrief): string {
-    const name = g.name || g.chatId;
-    const active = g.chatId === state.activeChatId ? 'active' : '';
-    return `
-      <article class="topo-v2-card status-idle topo-v2-offtree-card ${active}" data-chat-id="${escapeHtml(g.chatId)}">
-        <header class="topo-v2-card-head">
-          <strong title="${escapeHtml(g.chatId)}">${escapeHtml(name)}</strong>
-          <span class="topo-v2-status status-idle">${t('topo.status.idle')}</span>
-        </header>
-        <footer class="topo-v2-card-foot">
-          <span><code>${escapeHtml(g.chatId)}</code></span>
-          <a class="topo-v2-applink" target="_blank" rel="noopener" href="${applink(g.chatId)}">${t('topo.action.openInLark')}</a>
-        </footer>
-      </article>
-    `;
-  }
-
   function renderSectionList(label: string, list: ChatNode[]): string {
     if (!list.length) return '';
     return `<section class="topo-v2-section"><h3>${label} (${list.length})</h3>${list.map(renderCard).join('')}</section>`;
   }
 
   function renderStream(): void {
+    // P6 product decision: the board is a task tracker, not a chat inbox.
+    // Only chats that the bot itself spawned (bot_spawned) belong here —
+    // p2p / human_created groups are info-gathering surfaces and must NOT
+    // leak into the active task panel. Backend digest / topology ingest
+    // is unchanged so main-bot still observes those chats for context;
+    // we just don't surface them to the human. Archived chats keep all
+    // originType (松松 confirmed A: a manually-archived human-created
+    // chat should still be recoverable from the archived section).
+    const bot_spawned_nodes = state.nodes.filter(n => n.originType === 'bot_spawned');
+
     // Partition into archived vs active first.
     const archivedNodes: ChatNode[] = [];
     const activeNodes: ChatNode[] = [];
-    for (const n of state.nodes) {
+    for (const n of bot_spawned_nodes) {
       if (n.status === 'archived') archivedNodes.push(n);
       else activeNodes.push(n);
+    }
+    // Plus: all archived nodes regardless of originType (so recovery works
+    // for human_created chats that 松松 archived by mistake).
+    for (const n of state.nodes) {
+      if (n.status === 'archived' && n.originType !== 'bot_spawned') {
+        archivedNodes.push(n);
+      }
     }
 
     // Filter active nodes for the main sections
@@ -227,22 +226,6 @@ export function renderTopologyPage(root: HTMLElement): () => void {
       });
     }
 
-    // Off-tree chats (groups not in main-bot topology — p2p / human created
-    // groups that the bot is in but hasn't been onboarded as bot_spawned).
-    // Apply the same search filter so the user can find them too.
-    const offTreeFiltered = state.offTreeChats.filter(g => {
-      if (!state.search) return true;
-      const needle = state.search.toLowerCase();
-      const name = (g.name || g.chatId).toLowerCase();
-      return name.includes(needle) || g.chatId.toLowerCase().includes(needle);
-    });
-    // Filter status: off-tree have no metrics so they're effectively 'idle';
-    // hide them unless filter is 'all' or 'idle'.
-    const showOffTree = state.filter === 'all' || state.filter === 'idle';
-    const offTreeSection = (showOffTree && offTreeFiltered.length)
-      ? `<section class="topo-v2-section topo-v2-offtree"><h3>${t('topo.section.offTree')} (${offTreeFiltered.length})</h3>${offTreeFiltered.map(renderOffTreeCard).join('')}</section>`
-      : '';
-
     // P5: archived section, gated by state.showArchived toggle.
     const archivedSection = (state.showArchived && archivedFiltered.length)
       ? `<section class="topo-v2-section topo-v2-archived"><h3>${t('topo.section.archived', { n: archivedFiltered.length })}</h3>${archivedFiltered.map(renderCard).join('')}</section>`
@@ -252,16 +235,15 @@ export function renderTopologyPage(root: HTMLElement): () => void {
       renderSectionList(t('topo.section.needsReply'), groups.needs_reply),
       renderSectionList(t('topo.section.botWorking'), groups.bot_working),
       renderSectionList(t('topo.section.idle'), groups.idle),
-      offTreeSection,
       archivedSection,
     ].filter(Boolean).join('');
 
     streamEl.innerHTML = sections || `<div class="topo-v2-empty">${t('topo.empty')}</div>`;
 
-    // Topbar live counts — idle includes both in-topology idle AND off-tree
-    // groups (semantics: "all idle items on the board"). When filter narrows
-    // the view we count what's actually visible, not the underlying total.
-    const idleCount = groups.idle.length + (showOffTree ? offTreeFiltered.length : 0);
+    // Topbar live counts. P6: off-tree no longer surfaces on the board,
+    // so idle is purely "bot_spawned idle in topology". When the user
+    // narrows the filter, count what's visible, not the underlying total.
+    const idleCount = groups.idle.length;
     const parts: string[] = [];
     if (groups.needs_reply.length) parts.push(`<span class="topo-v2-stat urgent">${t('topo.topbar.needsReply', { n: groups.needs_reply.length })}</span>`);
     if (groups.bot_working.length) parts.push(`<span class="topo-v2-stat working">${t('topo.topbar.botWorking', { n: groups.bot_working.length })}</span>`);
@@ -386,17 +368,15 @@ export function renderTopologyPage(root: HTMLElement): () => void {
 
   async function loadGroups(): Promise<void> {
     // /api/groups fans out to Lark API per daemon — keep at 60s+ TTL.
+    // Used purely for chatId → human name lookup (nameOf). P6: off-tree
+    // chats no longer render on the board, so we just need names.
     try {
       const groupsRes = await fetch('/api/groups');
       const groups: { chats?: GroupBrief[] } = await groupsRes.json();
       state.groupNameByChatId.clear();
-      const inTopoIds = new Set(state.nodes.map(n => n.chatId));
-      const offTree: GroupBrief[] = [];
       for (const g of (groups.chats || [])) {
         if (g.name) state.groupNameByChatId.set(g.chatId, g.name);
-        if (!inTopoIds.has(g.chatId)) offTree.push(g);
       }
-      state.offTreeChats = offTree;
       renderStream();
     } catch (err) {
       // Don't crash the page on a failed groups fetch — names will fall

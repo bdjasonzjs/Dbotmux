@@ -56,9 +56,17 @@ export async function runScoutTick(larkAppId?: string): Promise<{ digest: MainBo
     needsAttention: node.metrics.hasUnansweredPing,
   }));
 
-  // 2. Run escalation rules — skip archived chats so they stop firing
-  //    R1/R3/R5 reminders after being marked done.
-  const activeNodes = topo.nodes.filter(n => !isArchived(n.chatId));
+  // 2. Run escalation rules. Skip:
+  //    - archived chats: R1/R3/R5 reminders must stop after manual archive
+  //    - non-bot_spawned chats: P6 product decision — the board / scout
+  //      pipeline tracks tasks only. p2p / human_created groups are info-
+  //      gathering surfaces (still ingested into digest below for main-bot
+  //      context), but must NOT trigger escalations or ping 松松, otherwise
+  //      a stray "blocked" in some unrelated chat the bot was pulled into
+  //      would alert him for nothing.
+  const activeNodes = topo.nodes.filter(n =>
+    !isArchived(n.chatId) && n.originType === 'bot_spawned',
+  );
   const rulesInput: RulesInput = {
     nodes: activeNodes,
     inbox,
