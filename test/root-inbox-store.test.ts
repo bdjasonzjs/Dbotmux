@@ -152,6 +152,61 @@ describe('root-inbox-store (P2 commit #1)', () => {
     });
   });
 
+  describe('upsertOpen allowReopen — generation suffix on closed baseId (P2-rev1 #2)', () => {
+    it('closed + allowReopen=true → new item with #2 suffix, inserted=true', async () => {
+      const s = await freshImport();
+      const id = 'R5:oc_reopen_test';
+      // First fire
+      const r1 = s.upsertOpen({ id, kind: 'escalation', subChatId: 'oc_reopen_test', subChatName: 'X', ruleId: 'R5', summary: 'v1', allowReopen: true });
+      expect(r1.item.id).toBe(id);
+      expect(r1.inserted).toBe(true);
+      // Close
+      s.close(id);
+      // Second fire — reopen with generation 2
+      const r2 = s.upsertOpen({ id, kind: 'escalation', subChatId: 'oc_reopen_test', subChatName: 'X', ruleId: 'R5', summary: 'v2', allowReopen: true });
+      expect(r2.item.id).toBe(`${id}#2`);
+      expect(r2.inserted).toBe(true);
+      expect(r2.reopenedGeneration).toBe(2);
+      expect(r2.item.status).toBe('open');
+      expect(r2.item.summary).toBe('v2');
+    });
+    it('closed + allowReopen=false → returns existing closed (legacy behavior)', async () => {
+      const s = await freshImport();
+      const id = 'progress:oc_x:m1';
+      s.upsertOpen({ id, kind: 'progress', subChatId: 'oc_x', subChatName: 'X', summary: 'v1' });
+      s.close(id);
+      const r = s.upsertOpen({ id, kind: 'progress', subChatId: 'oc_x', subChatName: 'X', summary: 'v2 trying' });
+      expect(r.inserted).toBe(false);
+      expect(r.item.id).toBe(id);
+      expect(r.item.status).toBe('closed');
+      expect(r.item.summary).toBe('v1');  // unchanged
+    });
+    it('open + allowReopen=true → still updates the open item (no new generation)', async () => {
+      const s = await freshImport();
+      const id = 'R5:oc_open_update';
+      s.upsertOpen({ id, kind: 'escalation', subChatId: 'oc_open_update', subChatName: 'X', ruleId: 'R5', summary: 'v1', allowReopen: true });
+      const r = s.upsertOpen({ id, kind: 'escalation', subChatId: 'oc_open_update', subChatName: 'X', ruleId: 'R5', summary: 'v2', allowReopen: true });
+      expect(r.inserted).toBe(false);
+      expect(r.item.id).toBe(id);   // no #2 suffix yet
+      expect(r.item.status).toBe('updated');
+      expect(r.item.updateCount).toBe(2);
+    });
+    it('multiple closed generations → next reopen takes max+1', async () => {
+      const s = await freshImport();
+      const id = 'R5:oc_multi_gen';
+      // Generation 1 → close
+      s.upsertOpen({ id, kind: 'escalation', subChatId: 'oc_multi_gen', subChatName: 'X', ruleId: 'R5', summary: 'v1', allowReopen: true });
+      s.close(id);
+      // Generation 2 → close
+      s.upsertOpen({ id, kind: 'escalation', subChatId: 'oc_multi_gen', subChatName: 'X', ruleId: 'R5', summary: 'v2', allowReopen: true });
+      s.close(`${id}#2`);
+      // Generation 3
+      const r = s.upsertOpen({ id, kind: 'escalation', subChatId: 'oc_multi_gen', subChatName: 'X', ruleId: 'R5', summary: 'v3', allowReopen: true });
+      expect(r.item.id).toBe(`${id}#3`);
+      expect(r.reopenedGeneration).toBe(3);
+    });
+  });
+
   describe('closeAllForSubChat — bulk close by subChatId (P2 commit #3)', () => {
     it('closes only matching subChatId open items, returns count', async () => {
       const s = await freshImport();

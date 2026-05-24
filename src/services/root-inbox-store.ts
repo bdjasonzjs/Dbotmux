@@ -125,12 +125,22 @@ export function buildId(opts:
  * Insert a new open item, or update an existing open item with the same id.
  * Returns the (possibly updated) item + whether it was newly inserted.
  *
- * Update semantics:
- *   - if existing.status === 'closed': **do nothing**, return existing
- *     (closed items are terminal — caller must use a different slug to
- *      get a fresh card; intentional to avoid resurrecting old issues)
- *   - else: bump lastUpdatedAt + updateCount, replace summary; keep
- *     firstSeenAt + rootCardMessageId; flip status open → updated
+ * P2-rev1 #2 (妹妹 review): closed item is **NOT a terminal sink for the
+ * baseId** when `allowReopen=true`. After all prior generations are closed,
+ * a new fire creates a fresh item with `#<N>` generation suffix on the
+ * stored id (lifecycle is independent — new card, separate close history).
+ *
+ *   - existing open/updated with same id → update in place
+ *   - all prior generations closed + allowReopen=true →
+ *     create new item with id = `${opts.id}#${N+1}` (N = max prior gen)
+ *   - closed + allowReopen=false → return existing closed item (no-op,
+ *     same as old behavior; used for progress/request_decision where slug
+ *     change is the proper way to start a new card)
+ *
+ * `inserted: true` is returned in BOTH the brand-new and reopened cases —
+ * caller treats them identically (send fresh card to mainTopic).
+ *
+ * `reopenedGeneration` is set when this is a re-open (N+1 ≥ 2).
  */
 export function upsertOpen(opts: {
   id: string;
@@ -139,28 +149,56 @@ export function upsertOpen(opts: {
   subChatName: string;
   ruleId?: EscalationRuleId;
   summary: string;
-}): { item: RootInboxItem; inserted: boolean } {
+  /** P2-rev1 #2: when true, a closed baseId allows a new generation
+   *  (with `#N` suffix). Default false preserves legacy behavior. */
+  allowReopen?: boolean;
+}): { item: RootInboxItem; inserted: boolean; reopenedGeneration?: number } {
   const store = read();
-  const idx = store.items.findIndex(it => it.id === opts.id);
   const now = new Date().toISOString();
-  if (idx >= 0) {
-    const existing = store.items[idx];
-    if (existing.status === 'closed') return { item: existing, inserted: false };
+  // Walk existing items with this base id (including any reopened
+  // generations like `id#2`, `id#3`). Use baseId prefix matching.
+  const baseId = opts.id;
+  const sameBaseItems = store.items.filter(it => it.id === baseId || it.id.startsWith(baseId + '#'));
+  const openOne = sameBaseItems.find(it => it.status !== 'closed');
+  if (openOne) {
+    const idx = store.items.findIndex(it => it.id === openOne.id);
     const updated: RootInboxItem = {
-      ...existing,
+      ...openOne,
       status: 'updated',
       lastUpdatedAt: now,
-      updateCount: existing.updateCount + 1,
+      updateCount: openOne.updateCount + 1,
       summary: opts.summary,
-      // Keep the same card target so update edits the original.
       subChatName: opts.subChatName,
     };
     store.items[idx] = updated;
     write(store);
     return { item: updated, inserted: false };
   }
+  // No open item with this baseId.
+  if (sameBaseItems.length > 0 && !opts.allowReopen) {
+    // Legacy: closed + no reopen → return last closed unchanged
+    const lastClosed = sameBaseItems[sameBaseItems.length - 1];
+    return { item: lastClosed, inserted: false };
+  }
+  // Decide id: brand-new (no prior) → use baseId; reopen → baseId#N+1
+  let newId = baseId;
+  let reopenedGeneration: number | undefined;
+  if (sameBaseItems.length > 0) {
+    // All closed, but reopen allowed. Find max generation suffix used.
+    let maxGen = 1;   // baseId == generation 1
+    for (const it of sameBaseItems) {
+      const m = it.id.match(/#(\d+)$/);
+      if (m) {
+        const g = Number(m[1]);
+        if (g > maxGen) maxGen = g;
+      }
+    }
+    const nextGen = maxGen + 1;
+    newId = `${baseId}#${nextGen}`;
+    reopenedGeneration = nextGen;
+  }
   const item: RootInboxItem = {
-    id: opts.id,
+    id: newId,
     kind: opts.kind,
     subChatId: opts.subChatId,
     subChatName: opts.subChatName,
@@ -174,7 +212,7 @@ export function upsertOpen(opts: {
   };
   store.items.push(item);
   write(store);
-  return { item, inserted: true };
+  return { item, inserted: true, reopenedGeneration };
 }
 
 /** Set rootCardMessageId after first card send (commit #3 hook will use this). */

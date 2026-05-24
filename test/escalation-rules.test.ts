@@ -4,7 +4,7 @@
  * Run:  pnpm vitest run test/escalation-rules.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { runEscalationRules } from '../src/core/escalation-rules.js';
+import { runEscalationRules, evaluateRawConditions } from '../src/core/escalation-rules.js';
 
 function mkNode(overrides: Partial<import('../src/services/chat-topology-store.js').ChatNode> = {}) {
   return {
@@ -262,6 +262,48 @@ describe('escalation-rules', () => {
       const r1List = out.filter(e => e.ruleId === 'R1');
       expect(r1List.length).toBe(1);
       expect(r1List[0].chatId).toBe('oc_b');
+    });
+  });
+
+  describe('evaluateRawConditions (P2-rev1 #1) — skips dedup/cooldown', () => {
+    it('returns R5:chatId for nodes with stuck keyword in summary, regardless of inbox state', () => {
+      const node = mkNode({ chatId: 'oc_stuck', summary: 'CI build is blocked' });
+      const inbox = {
+        // Existing pending R5:oc_stuck — runEscalationRules would suppress
+        // a new entry, but evaluateRawConditions doesn't care.
+        pending: [{
+          id: 'existing', enqueuedAt: 'x', status: 'pending' as const, resolvedBy: null, resolution: null,
+          escalation: { ruleId: 'R5' as const, triggeredAt: 'x', chatId: 'oc_stuck', context: 'old', payload: {} },
+        }],
+        processed: [],
+      };
+      const raw = evaluateRawConditions({ nodes: [node], inbox, now: NOW });
+      expect(raw.has('R5:oc_stuck')).toBe(true);
+      // runEscalationRules WOULD return empty (suppressed)
+      const newOut = runEscalationRules({ nodes: [node], inbox, now: NOW });
+      expect(newOut.find(e => e.ruleId === 'R5' && e.chatId === 'oc_stuck')).toBeUndefined();
+    });
+    it('returns R3:chatId for fresh bot_spawned chat with no activity', () => {
+      const node = mkNode({
+        chatId: 'oc_r3', originType: 'bot_spawned',
+        metrics: { lastMessageAt: new Date(NOW - 2 * 60 * 60 * 1000).toISOString(), messages24h: 0, hasUnansweredPing: false },
+      });
+      const raw = evaluateRawConditions({ nodes: [node], inbox: { pending: [], processed: [] }, now: NOW });
+      expect(raw.has('R3:oc_r3')).toBe(true);
+    });
+    it('does NOT include R2 / R4 (aggregate rules — caller wants per-chat only)', () => {
+      const node = mkNode({ chatId: 'oc_x', tags: ['t1'], metrics: { lastMessageAt: new Date(NOW - 60000).toISOString(), messages24h: 5, hasUnansweredPing: false }, summary: '' });
+      const raw = evaluateRawConditions({ nodes: [node], inbox: { pending: [], processed: [] }, now: NOW });
+      // No R2:xxx or R4:xxx keys present (raw evaluator skips aggregate rules)
+      for (const key of raw) {
+        expect(key.startsWith('R2:')).toBe(false);
+        expect(key.startsWith('R4:')).toBe(false);
+      }
+    });
+    it('empty when no condition fires', () => {
+      const node = mkNode({ chatId: 'oc_quiet', summary: 'normal task progress' });
+      const raw = evaluateRawConditions({ nodes: [node], inbox: { pending: [], processed: [] }, now: NOW });
+      expect(raw.size).toBe(0);
     });
   });
 });

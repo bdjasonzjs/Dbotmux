@@ -19,9 +19,10 @@ import {
   readInbox, markInProgress, markResolved,
   type ScoutInboxItem, type EscalationRuleId,
 } from '../services/main-bot-digest-store.js';
-import { sendMessage, updateMessage } from '../im/lark/client.js';
+import { sendMessage } from '../im/lark/client.js';
 import { getMainTopicChatId } from '../services/main-topic-config.js';
 import * as rootInbox from '../services/root-inbox-store.js';
+import { sendOrUpdateCard } from '../services/root-inbox-card-renderer.js';
 import { logger } from '../utils/logger.js';
 
 const HANDLER_SESSION_ID = `escalation-playbook-${process.pid}`;
@@ -160,62 +161,21 @@ async function pushEscalationToRootInbox(
   }
   const ruleId = item.escalation.ruleId;
   const subChatId = item.escalation.chatId;
-  const subChatName = subChatId;  // 占位 — 暂无 chat 名称 lookup；commit #5/#6 可加
+  const subChatName = subChatId;
   const id = rootInbox.buildId({ kind: 'escalation', ruleId, subChatId });
-  const { item: row, inserted } = rootInbox.upsertOpen({
+  // P2-rev1 #2: allowReopen=true — closed escalation can reopen with new
+  // generation (new card lifecycle) on next firing. Avoids the "closed
+  // R5:chat永久静默" bug妹妹 review #2.
+  const { item: row } = rootInbox.upsertOpen({
     id,
     kind: 'escalation',
     subChatId,
     subChatName,
     ruleId,
     summary: oneLineSummary,
+    allowReopen: true,
   });
-
-  const cardJson = buildEscalationCard(row);
-
-  try {
-    if (inserted || !row.rootCardMessageId) {
-      // First time — fresh card to mainTopic
-      const messageId = await sendMessage(larkAppId, mainTopic, cardJson, 'interactive');
-      if (messageId) rootInbox.setRootCardMessageId(id, messageId);
-    } else {
-      // Update existing card in place — no reply, no new message
-      try {
-        await updateMessage(larkAppId, row.rootCardMessageId, cardJson);
-      } catch (err) {
-        // Card may have been withdrawn manually — fall back to a fresh send
-        logger.warn(`[escalation-playbook] updateMessage failed for ${row.rootCardMessageId}, sending fresh card: ${err}`);
-        const messageId = await sendMessage(larkAppId, mainTopic, cardJson, 'interactive');
-        if (messageId) rootInbox.setRootCardMessageId(id, messageId);
-      }
-    }
-  } catch (err) {
-    logger.warn(`[escalation-playbook] RootInbox sink Lark send failed (item ${id}): ${err}`);
-  }
-}
-
-/** Render a minimal Lark interactive card from a RootInbox item.
- *  Schema v2.0 — Lark 自动识别 schema 字段。 */
-function buildEscalationCard(row: rootInbox.RootInboxItem): string {
-  const statusEmoji = row.status === 'closed' ? '✅' : row.status === 'updated' ? '🔁' : '🆕';
-  const ruleLabel = row.ruleId ?? '?';
-  const subChatLink = `[查看子群](https://applink.feishu.cn/client/chat/open?openChatId=${row.subChatId})`;
-  const updateBadge = row.updateCount > 1 ? `更新 ${row.updateCount} 次 · ` : '';
-  const lines = [
-    `**${statusEmoji} [${ruleLabel}] 子群进展**`,
-    `\n${row.summary}\n`,
-    `${updateBadge}首发 ${row.firstSeenAt.slice(11, 19)} UTC · 最新 ${row.lastUpdatedAt.slice(11, 19)} UTC · ${subChatLink}`,
-  ].join('\n');
-  return JSON.stringify({
-    schema: '2.0',
-    config: { update_multi: true },
-    body: {
-      direction: 'vertical',
-      elements: [
-        { tag: 'markdown', content: lines },
-      ],
-    },
-  });
+  await sendOrUpdateCard(larkAppId, mainTopic, row);
 }
 
 /** Wrap PLAYBOOK lookup to fan out: original handler runs (sub-chat

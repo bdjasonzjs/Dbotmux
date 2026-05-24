@@ -595,9 +595,22 @@ const server = createServer(async (req, res) => {
     if (req.method === 'POST' && (mRootClose = url.pathname.match(/^\/api\/root-inbox\/([^/]+)\/close$/))) {
       const id = decodeURIComponent(mRootClose[1]);
       const root = await import('./services/root-inbox-store.js');
-      const r = root.close(id);
-      if (!r) return jsonRes(res, 404, { ok: false, error: 'item_not_found' });
-      return jsonRes(res, 200, { ok: true, status: r.status, lastUpdatedAt: r.lastUpdatedAt });
+      const existing = root.lookup(id);
+      if (!existing) return jsonRes(res, 404, { ok: false, error: 'item_not_found' });
+      // P2-rev1 #3: close + update Lark card to grayed state. Resolve
+      // Claude bot's app id for the card update sender.
+      try {
+        const { resolveBotIdent } = await import('./core/main-bot-playbook.js');
+        const { closeAndRenderClosed } = await import('./services/root-inbox-card-renderer.js');
+        const larkAppId = resolveBotIdent('claude').larkAppId;
+        await closeAndRenderClosed(id, larkAppId);
+      } catch {
+        // Fall back to store-only close so dashboard still works without
+        // bots-info or main-topic configured.
+        root.close(id);
+      }
+      const after = root.lookup(id);
+      return jsonRes(res, 200, { ok: true, status: after?.status ?? 'closed', lastUpdatedAt: after?.lastUpdatedAt });
     }
 
     // P1 commit #9: dashboard "设为主话题" 按钮的后端写入路由。

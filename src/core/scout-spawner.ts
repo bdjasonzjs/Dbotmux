@@ -24,7 +24,7 @@ import {
   type MainBotDigest, type MainBotDigestChat, type Escalation,
 } from '../services/main-bot-digest-store.js';
 import { isArchived } from '../services/chat-context-store.js';
-import { runEscalationRules, type RulesInput } from './escalation-rules.js';
+import { runEscalationRules, evaluateRawConditions, type RulesInput } from './escalation-rules.js';
 import { dispatchPendingEscalations } from './escalation-playbook.js';
 import { inferSameTopicEdges } from './same-topic-inference.js';
 import { logger } from '../utils/logger.js';
@@ -78,32 +78,33 @@ export async function runScoutTick(larkAppId?: string): Promise<{ digest: MainBo
     enqueueEscalation(esc);
   }
 
-  // P2 commit #4: scout "confirms condition gone" → auto-close RootInbox.
-  // For each open R1/R3/R5 item in RootInbox, check if the same
-  // (ruleId, subChatId) appears in newEscalations. If NOT, condition has
-  // resolved → close. (R2 and R4 are aggregate / count-based — skip auto-
-  // close to avoid false positives.)
+  // P2-rev1 #1: auto-close based on RAW condition evaluator (not
+  // newEscalations which is dedup/cooldown-filtered). Spec — cooldown ≠
+  // close: if R5 cooldown suppressed an enqueue but summary still
+  // contains "blocked", the condition is still true → DO NOT close.
   try {
     const root = await import('../services/root-inbox-store.js');
-    const stillFiring = new Set(
-      newEscalations
-        .filter(e => e.ruleId === 'R1' || e.ruleId === 'R3' || e.ruleId === 'R5')
-        .map(e => `${e.ruleId}:${e.chatId}`),
-    );
+    const renderer = await import('../services/root-inbox-card-renderer.js');
+    const stillFiring = evaluateRawConditions(rulesInput);
     let autoClosed = 0;
     for (const item of root.listOpen()) {
       if (item.kind !== 'escalation') continue;
       if (item.ruleId !== 'R1' && item.ruleId !== 'R3' && item.ruleId !== 'R5') continue;
-      // Skip if the underlying chat is itself archived (commit #3 already
-      // closed those; defensive check anyway).
       if (isArchived(item.subChatId)) continue;
-      if (!stillFiring.has(item.id)) {
-        root.close(item.id);
+      const baseKey = `${item.ruleId}:${item.subChatId}`;
+      if (!stillFiring.has(baseKey)) {
+        // larkAppId is passed in; if available, close-with-card grays the
+        // main-topic card. Otherwise fall back to store-only close.
+        if (larkAppId) {
+          await renderer.closeAndRenderClosed(item.id, larkAppId);
+        } else {
+          root.close(item.id);
+        }
         autoClosed++;
       }
     }
     if (autoClosed > 0) {
-      logger.info(`[scout-spawner] auto-closed ${autoClosed} root-inbox items (condition resolved)`);
+      logger.info(`[scout-spawner] auto-closed ${autoClosed} root-inbox items (raw condition resolved)`);
     }
   } catch (err) {
     logger.warn(`[scout-spawner] root-inbox auto-close pass failed: ${err}`);

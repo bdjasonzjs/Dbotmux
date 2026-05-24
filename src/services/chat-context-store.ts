@@ -198,15 +198,14 @@ export function archive(chatId: string): ChatContext {
   }
   if (existing.status === 'archived') return existing;
   const archived = update(chatId, { status: 'archived', archivedAt: new Date().toISOString() })!;
-  // Side effect — auto-close root-inbox items
+  // P2-rev1 #3: archive side effect now uses the card renderer so close
+  // also grays the main-topic card (not just store status). Best-effort.
   try {
-    // Lazy import to avoid a circular dep on root-inbox-store (which may
-    // grow dependencies later).
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    import('./root-inbox-store.js').then(({ closeAllForSubChat }) => {
-      try { closeAllForSubChat(chatId); }
-      catch (err) { logger.warn(`[chat-context-store] archive→closeRootInbox failed for ${chatId}: ${err}`); }
-    }).catch(err => logger.warn(`[chat-context-store] archive→root-inbox import failed: ${err}`));
+    import('./root-inbox-card-renderer.js').then(({ closeAllForSubChatWithCards }) => {
+      closeAllForSubChatWithCards(chatId).catch(err =>
+        logger.warn(`[chat-context-store] archive→closeAllForSubChatWithCards failed for ${chatId}: ${err}`),
+      );
+    }).catch(err => logger.warn(`[chat-context-store] archive→renderer import failed: ${err}`));
   } catch (err) {
     logger.warn(`[chat-context-store] archive→root-inbox dispatch failed for ${chatId}: ${err}`);
   }

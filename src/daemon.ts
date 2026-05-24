@@ -1299,7 +1299,7 @@ ipcRoute('POST', '/api/progress-report', async (req, res) => {
   let body: {
     sessionId?: string; summary?: string; slug?: string;
     kind?: 'progress' | 'request_decision';
-    subChatId?: string; subChatName?: string;
+    subChatName?: string;
   };
   try { body = await readJsonBody(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
@@ -1319,8 +1319,10 @@ ipcRoute('POST', '/api/progress-report', async (req, res) => {
     if (session.larkAppId !== claudeApp) {
       return jsonRes(res, 403, { ok: false, error: 'only main bot can publish progress reports' });
     }
-    // subChatId defaults to caller chat (where the bot is reporting from)
-    const subChatId = body.subChatId ?? session.chatId;
+    // P2-rev1 #4 (妹妹 review): subChatId is ALWAYS session.chatId, never
+    // accepted from caller body — CLI shouldn't be able to ghost-report
+    // on behalf of arbitrary chats.
+    const subChatId = session.chatId;
     const kind = body.kind ?? 'progress';
     const pub = await import('./services/root-inbox-publisher.js');
     const publishFn = kind === 'request_decision' ? pub.publishRequestDecision : pub.publishProgress;

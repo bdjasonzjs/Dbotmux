@@ -36,6 +36,31 @@ const ONE_HOUR_MS = 60 * 60 * 1000;
 const TWENTY_FOUR_H_MS = 24 * 60 * 60 * 1000;
 const BOT_ROUND_THRESHOLD = 20;
 
+/**
+ * P2-rev1 #1: raw condition evaluator — runs the SAME R1-R5 checks but
+ * **skips the dedup/cooldown gate**. Returns the set of (ruleId, chatId)
+ * pairs whose underlying condition is currently true, regardless of
+ * whether they were already enqueued or recently processed.
+ *
+ * Use this for "is the condition still active?" decisions (e.g. scout
+ * auto-close) — `runEscalationRules` is dedup-aware and will return []
+ * during cooldown, which would incorrectly cause a "stuck-but-suppressed"
+ * R5 to be auto-closed (the original cooldown ≠ close bug spec said
+ * never to repeat).
+ */
+export function evaluateRawConditions(input: RulesInput): Set<string> {
+  const out = new Set<string>();
+  for (const node of input.nodes) {
+    if (checkR1(node, input.now, input.unansweredPings)) out.add(`R1:${node.chatId}`);
+    if (checkR3(node, input.now)) out.add(`R3:${node.chatId}`);
+    if (checkR5(node)) out.add(`R5:${node.chatId}`);
+  }
+  // R2 / R4 are aggregate (cross-chat / round count) — caller (scout
+  // auto-close) intentionally skips them to avoid false-positive close,
+  // so we don't include them here either.
+  return out;
+}
+
 /** Run all 5 rules. Returns the list of new escalations (caller persists). */
 export function runEscalationRules(input: RulesInput): Escalation[] {
   const out: Escalation[] = [];

@@ -22,8 +22,10 @@ interface Args {
   summary: string;
   slug: string;
   kind: 'progress' | 'request_decision';
-  subChatId?: string;       // optional override; default = caller chatId from session
   subChatName?: string;
+  // P2-rev1 #4 (妹妹 review): `--sub-chat-id` flag removed. subChatId is
+  // always derived from session.chatId in the daemon (真凭证); CLI can't
+  // pass arbitrary chat ids to ghost-report on behalf of unrelated chats.
 }
 
 function parseArgs(argv: string[]): Args | { error: string } {
@@ -40,7 +42,6 @@ function parseArgs(argv: string[]): Args | { error: string } {
           return { error: `--kind 必须 progress|request_decision，got: ${next}` };
         }
         a.kind = next; i += 2; break;
-      case '--sub-chat-id':   a.subChatId = next; i += 2; break;
       case '--sub-chat-name': a.subChatName = next; i += 2; break;
       default: return { error: `未知参数: ${cur}` };
     }
@@ -77,8 +78,7 @@ export async function cmdProgressReport(argv: string[]): Promise<void> {
                           --summary "<一句话>"
                           --slug <stable-key>
                           [--kind progress|request_decision]   # default progress
-                          [--sub-chat-id <oc_...>]              # default = caller chat
-                          [--sub-chat-name "<群名>"]
+                          [--sub-chat-name "<群名>"]              # human label cached on card
 
 dedup: 同 kind+sub-chat+slug 第二次调用 → 编辑同张主话题卡（不刷屏）。
 切到 --kind request_decision 给松松一张「❓ 需要决策」卡。`);
