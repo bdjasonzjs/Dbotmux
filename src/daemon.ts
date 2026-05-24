@@ -2597,7 +2597,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // daily digest → publish to mainTopic 1 card per day (updated in
     // place). Independent of the R1-R5 escalation pipeline above.
     const TILLY_TICK_INTERVAL_MS = 15 * 60 * 1000;
+    // P3-rev1 #6 (妹妹): in-flight guard — if previous tick is still
+    // running (codex slow / lark stuck), skip this tick instead of
+    // overlapping. Cron is 15min; codex+fetch typically < 2min, so
+    // overlap is rare but recovery is messy if it happens.
+    let tillyTickInFlight = false;
     const tillyHandle = setInterval(async () => {
+      if (tillyTickInFlight) {
+        logger.info('[tilly/scout] previous tick still in flight — skipping this interval');
+        return;
+      }
+      tillyTickInFlight = true;
       const tickStartTime = Date.now();
       try {
         const { fetchRecentMessages } = await import('./services/tilly-scout.js');
@@ -2627,11 +2637,20 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         } catch (err) {
           logger.warn(`[tilly/scout] publish failed (digest still stored): ${err}`);
         }
-        markScanned(fresh.map(m => m.messageId));
+        // P3-rev1 #2 (妹妹): mark-scanned only the messageIds that LLM
+        // actually analyzed (capped-out messages stay unscanned and get
+        // picked up next tick). Falls back to fresh.map if analyzer didn't
+        // populate the field (legacy code path).
+        const toMark = digest.analyzedMessageIds.length > 0
+          ? digest.analyzedMessageIds
+          : fresh.map(m => m.messageId);
+        markScanned(toMark);
         const ms = Date.now() - tickStartTime;
-        logger.info(`[tilly/scout] tick done in ${ms}ms: ${fresh.length} fresh → +${digest.todos.length}t/${digest.progress.length}p/${digest.blockers.length}b/${digest.noteworthy.length}n (today total: ${cumulative.todos.length}/${cumulative.progress.length}/${cumulative.blockers.length}/${cumulative.noteworthy.length})`);
+        logger.info(`[tilly/scout] tick done in ${ms}ms: ${fresh.length} fresh / ${toMark.length} analyzed → +${digest.todos.length}t/${digest.progress.length}p/${digest.blockers.length}b/${digest.noteworthy.length}n (today total: ${cumulative.todos.length}/${cumulative.progress.length}/${cumulative.blockers.length}/${cumulative.noteworthy.length})`);
       } catch (err) {
         logger.error(`[tilly/scout] tick failed: ${err}`);
+      } finally {
+        tillyTickInFlight = false;
       }
     }, TILLY_TICK_INTERVAL_MS);
     process.on('SIGTERM', () => clearInterval(tillyHandle));

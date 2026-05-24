@@ -77,6 +77,55 @@ describe('root-inbox-card-renderer (P2-rev1 #3)', () => {
     });
   });
 
+  describe('P3-rev1 #5: tilly_digest layout', () => {
+    it('kind=tilly_digest uses customMarkdown override, no fake subChat link', async () => {
+      const { renderer } = await freshImports();
+      const json = renderer.renderRootInboxCard({
+        id: 'tilly_digest:2026-05-25', kind: 'tilly_digest',
+        subChatId: 'tilly-scout', subChatName: '缇蕾扫读',
+        status: 'open', firstSeenAt: '', lastUpdatedAt: '',
+        updateCount: 1, summary: '今日 N items (short label, not full card)',
+        rootCardMessageId: null,
+      }, { customMarkdown: '**🐶 缇蕾今日扫读**\n📝 待办 (3)\n- todo 1\n- todo 2' });
+      const parsed = JSON.parse(json);
+      const content = parsed.body.elements[0].content;
+      // Contains the custom markdown
+      expect(content).toContain('🐶 缇蕾今日扫读');
+      expect(content).toContain('📝 待办 (3)');
+      expect(content).toContain('todo 1');
+      // Does NOT contain fake子群 link / generic footer
+      expect(content).not.toContain('openChatId=tilly-scout');
+      expect(content).not.toContain('查看子群');
+      // Does NOT echo store's short summary label (caller passes full md)
+      expect(content).not.toContain('today N items (short label, not full card)');
+    });
+    it('kind=tilly_digest WITHOUT customMarkdown emits fallback (caller bug)', async () => {
+      const { renderer } = await freshImports();
+      const json = renderer.renderRootInboxCard({
+        id: 'tilly_digest:2026-05-25', kind: 'tilly_digest',
+        subChatId: 'tilly-scout', subChatName: '缇蕾扫读',
+        status: 'open', firstSeenAt: '', lastUpdatedAt: '',
+        updateCount: 1, summary: 'short label',
+        rootCardMessageId: null,
+      });
+      const content = JSON.parse(json).body.elements[0].content;
+      expect(content).toContain('caller forgot customMarkdown');
+    });
+    it('other kinds still ignore customMarkdown', async () => {
+      const { renderer } = await freshImports();
+      const json = renderer.renderRootInboxCard({
+        id: 'R5:oc_x', kind: 'escalation', subChatId: 'oc_x', subChatName: 'X',
+        ruleId: 'R5', status: 'open', firstSeenAt: '2026-05-25T00:00:00Z',
+        lastUpdatedAt: '2026-05-25T00:00:00Z', updateCount: 1, summary: 'stuck',
+        rootCardMessageId: null,
+      }, { customMarkdown: 'IGNORED' });
+      const content = JSON.parse(json).body.elements[0].content;
+      expect(content).not.toContain('IGNORED');
+      expect(content).toContain('[R5]');
+      expect(content).toContain('查看子群');   // generic layout still has it
+    });
+  });
+
   describe('sendOrUpdateCard', () => {
     it('no existing messageId → sendMessage + setRootCardMessageId', async () => {
       const { renderer, root } = await freshImports();

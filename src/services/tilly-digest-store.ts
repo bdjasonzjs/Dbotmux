@@ -48,9 +48,17 @@ function ensureDir(): void {
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 }
 
-/** Today's dateId in YYYY-MM-DD (UTC). */
-export function getDateId(): string {
-  return new Date().toISOString().slice(0, 10);
+/** P3-rev1 #4 (妹妹): "今日"按本地业务时区算（Asia/Shanghai UTC+8），不是
+ *  UTC。否则北京 0:00-8:00 的消息会归到前一天的卡，违反"今日扫读"语义。
+ *
+ *  实现：Intl.DateTimeFormat 用 'Asia/Shanghai' 时区，输出 YYYY-MM-DD。 */
+export function getDateId(date: Date = new Date()): string {
+  // Format yields like "2026/05/25" — normalize to "2026-05-25"
+  const fmt = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+  });
+  return fmt.format(date);   // en-CA emits YYYY-MM-DD natively
 }
 
 function emptyDay(dateId: string): CurrentDigestFile {

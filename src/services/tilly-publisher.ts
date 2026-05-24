@@ -86,20 +86,10 @@ export async function publishTillyDigest(
     return { rootCardMessageId: item.rootCardMessageId, inserted };
   }
 
-  // sendOrUpdateCard expects a RootInboxItem and renders it via the
-  // generic renderer. But tilly_digest needs its own markdown content
-  // (4 sections, not the generic escalation layout). We pass a custom
-  // content via the item.summary field — for tilly_digest the renderer
-  // already swaps to the multi-section format below.
-  // Approach: temporarily put the rendered markdown into item.summary
-  // so renderRootInboxCard echoes it. (Cleaner long-term: extend the
-  // renderer to inspect kind=tilly_digest and call this content builder
-  // directly; doing it via summary keeps the renderer change minimal
-  // and avoids cross-import.)
-  const cardItem: rootInbox.RootInboxItem = {
-    ...item,
-    summary: renderTillyCardContent(digest),
-  };
-  const msgId = await sendOrUpdateCard(opts.larkAppId, mainTopic, cardItem);
+  // P3-rev1 #5 (妹妹 v0.2): pass tilly card markdown explicitly via
+  // RenderOpts.customMarkdown, NOT by overwriting item.summary. store's
+  // summary stays a short label so dashboard/listOpen don't get bloated.
+  const cardMarkdown = renderTillyCardContent(digest);
+  const msgId = await sendOrUpdateCard(opts.larkAppId, mainTopic, item, { customMarkdown: cardMarkdown });
   return { rootCardMessageId: msgId, inserted };
 }

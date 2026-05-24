@@ -30,8 +30,38 @@ const KIND_LABEL: Record<rootInbox.RootInboxKind, string> = {
   tilly_digest: '缇蕾每日扫读',
 };
 
-/** Render a RootInbox item as a Lark v2 interactive-card JSON string. */
-export function renderRootInboxCard(item: rootInbox.RootInboxItem): string {
+/** Render a RootInbox item as a Lark v2 interactive-card JSON string.
+ *
+ *  P3-rev1 #5 (妹妹): kind='tilly_digest' uses its own multi-section
+ *  layout (no fake "查看子群" link, no generic ruleId badge). Caller
+ *  passes the rendered markdown explicitly via `opts.customMarkdown` —
+ *  store's `summary` field stays as a short label ("今日 N items"),
+ *  not bloated with full card markdown.
+ *
+ *  For other kinds, `opts.customMarkdown` is ignored and the generic
+ *  escalation layout (with subChat link, status emoji, rule badge, etc.)
+ *  is rendered. */
+export interface RenderOpts {
+  /** For kind='tilly_digest' only: override the markdown body. Required
+   *  for tilly_digest (otherwise an empty content body is emitted). */
+  customMarkdown?: string;
+}
+
+export function renderRootInboxCard(
+  item: rootInbox.RootInboxItem,
+  opts: RenderOpts = {},
+): string {
+  if (item.kind === 'tilly_digest') {
+    const md = opts.customMarkdown ?? `_(no content — caller forgot customMarkdown)_`;
+    return JSON.stringify({
+      schema: '2.0',
+      config: { update_multi: true },
+      body: {
+        direction: 'vertical',
+        elements: [{ tag: 'markdown', content: md }],
+      },
+    });
+  }
   let statusEmoji: string;
   if (item.status === 'closed') statusEmoji = '✅';
   else if (item.status === 'updated') statusEmoji = '🔁';
@@ -62,6 +92,9 @@ export function renderRootInboxCard(item: rootInbox.RootInboxItem): string {
  * (e.g. card withdrawn) falls back to sending a fresh card and updates
  * `rootCardMessageId` to the new one.
  *
+ * `opts.customMarkdown` is forwarded to `renderRootInboxCard` and only
+ * affects kind='tilly_digest'.
+ *
  * Returns the (possibly new) rootCardMessageId; null if Lark send failed
  * entirely (caller can decide to retry).
  */
@@ -69,8 +102,9 @@ export async function sendOrUpdateCard(
   larkAppId: string,
   mainTopicChatId: string,
   item: rootInbox.RootInboxItem,
+  opts: RenderOpts = {},
 ): Promise<string | null> {
-  const cardJson = renderRootInboxCard(item);
+  const cardJson = renderRootInboxCard(item, opts);
   try {
     if (item.rootCardMessageId) {
       try {

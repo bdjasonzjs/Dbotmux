@@ -31,6 +31,20 @@ beforeEach(() => { tempDir = mkdtempSync(join(tmpdir(), 'tilly-dig-')); });
 afterEach(() => { rmSync(tempDir, { recursive: true, force: true }); });
 
 describe('tilly-digest-store (P3 commit #4)', () => {
+  it('P3-rev1 #4: getDateId uses Asia/Shanghai (UTC+8) timezone', async () => {
+    const s = await freshImport();
+    // 2026-05-25 00:30 +08:00 = 2026-05-24 16:30 UTC
+    // PRC date should be 2026-05-25, UTC date would be 2026-05-24
+    const d = new Date('2026-05-24T16:30:00Z');
+    expect(s.getDateId(d)).toBe('2026-05-25');
+    // Edge: 2026-05-24 23:30 +08:00 = 2026-05-24 15:30 UTC — both same day
+    const d2 = new Date('2026-05-24T15:30:00Z');
+    expect(s.getDateId(d2)).toBe('2026-05-24');
+    // Edge: 2026-05-25 07:59 +08:00 = 2026-05-24 23:59 UTC — UTC would be 24, but Shanghai 25
+    const d3 = new Date('2026-05-24T23:59:00Z');
+    expect(s.getDateId(d3)).toBe('2026-05-25');
+  });
+
   it('getCurrentDigest defaults to empty for today', async () => {
     const s = await freshImport();
     const d = s.getCurrentDigest();

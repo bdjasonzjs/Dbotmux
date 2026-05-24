@@ -107,7 +107,10 @@ export async function fetchRecentMessages(opts: FetchOpts): Promise<TillyMessage
   ];
   let stdout: string;
   try {
-    const r = await execFileAsync(cli, args, { maxBuffer: 50 * 1024 * 1024 });
+    // P3-rev1 #6: 60s timeout so a stuck lark-cli can't pile up tick
+    // overlaps (cron is 15min; 60s gives lots of room for normal calls
+    // including pagination, but kills truly hung subprocess).
+    const r = await execFileAsync(cli, args, { maxBuffer: 50 * 1024 * 1024, timeout: 60_000 });
     stdout = r.stdout;
   } catch (err: any) {
     throw new Error(`[tilly-scout] lark-cli exec failed: ${err?.message ?? err}`);
