@@ -178,6 +178,17 @@ export async function dispatchChatCreated(opts: DispatchChatCreatedOpts): Promis
     originType: opts.originType,
     parentChatId: opts.parentChatId ?? null,
     participants: opts.participants ?? [],
+    // P1 commit #5: persist rich ChatContext fields plumbed through
+    // from group-creator (which got them from MainBotPlaybook). Optional —
+    // legacy callers omit and ChatContext gets old behavior (empty arrays
+    // / undefined). taskType is undefined for non-Playbook spawns
+    // (legacy /group / human_created etc.) which is exactly what dashboard
+    // filtering wants.
+    relatedRefs: opts.relatedRefs,
+    activeTodoRefs: opts.activeTodoRefs,
+    rules: opts.rules,
+    parentDigest: opts.parentDigest,
+    taskType: opts.taskType,
   });
 
   // P4-fix: also write to ChatTopology so dashboard's topology page sees
