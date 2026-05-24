@@ -16,6 +16,7 @@ import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { getBot, getAllBots } from '../bot-registry.js';
+import { getMainTopicChatId } from '../services/main-topic-config.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { validateAdoptTarget } from './session-discovery.js';
 import type { LarkAttachment, LarkMention, ScheduledTask } from '../types.js';
@@ -197,6 +198,50 @@ export function formatAttachmentsHint(attachments?: LarkAttachment[], locale?: L
 /** P1 main-bot mode: build the `<chat_context>` block to prepend to a
  *  spawned bot's first user message. Returns empty string when no
  *  ChatContext exists for this chat. */
+/**
+ * P1 commit #8 (spec §6) — main-bot prompt block. Injected at session
+ * spawn time when:
+ *   - chat is the configured mainTopicChatId (松松's Flumy 主话题)
+ *   - bot is the main bot (cliId='claude-code')
+ *
+ * Tells the spawned Claude session it's in main-bot mode and should
+ * route complex tasks via `botmux subtask-create` instead of doing them
+ * inline. Heuristic (松松 Q3=b): short Q's get answered directly; PRDs /
+ * bug lists / multi-bot collab get spawned subgroups.
+ *
+ * Returns empty string when conditions don't match — block is omitted
+ * from the prompt.
+ */
+export function buildMainBotPromptBlock(chatId: string | undefined, larkAppId: string | undefined): string {
+  if (!chatId || !larkAppId) return '';
+  const mainTopic = getMainTopicChatId();
+  if (!mainTopic || chatId !== mainTopic) return '';
+  // Verify bot is Claude (cliId='claude-code') via bot-registry.
+  let isMainBot = false;
+  try {
+    const bot = getBot(larkAppId);
+    isMainBot = bot.config.cliId === 'claude-code';
+  } catch { return ''; }
+  if (!isMainBot) return '';
+  return `<main_bot_routing>
+你在 Flumy 主话题工作（mainTopicChatId）。
+
+**任务路由（启发式）**：
+- 短问题 / 闲聊 / 即时答疑（一句话能搞定）→ 直接答，不拉子群
+- 复杂任务（PRD 分析 / bug 清单 / 跨多群事项 / 需要多 bot 协作 / 预期 >5 轮对话）
+  → 调用 \`botmux subtask-create --purpose "..." --task-type prd|bug|misc\`
+  → 阻塞等待返回 chatId
+  → 主话题简短回报「✅ 已建子群 [群名]（oc_xxx），进展会自动汇报回来」
+
+**红线**：
+- 任何决策/求助走 RootInbox（P2），**不在子群 @ 松松**（他不在群里）
+- 同一任务不重复调 subtask-create（idempotencyKey 自动夹）
+- 拿不准是不是复杂任务 → 偏向"直接答"（拉群成本 > 多说一句话）
+
+工具自动从 env 注入 sessionId — 你**不需要**手动带 \`--session-id\` flag。
+</main_bot_routing>`;
+}
+
 export function buildChatContextBlock(chatId: string): string {
   try {
     const ctx = chatContextStore.read(chatId);
@@ -242,6 +287,10 @@ export function buildNewTopicPrompt(
    *  ChatContext exists, a `<chat_context>` block is appended to the prompt
    *  parts so the spawned bot knows what this chat is about. */
   chatId?: string,
+  /** P1 commit #8: larkAppId of the spawning bot. When provided AND chatId
+   *  matches mainTopicChatId AND larkAppId is Claude's, a `<main_bot_routing>`
+   *  block is appended telling the bot to use subtask-create. */
+  larkAppId?: string,
 ): string {
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
   // Non-Claude CLIs receive the botmux routing hints inline via the prompt
@@ -297,6 +346,12 @@ export function buildNewTopicPrompt(
     const ctxBlock = buildChatContextBlock(chatId);
     if (ctxBlock) parts.push(ctxBlock);
   }
+
+  // P1 commit #8: when this is the main bot (Claude) running in the
+  // configured main topic, append routing guidance (subtask-create
+  // heuristic). Returns '' when conditions don't match.
+  const mainBotBlock = buildMainBotPromptBlock(chatId, larkAppId);
+  if (mainBotBlock) parts.push(mainBotBlock);
 
   const senderBlock = renderSenderTag(sender);
   if (senderBlock) parts.push(senderBlock);
@@ -936,7 +991,7 @@ export async function executeScheduledTask(
   sessionStore.updateSession(session);
   messageQueue.ensureQueue(anchor);
 
-  const prompt = buildNewTopicPrompt(task.prompt, session.sessionId, bot.config.cliId, bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId }, localeForBot(larkAppId));
+  const prompt = buildNewTopicPrompt(task.prompt, session.sessionId, bot.config.cliId, bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId }, localeForBot(larkAppId), undefined, session.chatId, larkAppId);
 
   const ds: DaemonSession = {
     session,

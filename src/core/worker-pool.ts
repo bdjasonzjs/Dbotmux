@@ -627,6 +627,10 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
       SESSION_DATA_DIR: config.session.dataDir,
       LARK_APP_ID: botCfg.larkAppId,
       LARK_APP_SECRET: botCfg.larkAppSecret,
+      // P1 commit #8 (spec §6.5): authoritative session id for CLI
+      // subprocesses (e.g. `botmux subtask-create`). Reader: env precedence
+      // is `--session-id` flag > BOTMUX_SESSION_ID > exit 2.
+      BOTMUX_SESSION_ID: ds.session.sessionId,
     },
   });
 
@@ -1333,6 +1337,8 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
       BOTMUX: '1',
       LARK_APP_ID: botCfg.larkAppId,
       LARK_APP_SECRET: botCfg.larkAppSecret,
+      // P1 commit #8: same env injection in adopt-fork path (spec §6.5).
+      BOTMUX_SESSION_ID: ds.session.sessionId,
     },
   });
 

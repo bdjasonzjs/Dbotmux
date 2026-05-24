@@ -434,6 +434,7 @@ export async function handleCommand(
               loc,
               ds.pendingSender,
               ds.chatId,
+              ds.larkAppId,
             );
             rememberLastCliInput(ds, pendingPrompt, prompt);
             ds.pendingPrompt = undefined;
@@ -514,6 +515,7 @@ export async function handleCommand(
             loc,
             ds.pendingSender,
             ds.chatId,
+            ds.larkAppId,
           );
           rememberLastCliInput(ds, pendingPrompt, prompt);
           ds.pendingPrompt = undefined;
