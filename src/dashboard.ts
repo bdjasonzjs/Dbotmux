@@ -21,6 +21,7 @@ import {
   exchangeCodeForToken,
   fetchUserInfo as fetchUserInfoOAuth,
   defaultRedirectUri,
+  sanitizeNext,
 } from './dashboard/lark-oauth-flow.js';
 import { DaemonRegistry } from './dashboard/registry.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
@@ -326,7 +327,7 @@ const server = createServer(async (req, res) => {
 
     // ─── Auth: /login page + device flow API ────────────────────────────────
     if (req.method === 'GET' && url.pathname === '/login') {
-      const next = url.searchParams.get('next') || '/';
+      const next = sanitizeNext(url.searchParams.get('next'));
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
       res.end(renderLoginPage(next));
       return;
@@ -351,7 +352,7 @@ const server = createServer(async (req, res) => {
           res.end(renderLoginPage('/', 'no_bot_configured: bots.json 里没有 larkAppId'));
           return;
         }
-        const next = url.searchParams.get('next') || '/';
+        const next = sanitizeNext(url.searchParams.get('next'));
         const reqHost = req.headers.host;
         const redirectUri = defaultRedirectUri({
           publicBaseUrl: process.env.BOTMUX_DASHBOARD_PUBLIC_BASE_URL,
@@ -414,7 +415,10 @@ const server = createServer(async (req, res) => {
           res.end(renderLoginPage('/', `你的飞书账号 (${info.name ?? info.open_id}) 不在白名单`));
           return;
         }
-        const safeNext = (next && next.startsWith('/')) ? next : '/';
+        // `next` came out of the HMAC-signed state, but re-sanitize as a
+        // belt-and-suspenders guard against an attacker who forged a
+        // valid state (e.g., via secret leak) carrying `//evil/...`.
+        const safeNext = sanitizeNext(next);
         res.writeHead(302, {
           'set-cookie': buildUserSetCookie(info.open_id),
           location: safeNext,
@@ -492,7 +496,7 @@ const server = createServer(async (req, res) => {
         if (!isUserAllowed(info.open_id)) {
           return jsonRes(res, 200, { ok: true, status: 'denied_not_in_allowlist', open_id: info.open_id });
         }
-        const next = (body?.next && body.next.startsWith('/')) ? body.next : '/';
+        const next = sanitizeNext(body?.next);
         res.writeHead(200, {
           'content-type': 'application/json',
           'set-cookie': buildUserSetCookie(info.open_id),
@@ -542,9 +546,18 @@ const server = createServer(async (req, res) => {
       });
       return jsonRes(res, 200, { ...topo, nodes });
     }
+    // chatId in API paths needs strict whitelist BEFORE the store accepts
+    // it as a filename: decodeURIComponent already turned `%2F` into `/`,
+    // so a request like `/api/contexts/%2E%2E%2Foops/archive` would
+    // otherwise reach the store with `../oops` and write outside
+    // `chat-contexts/`. The store also asserts, but failing early at the
+    // route gives a clean 400 instead of an unhandled-throw 500.
+    const isSafeChatId = (s: string): boolean => /^[A-Za-z0-9_-]{1,128}$/.test(s);
+
     let mCtx: RegExpMatchArray | null;
     if (req.method === 'GET' && (mCtx = url.pathname.match(/^\/api\/contexts\/([^/]+)$/))) {
       const chatId = decodeURIComponent(mCtx[1]);
+      if (!isSafeChatId(chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
       const { read } = await import('./services/chat-context-store.js');
       const ctx = read(chatId);
       if (!ctx) return jsonRes(res, 404, { ok: false, error: 'context_not_found' });
@@ -553,14 +566,15 @@ const server = createServer(async (req, res) => {
     let mArchive: RegExpMatchArray | null;
     if (req.method === 'POST' && (mArchive = url.pathname.match(/^\/api\/contexts\/([^/]+)\/archive$/))) {
       const chatId = decodeURIComponent(mArchive[1]);
+      if (!isSafeChatId(chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
       const { archive } = await import('./services/chat-context-store.js');
       const r = archive(chatId);
-      if (!r) return jsonRes(res, 404, { ok: false, error: 'context_not_found' });
       return jsonRes(res, 200, { ok: true, status: r.status, archivedAt: r.archivedAt });
     }
     let mUnarchive: RegExpMatchArray | null;
     if (req.method === 'POST' && (mUnarchive = url.pathname.match(/^\/api\/contexts\/([^/]+)\/unarchive$/))) {
       const chatId = decodeURIComponent(mUnarchive[1]);
+      if (!isSafeChatId(chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
       const { unarchive } = await import('./services/chat-context-store.js');
       const r = unarchive(chatId);
       if (!r) return jsonRes(res, 404, { ok: false, error: 'context_not_found' });

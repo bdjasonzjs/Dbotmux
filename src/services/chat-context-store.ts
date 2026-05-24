@@ -68,11 +68,36 @@ export interface ChatContext {
 
 const CHAT_CONTEXTS_DIR = 'chat-contexts';
 
+/**
+ * Lark `chat_id` is `oc_` followed by 32 lowercase hex chars in production
+ * (`oc_3dabc5b37bca8301b12783ef684fc4a5`) but we accept any
+ * `[A-Za-z0-9_-]{1,128}` to stay tolerant of:
+ *   - test fixtures using shorter ids (`oc_new`)
+ *   - p2p chats whose dataset is opaque
+ *   - any future Lark id-format change as long as it remains
+ *     filesystem-safe
+ * What we *must* reject: anything that could escape the chat-contexts
+ * dir (`/`, `\\`, `..`, `%2F`-decoded slashes, NUL bytes) — those would
+ * let an attacker who reaches the archive endpoint write outside the
+ * intended directory after the request decoder has un-escaped the path.
+ */
+const CHAT_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
+/** Throws if `chatId` could escape the chat-contexts directory. Use at
+ *  the public store boundary (every external entry point that turns a
+ *  chatId into a filesystem path). */
+function assertSafeChatId(chatId: string): void {
+  if (typeof chatId !== 'string' || !CHAT_ID_RE.test(chatId)) {
+    throw new Error(`[chat-context-store] refusing unsafe chatId: ${JSON.stringify(chatId).slice(0, 80)}`);
+  }
+}
+
 function dirPath(): string {
   return join(config.session.dataDir, CHAT_CONTEXTS_DIR);
 }
 
 function filePath(chatId: string): string {
+  assertSafeChatId(chatId);
   return join(dirPath(), chatId + '.json');
 }
 

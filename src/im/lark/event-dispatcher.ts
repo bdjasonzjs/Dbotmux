@@ -770,11 +770,19 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         if (chatType === 'group' && chatId) {
           try { topologyBumpMessage(chatId); } catch (err) { logger.debug(`[main-bot/L1] topology bump failed: ${err}`); }
           try { digestMarkStale(); } catch (err) { logger.debug(`[main-bot/L1] digest markStale failed: ${err}`); }
-          // P5/archive: auto-unarchive a chat when a real new message arrives —
-          // any conversation activity means the work isn't done after all.
-          try {
-            if (ctxIsArchived(chatId)) ctxUnarchive(chatId);
-          } catch (err) { logger.debug(`[main-bot/L1] auto-unarchive failed: ${err}`); }
+          // P5/archive: auto-unarchive a chat when a *human* sends a new
+          // message — auto card refreshes, bot keep-alive pings, or
+          // foreign-bot session messages must NOT revive an archived chat,
+          // or the archive button stops sticking. Lark's `sender_type` is
+          // 'user' for humans, 'app'/'bot' for bots (we accept both bot
+          // variants because Lark inconsistently emits them on cross-bot
+          // card replies — see the comment block below at L790).
+          const isHumanSender = sender?.sender_type === 'user';
+          if (isHumanSender) {
+            try {
+              if (ctxIsArchived(chatId)) ctxUnarchive(chatId);
+            } catch (err) { logger.debug(`[main-bot/L1] auto-unarchive failed: ${err}`); }
+          }
         }
 
         // Bot-originated messages — bots historically only post inside threads

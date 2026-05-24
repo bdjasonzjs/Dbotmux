@@ -145,8 +145,8 @@ export function renderTopologyPage(root: HTMLElement): () => void {
     const lastWhen = formatAge(n.metrics.lastMessageAt);
     const summary = n.summary || '(无摘要)';
     const archiveBtn = isArchived
-      ? `<button class="topo-v2-archive-btn" data-action="unarchive" data-chat-id="${escapeHtml(n.chatId)}" title="恢复到活跃列表">↩️ 恢复</button>`
-      : `<button class="topo-v2-archive-btn" data-action="archive" data-chat-id="${escapeHtml(n.chatId)}" title="归档：从协作面板隐藏 + 停止 escalation">📦 归档</button>`;
+      ? `<button class="topo-v2-archive-btn" data-action="unarchive" data-chat-id="${escapeHtml(n.chatId)}" title="${t('topo.action.unarchiveTitle')}">${t('topo.action.unarchive')}</button>`
+      : `<button class="topo-v2-archive-btn" data-action="archive" data-chat-id="${escapeHtml(n.chatId)}" title="${t('topo.action.archiveTitle')}">${t('topo.action.archive')}</button>`;
     return `
       <article class="topo-v2-card status-${status} ${isArchived ? 'archived' : ''} ${n.chatId === state.activeChatId ? 'active' : ''}" data-chat-id="${escapeHtml(n.chatId)}">
         <header class="topo-v2-card-head">
@@ -245,7 +245,7 @@ export function renderTopologyPage(root: HTMLElement): () => void {
 
     // P5: archived section, gated by state.showArchived toggle.
     const archivedSection = (state.showArchived && archivedFiltered.length)
-      ? `<section class="topo-v2-section topo-v2-archived"><h3>📦 已归档 (${archivedFiltered.length})</h3>${archivedFiltered.map(renderCard).join('')}</section>`
+      ? `<section class="topo-v2-section topo-v2-archived"><h3>${t('topo.section.archived', { n: archivedFiltered.length })}</h3>${archivedFiltered.map(renderCard).join('')}</section>`
       : '';
 
     const sections = [
@@ -267,8 +267,8 @@ export function renderTopologyPage(root: HTMLElement): () => void {
     if (groups.bot_working.length) parts.push(`<span class="topo-v2-stat working">${t('topo.topbar.botWorking', { n: groups.bot_working.length })}</span>`);
     if (idleCount) parts.push(`<span class="topo-v2-stat idle">${t('topo.topbar.idle', { n: idleCount })}</span>`);
     if (archivedFiltered.length) {
-      const label = state.showArchived ? '隐藏已归档' : '显示已归档';
-      parts.push(`<button class="topo-v2-stat archived-toggle" id="topo-archived-toggle">📦 ${archivedFiltered.length} ${label}</button>`);
+      const key = state.showArchived ? 'topo.topbar.archivedHide' : 'topo.topbar.archivedShow';
+      parts.push(`<button class="topo-v2-stat archived-toggle" id="topo-archived-toggle">${t(key, { n: archivedFiltered.length })}</button>`);
     }
     const refreshWhen = state.lastLoadedAt
       ? formatAge(new Date(state.lastLoadedAt).toISOString())
