@@ -19,7 +19,9 @@ import {
   readInbox, markInProgress, markResolved,
   type ScoutInboxItem, type EscalationRuleId,
 } from '../services/main-bot-digest-store.js';
-import { sendMessage } from '../im/lark/client.js';
+import { sendMessage, updateMessage } from '../im/lark/client.js';
+import { getMainTopicChatId } from '../services/main-topic-config.js';
+import * as rootInbox from '../services/root-inbox-store.js';
 import { logger } from '../utils/logger.js';
 
 const HANDLER_SESSION_ID = `escalation-playbook-${process.pid}`;
@@ -39,12 +41,11 @@ export async function dispatchPendingEscalations(larkAppId: string): Promise<num
     const claimed = markInProgress(item.id);
     if (!claimed) continue;  // race lost — another dispatcher claimed it
 
-    const handler = PLAYBOOK[item.escalation.ruleId];
     let resolution: string;
     try {
-      resolution = handler
-        ? await handler(claimed, larkAppId)
-        : `[${item.escalation.ruleId}] no playbook handler — item logged only`;
+      // P2 commit #2: handler runs sub-chat reminder, then RootInbox sink
+      // fires (best-effort, never blocks).
+      resolution = await runHandlerWithRootSink(claimed, larkAppId);
     } catch (err) {
       logger.error(`[escalation-playbook] R${item.escalation.ruleId} handler threw: ${err}`);
       resolution = `error: ${String(err).slice(0, 200)}`;
@@ -133,3 +134,101 @@ const PLAYBOOK: Record<EscalationRuleId, PlaybookHandler> = {
   R4: handleR4,
   R5: handleR5,
 };
+
+// ─── P2 commit #2: RootInbox sink ─────────────────────────────────────────
+
+/** Push an escalation to the RootInbox + render/update the main-topic card.
+ *
+ *  On first push for a given (ruleId, subChatId): insert RootInboxItem,
+ *  send a fresh interactive card to mainTopic, store messageId.
+ *  On subsequent pushes (same id, still 'open'): update RootInboxItem
+ *  (lastUpdatedAt + updateCount++), call Lark `updateMessage` on the
+ *  stored rootCardMessageId to edit the SAME card (no reply, no new msg
+ *  → won't spam mainTopic).
+ *
+ *  All sends are best-effort: failure to talk to Lark is logged but does
+ *  not throw — escalation processing continues. */
+async function pushEscalationToRootInbox(
+  item: ScoutInboxItem,
+  larkAppId: string,
+  oneLineSummary: string,
+): Promise<void> {
+  const mainTopic = getMainTopicChatId();
+  if (!mainTopic) {
+    logger.debug('[escalation-playbook] mainTopicChatId not configured — skipping RootInbox sink');
+    return;
+  }
+  const ruleId = item.escalation.ruleId;
+  const subChatId = item.escalation.chatId;
+  const subChatName = subChatId;  // 占位 — 暂无 chat 名称 lookup；commit #5/#6 可加
+  const id = rootInbox.buildId({ kind: 'escalation', ruleId, subChatId });
+  const { item: row, inserted } = rootInbox.upsertOpen({
+    id,
+    kind: 'escalation',
+    subChatId,
+    subChatName,
+    ruleId,
+    summary: oneLineSummary,
+  });
+
+  const cardJson = buildEscalationCard(row);
+
+  try {
+    if (inserted || !row.rootCardMessageId) {
+      // First time — fresh card to mainTopic
+      const messageId = await sendMessage(larkAppId, mainTopic, cardJson, 'interactive');
+      if (messageId) rootInbox.setRootCardMessageId(id, messageId);
+    } else {
+      // Update existing card in place — no reply, no new message
+      try {
+        await updateMessage(larkAppId, row.rootCardMessageId, cardJson);
+      } catch (err) {
+        // Card may have been withdrawn manually — fall back to a fresh send
+        logger.warn(`[escalation-playbook] updateMessage failed for ${row.rootCardMessageId}, sending fresh card: ${err}`);
+        const messageId = await sendMessage(larkAppId, mainTopic, cardJson, 'interactive');
+        if (messageId) rootInbox.setRootCardMessageId(id, messageId);
+      }
+    }
+  } catch (err) {
+    logger.warn(`[escalation-playbook] RootInbox sink Lark send failed (item ${id}): ${err}`);
+  }
+}
+
+/** Render a minimal Lark interactive card from a RootInbox item.
+ *  Schema v2.0 — Lark 自动识别 schema 字段。 */
+function buildEscalationCard(row: rootInbox.RootInboxItem): string {
+  const statusEmoji = row.status === 'closed' ? '✅' : row.status === 'updated' ? '🔁' : '🆕';
+  const ruleLabel = row.ruleId ?? '?';
+  const subChatLink = `[查看子群](https://applink.feishu.cn/client/chat/open?openChatId=${row.subChatId})`;
+  const updateBadge = row.updateCount > 1 ? `更新 ${row.updateCount} 次 · ` : '';
+  const lines = [
+    `**${statusEmoji} [${ruleLabel}] 子群进展**`,
+    `\n${row.summary}\n`,
+    `${updateBadge}首发 ${row.firstSeenAt.slice(11, 19)} UTC · 最新 ${row.lastUpdatedAt.slice(11, 19)} UTC · ${subChatLink}`,
+  ].join('\n');
+  return JSON.stringify({
+    schema: '2.0',
+    config: { update_multi: true },
+    body: {
+      direction: 'vertical',
+      elements: [
+        { tag: 'markdown', content: lines },
+      ],
+    },
+  });
+}
+
+/** Wrap PLAYBOOK lookup to fan out: original handler runs (sub-chat
+ *  reminder) THEN root-inbox sink fires (with the handler's resolution
+ *  string used as the 1-line summary). */
+async function runHandlerWithRootSink(
+  item: ScoutInboxItem,
+  larkAppId: string,
+): Promise<string> {
+  const handler = PLAYBOOK[item.escalation.ruleId];
+  if (!handler) return `[${item.escalation.ruleId}] no playbook handler — item logged only`;
+  const resolution = await handler(item, larkAppId);
+  // Best-effort RootInbox sink (after handler succeeds — never block on it).
+  await pushEscalationToRootInbox(item, larkAppId, item.escalation.context || resolution);
+  return resolution;
+}
