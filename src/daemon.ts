@@ -2637,13 +2637,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         } catch (err) {
           logger.warn(`[tilly/scout] publish failed (digest still stored): ${err}`);
         }
-        // P3-rev1 #2 (妹妹): mark-scanned only the messageIds that LLM
-        // actually analyzed (capped-out messages stay unscanned and get
-        // picked up next tick). Falls back to fresh.map if analyzer didn't
-        // populate the field (legacy code path).
-        const toMark = digest.analyzedMessageIds.length > 0
-          ? digest.analyzedMessageIds
-          : fresh.map(m => m.messageId);
+        // P3-rev1 v0.2 (妹妹补): mark-scanned strictly the messageIds that
+        // LLM actually analyzed. No fallback to fresh.map — if analyzer
+        // returns ok=true but analyzedMessageIds empty, marking nothing is
+        // correct (we don't want a future regression to silently re-enable
+        // full mark and永久漏扫超 cap 消息).
+        const toMark = digest.analyzedMessageIds;
         markScanned(toMark);
         const ms = Date.now() - tickStartTime;
         logger.info(`[tilly/scout] tick done in ${ms}ms: ${fresh.length} fresh / ${toMark.length} analyzed → +${digest.todos.length}t/${digest.progress.length}p/${digest.blockers.length}b/${digest.noteworthy.length}n (today total: ${cumulative.todos.length}/${cumulative.progress.length}/${cumulative.blockers.length}/${cumulative.noteworthy.length})`);

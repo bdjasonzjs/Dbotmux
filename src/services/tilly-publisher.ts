@@ -68,16 +68,17 @@ export async function publishTillyDigest(
   opts: PublishTillyOpts,
 ): Promise<{ rootCardMessageId: string | null; inserted: boolean }> {
   const id = `tilly_digest:${digest.dateId}`;
-  // upsertOpen with allowReopen=true so that if someone manually closed
-  // it earlier today the next tick still creates a fresh one (unlikely
-  // for daily digest but cheap insurance).
+  // P3-rev1 v0.2 (妹妹补): allowReopen=false — daily digest 语义是
+  // "今日 dismiss 后不再打扰"。如果松松手动关闭今日扫读卡，下个 tick
+  // 不应该 reopen 一张新 #2 卡（会变成"撤销关闭"，反产品意图）。
+  // 跨日自然新卡（dateId 不同），不依赖 reopen 机制。
   const { item, inserted } = rootInbox.upsertOpen({
     id,
     kind: 'tilly_digest',
     subChatId: TILLY_SUBCHAT_PLACEHOLDER,
     subChatName: `缇蕾扫读 ${digest.dateId}`,
     summary: `今日 ${totalCount(digest)} items / ${digest.tickCount} ticks`,
-    allowReopen: true,
+    // allowReopen defaults to false
   });
 
   const mainTopic = getMainTopicChatId();
