@@ -189,27 +189,58 @@ describe('buildCardBodyElements', () => {
 });
 
 describe('buildMarkdownCard', () => {
-  it('appends footer hr + grey link element', () => {
+  // 2026-05-25: footer 默认关闭（松松反馈是群里噪音）。需要回放出来
+  // 验证 footer 仍可用时 set env BOTMUX_SHOW_CARD_FOOTER=1。
+  const withFooter = <T>(fn: () => T): T => {
+    const prev = process.env.BOTMUX_SHOW_CARD_FOOTER;
+    process.env.BOTMUX_SHOW_CARD_FOOTER = '1';
+    try { return fn(); } finally {
+      if (prev === undefined) delete process.env.BOTMUX_SHOW_CARD_FOOTER;
+      else process.env.BOTMUX_SHOW_CARD_FOOTER = prev;
+    }
+  };
+
+  it('default: no footer hr / no botmux link (env gate off)', () => {
     const json = buildMarkdownCard('hello');
     const card = JSON.parse(json);
     const tags = card.body.elements.map((e: any) => e.tag);
-    expect(tags).toContain('hr');
-    const last = card.body.elements[card.body.elements.length - 1];
-    expect(last.content).toContain('[botmux](');
+    expect(tags).not.toContain('hr');
+    // No element should mention botmux footer link
+    expect(JSON.stringify(card)).not.toContain('[botmux](');
   });
 
-  it('addresses recipient in footer when openId is provided', () => {
+  it('default: no recipient at-mention even when openId provided', () => {
     const json = buildMarkdownCard('hi', 'ou_abc');
-    const card = JSON.parse(json);
-    const last = card.body.elements[card.body.elements.length - 1];
-    expect(last.content).toContain('<at id=ou_abc></at>');
+    expect(JSON.stringify(JSON.parse(json))).not.toContain('<at id=ou_abc></at>');
   });
 
-  it('omits recipient line when openId is undefined', () => {
-    const json = buildMarkdownCard('hi');
-    const card = JSON.parse(json);
-    const last = card.body.elements[card.body.elements.length - 1];
-    expect(last.content).not.toContain('<at id=');
+  it('BOTMUX_SHOW_CARD_FOOTER=1: appends footer hr + grey link element', () => {
+    withFooter(() => {
+      const json = buildMarkdownCard('hello');
+      const card = JSON.parse(json);
+      const tags = card.body.elements.map((e: any) => e.tag);
+      expect(tags).toContain('hr');
+      const last = card.body.elements[card.body.elements.length - 1];
+      expect(last.content).toContain('[botmux](');
+    });
+  });
+
+  it('BOTMUX_SHOW_CARD_FOOTER=1: addresses recipient when openId provided', () => {
+    withFooter(() => {
+      const json = buildMarkdownCard('hi', 'ou_abc');
+      const card = JSON.parse(json);
+      const last = card.body.elements[card.body.elements.length - 1];
+      expect(last.content).toContain('<at id=ou_abc></at>');
+    });
+  });
+
+  it('BOTMUX_SHOW_CARD_FOOTER=1: omits recipient line when openId undefined', () => {
+    withFooter(() => {
+      const json = buildMarkdownCard('hi');
+      const card = JSON.parse(json);
+      const last = card.body.elements[card.body.elements.length - 1];
+      expect(last.content).not.toContain('<at id=');
+    });
   });
 });
 
