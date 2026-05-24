@@ -2591,6 +2591,52 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     process.on('SIGTERM', () => clearInterval(tickHandle));
     process.on('SIGINT', () => clearInterval(tickHandle));
     logger.info(`[main-bot/scout] cron registered (every ${SCOUT_TICK_INTERVAL_MS / 1000}s, stale gate on)`);
+
+    // P3 commit #5: tilly LLM scout cron — every 15min fetch new 松松 user-
+    // identity messages → codex analyze 4 categories → merge cumulative
+    // daily digest → publish to mainTopic 1 card per day (updated in
+    // place). Independent of the R1-R5 escalation pipeline above.
+    const TILLY_TICK_INTERVAL_MS = 15 * 60 * 1000;
+    const tillyHandle = setInterval(async () => {
+      const tickStartTime = Date.now();
+      try {
+        const { fetchRecentMessages } = await import('./services/tilly-scout.js');
+        const { analyzeMessages } = await import('./services/tilly-llm-analyzer.js');
+        const { mergeNewDigest } = await import('./services/tilly-digest-store.js');
+        const { publishTillyDigest } = await import('./services/tilly-publisher.js');
+        const { markScanned } = await import('./services/tilly-message-store.js');
+        const { resolveBotIdent } = await import('./core/main-bot-playbook.js');
+        const end = new Date();
+        const start = new Date(end.getTime() - TILLY_TICK_INTERVAL_MS);
+        const fresh = await fetchRecentMessages({ start, end });
+        if (fresh.length === 0) {
+          logger.info('[tilly/scout] tick — no new messages');
+          return;
+        }
+        const digest = await analyzeMessages(fresh);
+        if (!digest.ok) {
+          // Don't mark scanned — retry next tick; LLM failure is
+          // recoverable (e.g. codex restart, transient API issue).
+          logger.warn(`[tilly/scout] LLM analyze failed (${fresh.length} msgs in window): ${digest.error}`);
+          return;
+        }
+        const cumulative = mergeNewDigest(digest);
+        try {
+          const claudeApp = resolveBotIdent('claude').larkAppId;
+          await publishTillyDigest(cumulative, { larkAppId: claudeApp });
+        } catch (err) {
+          logger.warn(`[tilly/scout] publish failed (digest still stored): ${err}`);
+        }
+        markScanned(fresh.map(m => m.messageId));
+        const ms = Date.now() - tickStartTime;
+        logger.info(`[tilly/scout] tick done in ${ms}ms: ${fresh.length} fresh → +${digest.todos.length}t/${digest.progress.length}p/${digest.blockers.length}b/${digest.noteworthy.length}n (today total: ${cumulative.todos.length}/${cumulative.progress.length}/${cumulative.blockers.length}/${cumulative.noteworthy.length})`);
+      } catch (err) {
+        logger.error(`[tilly/scout] tick failed: ${err}`);
+      }
+    }, TILLY_TICK_INTERVAL_MS);
+    process.on('SIGTERM', () => clearInterval(tillyHandle));
+    process.on('SIGINT', () => clearInterval(tillyHandle));
+    logger.info(`[tilly/scout] cron registered (every ${TILLY_TICK_INTERVAL_MS / 1000}s)`);
   }
 
   logger.info('Daemon is running. Press Ctrl+C to stop.');
