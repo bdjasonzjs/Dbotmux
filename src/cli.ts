@@ -3274,6 +3274,11 @@ switch (command) {
     await cmdSubtaskCreate(process.argv.slice(3));
     break;
   }
+  case 'progress-report': {
+    const { cmdProgressReport } = await import('./cli/progress-report.js');
+    await cmdProgressReport(process.argv.slice(3));
+    break;
+  }
   case 'bots':     await cmdBots(process.argv[3] ?? 'list', process.argv.slice(4)); break;
   case 'history':  await cmdHistory(process.argv.slice(3)); break;
   case 'quoted':   await cmdQuoted(process.argv.slice(3)); break;

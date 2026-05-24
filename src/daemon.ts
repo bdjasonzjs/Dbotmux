@@ -1290,6 +1290,55 @@ function attemptResumeStatus(error: { error: string }): number {
   }
 }
 
+// P2 commit #5: progress-report / request_decision IPC route.
+// Body: { sessionId, summary, slug, kind?, subChatId?, subChatName? }
+// authzCheck verifies session belongs to main bot Claude (any chat — not
+// limited to mainTopic, because progress reports legitimately come from
+// sub-chats), then publishes to RootInbox via root-inbox-publisher.
+ipcRoute('POST', '/api/progress-report', async (req, res) => {
+  let body: {
+    sessionId?: string; summary?: string; slug?: string;
+    kind?: 'progress' | 'request_decision';
+    subChatId?: string; subChatName?: string;
+  };
+  try { body = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+
+  try {
+    if (!body.sessionId || !body.summary || !body.slug) {
+      return jsonRes(res, 400, { ok: false, error: 'missing sessionId/summary/slug' });
+    }
+    // authzCheck: verify session exists + is main bot (Claude). Unlike
+    // spawnSubTask, progress reports can come from ANY chat (sub-chat
+    // included), so we don't enforce mainTopic.
+    const session = (await import('./services/session-store.js')).getSession(body.sessionId);
+    if (!session) return jsonRes(res, 403, { ok: false, error: `unknown session: ${body.sessionId}` });
+    // Resolve Claude's app id once via Playbook helper
+    const { resolveBotIdent } = await import('./core/main-bot-playbook.js');
+    const claudeApp = resolveBotIdent('claude').larkAppId;
+    if (session.larkAppId !== claudeApp) {
+      return jsonRes(res, 403, { ok: false, error: 'only main bot can publish progress reports' });
+    }
+    // subChatId defaults to caller chat (where the bot is reporting from)
+    const subChatId = body.subChatId ?? session.chatId;
+    const kind = body.kind ?? 'progress';
+    const pub = await import('./services/root-inbox-publisher.js');
+    const publishFn = kind === 'request_decision' ? pub.publishRequestDecision : pub.publishProgress;
+    const result = await publishFn({
+      callerSessionId: body.sessionId,
+      subChatId,
+      subChatName: body.subChatName,
+      slug: body.slug,
+      summary: body.summary,
+      larkAppId: session.larkAppId!,
+    });
+    return jsonRes(res, 200, { ok: true, ...result });
+  } catch (err: any) {
+    const status = err && err.name === 'HttpError' ? err.status : 500;
+    return jsonRes(res, status, { ok: false, error: String(err?.message ?? err) });
+  }
+});
+
 // P1 commit #6: MainBotPlaybook spawn-subtask IPC route.
 // Mounted on every daemon; authzCheck rejects sessions not on this
 // daemon (session-store partitioned per larkAppId) and non-main-bot
