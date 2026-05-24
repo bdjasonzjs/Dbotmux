@@ -109,6 +109,42 @@ describe('scout-spawner originType filter (P6 regression)', () => {
     expect(result.escalationsAdded).toBe(0);
   });
 
+  it('pendingForJason also filtered (Finding 1 regression): human_created with unanswered ping does NOT enter pending tray', async () => {
+    // Tray surface is task-tracking, same scoping as escalation.
+    // digest.chats still includes the human_created chat (info-gathering),
+    // but pendingForJason must drop it.
+    const { scout, topo, digest } = await freshImports();
+    topo.upsertNode({
+      chatId: 'oc_human_with_ping',
+      name: '问答群',
+      chatType: 'group',
+      originType: 'human_created',
+      parentChatId: null,
+      tags: [],
+      metrics: { lastMessageAt: new Date().toISOString(), messages24h: 1, hasUnansweredPing: true },
+      summary: '',
+    });
+    topo.upsertNode({
+      chatId: 'oc_bot_with_ping',
+      name: '任务群',
+      chatType: 'group',
+      originType: 'bot_spawned',
+      parentChatId: 'oc_parent',
+      tags: [],
+      metrics: { lastMessageAt: new Date().toISOString(), messages24h: 1, hasUnansweredPing: true },
+      summary: '',
+    });
+    digest.writeInbox({ pending: [], processed: [] });
+
+    const result = await scout.runScoutTick(undefined);
+    const pendingIds = new Set(result.digest.pendingForJason.map(p => p.chatId));
+    expect(pendingIds.has('oc_bot_with_ping')).toBe(true);   // task → in tray
+    expect(pendingIds.has('oc_human_with_ping')).toBe(false); // info-gather → not in tray
+    // But the human chat IS still in digest.chats for main-bot context
+    const chatIds = new Set(result.digest.chats.map(c => c.chatId));
+    expect(chatIds.has('oc_human_with_ping')).toBe(true);
+  });
+
   it('digest still includes ALL chats (info-gathering link is untouched)', async () => {
     // 松松's explicit instruction: 信息搜集 (digest) for main-bot context
     // continues to include every chat the bot is in, even though the

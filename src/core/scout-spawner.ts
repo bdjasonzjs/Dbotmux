@@ -84,7 +84,11 @@ export async function runScoutTick(larkAppId?: string): Promise<{ digest: MainBo
     generatedAt: new Date().toISOString(),
     chats,
     crossChatThreads: prevDigest.crossChatThreads, // P5 cross-topic edges feed this; preserve until then
-    pendingForJason: derivePendingForJason(topo.nodes),
+    // pendingForJason feeds the dashboard's "需要松松处理" tray, which is
+    // a task-tracker surface — same scoping rule as escalation. We pass
+    // activeNodes (already filtered to !archived && originType ===
+    // 'bot_spawned'). digest.chats above stays full-fat for info-gathering.
+    pendingForJason: derivePendingForJason(activeNodes),
     escalations: newEscalations,
   };
   writeDigest(digest);
