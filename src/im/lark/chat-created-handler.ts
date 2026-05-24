@@ -194,13 +194,28 @@ export async function dispatchChatCreated(opts: DispatchChatCreatedOpts): Promis
   // P4-fix: also write to ChatTopology so dashboard's topology page sees
   // the new chat (otherwise topology only gets nodes via onMessage hook,
   // which defaults to originType=human_created — losing the real type).
+  //
+  // 2026-05-25 fix: dispatchChatCreated 可能被两条路径调用——
+  //   (a) group-creator 主动派 (带 parentChatId)
+  //   (b) Lark im.chat.created 事件 (payload 不带 parent)
+  // 如果 (b) 后于 (a) 到达，opts.parentChatId 是 undefined → 旧代码 `?? null`
+  // 会把 (a) 写好的 parent 抹成 null，导致前端拓扑图永远画不出主→子线。
+  // 改成「caller 没显式传时就 preserve 已存的字段」。originType 同理：
+  // bot_spawned 比 human_created 信息量大，已存为 bot_spawned 不能被
+  // 后到的 human_created 覆盖。
   const existingTopoNode = topologyGetNode(opts.chatId);
+  const nextParent = opts.parentChatId !== undefined
+    ? opts.parentChatId
+    : existingTopoNode?.parentChatId ?? null;
+  const nextOrigin = (existingTopoNode?.originType === 'bot_spawned' && opts.originType !== 'bot_spawned')
+    ? existingTopoNode.originType
+    : opts.originType;
   topologyUpsertNode({
     chatId: opts.chatId,
     name: existingTopoNode?.name ?? opts.chatId,
     chatType: 'group',
-    originType: opts.originType,
-    parentChatId: opts.parentChatId ?? null,
+    originType: nextOrigin,
+    parentChatId: nextParent,
     tags: existingTopoNode?.tags ?? [],
     metrics: existingTopoNode?.metrics ?? { lastMessageAt: new Date().toISOString(), messages24h: 0, hasUnansweredPing: false },
     summary: existingTopoNode?.summary ?? (opts.purpose ?? ''),

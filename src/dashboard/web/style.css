@@ -1313,3 +1313,47 @@ input.row-select,
 .topo-v2-root-inbox-close { background: #f0fdf4; color: #15803d; border: 1px solid #86efac; padding: 3px 8px; border-radius: 4px; font-size: 12px; cursor: pointer; }
 .topo-v2-root-inbox-close:hover:not([disabled]) { background: #dcfce7; }
 .topo-v2-root-inbox-close[disabled] { opacity: 0.5; cursor: not-allowed; }
+
+/* 2026-05-25 — view-mode switcher + SVG topology graph */
+.topo-v2-view-switch { display: inline-flex; gap: 0; border: 1px solid #cbd5e1; border-radius: 6px; overflow: hidden; margin-right: 8px; }
+.topo-v2-view-btn { background: #fff; color: #475569; border: none; padding: 4px 12px; font-size: 12px; cursor: pointer; }
+.topo-v2-view-btn.active { background: #2563eb; color: #fff; }
+.topo-v2-view-btn:hover:not(.active) { background: #f1f5f9; }
+
+.topo-v2-graph-pane { background: #fff; border-radius: 8px; padding: 12px; min-height: 520px; box-shadow: 0 1px 3px rgba(0,0,0,0.04); }
+.topo-v2-graph-legend { display: flex; gap: 14px; flex-wrap: wrap; padding: 4px 0 10px; font-size: 12px; color: #64748b; }
+.topo-v2-graph-legend .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 50%; vertical-align: middle; margin-right: 4px; }
+.topo-v2-graph-svg { width: 100%; height: 560px; display: block; user-select: none; }
+.topo-v2-graph-svg .node-card { cursor: pointer; transition: filter 0.12s; }
+.topo-v2-graph-svg .node-card:hover { filter: brightness(1.06) drop-shadow(0 2px 6px rgba(0,0,0,0.18)); }
+.topo-v2-graph-svg .node-card.faded { opacity: 0.28; }
+.topo-v2-graph-svg .node-card.faded:hover { opacity: 0.55; }
+.topo-v2-graph-orphan-chip.faded { opacity: 0.35; }
+/* Fix #6: archived 节点 dashed 边 + 70% 透明 */
+.topo-v2-graph-svg .node-card.archived rect { stroke-dasharray: 4 3; opacity: 0.6; }
+.topo-v2-graph-svg .node-card.archived text { opacity: 0.7; }
+.topo-v2-graph-orphan-chip.archived { border-style: dashed; opacity: 0.7; }
+.topo-v2-graph-svg .node-card.active rect { stroke: #2563eb; stroke-width: 3; }
+.topo-v2-graph-svg .node-rect-root { fill: #fef3c7; stroke: #f59e0b; stroke-width: 2; }
+.topo-v2-graph-svg .node-rect-spawned { fill: #ecfdf5; stroke: #10b981; stroke-width: 1.5; }
+.topo-v2-graph-svg .node-rect-human { fill: #f1f5f9; stroke: #94a3b8; stroke-width: 1.5; }
+.topo-v2-graph-svg .node-rect.status-needs_reply { stroke: #ef4444 !important; stroke-width: 2; }
+.topo-v2-graph-svg .node-rect.status-bot_working { stroke: #f59e0b !important; stroke-width: 2; }
+.topo-v2-graph-svg .node-label { font-size: 11px; font-weight: 600; fill: #1e293b; pointer-events: none; }
+.topo-v2-graph-svg .node-sub { font-size: 9px; fill: #64748b; pointer-events: none; }
+.topo-v2-graph-svg .edge { stroke: #94a3b8; stroke-width: 1.4; fill: none; opacity: 0.55; }
+.topo-v2-graph-svg .edge.parent_child { stroke: #2563eb; opacity: 0.6; }
+.topo-v2-graph-orphans-row { margin-top: 16px; padding-top: 10px; border-top: 1px dashed #e2e8f0; }
+.topo-v2-graph-orphans-row h4 { margin: 0 0 8px; font-size: 13px; color: #64748b; font-weight: 600; }
+.topo-v2-graph-orphans-list { display: flex; flex-wrap: wrap; gap: 8px; }
+.topo-v2-graph-orphan-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 14px;
+  padding: 4px 10px; font-size: 12px; cursor: pointer;
+}
+.topo-v2-graph-orphan-chip:hover { background: #f1f5f9; }
+.topo-v2-graph-orphan-chip.status-needs_reply { border-color: #ef4444; }
+.topo-v2-graph-orphan-chip.status-bot_working { border-color: #f59e0b; }
+.topo-v2-graph-orphan-chip .chip-dot { width: 8px; height: 8px; border-radius: 50%; background: #94a3b8; }
+.topo-v2-graph-orphan-chip.status-needs_reply .chip-dot { background: #ef4444; }
+.topo-v2-graph-orphan-chip.status-bot_working .chip-dot { background: #f59e0b; }

@@ -41,6 +41,13 @@ interface ChatNode {
   archivedAt?: string | null;
 }
 
+interface ApiTopology {
+  rootChatId: string;
+  nodes: ChatNode[];
+}
+
+type ViewMode = 'list' | 'graph';
+
 interface GroupBrief { chatId: string; name?: string }
 
 interface ChatContext {
@@ -102,6 +109,10 @@ export function renderTopologyPage(root: HTMLElement): () => void {
       </header>
       <div class="topo-v2-topbar" id="topo-topbar">${t('topo.refreshing')}</div>
       <div class="topo-v2-controls">
+        <div class="topo-v2-view-switch" id="topo-view-switch">
+          <button class="topo-v2-view-btn active" data-view="list">${t('topo.view.list')}</button>
+          <button class="topo-v2-view-btn" data-view="graph">${t('topo.view.graph')}</button>
+        </div>
         <input type="search" id="topo-search" placeholder="${t('topo.searchPlaceholder')}" autocomplete="off" />
         <select id="topo-filter">
           <option value="all">${t('topo.filter.all')}</option>
@@ -119,12 +130,14 @@ export function renderTopologyPage(root: HTMLElement): () => void {
 
   const state = {
     nodes: [] as ChatNode[],
+    rootChatId: '' as string,
     groupNameByChatId: new Map<string, string>(),
     activeChatId: null as string | null,
     search: '',
     filter: 'all' as 'all' | CardStatus,
     showArchived: false,  // P5: toggle archived section
     lastLoadedAt: 0,  // ms epoch when latest topology data landed
+    viewMode: 'list' as ViewMode,  // 2026-05-25: list vs graph
   };
 
   const streamEl = document.getElementById('topo-stream')!;
@@ -168,6 +181,222 @@ export function renderTopologyPage(root: HTMLElement): () => void {
     return `<section class="topo-v2-section"><h3>${label} (${list.length})</h3>${list.map(renderCard).join('')}</section>`;
   }
 
+  // 2026-05-25 fix (妹妹 review #4): graph + list 共用的 search/filter
+  // predicate. Graph 用它来 dim 不 match 的节点（保持连通性，比"消失"友好）；
+  // list 也共享同一规则，避免两个视图筛选不一致。
+  function matchesSearchFilter(n: ChatNode): boolean {
+    if (state.filter !== 'all' && statusOf(n) !== state.filter) return false;
+    if (state.search) {
+      const needle = state.search.toLowerCase();
+      const name = nameOf(n.chatId, n.name).toLowerCase();
+      if (!name.includes(needle) && !n.chatId.toLowerCase().includes(needle)) return false;
+    }
+    return true;
+  }
+
+  // ----- 2026-05-25: SVG graph view -----------------------------------
+  // Renders nodes as a radial layout: rootChatId in the center; each
+  // bot_spawned child orbits at r=190; grandchildren at r=340. human_created
+  // chats that themselves have bot_spawned children are also surfaced as
+  // "alt-roots" outside the main orbit (top row). Orphans (parent=null
+  // bot_spawned that aren't reachable from root) get a chip strip below.
+  function renderGraph(): void {
+    // 2026-05-25 fix #6 (实拍后发现): graph 视图原本只画 active，但现状
+    // 5 个 bot_spawned 里有 4 个 status=archived，导致 graph 几乎啥都
+    // 看不到。改成 archived 也画进去 + 加 .archived class 视觉降权
+    // (dimmer + dashed border)，这样松松能看到完整拓扑，archived 一眼
+    // 区分。orphan strip 同理也包含 archived 孤儿。
+    const all = state.nodes;
+    if (all.length === 0) {
+      streamEl.innerHTML = `<div class="topo-v2-empty">${t('topo.graph.empty')}</div>`;
+      return;
+    }
+
+    const byId = new Map<string, ChatNode>(all.map(n => [n.chatId, n]));
+    const childrenOf = new Map<string, ChatNode[]>();
+    for (const n of all) {
+      if (n.parentChatId && byId.has(n.parentChatId)) {
+        const arr = childrenOf.get(n.parentChatId) ?? [];
+        arr.push(n);
+        childrenOf.set(n.parentChatId, arr);
+      }
+    }
+
+    // BFS from rootChatId to discover the connected tree.
+    const rootId = state.rootChatId && byId.has(state.rootChatId) ? state.rootChatId : null;
+    const reachable = new Set<string>();
+    if (rootId) {
+      const q = [rootId];
+      while (q.length) {
+        const cur = q.shift()!;
+        if (reachable.has(cur)) continue;
+        reachable.add(cur);
+        for (const c of childrenOf.get(cur) ?? []) q.push(c.chatId);
+      }
+    }
+
+    // Anything human_created with bot_spawned children but not reachable → alt-root.
+    const altRoots = all.filter(
+      n => !reachable.has(n.chatId)
+        && n.originType !== 'bot_spawned'
+        && (childrenOf.get(n.chatId)?.length ?? 0) > 0
+    );
+    // 2026-05-25 fix (妹妹 review #5): alt-root 的 children 已经在主图里画了，
+    // 不能再进 orphan chip strip（之前会双显）。把 alt-root parent 也排除。
+    const altRootIds = new Set(altRoots.map(n => n.chatId));
+    const orphans = all.filter(
+      n => n.originType === 'bot_spawned'
+        && !reachable.has(n.chatId)
+        && !(n.parentChatId && altRootIds.has(n.parentChatId))
+    );
+
+    // ----- layout: radial -------------------------------------------------
+    const W = 1100, H = 540;
+    const cx = W / 2, cy = H / 2 - 30;
+    type Placed = { n: ChatNode; x: number; y: number; ring: 0 | 1 | 2 | -1 };
+    const placed: Placed[] = [];
+
+    if (rootId) {
+      placed.push({ n: byId.get(rootId)!, x: cx, y: cy, ring: 0 });
+      const ring1 = childrenOf.get(rootId) ?? [];
+      const R1 = 190;
+      ring1.forEach((c, i) => {
+        const a = (i / Math.max(ring1.length, 1)) * 2 * Math.PI - Math.PI / 2;
+        placed.push({ n: c, x: cx + R1 * Math.cos(a), y: cy + R1 * Math.sin(a), ring: 1 });
+        const ring2 = childrenOf.get(c.chatId) ?? [];
+        const R2 = 340;
+        const ring2Angle = (i / Math.max(ring1.length, 1)) * 2 * Math.PI - Math.PI / 2;
+        const spread = Math.min(ring2.length * 0.12, 0.8);
+        ring2.forEach((gc, j) => {
+          const offset = ring2.length === 1 ? 0 : ((j / (ring2.length - 1)) - 0.5) * spread;
+          const a2 = ring2Angle + offset;
+          placed.push({ n: gc, x: cx + R2 * Math.cos(a2), y: cy + R2 * Math.sin(a2), ring: 2 });
+        });
+      });
+    }
+
+    // Alt-roots: spread across the top row.
+    altRoots.forEach((ar, i) => {
+      const x = 80 + i * 180;
+      const y = 40;
+      placed.push({ n: ar, x, y, ring: -1 });
+      // include direct children of alt-root one row below
+      const children = childrenOf.get(ar.chatId) ?? [];
+      children.forEach((c, j) => {
+        placed.push({ n: c, x: x + (j - (children.length - 1) / 2) * 90, y: y + 90, ring: -1 });
+      });
+    });
+
+    const placedById = new Map<string, Placed>(placed.map(p => [p.n.chatId, p]));
+
+    // Edges from parent → child for every placed node with a placed parent.
+    const edgesSvg: string[] = [];
+    for (const p of placed) {
+      if (!p.n.parentChatId) continue;
+      const parent = placedById.get(p.n.parentChatId);
+      if (!parent) continue;
+      // Quadratic curve for nicer routing on radial layout
+      const mx = (p.x + parent.x) / 2;
+      const my = (p.y + parent.y) / 2 - 12;
+      edgesSvg.push(
+        `<path class="edge parent_child" d="M ${parent.x.toFixed(1)} ${parent.y.toFixed(1)} Q ${mx.toFixed(1)} ${my.toFixed(1)} ${p.x.toFixed(1)} ${p.y.toFixed(1)}" marker-end="url(#arrow)" />`
+      );
+    }
+
+    // Nodes as rounded rectangles with name + msg/24h
+    const nodesSvg: string[] = [];
+    for (const p of placed) {
+      const status = statusOf(p.n);
+      const name = nameOf(p.n.chatId, p.n.name);
+      const short = name.length > 14 ? name.slice(0, 13) + '…' : name;
+      const w = p.ring === 0 ? 140 : 120;
+      const h = p.ring === 0 ? 56 : 44;
+      const x0 = p.x - w / 2;
+      const y0 = p.y - h / 2;
+      const kindClass = p.n.chatId === rootId
+        ? 'node-rect-root'
+        : p.n.originType === 'bot_spawned' ? 'node-rect-spawned' : 'node-rect-human';
+      const activeCls = p.n.chatId === state.activeChatId ? 'active' : '';
+      const statusCls = `status-${status}`;
+      // Fix #4: search/filter 不 match 的节点 dim 化 (保持连通性), 不消失。
+      const fadedCls = matchesSearchFilter(p.n) ? '' : 'faded';
+      // Fix #6: archived 节点用 dashed border + 半透明区分 active
+      const archivedCls = p.n.status === 'archived' ? 'archived' : '';
+      nodesSvg.push(`
+        <g class="node-card ${activeCls} ${fadedCls} ${archivedCls}" data-chat-id="${escapeHtml(p.n.chatId)}">
+          <title>${escapeHtml(name)} · ${p.n.metrics.messages24h} msg/24h · ${t(statusKey(status))}</title>
+          <rect class="node-rect ${kindClass} ${statusCls}" x="${x0.toFixed(1)}" y="${y0.toFixed(1)}" rx="8" ry="8" width="${w}" height="${h}" />
+          <text class="node-label" x="${p.x.toFixed(1)}" y="${(p.y - 4).toFixed(1)}" text-anchor="middle">${escapeHtml(short)}</text>
+          <text class="node-sub" x="${p.x.toFixed(1)}" y="${(p.y + 12).toFixed(1)}" text-anchor="middle">${p.n.metrics.messages24h} msg/24h · ${formatAge(p.n.metrics.lastMessageAt)}</text>
+        </g>
+      `);
+    }
+
+    const legend = `
+      <div class="topo-v2-graph-legend">
+        <span><span class="swatch" style="background:#fef3c7;border:1px solid #f59e0b"></span>${t('topo.graph.legend.root')}</span>
+        <span><span class="swatch" style="background:#ecfdf5;border:1px solid #10b981"></span>${t('topo.graph.legend.spawned')}</span>
+        <span><span class="swatch" style="background:#f1f5f9;border:1px solid #94a3b8"></span>${t('topo.graph.legend.human')}</span>
+        <span><span class="swatch" style="background:#ef4444"></span>${t('topo.graph.legend.needsReply')}</span>
+        <span><span class="swatch" style="background:#f59e0b"></span>${t('topo.graph.legend.botWorking')}</span>
+        <span><span class="swatch" style="background:#cbd5e1"></span>${t('topo.graph.legend.idle')}</span>
+      </div>
+    `;
+
+    const orphanStrip = orphans.length === 0 ? '' : `
+      <div class="topo-v2-graph-orphans-row">
+        <h4>${t('topo.graph.orphans', { n: orphans.length })}</h4>
+        <div class="topo-v2-graph-orphans-list">
+          ${orphans.map(n => {
+            const st = statusOf(n);
+            const nm = nameOf(n.chatId, n.name);
+            const fadedCls = matchesSearchFilter(n) ? '' : 'faded';
+            const archivedCls = n.status === 'archived' ? 'archived' : '';
+            return `<span class="topo-v2-graph-orphan-chip status-${st} ${fadedCls} ${archivedCls}" data-chat-id="${escapeHtml(n.chatId)}" title="${escapeHtml(n.chatId)}"><span class="chip-dot"></span>${escapeHtml(nm.length > 18 ? nm.slice(0,17) + '…' : nm)}</span>`;
+          }).join('')}
+        </div>
+      </div>
+    `;
+
+    streamEl.innerHTML = `
+      <div class="topo-v2-graph-pane">
+        ${legend}
+        <svg class="topo-v2-graph-svg" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">
+          <defs>
+            <marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto">
+              <path d="M 0 0 L 6 4 L 0 8 Z" fill="#2563eb" opacity="0.6"/>
+            </marker>
+          </defs>
+          <g class="edges">${edgesSvg.join('')}</g>
+          <g class="nodes">${nodesSvg.join('')}</g>
+        </svg>
+        ${orphanStrip}
+      </div>
+    `;
+
+    // Wire node + orphan-chip clicks → loadContext (same drawer as list view)
+    streamEl.querySelectorAll<SVGGElement>('.node-card').forEach(g => {
+      g.addEventListener('click', () => {
+        const cid = g.dataset.chatId;
+        if (!cid) return;
+        state.activeChatId = cid;
+        history.replaceState(null, '', `#/topology?chat=${encodeURIComponent(cid)}&view=graph`);
+        void loadContext(cid);
+        renderGraph();
+      });
+    });
+    streamEl.querySelectorAll<HTMLElement>('.topo-v2-graph-orphan-chip').forEach(el => {
+      el.addEventListener('click', () => {
+        const cid = el.dataset.chatId;
+        if (!cid) return;
+        state.activeChatId = cid;
+        history.replaceState(null, '', `#/topology?chat=${encodeURIComponent(cid)}&view=graph`);
+        void loadContext(cid);
+        renderGraph();
+      });
+    });
+  }
+
   function renderStream(): void {
     // P6 product decision: the board is a task tracker, not a chat inbox.
     // Only chats that the bot itself spawned (bot_spawned) belong here —
@@ -194,16 +423,9 @@ export function renderTopologyPage(root: HTMLElement): () => void {
       }
     }
 
-    // Filter active nodes for the main sections
-    const filtered = activeNodes.filter(n => {
-      if (state.filter !== 'all' && statusOf(n) !== state.filter) return false;
-      if (state.search) {
-        const needle = state.search.toLowerCase();
-        const name = nameOf(n.chatId, n.name).toLowerCase();
-        if (!name.includes(needle) && !n.chatId.toLowerCase().includes(needle)) return false;
-      }
-      return true;
-    });
+    // Filter active nodes for the main sections (Fix #4: use shared predicate
+    // so list 和 graph 用同一规则; 之前两份实现可能漂移)
+    const filtered = activeNodes.filter(matchesSearchFilter);
     // Filter archived nodes (search applies; status filter doesn't to keep
     // discovery flexible).
     const archivedFiltered = archivedNodes.filter(n => {
@@ -261,14 +483,8 @@ export function renderTopologyPage(root: HTMLElement): () => void {
     topbarEl.innerHTML = parts.join(' · ');
 
     // RootInbox panel container (renders below topbar when expanded)
-    let panel = document.getElementById('topo-root-inbox-panel');
-    if (!panel) {
-      panel = document.createElement('div');
-      panel.id = 'topo-root-inbox-panel';
-      panel.className = 'topo-v2-root-inbox-panel';
-      panel.style.display = 'none';
-      topbarEl.parentElement?.insertBefore(panel, topbarEl.nextSibling);
-    }
+    // Fix #7: shared idempotent ensure — same fn called by renderTopbar.
+    ensureRootInboxPanel();
 
     wireClicks();
     wireRootInboxPanel();
@@ -485,13 +701,62 @@ export function renderTopologyPage(root: HTMLElement): () => void {
   async function loadTopology(): Promise<void> {
     try {
       const topoRes = await fetch('/api/topology');
-      const topo: { nodes: ChatNode[] } = await topoRes.json();
+      const topo: ApiTopology = await topoRes.json();
       state.nodes = topo.nodes || [];
+      state.rootChatId = topo.rootChatId || '';
       state.lastLoadedAt = Date.now();
-      renderStream();
+      rerender();
     } catch (err) {
       streamEl.innerHTML = `<div class="topo-v2-err">加载 topology 失败: ${escapeHtml(String(err))}</div>`;
     }
+  }
+
+  // Single entry point — picks view by state.viewMode. All places that
+  // previously called renderStream() directly still work (renderStream
+  // delegates here).
+  function rerender(): void {
+    if (state.viewMode === 'graph') {
+      renderGraph();
+      renderTopbar();
+    } else {
+      renderStream();
+    }
+  }
+
+  // Compact topbar render shared between views (renderStream produces its
+  // own topbar inline; renderGraph also needs counts/refresh/RootInbox).
+  //
+  // 2026-05-25 fix (妹妹 review #4): topbar scope 显式覆盖 "graph 视图上所有
+  // active 节点"，而非 list 的 P6 bot_spawned scope。两个视图本就是不同事物
+  // (list = 我自己派的 task / graph = 全拓扑 + parent 关系)，topbar 跟着当前
+  // 视图的范围走比强行对齐更直觉；这里的 active 也跟 graph 的 active 一致。
+  function renderTopbar(): void {
+    const active = state.nodes.filter(n => n.status !== 'archived' && matchesSearchFilter(n));
+    const groups: Record<CardStatus, number> = { needs_reply: 0, bot_working: 0, idle: 0 };
+    for (const n of active) groups[statusOf(n)]++;
+    const parts: string[] = [];
+    if (groups.needs_reply) parts.push(`<span class="topo-v2-stat urgent">${t('topo.topbar.needsReply', { n: groups.needs_reply })}</span>`);
+    if (groups.bot_working) parts.push(`<span class="topo-v2-stat working">${t('topo.topbar.botWorking', { n: groups.bot_working })}</span>`);
+    if (groups.idle) parts.push(`<span class="topo-v2-stat idle">${t('topo.topbar.idle', { n: groups.idle })}</span>`);
+    const when = state.lastLoadedAt ? formatAge(new Date(state.lastLoadedAt).toISOString()) : '-';
+    parts.push(`<span class="topo-v2-stat last-refresh" id="topo-refresh-label">${t('topo.topbar.lastRefresh', { when })}</span>`);
+    parts.push(`<button class="topo-v2-stat root-inbox-toggle" id="topo-root-inbox-toggle" title="主话题待处理 root-inbox 项">📥 RootInbox</button>`);
+    topbarEl.innerHTML = parts.join(' · ');
+    // Fix #7 (妹妹 2 轮): 深链 #/topology?view=graph 直接进只走 renderTopbar，
+    // 不走 renderStream，panel 容器没有被创建 → RootInbox 按钮点不动。
+    ensureRootInboxPanel();
+    wireRootInboxPanel();
+  }
+
+  // Fix #7: shared by renderStream (list) 和 renderTopbar (graph)。idempotent
+  // — 已存在则不动。
+  function ensureRootInboxPanel(): void {
+    if (document.getElementById('topo-root-inbox-panel')) return;
+    const panel = document.createElement('div');
+    panel.id = 'topo-root-inbox-panel';
+    panel.className = 'topo-v2-root-inbox-panel';
+    panel.style.display = 'none';
+    topbarEl.parentElement?.insertBefore(panel, topbarEl.nextSibling);
   }
 
   async function loadGroups(): Promise<void> {
@@ -505,7 +770,10 @@ export function renderTopologyPage(root: HTMLElement): () => void {
       for (const g of (groups.chats || [])) {
         if (g.name) state.groupNameByChatId.set(g.chatId, g.name);
       }
-      renderStream();
+      // 2026-05-25 fix (妹妹 review #2 blocker): 必须用 rerender() 否则
+      // 在 graph 视图下，loadGroups 每次成功（initial + 60s 周期）都把主区
+      // 替换成 list，用户根本停不在 graph。
+      rerender();
     } catch (err) {
       // Don't crash the page on a failed groups fetch — names will fall
       // back to chat_id, which is ugly but not broken.
@@ -520,18 +788,38 @@ export function renderTopologyPage(root: HTMLElement): () => void {
     labelEl.textContent = t('topo.topbar.lastRefresh', { when });
   }
 
-  // Deep-link from chat-context card URL: #/topology?chat=oc_xxx
+  // Deep-link from chat-context card URL: #/topology?chat=oc_xxx[&view=graph]
   const m = location.hash.match(/[?&]chat=([^&]+)/);
   if (m) state.activeChatId = decodeURIComponent(m[1]);
+  const vm = location.hash.match(/[?&]view=(list|graph)/);
+  if (vm) state.viewMode = vm[1] as ViewMode;
 
   searchEl.addEventListener('input', () => {
     state.search = searchEl.value;
-    renderStream();
+    rerender();
   });
   filterEl.addEventListener('change', () => {
     state.filter = filterEl.value as any;
-    renderStream();
+    rerender();
   });
+
+  // View-mode switch
+  const switchEl = document.getElementById('topo-view-switch');
+  if (switchEl) {
+    switchEl.querySelectorAll<HTMLElement>('.topo-v2-view-btn').forEach(btn => {
+      // Reflect current state on initial bind (deep-link may have set graph)
+      btn.classList.toggle('active', btn.dataset.view === state.viewMode);
+      btn.addEventListener('click', () => {
+        const v = btn.dataset.view as ViewMode | undefined;
+        if (!v || v === state.viewMode) return;
+        state.viewMode = v;
+        switchEl.querySelectorAll<HTMLElement>('.topo-v2-view-btn').forEach(b => b.classList.toggle('active', b.dataset.view === v));
+        const cidPart = state.activeChatId ? `chat=${encodeURIComponent(state.activeChatId)}&` : '';
+        history.replaceState(null, '', `#/topology?${cidPart}view=${v}`);
+        rerender();
+      });
+    });
+  }
 
   // Initial load: topology first (cheap), then groups (Lark API call) so the
   // page renders with real names as soon as groups arrive.
