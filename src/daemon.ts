@@ -2687,7 +2687,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         // tilly_digest_high items, capped 20. LLM 跨 sourceMessageId
         // 语义 dedup —— 不再反复报同一个已被人工处理的卡点。
         const { listRecentHandledHigh } = await import('./services/main-bot-digest-store.js');
-        const knownHandled = listRecentHandledHigh({ maxAgeHours: 24, limit: 20 });
+        // listRecentHandledHigh 已保证 status ∈ {processed,dismissed}
+        // (store 层 filter)，runtime narrow 给 TS 一个 anchor。
+        const knownHandled = listRecentHandledHigh({ maxAgeHours: 24, limit: 20 })
+          .filter((i): i is typeof i & { status: 'processed' | 'dismissed' } => i.status === 'processed' || i.status === 'dismissed');
         const digest = await analyzeMessages(fresh, { knownHandled });
         if (!digest.ok) {
           tickFailed = true;
