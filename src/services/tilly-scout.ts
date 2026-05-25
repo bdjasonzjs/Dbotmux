@@ -57,17 +57,55 @@ export interface FetchOpts {
   /** P0-1: 是否包含 p2p (1:1 私聊)。默认 false（敏感内容不进 LLM）。
    *  env BOTMUX_TILLY_INCLUDE_P2P=1 显式打开。 */
   includeP2P?: boolean;
+  /** v2.1 (2026-05-26 松松/妹妹 P0): chatId+senderId 双维 bot allowlist —
+   *  默认所有 bot/app 消息 drop（断 self-reference loop）。仅显式列出的
+   *  bot 在指定 chat 下能通过。每项格式：
+   *  - "chatId:senderId" 严格组合
+   *  - "*:senderId" 该 bot 跨所有 chat
+   *  - "chatId:*" 该 chat 所有 bot
+   *  env: BOTMUX_TILLY_INCLUDE_BOT_SENDERS=chat1:bot1,chat2:*,*:bot3 */
+  includeBotSenders?: string[];
+  /** v2.1 debug only: 全允许 bot sender（不进 daemon 默认，仅人工 debug
+   *  时用）。默认 false。 */
+  includeAllBotSenders?: boolean;
 }
 
 /** P0-1 (2026-05-25 妹妹 P0): 从 env 读 privacy 默认值。
  *  - BOTMUX_TILLY_ALLOWLIST_CHATS=oc_a,oc_b → 只扫这些
  *  - BOTMUX_TILLY_INCLUDE_P2P=1 → 显式打开 p2p 扫描
+ *  v2.1 (2026-05-26): + BOTMUX_TILLY_INCLUDE_BOT_SENDERS 双维 bot allowlist
  *  caller (daemon cron) 不传 opts 时这些 env 生效。 */
-function loadPrivacyDefaults(): { allowlist: string[]; includeP2P: boolean } {
+function loadPrivacyDefaults(): {
+  allowlist: string[];
+  includeP2P: boolean;
+  includeBotSenders: string[];
+} {
   const allowlistRaw = process.env.BOTMUX_TILLY_ALLOWLIST_CHATS?.trim();
   const allowlist = allowlistRaw ? allowlistRaw.split(/[,\s]+/).filter(Boolean) : [];
   const includeP2P = process.env.BOTMUX_TILLY_INCLUDE_P2P === '1';
-  return { allowlist, includeP2P };
+  const botSendersRaw = process.env.BOTMUX_TILLY_INCLUDE_BOT_SENDERS?.trim();
+  const includeBotSenders = botSendersRaw ? botSendersRaw.split(/[,\s]+/).filter(Boolean) : [];
+  return { allowlist, includeP2P, includeBotSenders };
+}
+
+/** v2.1 (2026-05-26 妹妹): 判断 (chatId, senderId) 是否在 bot allowlist。
+ *  rules: 三种格式
+ *  - "chatId:senderId" — 严格组合
+ *  - "*:senderId"      — 该 bot 跨所有 chat
+ *  - "chatId:*"        — 该 chat 所有 bot
+ *  注: bot/app/cli_xxx 发的消息默认被 drop；只有命中此处规则才放行。
+ *  目的是断 self-reference loop（缇蕾扫到自己 + 主 bot 发的 notify 文本
+ *  让 LLM 二次归类成 meta blocker → 又 push 又 notify）。bot 进展通报
+ *  走 P2 RootInbox / progress-report 主链路，不靠缇蕾扫 bot 输出 LLM。 */
+function isBotSenderAllowed(chatId: string, senderId: string, rules: string[]): boolean {
+  for (const r of rules) {
+    const [c, s] = r.split(':');
+    if (!c || !s) continue;
+    const chatOk = c === '*' || c === chatId;
+    const senderOk = s === '*' || s === senderId;
+    if (chatOk && senderOk) return true;
+  }
+  return false;
 }
 
 interface LarkMessagesSearchResp {
@@ -177,11 +215,14 @@ export async function fetchRecentMessages(opts: FetchOpts): Promise<TillyMessage
   const allowlist = opts.allowlistChatIds ?? envDefaults.allowlist;
   const allowlistSet = new Set(allowlist);
   const includeP2P = opts.includeP2P ?? envDefaults.includeP2P;
+  const includeBotSenders = opts.includeBotSenders ?? envDefaults.includeBotSenders;
+  const includeAllBotSenders = opts.includeAllBotSenders === true;
   const excludeSet = new Set(opts.excludeChatIds ?? []);
   let inScope = messages;
   let droppedAllowlist = 0;
   let droppedP2P = 0;
   let droppedExclude = 0;
+  let droppedBot = 0;
   if (allowlistSet.size > 0) {
     inScope = inScope.filter(m => {
       if (allowlistSet.has(m.chatId)) return true;
@@ -197,6 +238,20 @@ export async function fetchRecentMessages(opts: FetchOpts): Promise<TillyMessage
       return false;
     });
   }
+  // v2.1 (2026-05-26 松松/妹妹 P0): bot-sender 双维 allowlist 过滤。
+  // 默认所有 sender_type='app'/'bot' 或 senderId 以 'cli_' 开头的消息
+  // drop（断 self-reference loop：缇蕾扫到自己/主 bot 发的 notify 文本
+  // 让 LLM 二次归类成 meta blocker → 又 push 又 notify）。
+  // 仅当 isBotSenderAllowed(chatId, senderId, rules) 命中才放行。
+  if (!includeAllBotSenders) {
+    inScope = inScope.filter(m => {
+      const isBot = m.senderType === 'app' || m.senderType === 'bot' || m.senderId.startsWith('cli_');
+      if (!isBot) return true;
+      if (isBotSenderAllowed(m.chatId, m.senderId, includeBotSenders)) return true;
+      droppedBot++;
+      return false;
+    });
+  }
   if (excludeSet.size > 0) {
     inScope = inScope.filter(m => {
       if (!excludeSet.has(m.chatId)) return true;
@@ -204,8 +259,8 @@ export async function fetchRecentMessages(opts: FetchOpts): Promise<TillyMessage
       return false;
     });
   }
-  if (droppedAllowlist + droppedP2P + droppedExclude > 0) {
-    logger.info(`[tilly-scout] privacy filter dropped: allowlist=${droppedAllowlist} p2p=${droppedP2P} exclude=${droppedExclude} (mode: allowlist=${allowlistSet.size > 0 ? allowlist.join(',') : 'none'}, includeP2P=${includeP2P})`);
+  if (droppedAllowlist + droppedP2P + droppedExclude + droppedBot > 0) {
+    logger.info(`[tilly-scout] privacy filter dropped: allowlist=${droppedAllowlist} p2p=${droppedP2P} bot=${droppedBot} exclude=${droppedExclude} (mode: allowlist=${allowlistSet.size > 0 ? allowlist.join(',') : 'none'}, includeP2P=${includeP2P}, includeBotSenders=${includeBotSenders.length}规则${includeAllBotSenders ? ' [ALL OVERRIDE]' : ''})`);
   }
 
   // Dedup by tilly-message-store
