@@ -2762,26 +2762,30 @@ async function cmdSend(rest: string[]): Promise<void> {
 
       const elements = mdWithImages ? buildCardBodyElements(mdWithImages) : [];
 
-      // Footer: de-emphasized markdown (v2 dropped the `note` tag). Use small
-      // text size + grey font tag so it reads like a footnote below the hr.
-      // Oncall groups: `发送给` targets whoever triggered this turn (may not
-      // be the session owner). Non-oncall: keep owner-only behaviour.
-      const footerParts = ['[botmux](https://github.com/deepcoldy/botmux)'];
-      // Top-level publish has no specific recipient — drop "发送给/cc" addressing
-      // so the message doesn't @ the session owner who isn't even in the target chat.
-      const addressing = sendTopLevel
-        ? { sendTo: undefined as string | undefined, cc: [] as string[] }
-        : buildFooterAddressing(s, oncallEntry);
-      if (addressing.sendTo) footerParts.push(`发送给：<at id=${addressing.sendTo}></at>`);
-      if (addressing.cc.length > 0) {
-        footerParts.push(`cc：${addressing.cc.map(id => `<at id=${id}></at>`).join(' ')}`);
+      // 2026-05-25 Fix #9 (妹妹找到的第二路径): `botmux send` CLI 自己拼
+      // footer，没走 md-card.ts 的 env gate。统一行为：CLI 这边也按
+      // `BOTMUX_SHOW_CARD_FOOTER=1` env 才显示。注意 `addressing` 里的 cc
+      // 是真有产品语义（让人知道该消息也 cc 给了谁），但目前 footer 也
+      // 把它埋在小字里，跟"version 水印"一起 — 一并按 env gate 控制。
+      // 真要保留 cc 可见性可以以后改成上面 body 末尾正文里加一行。
+      if (process.env.BOTMUX_SHOW_CARD_FOOTER === '1') {
+        const footerParts = ['[botmux](https://github.com/deepcoldy/botmux)'];
+        // Top-level publish has no specific recipient — drop "发送给/cc" addressing
+        // so the message doesn't @ the session owner who isn't even in the target chat.
+        const addressing = sendTopLevel
+          ? { sendTo: undefined as string | undefined, cc: [] as string[] }
+          : buildFooterAddressing(s, oncallEntry);
+        if (addressing.sendTo) footerParts.push(`发送给：<at id=${addressing.sendTo}></at>`);
+        if (addressing.cc.length > 0) {
+          footerParts.push(`cc：${addressing.cc.map(id => `<at id=${id}></at>`).join(' ')}`);
+        }
+        elements.push({ tag: 'hr' });
+        elements.push({
+          tag: 'markdown',
+          text_size: 'notation_small_v2',
+          content: `<font color='grey'>${footerParts.join(' · ')}</font>`,
+        });
       }
-      elements.push({ tag: 'hr' });
-      elements.push({
-        tag: 'markdown',
-        text_size: 'notation_small_v2',
-        content: `<font color='grey'>${footerParts.join(' · ')}</font>`,
-      });
 
       const cardJson = JSON.stringify({
         schema: '2.0',
@@ -2818,19 +2822,19 @@ async function cmdSend(rest: string[]): Promise<void> {
         }
       }
 
-      // Footer: mirror the card layout — a blank paragraph separates the body
-      // from the addressing line(s). `发送给: @<caller>` always. Top-level
-      // publish has no specific recipient — skip addressing entirely.
-      const addressing = sendTopLevel
-        ? { sendTo: undefined as string | undefined, cc: [] as string[] }
-        : buildFooterAddressing(s, oncallEntry);
-      if (addressing.sendTo || addressing.cc.length > 0) {
-        if (postContent.length > 0) postContent.push([{ tag: 'text', text: '' }]);
-        if (addressing.sendTo) {
-          postContent.push([{ tag: 'text', text: '发送给：' }, { tag: 'at', user_id: addressing.sendTo }]);
-        }
-        if (addressing.cc.length > 0) {
-          postContent.push([{ tag: 'text', text: 'cc：' }, ...addressing.cc.map(id => ({ tag: 'at', user_id: id }))]);
+      // 2026-05-25 Fix #9: post 路径同 card 路径，footer 默认关。
+      if (process.env.BOTMUX_SHOW_CARD_FOOTER === '1') {
+        const addressing = sendTopLevel
+          ? { sendTo: undefined as string | undefined, cc: [] as string[] }
+          : buildFooterAddressing(s, oncallEntry);
+        if (addressing.sendTo || addressing.cc.length > 0) {
+          if (postContent.length > 0) postContent.push([{ tag: 'text', text: '' }]);
+          if (addressing.sendTo) {
+            postContent.push([{ tag: 'text', text: '发送给：' }, { tag: 'at', user_id: addressing.sendTo }]);
+          }
+          if (addressing.cc.length > 0) {
+            postContent.push([{ tag: 'text', text: 'cc：' }, ...addressing.cc.map(id => ({ tag: 'at', user_id: id }))]);
+          }
         }
       }
 
