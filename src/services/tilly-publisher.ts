@@ -163,7 +163,7 @@ let lastNotifyAt = 0;
  */
 export async function notifyClaudeAboutInboxItems(
   newlyInserted: ScoutTillyHighItem[],
-  opts: PublishTillyOpts & { claudeOpenId: string; ownerOpenId?: string },
+  opts: PublishTillyOpts & { claudeOpenId: string },
 ): Promise<boolean> {
   // 合并：本次新插入 + 历史遗留 (throttle/失败未通知的 pending items)
   const carryover = listUnnotifiedTillyHigh().filter(
@@ -182,28 +182,31 @@ export async function notifyClaudeAboutInboxItems(
 
   const blockerCount = all.filter(i => i.category === 'blocker').length;
   const todoCount = all.filter(i => i.category === 'todo').length;
-  const parts: string[] = [];
-  if (blockerCount > 0) parts.push(`${blockerCount} 个 blocker`);
-  if (todoCount > 0) parts.push(`${todoCount} 个 high-prio todo`);
-  const reason = parts.join(' + ');
+  const total = all.length;
 
-  const ownerAt = opts.ownerOpenId ? `<at user_id="${opts.ownerOpenId}"></at> ` : '';
-  // 2026-05-25 commit 2 follow-up (妹妹 P1 #2): top3 summary 来自 LLM 输出，
-  // 可能含 `<at user_id=>` / HTML-like tag / 巨长文本 → 污染通知格式 + 误
-  // @ 别人。截 120 char + 替换 `<`/`>` 防注入。owner/Claude at 由我们显
-  // 式拼，不受影响。
-  const safeSummary = (s: string): string =>
-    s.replace(/[<>]/g, '').slice(0, 120);
-  const top3 = all.slice(0, 3).map(i => `- [${i.category}] ${safeSummary(i.payload.summary)}`).join('\n');
-  const dashLink = '\n\n→ dashboard 协作面板「🐶 缇蕾扫读」tab 看完整 + dismiss';
-  const text = `${ownerAt}<at user_id="${opts.claudeOpenId}"></at> 🐶 缇蕾扫到 ${reason}:\n${top3}${dashLink}`;
+  // v2.1 commit 2 (2026-05-26 松松/妹妹): 不再 @ 松松 (只 @ 克劳德分身)
+  // + 文案去业务化。
+  // - 旧版: "@松松 @克劳德 🐶 缇蕾扫到 X blocker:\n- [blocker] <summary>" → 自己
+  //   制造业务语义 ("有 N blocker 需要松松处理")，被下一轮缇蕾扫到时
+  //   又被 LLM 当成业务消息生成 meta blocker (self-loop)。
+  // - 新版: 中性 stat 描述 + dashboard 路由，**不包含 LLM 自由文本
+  //   summary**，避免下一轮缇蕾把通知里的 high-prio summary 字符串再
+  //   归类成新业务卡点。
+  //   "@克劳德 🐶 缇蕾新增 N 条高优先级扫读项 (X blocker + Y todo)，
+  //    已进 ScoutInbox / 协作面板。"
+  // 主 bot 自己决定要不要找松松；这里不替主 bot 拍板"重要程度"。
+  const parts: string[] = [];
+  if (blockerCount > 0) parts.push(`${blockerCount} blocker`);
+  if (todoCount > 0) parts.push(`${todoCount} high-prio todo`);
+  const breakdown = parts.length > 0 ? ` (${parts.join(' + ')})` : '';
+  const text = `<at user_id="${opts.claudeOpenId}"></at> 🐶 缇蕾新增 ${total} 条高优先级扫读项${breakdown}，已进 ScoutInbox / 协作面板「🐶 缇蕾扫读」tab。`;
 
   try {
     const msgId = await sendMessage(opts.larkAppId, mainTopic, text, 'text');
     lastNotifyAt = now;
     // 标 inbox items 已通知 — 防下次 tick 重发同一批
     for (const it of all) markTillyHighNotified(it.id);
-    logger.info(`[tilly-publisher] notify sent (msg=${msgId}, ${all.length} items: ${reason}) to mainTopic ${mainTopic}`);
+    logger.info(`[tilly-publisher] notify sent (msg=${msgId}, ${all.length} items${breakdown}) to mainTopic ${mainTopic}`);
     return true;
   } catch (err) {
     logger.warn(`[tilly-publisher] notify failed: ${err} — items stay unnotified for next tick`);
@@ -214,8 +217,7 @@ export async function notifyClaudeAboutInboxItems(
 /** @deprecated Phase A v2 (2026-05-25): 用 notifyClaudeAboutInboxItems
  *  替代。这个旧 API 直接看 TillyDigest 算 high-prio count，没绑定 inbox
  *  insert 结果，throttle 时 item 会被永久跳过（妹妹 review #6 防误吞）。
- *  Caller 应该先 pushHighPriorityToScoutInbox(digest) 拿 inserted 列表再
- *  调 notifyClaudeAboutInboxItems。本函数保留只是为了不破坏老 import。
+ *  v2.1 commit 2: 旧签名里的 ownerOpenId 也已删，新链路完全不 @ 松松。
  */
 export async function notifyClaudeIfImportant(
   _newTick: TillyDigest,

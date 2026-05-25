@@ -2651,7 +2651,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         // bot-registry 让任何 daemon 都能用任意 bot client，verified safe.
         const tillyApp = resolveBotIdent('tilly').larkAppId;
         const claudeIdent = resolveBotIdent('claude');
-        const OWNER_OPEN_ID = 'ou_974b9321334628537abee157413b33b6';
+        // v2.1 commit 2: 之前 notify 会 @ OWNER_OPEN_ID (松松)，现在不再 @，
+        // 常量删除。主 bot 自己决定要不要找松松。
         const end = new Date();
         const start = new Date(end.getTime() - TILLY_TICK_INTERVAL_MS);
         const fresh = await fetchRecentMessages({ start, end });
@@ -2671,10 +2672,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           // newlyInserted=[] 也 call notify helper，让 historical
           // unnotified (throttle/失败遗留) 在下一个 tick 被补发。
           try {
+            // v2.1 commit 2: notify 不再 @ 松松，只 @ 克劳德分身 (主 bot
+            // 自己决定要不要找松松)。OWNER_OPEN_ID 已不需要传给 notify。
             await notifyClaudeAboutInboxItems([], {
               larkAppId: tillyApp,
               claudeOpenId: claudeIdent.openId,
-              ownerOpenId: OWNER_OPEN_ID,
             });
           } catch (err) {
             logger.warn(`[tilly/scout] carryover notify failed (non-blocking): ${err}`);
@@ -2690,8 +2692,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         }
         const cumulative = mergeNewDigest(digest);
         // 2026-05-25 Phase A v2 commit 3: 不再 publishTillyDigest 主话题
-        // 大卡。改成 push high-prio item 到 scout-inbox + notify @ 松松 +
-        // 克劳德分身。
+        // 大卡。改成 push high-prio item 到 scout-inbox + notify @ 克劳德
+        // 分身 (v2.1: 不再 @ 松松；主 bot 自己决定要不要找他)。
         let newlyInserted: Awaited<ReturnType<typeof pushHighPriorityToScoutInbox>> = [];
         try {
           newlyInserted = pushHighPriorityToScoutInbox(digest);
@@ -2702,7 +2704,6 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           await notifyClaudeAboutInboxItems(newlyInserted, {
             larkAppId: tillyApp,
             claudeOpenId: claudeIdent.openId,
-            ownerOpenId: OWNER_OPEN_ID,
           });
         } catch (err) {
           logger.warn(`[tilly/scout] notifyClaudeAboutInboxItems failed (non-blocking): ${err}`);
