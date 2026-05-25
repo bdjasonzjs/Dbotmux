@@ -652,6 +652,30 @@ const server = createServer(async (req, res) => {
       const { readInbox } = await import('./services/main-bot-digest-store.js');
       return jsonRes(res, 200, readInbox());
     }
+    // 2026-05-25 Phase A v2 commit 4 (松松/妹妹 review): cumulative 缇蕾
+    // 扫读追溯入口。读 tilly-digest-store (不是 main-bot-digest，那是
+    // R1-R5 escalation 那条线)。返 { current: <今日>, archive: [...过去 7 天] }。
+    if (req.method === 'GET' && url.pathname === '/api/tilly-digest') {
+      const { getCurrentDigest, listArchive } = await import('./services/tilly-digest-store.js');
+      return jsonRes(res, 200, { current: getCurrentDigest(), archive: listArchive() });
+    }
+    // 2026-05-25 Phase A v2 commit 4: 处理 tilly_digest_high item — dismiss
+    // (松松不感兴趣 / 误报) or processed (Phase B handler 自动处理完). 不和
+    // RootInbox close 混 (RootInbox close 是另一套 root-inbox-store.close)。
+    // 仅作用于 ScoutInbox 的 tilly_digest_high 类，store 层 dispositionTillyHigh
+    // 有类型守卫；escalation item 不允许这个路径。
+    let mTillyHigh: RegExpMatchArray | null;
+    if (req.method === 'POST' && (mTillyHigh = url.pathname.match(/^\/api\/scout-inbox\/([^/]+)\/(dismiss|processed)$/))) {
+      const itemId = decodeURIComponent(mTillyHigh[1]);
+      const action = mTillyHigh[2] as 'dismiss' | 'processed';
+      const { dispositionTillyHigh } = await import('./services/main-bot-digest-store.js');
+      const r = dispositionTillyHigh(itemId, {
+        status: action === 'dismiss' ? 'dismissed' : 'processed',
+        handledBy: action === 'dismiss' ? 'dashboard:user' : 'dashboard:user',
+      });
+      if (!r) return jsonRes(res, 404, { ok: false, error: 'tilly_digest_high item not found (id 不存在或不是 tilly_digest_high 类)' });
+      return jsonRes(res, 200, { ok: true, item: r });
+    }
 
     if (req.method === 'POST' && url.pathname === '/api/bot-onboarding/start') {
       const job = botOnboarding.start();

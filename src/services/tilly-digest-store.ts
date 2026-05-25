@@ -124,6 +124,13 @@ function archiveDay(day: CurrentDigestFile): void {
   writeArchive(arch);
 }
 
+/** Phase A v2 commit 4 (2026-05-25): 列归档天的 cumulative digests
+ *  (默认 7 天)，dashboard `/api/tilly-digest` 用来给松松追溯历史。
+ *  返回顺序：旧 → 新 (push 顺序)。 */
+export function listArchive(): CurrentDigestFile[] {
+  return readArchive().days;
+}
+
 /** Get the current day's cumulative digest (rolls over at UTC midnight). */
 export function getCurrentDigest(): CurrentDigestFile {
   return readCurrent();
