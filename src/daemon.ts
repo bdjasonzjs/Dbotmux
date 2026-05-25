@@ -2623,7 +2623,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         const { publishTillyDigest, publishTillyAlert, dismissTillyAlert, notifyClaudeIfImportant } = await import('./services/tilly-publisher.js');
         const { markScanned } = await import('./services/tilly-message-store.js');
         const { resolveBotIdent } = await import('./core/main-bot-playbook.js');
-        const claudeApp = resolveBotIdent('claude').larkAppId;
+        // 2026-05-25 (松松实拍): 之前用 claudeApp 发卡 → 群里 sender 显示
+        // 克劳德，缇蕾 bot identity 一次都没用过。从 P3 commit #5 起就
+        // 错了。改用 tilly (coco bot) identity 发，sender 真正显示缇蕾。
+        // bot-registry 让任何 daemon 都能用任意 bot client，verified safe.
+        const tillyApp = resolveBotIdent('tilly').larkAppId;
+        const claudeIdent = resolveBotIdent('claude');
         const end = new Date();
         const start = new Date(end.getTime() - TILLY_TICK_INTERVAL_MS);
         const fresh = await fetchRecentMessages({ start, end });
@@ -2636,7 +2641,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           if (tillyConsecutiveFails > 0) {
             logger.info(`[tilly/scout] no-new-messages tick recovers from ${tillyConsecutiveFails} consecutive fails — dismissing alert`);
             tillyConsecutiveFails = 0;
-            try { await dismissTillyAlert({ larkAppId: claudeApp }); }
+            try { await dismissTillyAlert({ larkAppId: tillyApp }); }
             catch (err) { logger.warn(`[tilly/scout] dismissTillyAlert failed: ${err}`); }
           }
           return;
@@ -2651,7 +2656,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         const cumulative = mergeNewDigest(digest);
         let publishedCardId: string | null = null;
         try {
-          const pub = await publishTillyDigest(cumulative, { larkAppId: claudeApp });
+          const pub = await publishTillyDigest(cumulative, { larkAppId: tillyApp });
           publishedCardId = pub.rootCardMessageId;
         } catch (err) {
           logger.warn(`[tilly/scout] publish failed (digest still stored): ${err}`);
@@ -2665,7 +2670,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           // 支持多 owner 可以从 allowlist 第一个 owner 取。
           const OWNER_OPEN_ID = 'ou_974b9321334628537abee157413b33b6';
           await notifyClaudeIfImportant(digest, {
-            larkAppId: claudeApp,
+            larkAppId: tillyApp,
             claudeOpenId: claudeIdent.openId,
             ownerOpenId: OWNER_OPEN_ID,
             cardMessageId: publishedCardId,
@@ -2677,7 +2682,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         if (tillyConsecutiveFails > 0) {
           logger.info(`[tilly/scout] recovered after ${tillyConsecutiveFails} consecutive fails — dismissing alert`);
           tillyConsecutiveFails = 0;
-          try { await dismissTillyAlert({ larkAppId: claudeApp }); }
+          try { await dismissTillyAlert({ larkAppId: tillyApp }); }
           catch (err) { logger.warn(`[tilly/scout] dismissTillyAlert failed: ${err}`); }
         }
         // P3-rev1 v0.2 (妹妹补): mark-scanned strictly the messageIds that
