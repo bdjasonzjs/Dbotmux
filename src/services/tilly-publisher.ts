@@ -151,12 +151,13 @@ export async function notifyClaudeIfImportant(
   const cardLink = opts.cardMessageId
     ? `\n\n查看完整扫读卡: 在主话题向上滑或搜 [缇蕾今日扫读]`
     : '';
-  const textContent = JSON.stringify({
-    text: `${ownerAt}<at user_id="${opts.claudeOpenId}"></at> 🐶 缇蕾刚扫到 ${reason}，请消化今日扫读卡并安排.${cardLink}`,
-  });
+  // 2026-05-25 (松松实拍 fix): sendMessage(msgType='text') 已经会自动包
+  // `{text: content}`，再 JSON.stringify 一层会被 Lark 当字面量整串显示
+  // (含 `{"text":"<at..>"}` 字面字符串)。传 plain string 即可。
+  const text = `${ownerAt}<at user_id="${opts.claudeOpenId}"></at> 🐶 缇蕾刚扫到 ${reason}，请消化今日扫读卡并安排.${cardLink}`;
 
   try {
-    const msgId = await sendMessage(opts.larkAppId, mainTopic, textContent, 'text');
+    const msgId = await sendMessage(opts.larkAppId, mainTopic, text, 'text');
     lastNotifyAt = now;
     logger.info(`[tilly-publisher] notify sent (msg=${msgId}, ${reason}) to mainTopic ${mainTopic} with owner=${opts.ownerOpenId ?? 'none'}`);
     return true;

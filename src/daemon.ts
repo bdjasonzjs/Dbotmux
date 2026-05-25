@@ -2575,6 +2575,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // escalations + infer same_topic edges. Only the first registered bot's
   // daemon runs the global tick (others would race on the shared
   // chat-topology.json / main-bot-digest.json files).
+  //
+  // 2026-05-25 (松松实拍): 角色边界——扫聊天+LLM 分析的工作应该是缇蕾
+  // (coco bot) 做，不是 main-bot (claude) 顺手代劳。把 tilly cron 挪到
+  // cliId === 'coco' 的 daemon 上跑；main-bot/scout cron 仍在 botIndex=0
+  // (claude daemon)，那是 main-bot 自己 escalation 的逻辑，归 main-bot
+  // 管。注意：实际 LLM 调用是 spawn codex CLI，codex CLI 用 ~/.codex/
+  // auth.json 的 token（用户 system-level auth），跟 daemon 谁跑没关系；
+  // 改这条 cron 归属是产品/角色边界，不会真的"省 token"。完整的 token
+  // 切换需要 codex 支持 multi-auth 或换 LLM 入口，待后续。
   if (botIndex === undefined || botIndex === 0) {
     const SCOUT_TICK_INTERVAL_MS = 15 * 60 * 1000;
     const tickHandle = setInterval(async () => {
@@ -2592,6 +2601,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     process.on('SIGINT', () => clearInterval(tickHandle));
     logger.info(`[main-bot/scout] cron registered (every ${SCOUT_TICK_INTERVAL_MS / 1000}s, stale gate on)`);
 
+  }   // end of botIndex===0 (main-bot/scout cron only)
+
+  // ── 2026-05-25 (松松实拍): tilly cron 单独迁到 coco daemon (cliId==='coco')
+  // 上跑。理由：扫聊天 + LLM 分析是缇蕾 (coco bot) 的活，不该挂在 main-
+  // bot (claude) daemon。注意：LLM 调用仍是 spawn codex CLI，codex 用
+  // ~/.codex/auth.json 的 token（user system-level，跟 daemon 谁跑无关），
+  // 切 daemon 归属是角色边界，不会真"省 token"。token 真切要 codex
+  // 支持 multi-auth。
+  if (cfg.cliId === 'coco') {
     // P3 commit #5: tilly LLM scout cron — every 15min fetch new 松松 user-
     // identity messages → codex analyze 4 categories → merge cumulative
     // daily digest → publish to mainTopic 1 card per day (updated in
@@ -2710,7 +2728,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               const { publishTillyAlert } = await import('./services/tilly-publisher.js');
               const { resolveBotIdent } = await import('./core/main-bot-playbook.js');
               await publishTillyAlert({
-                larkAppId: resolveBotIdent('claude').larkAppId,
+                larkAppId: resolveBotIdent('tilly').larkAppId,
                 consecutiveFails: tillyConsecutiveFails,
                 lastError: tickFailReason,
               });
@@ -2723,7 +2741,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }, TILLY_TICK_INTERVAL_MS);
     process.on('SIGTERM', () => clearInterval(tillyHandle));
     process.on('SIGINT', () => clearInterval(tillyHandle));
-    logger.info(`[tilly/scout] cron registered (every ${TILLY_TICK_INTERVAL_MS / 1000}s)`);
+    logger.info(`[tilly/scout] cron registered (every ${TILLY_TICK_INTERVAL_MS / 1000}s) on coco daemon`);
   }
 
   logger.info('Daemon is running. Press Ctrl+C to stop.');
