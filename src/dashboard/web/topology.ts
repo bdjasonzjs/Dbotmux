@@ -827,9 +827,11 @@ export function renderTopologyPage(root: HTMLElement): () => void {
           try {
             const r = await fetch(`/api/scout-inbox/${encodeURIComponent(inboxId)}/dismiss`, { method: 'POST' });
             if (!r.ok) { alert('dismiss failed: HTTP ' + r.status); btn.disabled = false; btn.textContent = t('topo.tilly.dismiss'); return; }
-            // remove button (dismissed item still appears in cumulative but no
-            // longer in pending list)
-            btn.remove();
+            // 2026-05-25 commit 5 follow-up (妹妹 P1 #1): 整体 re-render
+            // 让 badge (pending high-prio 数) + pending map + 同 inboxId
+            // 多处按钮全部跟后端状态一致；不止 btn.remove() (会让 badge
+            // 和别的 render 位置不同步)。
+            await renderTillyView();
           } catch (err) {
             alert('dismiss failed: ' + err);
             btn.disabled = false; btn.textContent = t('topo.tilly.dismiss');
@@ -909,7 +911,8 @@ export function renderTopologyPage(root: HTMLElement): () => void {
   // Deep-link from chat-context card URL: #/topology?chat=oc_xxx[&view=graph]
   const m = location.hash.match(/[?&]chat=([^&]+)/);
   if (m) state.activeChatId = decodeURIComponent(m[1]);
-  const vm = location.hash.match(/[?&]view=(list|graph)/);
+  // 2026-05-25 commit 5 follow-up (妹妹 P1 #2): deep-link 加 tilly
+  const vm = location.hash.match(/[?&]view=(list|graph|tilly)/);
   if (vm) state.viewMode = vm[1] as ViewMode;
 
   searchEl.addEventListener('input', () => {
