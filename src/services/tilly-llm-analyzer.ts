@@ -33,6 +33,10 @@ export interface TillyDigestItem {
   sourceChatName: string;
   sourceMessageId: string;
   priority?: 'high' | 'med' | 'low';
+  /** P1-5 (2026-05-25 妹妹): 源消息的 Lark applink，让卡里 todo 能一键跳
+   *  回现场。由 enrich 阶段从 raw message.appLink 填，不让 LLM 拼链接。
+   *  optional 因为 lark-cli 偶发 message_app_link 为空。 */
+  sourceAppLink?: string;
 }
 
 export interface TillyDigest {
@@ -339,6 +343,8 @@ export async function analyzeMessages(
       sourceChatName: found?.chatName || it.sourceChatName || found?.chatId || '',
       sourceMessageId: it.sourceMessageId,
       priority: it.priority,
+      // P1-5: 后端 enrich applink，不让 LLM 拼链接（防止幻觉伪链接）
+      sourceAppLink: found?.appLink,
     };
   };
   const safe = (arr: any): TillyDigestItem[] =>

@@ -39,10 +39,15 @@ export function renderTillyCardContent(d: CurrentDigestFile): string {
     `\n_最新 tick: ${d.lastTickAt.slice(11, 19)} UTC_\n`,
   ];
 
-  const formatItem = (it: { summary: string; sourceChatName: string; sourceMessageId: string; priority?: string }): string => {
+  // P1-5 (2026-05-25 妹妹): 每条 item 末尾加 [→](applink) 一键跳回原消息。
+  // sourceAppLink 由 tilly-llm-analyzer enrich 阶段从 raw lark 消息字段填，
+  // LLM 不参与链接拼接（防幻觉）。link 缺失 (lark-cli 偶发返回空) 时退化
+  // 为不带链接，不阻塞产出。
+  const formatItem = (it: { summary: string; sourceChatName: string; sourceMessageId: string; priority?: string; sourceAppLink?: string }): string => {
     const prio = it.priority ? `[${it.priority}] ` : '';
     const sub = it.sourceChatName ? ` · *${it.sourceChatName}*` : '';
-    return `- ${prio}${it.summary}${sub}`;
+    const jump = it.sourceAppLink ? ` [→](${it.sourceAppLink})` : '';
+    return `- ${prio}${it.summary}${sub}${jump}`;
   };
 
   const sec = (title: string, items: any[]): string[] => {
