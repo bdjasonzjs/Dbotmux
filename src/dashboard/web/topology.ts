@@ -46,7 +46,7 @@ interface ApiTopology {
   nodes: ChatNode[];
 }
 
-type ViewMode = 'list' | 'graph';
+type ViewMode = 'list' | 'graph' | 'tilly';
 
 interface GroupBrief { chatId: string; name?: string }
 
@@ -112,6 +112,7 @@ export function renderTopologyPage(root: HTMLElement): () => void {
         <div class="topo-v2-view-switch" id="topo-view-switch">
           <button class="topo-v2-view-btn active" data-view="list">${t('topo.view.list')}</button>
           <button class="topo-v2-view-btn" data-view="graph">${t('topo.view.graph')}</button>
+          <button class="topo-v2-view-btn" data-view="tilly">${t('topo.view.tilly')}</button>
         </div>
         <input type="search" id="topo-search" placeholder="${t('topo.searchPlaceholder')}" autocomplete="off" />
         <select id="topo-filter">
@@ -742,8 +743,101 @@ export function renderTopologyPage(root: HTMLElement): () => void {
     if (state.viewMode === 'graph') {
       renderGraph();
       renderTopbar();
+    } else if (state.viewMode === 'tilly') {
+      void renderTillyView();
+      renderTopbar();
     } else {
       renderStream();
+    }
+  }
+
+  // 2026-05-25 Phase A v2 commit 5 (松松/妹妹 review): "🐶 缇蕾扫读" tab
+  // 整体内容追溯。从 `/api/tilly-digest` 拉 cumulative + archive，从
+  // `/api/scout-inbox` 拉 pending tilly_digest_high item 的 sourceMessageId
+  // 集合 → 只有这些 item 在 cumulative 列表里显示"dismiss"按钮 (妹妹 #5)。
+  // 普通 cumulative item 只展示 applink，不打 dismiss API。
+  async function renderTillyView(): Promise<void> {
+    streamEl.innerHTML = `<div class="topo-v2-empty">${t('topo.tilly.loading')}</div>`;
+    try {
+      const [tdResp, siResp] = await Promise.all([
+        fetch('/api/tilly-digest').then(r => r.json()),
+        fetch('/api/scout-inbox').then(r => r.json()),
+      ]);
+      const current = tdResp.current ?? { todos: [], progress: [], blockers: [], noteworthy: [], dateId: '-', tickCount: 0, lastTickAt: '' };
+      const archive = (tdResp.archive ?? []) as Array<{ dateId: string; todos: any[]; progress: any[]; blockers: any[]; noteworthy: any[]; tickCount: number }>;
+      // Map: sourceMessageId → scoutInboxItem.id (only pending tilly_digest_high)
+      const pendingDismissMap = new Map<string, string>();
+      for (const it of (siResp.pending ?? [])) {
+        if (it.type === 'tilly_digest_high' && it.status === 'pending' && it.payload?.sourceMessageId) {
+          pendingDismissMap.set(it.payload.sourceMessageId, it.id);
+        }
+      }
+      const renderItem = (it: any): string => {
+        const prio = it.priority ? `<span class="tilly-prio tilly-prio-${it.priority}">${it.priority}</span> ` : '';
+        const chatTag = it.sourceChatName ? `<span class="tilly-chat">· ${escapeHtml(it.sourceChatName)}</span>` : '';
+        const jump = it.sourceAppLink ? ` <a href="${escapeHtml(it.sourceAppLink)}" target="_blank" rel="noopener">[→]</a>` : '';
+        const inboxId = pendingDismissMap.get(it.sourceMessageId);
+        const dismiss = inboxId
+          ? ` <button class="tilly-dismiss" data-inbox-id="${escapeHtml(inboxId)}">${t('topo.tilly.dismiss')}</button>`
+          : '';
+        return `<li class="tilly-item">${prio}${escapeHtml(it.summary || '')}${chatTag}${jump}${dismiss}</li>`;
+      };
+      const renderCategory = (title: string, emoji: string, items: any[]): string => {
+        if (!items || items.length === 0) return '';
+        return `<section class="tilly-category"><h4>${emoji} ${title} <span class="tilly-count">(${items.length})</span></h4><ul>${items.map(renderItem).join('')}</ul></section>`;
+      };
+      const totalCurrent = current.todos.length + current.progress.length + current.blockers.length + current.noteworthy.length;
+      const archiveBlock = archive.length === 0
+        ? ''
+        : `<details class="tilly-archive"><summary>${t('topo.tilly.archiveHeader', { n: archive.length })}</summary>${
+            archive.slice().reverse().map(day => `
+              <div class="tilly-archive-day">
+                <h4>${escapeHtml(day.dateId)} <span class="tilly-count">(${day.todos.length + day.progress.length + day.blockers.length + day.noteworthy.length} items / ${day.tickCount} ticks)</span></h4>
+                ${renderCategory(t('topo.tilly.cat.todos'), '📝', day.todos)}
+                ${renderCategory(t('topo.tilly.cat.progress'), '✅', day.progress)}
+                ${renderCategory(t('topo.tilly.cat.blockers'), '🚧', day.blockers)}
+                ${renderCategory(t('topo.tilly.cat.noteworthy'), '💡', day.noteworthy)}
+              </div>
+            `).join('')
+          }</details>`;
+      const pendingCount = pendingDismissMap.size;
+      streamEl.innerHTML = `
+        <div class="topo-v2-tilly-pane">
+          <header class="tilly-header">
+            <h2>🐶 ${t('topo.tilly.title')} · ${escapeHtml(current.dateId)}</h2>
+            <p class="tilly-meta">
+              ${t('topo.tilly.meta', { n: totalCurrent, ticks: current.tickCount, lastTick: current.lastTickAt ? current.lastTickAt.slice(11, 19) + ' UTC' : '-' })}
+              · <span class="tilly-pending-badge">${pendingCount} pending high-prio</span>
+            </p>
+          </header>
+          ${renderCategory(t('topo.tilly.cat.todos'), '📝', current.todos)}
+          ${renderCategory(t('topo.tilly.cat.progress'), '✅', current.progress)}
+          ${renderCategory(t('topo.tilly.cat.blockers'), '🚧', current.blockers)}
+          ${renderCategory(t('topo.tilly.cat.noteworthy'), '💡', current.noteworthy)}
+          ${archiveBlock}
+        </div>
+      `;
+      // wire dismiss buttons
+      streamEl.querySelectorAll<HTMLButtonElement>('.tilly-dismiss').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          const inboxId = btn.dataset.inboxId;
+          if (!inboxId) return;
+          btn.disabled = true;
+          btn.textContent = '...';
+          try {
+            const r = await fetch(`/api/scout-inbox/${encodeURIComponent(inboxId)}/dismiss`, { method: 'POST' });
+            if (!r.ok) { alert('dismiss failed: HTTP ' + r.status); btn.disabled = false; btn.textContent = t('topo.tilly.dismiss'); return; }
+            // remove button (dismissed item still appears in cumulative but no
+            // longer in pending list)
+            btn.remove();
+          } catch (err) {
+            alert('dismiss failed: ' + err);
+            btn.disabled = false; btn.textContent = t('topo.tilly.dismiss');
+          }
+        });
+      });
+    } catch (err) {
+      streamEl.innerHTML = `<div class="topo-v2-err">${t('topo.tilly.loadErr', { err: escapeHtml(String(err)) })}</div>`;
     }
   }
 
