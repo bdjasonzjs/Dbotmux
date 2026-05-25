@@ -89,18 +89,36 @@ function loadPrivacyDefaults(): {
 }
 
 /** v2.1 (2026-05-26 妹妹): 判断 (chatId, senderId) 是否在 bot allowlist。
- *  rules: 三种格式
+ *  rules: 严格 3 种格式 (fail-closed)
  *  - "chatId:senderId" — 严格组合
  *  - "*:senderId"      — 该 bot 跨所有 chat
  *  - "chatId:*"        — 该 chat 所有 bot
- *  注: bot/app/cli_xxx 发的消息默认被 drop；只有命中此处规则才放行。
+ *
+ *  显式拒绝:
+ *  - "*:*"              全通配（"全开" 是 internal debug option includeAllBotSenders 的领地，
+ *                       不应通过 env allowlist 借后门）
+ *  - "a:b:c"            多冒号
+ *  - ":x" / "x:" / ""   空段
+ *  这些 malformed 项 logger.warn + 静默 drop，绝不 fall through 成放行。
+ *
+ *  注: bot/app/cli_xxx 发的消息默认被 drop；只有命中此处合法规则才放行。
  *  目的是断 self-reference loop（缇蕾扫到自己 + 主 bot 发的 notify 文本
  *  让 LLM 二次归类成 meta blocker → 又 push 又 notify）。bot 进展通报
  *  走 P2 RootInbox / progress-report 主链路，不靠缇蕾扫 bot 输出 LLM。 */
 function isBotSenderAllowed(chatId: string, senderId: string, rules: string[]): boolean {
   for (const r of rules) {
-    const [c, s] = r.split(':');
-    if (!c || !s) continue;
+    const parts = r.split(':');
+    // 必须恰好 2 段 + 都非空
+    if (parts.length !== 2 || !parts[0] || !parts[1]) {
+      logger.warn(`[tilly-scout] bot-allowlist rule rejected (malformed): "${r}"`);
+      continue;
+    }
+    const [c, s] = parts;
+    // 显式拒 "*:*" — 全开走 includeAllBotSenders debug option，不靠 env
+    if (c === '*' && s === '*') {
+      logger.warn(`[tilly-scout] bot-allowlist rule rejected ("*:*" not allowed; use includeAllBotSenders for debug)`);
+      continue;
+    }
     const chatOk = c === '*' || c === chatId;
     const senderOk = s === '*' || s === senderId;
     if (chatOk && senderOk) return true;

@@ -225,6 +225,43 @@ describe('tilly-scout (P3 commit #2)', () => {
       expect(r.map(m => m.messageId).sort()).toEqual(['om_a_in_x', 'om_a_in_y']);
     });
 
+    it('parser fail-closed: malformed (extra colon) 不放行', async () => {
+      const fake = makeFakeLarkCli({ ok: true, data: { messages: [
+        mkMsg('om_bot', 'oc_x', 'cli_a', 'app'),
+      ] } });
+      const { scout } = await freshImports();
+      const r = await scout.fetchRecentMessages({
+        start: new Date(0), end: new Date(), larkCliPath: fake,
+        // malformed: 3 段；旧的 split 解构会截成 oc_x:cli_a 误放行
+        includeBotSenders: ['oc_x:cli_a:extra_segment'],
+      });
+      expect(r).toEqual([]);
+    });
+
+    it('parser fail-closed: "*:*" 不放行 (走 includeAllBotSenders debug 不走 env)', async () => {
+      const fake = makeFakeLarkCli({ ok: true, data: { messages: [
+        mkMsg('om_bot', 'oc_x', 'cli_a', 'app'),
+      ] } });
+      const { scout } = await freshImports();
+      const r = await scout.fetchRecentMessages({
+        start: new Date(0), end: new Date(), larkCliPath: fake,
+        includeBotSenders: ['*:*'],
+      });
+      expect(r).toEqual([]);
+    });
+
+    it('parser fail-closed: 空段 (`:x` / `x:` / 空 str) 不放行', async () => {
+      const fake = makeFakeLarkCli({ ok: true, data: { messages: [
+        mkMsg('om_bot', 'oc_x', 'cli_a', 'app'),
+      ] } });
+      const { scout } = await freshImports();
+      const r = await scout.fetchRecentMessages({
+        start: new Date(0), end: new Date(), larkCliPath: fake,
+        includeBotSenders: [':cli_a', 'oc_x:', '', '   '],
+      });
+      expect(r).toEqual([]);
+    });
+
     it('debug only: includeAllBotSenders=true 全放行 (daemon 默认不开)', async () => {
       const fake = makeFakeLarkCli({ ok: true, data: { messages: [
         mkMsg('om_human', 'oc', 'ou_user', 'user'),
