@@ -276,3 +276,105 @@ describe('Phase A v2: ScoutInbox union + tilly_digest_high', () => {
     expect(store.readInbox().processed).toHaveLength(0);
   });
 });
+
+/* v2.1 commit 3 (2026-05-26 松松/妹妹 P0 #3) — listRecentHandledHigh */
+describe('Phase A v2.1: listRecentHandledHigh', () => {
+  beforeEach(() => { tempDir = mkdtempSync(join(tmpdir(), 'digest-test-')); });
+  afterEach(() => { rmSync(tempDir, { recursive: true, force: true }); });
+
+  const mkPayload = (msgId: string, summary = 's') => ({
+    summary, sourceChatId: 'oc_x', sourceChatName: 'X',
+    sourceMessageId: msgId, sourceAppLink: '', priority: 'high' as const,
+  });
+
+  it('空 inbox → 返 []', async () => {
+    const store = await freshImport();
+    expect(store.listRecentHandledHigh()).toEqual([]);
+  });
+
+  it('只取 type=tilly_digest_high 的 processed/dismissed (不混 escalation R1-R5)', async () => {
+    const store = await freshImport();
+    // 1 个 escalation resolved
+    const esc = store.enqueueEscalation({ ruleId: 'R1', triggeredAt: 'x', chatId: 'oc', context: 'c', payload: {} });
+    store.markResolved(esc.id, 'handler', 'done');
+    // 1 个 tilly_digest_high dismissed
+    const { item: t1 } = store.enqueueTillyDigestHigh({ category: 'blocker', payload: mkPayload('om_1') });
+    store.dispositionTillyHigh(t1.id, { status: 'dismissed', handledBy: 'songsong' });
+    const r = store.listRecentHandledHigh();
+    expect(r).toHaveLength(1);
+    expect(r[0].type).toBe('tilly_digest_high');
+    expect(r[0].payload.sourceMessageId).toBe('om_1');
+  });
+
+  it('只取 status processed/dismissed (pending 不算)', async () => {
+    const store = await freshImport();
+    // 1 pending
+    store.enqueueTillyDigestHigh({ category: 'todo', payload: mkPayload('om_pending') });
+    // 1 dismissed
+    const { item: d } = store.enqueueTillyDigestHigh({ category: 'todo', payload: mkPayload('om_dismissed') });
+    store.dispositionTillyHigh(d.id, { status: 'dismissed', handledBy: 'x' });
+    // 1 processed
+    const { item: p } = store.enqueueTillyDigestHigh({ category: 'blocker', payload: mkPayload('om_processed') });
+    store.dispositionTillyHigh(p.id, { status: 'processed', handledBy: 'x' });
+    const r = store.listRecentHandledHigh();
+    expect(r.map(i => i.payload.sourceMessageId).sort()).toEqual(['om_dismissed', 'om_processed']);
+  });
+
+  it('按 handledAt 倒序 (最新先)', async () => {
+    const store = await freshImport();
+    const a = store.enqueueTillyDigestHigh({ category: 'todo', payload: mkPayload('om_a') }).item;
+    const b = store.enqueueTillyDigestHigh({ category: 'todo', payload: mkPayload('om_b') }).item;
+    const c = store.enqueueTillyDigestHigh({ category: 'todo', payload: mkPayload('om_c') }).item;
+    // disposition 顺序 a 最早，c 最新
+    store.dispositionTillyHigh(a.id, { status: 'dismissed', handledBy: 'x' });
+    await new Promise(r => setTimeout(r, 10));
+    store.dispositionTillyHigh(b.id, { status: 'dismissed', handledBy: 'x' });
+    await new Promise(r => setTimeout(r, 10));
+    store.dispositionTillyHigh(c.id, { status: 'dismissed', handledBy: 'x' });
+    const r = store.listRecentHandledHigh();
+    expect(r.map(i => i.payload.sourceMessageId)).toEqual(['om_c', 'om_b', 'om_a']);
+  });
+
+  it('maxAgeHours 截断过老 item (默认 24h)', async () => {
+    const store = await freshImport();
+    const { item: old } = store.enqueueTillyDigestHigh({ category: 'todo', payload: mkPayload('om_old') });
+    store.dispositionTillyHigh(old.id, { status: 'dismissed', handledBy: 'x' });
+    // 手动改 handledAt 成 25h 前
+    const inbox = store.readInbox();
+    const oldItem = inbox.processed.find(i => i.id === old.id) as any;
+    oldItem.handledAt = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
+    // 直接 writeInbox
+    store.writeInbox(inbox);
+    const { item: fresh } = store.enqueueTillyDigestHigh({ category: 'todo', payload: mkPayload('om_fresh') });
+    store.dispositionTillyHigh(fresh.id, { status: 'dismissed', handledBy: 'x' });
+    // 默认 24h cutoff
+    const r = store.listRecentHandledHigh();
+    expect(r.map(i => i.payload.sourceMessageId)).toEqual(['om_fresh']);
+    // 显式给 maxAgeHours=48 时 om_old 应该回来
+    const r2 = store.listRecentHandledHigh({ maxAgeHours: 48 });
+    expect(r2.map(i => i.payload.sourceMessageId).sort()).toEqual(['om_fresh', 'om_old']);
+  });
+
+  it('limit 截断 (默认 20)', async () => {
+    const store = await freshImport();
+    for (let i = 0; i < 25; i++) {
+      const { item } = store.enqueueTillyDigestHigh({ category: 'todo', payload: mkPayload(`om_${i}`) });
+      store.dispositionTillyHigh(item.id, { status: 'dismissed', handledBy: 'x' });
+    }
+    expect(store.listRecentHandledHigh()).toHaveLength(20);
+    expect(store.listRecentHandledHigh({ limit: 5 })).toHaveLength(5);
+  });
+
+  it('handledAt missing/invalid → 跳过 (不允许无时间的排 top)', async () => {
+    const store = await freshImport();
+    const { item } = store.enqueueTillyDigestHigh({ category: 'todo', payload: mkPayload('om_bad') });
+    store.dispositionTillyHigh(item.id, { status: 'dismissed', handledBy: 'x' });
+    // 破坏 handledAt
+    const inbox = store.readInbox();
+    const bad = inbox.processed.find(i => i.id === item.id) as any;
+    bad.handledAt = 'not-a-date';
+    store.writeInbox(inbox);
+    expect(store.listRecentHandledHigh()).toHaveLength(0);
+  });
+});
+

@@ -345,6 +345,40 @@ export function listUnnotifiedTillyHigh(): ScoutTillyHighItem[] {
   );
 }
 
+/** v2.1 commit 3 (2026-05-26 松松/妹妹 P0 #3): 列最近被人工处理过的
+ *  tilly_digest_high item，用来给缇蕾 prompt 注入 KNOWN_HANDLED_TOPICS
+ *  让 LLM 跨卡点 dedup (commit 4 用)。
+ *
+ *  约束:
+ *  - 只取 type==='tilly_digest_high' (不混 escalation R1-R5)
+ *  - 只取 status ∈ {'processed', 'dismissed'} (pending 不算)
+ *  - 来源是 processed 队列 (dispositionTillyHigh 已 splice 到这里)
+ *  - 按 handledAt 倒序 (最新先)
+ *  - maxAgeHours 截断 (默认 24h, 超过的不在 prompt 里冲淡 context)
+ *  - limit 截断 (默认 20, 控 prompt 大小)
+ *  - handledAt missing/invalid 的 item 跳过 (有损 — 但不允许把无时间的
+ *    item 当 "最新"，避免脏数据排到 top)
+ */
+export function listRecentHandledHigh(
+  opts: { maxAgeHours?: number; limit?: number } = {},
+): ScoutTillyHighItem[] {
+  const maxAgeMs = (opts.maxAgeHours ?? 24) * 60 * 60 * 1000;
+  const limit = opts.limit ?? 20;
+  const now = Date.now();
+  const items: Array<ScoutTillyHighItem & { _ts: number }> = [];
+  for (const it of readInbox().processed) {
+    if (it.type !== 'tilly_digest_high') continue;
+    if (it.status !== 'processed' && it.status !== 'dismissed') continue;
+    if (!it.handledAt) continue;
+    const ts = new Date(it.handledAt).getTime();
+    if (Number.isNaN(ts)) continue;
+    if (now - ts > maxAgeMs) continue;
+    items.push({ ...it, _ts: ts });
+  }
+  items.sort((a, b) => b._ts - a._ts);
+  return items.slice(0, limit).map(({ _ts, ...rest }) => rest);
+}
+
 /** Mark a pending escalation item as in_progress. Returns the updated item,
  *  or null if not found / not pending / wrong type (tilly_digest_high item
  *  doesn't have 'in_progress' state — Phase A 妹妹 guard #1). */
