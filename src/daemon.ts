@@ -2638,7 +2638,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         const { fetchRecentMessages } = await import('./services/tilly-scout.js');
         const { analyzeMessages } = await import('./services/tilly-llm-analyzer.js');
         const { mergeNewDigest } = await import('./services/tilly-digest-store.js');
-        const { publishTillyDigest, publishTillyAlert, dismissTillyAlert, notifyClaudeIfImportant } = await import('./services/tilly-publisher.js');
+        // 2026-05-25 Phase A v2 commit 3 (妹妹 review): publishTillyDigest
+        // 已 no-op (不再 publish 主话题大卡 / 不再写 RootInbox)。新链路:
+        // pushHighPriorityToScoutInbox 写 scout-inbox + notifyClaudeAboutInboxItems
+        // 绑 inbox insert 结果通知。
+        const { publishTillyAlert, dismissTillyAlert, pushHighPriorityToScoutInbox, notifyClaudeAboutInboxItems } = await import('./services/tilly-publisher.js');
         const { markScanned } = await import('./services/tilly-message-store.js');
         const { resolveBotIdent } = await import('./core/main-bot-playbook.js');
         // 2026-05-25 (松松实拍): 之前用 claudeApp 发卡 → 群里 sender 显示
@@ -2647,6 +2651,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         // bot-registry 让任何 daemon 都能用任意 bot client，verified safe.
         const tillyApp = resolveBotIdent('tilly').larkAppId;
         const claudeIdent = resolveBotIdent('claude');
+        const OWNER_OPEN_ID = 'ou_974b9321334628537abee157413b33b6';
         const end = new Date();
         const start = new Date(end.getTime() - TILLY_TICK_INTERVAL_MS);
         const fresh = await fetchRecentMessages({ start, end });
@@ -2662,6 +2667,18 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             try { await dismissTillyAlert({ larkAppId: tillyApp }); }
             catch (err) { logger.warn(`[tilly/scout] dismissTillyAlert failed: ${err}`); }
           }
+          // 2026-05-25 commit 3 (妹妹 commit 2 review 提醒): 即使本 tick
+          // newlyInserted=[] 也 call notify helper，让 historical
+          // unnotified (throttle/失败遗留) 在下一个 tick 被补发。
+          try {
+            await notifyClaudeAboutInboxItems([], {
+              larkAppId: tillyApp,
+              claudeOpenId: claudeIdent.openId,
+              ownerOpenId: OWNER_OPEN_ID,
+            });
+          } catch (err) {
+            logger.warn(`[tilly/scout] carryover notify failed (non-blocking): ${err}`);
+          }
           return;
         }
         const digest = await analyzeMessages(fresh);
@@ -2672,29 +2689,23 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           return;
         }
         const cumulative = mergeNewDigest(digest);
-        let publishedCardId: string | null = null;
+        // 2026-05-25 Phase A v2 commit 3: 不再 publishTillyDigest 主话题
+        // 大卡。改成 push high-prio item 到 scout-inbox + notify @ 松松 +
+        // 克劳德分身。
+        let newlyInserted: Awaited<ReturnType<typeof pushHighPriorityToScoutInbox>> = [];
         try {
-          const pub = await publishTillyDigest(cumulative, { larkAppId: tillyApp });
-          publishedCardId = pub.rootCardMessageId;
+          newlyInserted = pushHighPriorityToScoutInbox(digest);
         } catch (err) {
-          logger.warn(`[tilly/scout] publish failed (digest still stored): ${err}`);
+          logger.warn(`[tilly/scout] pushHighPriorityToScoutInbox failed: ${err}`);
         }
-        // 2026-05-25 (松松实拍): 本次 tick 有 high-prio 新增时 @克劳德
-        // 分身上浮一条 text，让 Flumy 主话题分身被叫醒消化扫读卡。
-        // (digest = 本次新增；cumulative = 今日累积；用 digest 算 delta)
         try {
-          const claudeIdent = resolveBotIdent('claude');
-          // 松松 open_id 写在 CLAUDE.md 里 — 这里直接用常量。如果未来要
-          // 支持多 owner 可以从 allowlist 第一个 owner 取。
-          const OWNER_OPEN_ID = 'ou_974b9321334628537abee157413b33b6';
-          await notifyClaudeIfImportant(digest, {
+          await notifyClaudeAboutInboxItems(newlyInserted, {
             larkAppId: tillyApp,
             claudeOpenId: claudeIdent.openId,
             ownerOpenId: OWNER_OPEN_ID,
-            cardMessageId: publishedCardId,
           });
         } catch (err) {
-          logger.warn(`[tilly/scout] notifyClaudeIfImportant failed (non-blocking): ${err}`);
+          logger.warn(`[tilly/scout] notifyClaudeAboutInboxItems failed (non-blocking): ${err}`);
         }
         // Success path — clear counter + dismiss alert if it's up
         if (tillyConsecutiveFails > 0) {
@@ -2711,7 +2722,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         const toMark = digest.analyzedMessageIds;
         markScanned(toMark);
         const ms = Date.now() - tickStartTime;
-        logger.info(`[tilly/scout] tick done in ${ms}ms: ${fresh.length} fresh / ${toMark.length} analyzed → +${digest.todos.length}t/${digest.progress.length}p/${digest.blockers.length}b/${digest.noteworthy.length}n (today total: ${cumulative.todos.length}/${cumulative.progress.length}/${cumulative.blockers.length}/${cumulative.noteworthy.length})`);
+        logger.info(`[tilly/scout] tick done in ${ms}ms: ${fresh.length} fresh / ${toMark.length} analyzed → +${digest.todos.length}t/${digest.progress.length}p/${digest.blockers.length}b/${digest.noteworthy.length}n (today total: ${cumulative.todos.length}/${cumulative.progress.length}/${cumulative.blockers.length}/${cumulative.noteworthy.length}) · scout-inbox +${newlyInserted.length}`);
       } catch (err) {
         tickFailed = true;
         tickFailReason = `tick threw: ${err}`;
