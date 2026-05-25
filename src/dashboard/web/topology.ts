@@ -222,8 +222,32 @@ export function renderTopologyPage(root: HTMLElement): () => void {
       }
     }
 
-    // BFS from rootChatId to discover the connected tree.
-    const rootId = state.rootChatId && byId.has(state.rootChatId) ? state.rootChatId : null;
+    // G4 (2026-05-25): 不强行用 state.rootChatId 当中心 — 如果它没
+     // children，把图最大 subtree 的根拿来居中（视觉空间利用率高）。
+     // rootChatId 没 children 时降为 alt-root 顶部显示。
+    function subtreeSize(chatId: string, seen = new Set<string>()): number {
+      if (seen.has(chatId)) return 0;
+      seen.add(chatId);
+      let n = 1;
+      for (const c of childrenOf.get(chatId) ?? []) n += subtreeSize(c.chatId, seen);
+      return n;
+    }
+    // 候选 = 所有有 children 的 node（无 children 的不能当中心）
+    const subtreeCandidates = all.filter(n => (childrenOf.get(n.chatId)?.length ?? 0) > 0);
+    let bestRootId: string | null = null;
+    let bestSize = 0;
+    for (const n of subtreeCandidates) {
+      const size = subtreeSize(n.chatId);
+      if (size > bestSize) { bestSize = size; bestRootId = n.chatId; }
+    }
+    // 优先级：state.rootChatId 如果是 best 之一 → 用它（语义清晰）；
+     // 否则用 best (即使不是 mainTopic)。都没有 (无任何 parent_child edge)
+     // → null，渲染时全 alt-root 平铺。
+    const stateRootSize = state.rootChatId && byId.has(state.rootChatId)
+      ? subtreeSize(state.rootChatId) : 0;
+    const rootId: string | null = (state.rootChatId && stateRootSize > 0 && stateRootSize === bestSize)
+      ? state.rootChatId
+      : bestRootId;
     const reachable = new Set<string>();
     if (rootId) {
       const q = [rootId];
