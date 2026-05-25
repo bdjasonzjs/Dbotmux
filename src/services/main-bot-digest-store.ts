@@ -206,16 +206,21 @@ function normalizeInbox(raw: any): ScoutInbox {
   const normalize = (item: any): ScoutInboxItem | null => {
     if (!item || typeof item !== 'object') return null;
     if (item.type === 'tilly_digest_high') return item as ScoutTillyHighItem;
-    // type undefined OR 'escalation' → 视为 escalation (兼容旧数据)
-    return {
-      type: 'escalation' as const,
-      id: item.id,
-      enqueuedAt: item.enqueuedAt,
-      escalation: item.escalation,
-      status: item.status ?? 'pending',
-      resolvedBy: item.resolvedBy ?? null,
-      resolution: item.resolution ?? null,
-    };
+    // 2026-05-25 commit 1 (妹妹 review #P2 fix): 收紧 — 只 undefined / 'escalation'
+    // 归一成 escalation；未知 type drop + warn 防止未来脏数据被静默改造。
+    if (item.type === undefined || item.type === 'escalation') {
+      return {
+        type: 'escalation' as const,
+        id: item.id,
+        enqueuedAt: item.enqueuedAt,
+        escalation: item.escalation,
+        status: item.status ?? 'pending',
+        resolvedBy: item.resolvedBy ?? null,
+        resolution: item.resolution ?? null,
+      };
+    }
+    logger.warn(`[main-bot-digest-store] dropped scout-inbox item with unknown type=${item.type} id=${item.id}`);
+    return null;
   };
   return {
     pending: (raw.pending ?? []).map(normalize).filter((x: any): x is ScoutInboxItem => x !== null),
@@ -259,20 +264,27 @@ export function enqueueEscalation(escalation: Escalation): ScoutEscalationItem {
   return item;
 }
 
-/** 2026-05-25 Phase A v2: push 缇蕾本次 tick 发现的 high-prio item。
- *  dedup by sourceMessageId 跨 pending + processed 全状态（妹妹 #2 ack:
- *  dismissed 也算 sink，永久不重新入）。
+/** 2026-05-25 Phase A v2 (commit 1 妹妹 blocker fix): dedup 只按
+ *  sourceMessageId 跨 pending + processed 全状态。sourceMessageId 是原子
+ *  事件 id — 同一条消息即使被 LLM 同时归为 high todo + blocker，也只
+ *  入一条；用户 dismiss 后该消息永久 sink 不再 reinsert（妹妹 v2 #2
+ *  ack）。
+ *
+ *  当 caller 想以"更严重"的 category 替换已存的"轻"category 时，调用方
+ *  自己 dispositionTillyHigh 旧的再 enqueue 新的，store 不替 caller 做
+ *  优先级判断（保持 dedup 简单原子）。当前推荐策略：blocker > todo，
+ *  caller 先尝试 blocker 入 inbox 再 todo，前者命中 dedup 则 todo 不入。
+ *
  *  Returns: { item, inserted: true } 新插入 | { item, inserted: false } 已存在 */
 export function enqueueTillyDigestHigh(opts: {
   category: 'todo' | 'blocker';
   payload: ScoutTillyHighItem['payload'];
 }): { item: ScoutTillyHighItem; inserted: boolean } {
   const inbox = readInbox();
-  // Dedup: 跨 pending + processed 全部状态匹配 sourceMessageId + category
+  // Dedup: only sourceMessageId, cross pending + processed all status.
   const existing = [...inbox.pending, ...inbox.processed].find(
     it => it.type === 'tilly_digest_high'
-       && (it as ScoutTillyHighItem).payload.sourceMessageId === opts.payload.sourceMessageId
-       && (it as ScoutTillyHighItem).category === opts.category,
+       && (it as ScoutTillyHighItem).payload.sourceMessageId === opts.payload.sourceMessageId,
   ) as ScoutTillyHighItem | undefined;
   if (existing) return { item: existing, inserted: false };
   const item: ScoutTillyHighItem = {
