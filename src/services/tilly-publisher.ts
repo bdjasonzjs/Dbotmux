@@ -24,7 +24,13 @@ import { sendMessage } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
 import type { CurrentDigestFile } from './tilly-digest-store.js';
 import { totalCount } from './tilly-digest-store.js';
-import type { TillyDigest } from './tilly-llm-analyzer.js';
+import type { TillyDigest, TillyDigestItem } from './tilly-llm-analyzer.js';
+import {
+  enqueueTillyDigestHigh,
+  markTillyHighNotified,
+  listUnnotifiedTillyHigh,
+  type ScoutTillyHighItem,
+} from './main-bot-digest-store.js';
 
 const TILLY_SUBCHAT_PLACEHOLDER = 'tilly-scout';   // not a real chat; tilly_digest is a daemon channel
 
@@ -68,38 +74,74 @@ export function renderTillyCardContent(d: CurrentDigestFile): string {
   return [...headerLines, ...body].join('\n');
 }
 
-/** Publish (insert or update) the current day's TillyDigest card to mainTopic.
- *  Idempotent within a day (same dateId → updates same card). */
+/** 2026-05-25 Phase A v2 (松松/妹妹 review): 之前 publishTillyDigest 每
+ *  15min update 主话题一张 cumulative 大卡。松松实拍发现这卡卡死在第一
+ *  次 send 的时间点 (Lark UI 不让 update 后的 message 上浮)，他完全看
+ *  不到。妹妹 review #3: "完全停掉，不做'启动/恢复发 1 张状态卡'。
+ *  状态卡会把老问题换个形式留下来"。
+ *
+ *  Phase A 行为：完全不再 publish 主话题大卡。整体追溯改由 dashboard
+ *  `/api/tilly-digest` 提供；群里只发 high-prio text 通知（独立 Lark
+ *  消息会上浮，且 @ 松松+@ 克劳德 触发分身消化）+ failure alert。
+ *
+ *  本函数保留只是为了不破坏 caller import；现在只更新 root-inbox store
+ *  里那条 tilly_digest 元信息（dashboard 用），完全不 send Lark。 */
 export async function publishTillyDigest(
   digest: CurrentDigestFile,
-  opts: PublishTillyOpts,
+  _opts: PublishTillyOpts,
 ): Promise<{ rootCardMessageId: string | null; inserted: boolean }> {
   const id = `tilly_digest:${digest.dateId}`;
-  // P3-rev1 v0.2 (妹妹补): allowReopen=false — daily digest 语义是
-  // "今日 dismiss 后不再打扰"。如果松松手动关闭今日扫读卡，下个 tick
-  // 不应该 reopen 一张新 #2 卡（会变成"撤销关闭"，反产品意图）。
-  // 跨日自然新卡（dateId 不同），不依赖 reopen 机制。
   const { item, inserted } = rootInbox.upsertOpen({
     id,
     kind: 'tilly_digest',
     subChatId: TILLY_SUBCHAT_PLACEHOLDER,
     subChatName: `缇蕾扫读 ${digest.dateId}`,
     summary: `今日 ${totalCount(digest)} items / ${digest.tickCount} ticks`,
-    // allowReopen defaults to false
   });
+  // 不再 sendOrUpdateCard — 群里完全静默（妹妹 v2 review #3）。
+  return { rootCardMessageId: item.rootCardMessageId, inserted };
+}
 
-  const mainTopic = getMainTopicChatId();
-  if (!mainTopic) {
-    logger.info('[tilly-publisher] mainTopic not configured — card not sent (digest stored only)');
-    return { rootCardMessageId: item.rootCardMessageId, inserted };
+/** 2026-05-25 Phase A v2 commit 2: 缇蕾本次 tick 出现的 high-prio item
+ *  (high todo / 任何 blocker) → push 到 scout-inbox。dedup by sourceMessageId
+ *  跨 pending+processed (dismissed 永久 sink)。
+ *
+ *  策略：blocker > high todo。同条消息既 blocker 又 high todo 时优先
+ *  作 blocker 入 inbox，让后续 todo 命中 dedup 不重复入。返回新插入的
+ *  item 列表 — caller 用来决定是否发 notification + markNotified。
+ */
+export function pushHighPriorityToScoutInbox(d: TillyDigest): ScoutTillyHighItem[] {
+  const newlyInserted: ScoutTillyHighItem[] = [];
+  // Step 1: blockers 先入 (优先级最高)
+  for (const it of d.blockers) {
+    const r = enqueueTillyDigestHigh({
+      category: 'blocker',
+      payload: extractPayload(it),
+    });
+    if (r.inserted) newlyInserted.push(r.item);
   }
+  // Step 2: 仅 high-prio todos (priority='high') 入 — med/low 不进 inbox 也不通知
+  for (const it of d.todos) {
+    if (it.priority !== 'high') continue;
+    const r = enqueueTillyDigestHigh({
+      category: 'todo',
+      payload: extractPayload(it),
+    });
+    if (r.inserted) newlyInserted.push(r.item);
+  }
+  return newlyInserted;
+}
 
-  // P3-rev1 #5 (妹妹 v0.2): pass tilly card markdown explicitly via
-  // RenderOpts.customMarkdown, NOT by overwriting item.summary. store's
-  // summary stays a short label so dashboard/listOpen don't get bloated.
-  const cardMarkdown = renderTillyCardContent(digest);
-  const msgId = await sendOrUpdateCard(opts.larkAppId, mainTopic, item, { customMarkdown: cardMarkdown });
-  return { rootCardMessageId: msgId, inserted };
+/** Helper: TillyDigestItem → ScoutTillyHighItem.payload */
+function extractPayload(it: TillyDigestItem): ScoutTillyHighItem['payload'] {
+  return {
+    summary: it.summary,
+    sourceChatId: it.sourceChatId,
+    sourceChatName: it.sourceChatName,
+    sourceMessageId: it.sourceMessageId,
+    sourceAppLink: it.sourceAppLink,
+    priority: it.priority,
+  };
 }
 
 const TILLY_ALERT_ID = 'tilly_alert';
@@ -115,56 +157,75 @@ const TILLY_ALERT_ID = 'tilly_alert';
 const NOTIFY_THROTTLE_MS = 5 * 60 * 1000;
 let lastNotifyAt = 0;
 
-function isHighPriority(d: TillyDigest): { count: number; reason: string } {
-  let high = 0;
-  for (const t of d.todos) if (t.priority === 'high') high++;
-  const blockers = d.blockers.length;
-  const total = high + blockers;
-  const parts: string[] = [];
-  if (high > 0) parts.push(`${high} 个 high-prio todo`);
-  if (blockers > 0) parts.push(`${blockers} 个新 blocker`);
-  return { count: total, reason: parts.join(' + ') };
-}
-
-/** Send a notification text to mainTopic when this tick has high-priority
- *  additions. claudeOpenId is @-mentioned so the Claude bot session in
- *  Flumy main topic gets woken up to consume the tilly digest card.
+/** 2026-05-25 Phase A v2 commit 2: 通知 @松松 + @克劳德，**绑定 inbox
+ *  insert 结果**（妹妹 v2 review #6）。
  *
- *  Returns false if no high-prio items OR throttled. */
-export async function notifyClaudeIfImportant(
-  newTick: TillyDigest,
-  opts: PublishTillyOpts & { claudeOpenId: string; ownerOpenId?: string; cardMessageId?: string | null },
+ *  逻辑：
+ *  - caller 传入本次 tick 新增的 ScoutTillyHighItem 列表 + 之前
+ *    throttle/失败遗留的 unnotified item（从 listUnnotifiedTillyHigh 拿）
+ *  - 合并去重后判断有没有 items 需要通知
+ *  - throttle 命中 → 不发，items.notifiedAt 不更新（下次 tick 自然再
+ *    试，避免 throttle 误吞重点）
+ *  - 发送成功 → markTillyHighNotified 标 notifiedAt 防重复
+ *  - 发送失败 → 不标，下次 tick 重试
+ */
+export async function notifyClaudeAboutInboxItems(
+  newlyInserted: ScoutTillyHighItem[],
+  opts: PublishTillyOpts & { claudeOpenId: string; ownerOpenId?: string },
 ): Promise<boolean> {
-  const { count, reason } = isHighPriority(newTick);
-  if (count === 0) return false;
+  // 合并：本次新插入 + 历史遗留 (throttle/失败未通知的 pending items)
+  const carryover = listUnnotifiedTillyHigh().filter(
+    it => !newlyInserted.some(n => n.id === it.id),
+  );
+  const all = [...newlyInserted, ...carryover];
+  if (all.length === 0) return false;
+
   const now = Date.now();
   if (now - lastNotifyAt < NOTIFY_THROTTLE_MS) {
-    logger.info(`[tilly-publisher] notify throttled (last sent ${Math.floor((now - lastNotifyAt) / 1000)}s ago, throttle=${NOTIFY_THROTTLE_MS / 1000}s)`);
+    logger.info(`[tilly-publisher] notify throttled (${all.length} items pending, last sent ${Math.floor((now - lastNotifyAt) / 1000)}s ago, throttle=${NOTIFY_THROTTLE_MS / 1000}s) — items remain unnotified for next tick`);
     return false;
   }
   const mainTopic = getMainTopicChatId();
   if (!mainTopic) return false;
 
-  // 2026-05-25 (松松反馈): 同时 @ 松松 让他被 ping 看到通知（不然他不
-  // 知道哪个群在发）+ @ 克劳德 让分身被叫醒消化。
+  const blockerCount = all.filter(i => i.category === 'blocker').length;
+  const todoCount = all.filter(i => i.category === 'todo').length;
+  const parts: string[] = [];
+  if (blockerCount > 0) parts.push(`${blockerCount} 个 blocker`);
+  if (todoCount > 0) parts.push(`${todoCount} 个 high-prio todo`);
+  const reason = parts.join(' + ');
+
   const ownerAt = opts.ownerOpenId ? `<at user_id="${opts.ownerOpenId}"></at> ` : '';
-  const cardLink = opts.cardMessageId
-    ? `\n\n查看完整扫读卡: 在主话题向上滑或搜 [缇蕾今日扫读]`
-    : '';
-  // 2026-05-25 (松松实拍 fix): sendMessage(msgType='text') 已经会自动包
-  // `{text: content}`，再 JSON.stringify 一层会被 Lark 当字面量整串显示
-  // (含 `{"text":"<at..>"}` 字面字符串)。传 plain string 即可。
-  const text = `${ownerAt}<at user_id="${opts.claudeOpenId}"></at> 🐶 缇蕾刚扫到 ${reason}，请消化今日扫读卡并安排.${cardLink}`;
+  // Top 3 item summaries 给个抢眼摘要
+  const top3 = all.slice(0, 3).map(i => `- [${i.category}] ${i.payload.summary}`).join('\n');
+  const dashLink = '\n\n→ dashboard 协作面板「🐶 缇蕾扫读」tab 看完整 + dismiss';
+  const text = `${ownerAt}<at user_id="${opts.claudeOpenId}"></at> 🐶 缇蕾扫到 ${reason}:\n${top3}${dashLink}`;
 
   try {
     const msgId = await sendMessage(opts.larkAppId, mainTopic, text, 'text');
     lastNotifyAt = now;
-    logger.info(`[tilly-publisher] notify sent (msg=${msgId}, ${reason}) to mainTopic ${mainTopic} with owner=${opts.ownerOpenId ?? 'none'}`);
+    // 标 inbox items 已通知 — 防下次 tick 重发同一批
+    for (const it of all) markTillyHighNotified(it.id);
+    logger.info(`[tilly-publisher] notify sent (msg=${msgId}, ${all.length} items: ${reason}) to mainTopic ${mainTopic}`);
     return true;
   } catch (err) {
-    logger.warn(`[tilly-publisher] notify failed: ${err}`);
+    logger.warn(`[tilly-publisher] notify failed: ${err} — items stay unnotified for next tick`);
     return false;
   }
+}
+
+/** @deprecated Phase A v2 (2026-05-25): 用 notifyClaudeAboutInboxItems
+ *  替代。这个旧 API 直接看 TillyDigest 算 high-prio count，没绑定 inbox
+ *  insert 结果，throttle 时 item 会被永久跳过（妹妹 review #6 防误吞）。
+ *  Caller 应该先 pushHighPriorityToScoutInbox(digest) 拿 inserted 列表再
+ *  调 notifyClaudeAboutInboxItems。本函数保留只是为了不破坏老 import。
+ */
+export async function notifyClaudeIfImportant(
+  _newTick: TillyDigest,
+  _opts: PublishTillyOpts & { claudeOpenId: string; ownerOpenId?: string; cardMessageId?: string | null },
+): Promise<boolean> {
+  logger.warn('[tilly-publisher] notifyClaudeIfImportant is deprecated — use pushHighPriorityToScoutInbox + notifyClaudeAboutInboxItems');
+  return false;
 }
 
 /** P0-2 (2026-05-25 妹妹): tilly tick 连续失败 >= 阈值时主话题发 alert
