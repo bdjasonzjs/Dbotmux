@@ -22,19 +22,22 @@ async function freshImport() {
 beforeEach(() => { tempDir = mkdtempSync(join(tmpdir(), 'tilly-llm-')); });
 afterEach(() => { rmSync(tempDir, { recursive: true, force: true }); });
 
-/** Build a fake codex shell script that writes a fixed JSON to the file
- *  passed to `--output-last-message <FILE>`. */
+/** 2026-05-25: analyzer 切到 coco CLI 后 fake 也跟着改。coco 接口是把
+ *  整个 envelope JSON 写到 stdout，{message:{content: <LLM 文本>}}。
+ *  helper name 保留 makeFakeCodex (legacy 兼容)，但实际产出 coco envelope。 */
 function makeFakeCodex(jsonStr: string, exitCode = 0): string {
-  const fp = join(tempDir, 'fake-codex.sh');
-  // Bash parse args, find --output-last-message, write JSON there
+  const fp = join(tempDir, 'fake-coco.sh');
+  // coco 输出 stdout envelope，把传入的 jsonStr 当 message.content
+  const envelope = JSON.stringify({
+    session_id: 'test',
+    agent_states: {},
+    message: { role: 'assistant', content: jsonStr },
+    stats: {},
+  }).replace(/'/g, "'\\''");
   const body = `#!/bin/bash
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --output-last-message)
-      echo '${jsonStr.replace(/'/g, "'\\''")}' > "$2"; shift 2;;
-    *) shift;;
-  esac
-done
+cat <<'ENVELOPE'
+${envelope}
+ENVELOPE
 exit ${exitCode}
 `;
   writeFileSync(fp, body, 'utf-8');
@@ -216,15 +219,16 @@ describe('tilly-llm-analyzer (P3 commit #3)', () => {
     expect(r.analyzedMessageIds).not.toContain('om_new_000');
   });
 
-  it('P3-rev1 #3: codex args include read-only sandbox and explicit cwd (no dangerous bypass)', async () => {
-    // We can't easily intercept the args from the fake codex, but we can
-    // confirm the analyzer's source references the safer flags. Read the
-    // built JS or the TS source.
+  it('2026-05-25 (松松): args 走 coco --print --output-format json + 禁所有 agentic tool', async () => {
+    // Analyzer 切到 coco CLI (trae)；不需要 codex sandbox 那套，coco 自带
+    // --disallowed-tool 控制。这条 test verify 源码用 coco 接口。
     const { readFileSync } = await import('node:fs');
     const { join } = await import('node:path');
     const src = readFileSync(join(__dirname, '..', 'src', 'services', 'tilly-llm-analyzer.ts'), 'utf-8');
-    expect(src).toContain("'--sandbox', 'read-only'");
-    expect(src).toContain("'--cd', codexCwd");
+    expect(src).toContain("'--print'");
+    expect(src).toContain("'--output-format', 'json'");
+    expect(src).toContain("'--disallowed-tool'");
+    expect(src).toContain('Bash,Edit,Replace,Read,Write,Search,WebFetch');
     expect(src).not.toContain('--dangerously-bypass-approvals-and-sandbox');
   });
 

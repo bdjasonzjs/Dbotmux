@@ -202,11 +202,14 @@ function renderMessagesForPrompt(byChat: Map<string, TillyMessage[]>): {
 }
 
 export interface AnalyzeOpts {
-  /** Override codex binary path (testing). */
+  /** Override LLM CLI binary path (testing). Defaults to 'coco'.
+   *  Legacy field name `codexPath` kept as alias for backward compat with
+   *  existing tests. */
+  cliPath?: string;
   codexPath?: string;
   /** Skip LLM call (for tests) — return empty digest. */
   dryRun?: boolean;
-  /** Timeout ms for codex exec; default 5 min. */
+  /** Timeout ms for LLM exec; default 10 min. */
   timeoutMs?: number;
 }
 
@@ -229,96 +232,85 @@ export async function analyzeMessages(
   const prompt = PROMPT_PREFIX + renderedMessages + PROMPT_SUFFIX;
   const includedIdSet = new Set(includedIds);
 
-  // Tmp workspace for schema + output AND for codex cwd (P3-rev1 #3:
-  // sandbox cwd is fixed to an empty tmp dir so codex can't poke at our
-  // real source tree even if a prompt-injection somehow escaped).
+  // 2026-05-25 (松松实拍): 缇蕾 = 基于 trae/coco bot，coco CLI 调用公司
+  // 内部 LLM，token 是免费的。之前走 codex 烧的是松松个人 ChatGPT 订阅
+  // 的 quota，必须切。
+  //
+  // coco 接口：`coco --print --output-format json --disallowed-tool ... PROMPT`
+  // stdout 输出 JSON 对象，`data.message.content` 是 LLM 文本响应。
+  // 禁所有 agentic 工具防 coco 想跑 shell/edit；--query-timeout 控制单次
+  // LLM 调用时长。
   const tmp = mkdtempSync(join(tmpdir(), 'tilly-llm-'));
-  const codexCwd = join(tmp, 'cwd');
-  mkdirSync(codexCwd, { recursive: true });
   const schemaFp = join(tmp, 'schema.json');
-  const outFp = join(tmp, 'out.json');
-  writeFileSync(schemaFp, JSON.stringify(JSON_SCHEMA), 'utf-8');
+  writeFileSync(schemaFp, JSON.stringify(JSON_SCHEMA), 'utf-8');   // 留档便于排错
 
-  const cli = opts.codexPath ?? 'codex';
-  // 2026-05-25 fix (松松催 tilly cron 启动时实拍发现): 原参数带
-  // `--output-schema` 导致 codex 一直 timeout 不出 output file，5 个 tick
-  // 全 silent fail。诊断：read-only sandbox + --cd + --output-schema 三者
-  // 组合下 codex 卡 180s+ 不产出（OpenAI strict JSON schema 模式可能触发
-  // 过长 reasoning + 偶发 invalid_json_schema 拒收）。去掉 schema 后同
-  // sandbox 配置 60s 内稳定产出。约束靠 prompt 内显式描述格式 + 代码 245
-  // 行的 regex fallback + validateAndKeepReferencedItems。schemaFp 还在
-  // tmp 里写一份留作日志/排错，但不再传给 codex。
+  const cli = opts.cliPath ?? opts.codexPath ?? 'coco';
+  const timeoutMs = opts.timeoutMs ?? 600_000;
   const args = [
-    'exec',
-    '--ephemeral',
-    '--skip-git-repo-check',
-    // P3-rev1 #3: read-only sandbox + fixed empty cwd. We deliberately do
-    // NOT pass the dangerous bypass flag — Lark message content is
-    // untrusted input and prompt-injection could otherwise trigger
-    // arbitrary shell execution. Codex still produces the final-message
-    // JSON via --output-last-message under the read-only sandbox.
-    '--sandbox', 'read-only',
-    '--cd', codexCwd,
-    // 2026-05-25 fix #2 (实拍发现): 没这个 codex 会进入 reasoning loop，
-    // 含 `<chat>` 标签的非简单 prompt 在 read-only sandbox 下会触发 codex
-    // 想做 agentic 工具调用 → 被 sandbox 拒 → 重试 → 10min timeout 还不出
-    // output。`model_reasoning_effort="none"` 让 codex 直接输出最终答案，
-    // 不 reason 不 agentic。我们这个用法本就只要它返回 JSON，不需要 agent
-    // 行为，所以禁掉是合理的。验证：含 chat 标签的 prompt 从 90s+ Terminated
-    // 降到几十秒稳定出 JSON。
-    '-c', 'model_reasoning_effort="none"',
-    // 2026-05-25 fix #3 (再次实拍): 没 --json codex 在大 prompt 下 stdout
-    // 堵塞/不主动 flush，10min 不写 outFp；加 --json 后切到 SSE 事件流，
-    // outFp 60s 内稳定产出。代价：stdout 多了 JSONL 噪音但我们没 consume
-    // stdout（只读 outFp）所以无影响。
-    '--json',
-    '--output-last-message', outFp,
+    '--print',
+    '--output-format', 'json',
+    '--query-timeout', `${Math.floor(timeoutMs / 1000)}s`,
+    // 禁所有可能让 coco 想 agentic 跑工具的能力 — 我们只要纯 LLM 文本
+    // 响应，不需要它读/写/运行任何东西。安全 + 速度都更稳。
+    '--disallowed-tool', 'Bash,Edit,Replace,Read,Write,Search,WebFetch',
     prompt,
   ];
+
+  let stdout = '';
   try {
-    // 2026-05-25 fix #4 (根因): execFileAsync 默认 stdio='pipe'，但 codex
-    // 在 --json 模式下会持续写大量 JSONL 到 stdout。Node pipe buffer 满
-    // (~64KB) → 内核阻塞 codex write → codex 永远 stuck 在 stdout flush。
-    // 我们根本不读 stdout（只读 outFp 文件），用 spawn + stdio='ignore'
-    // 让内核直接丢 stdout，process 才能正常完成。execFileAsync 没法显式
-    // 设 stdio，所以走 spawn + Promise 自己管 exit/timeout。
     const { spawn } = await import('node:child_process');
     await new Promise<void>((resolve, reject) => {
-      const child = spawn(cli, args, { stdio: ['ignore', 'ignore', 'ignore'] });
+      const child = spawn(cli, args, { stdio: ['ignore', 'pipe', 'ignore'] });
+      child.stdout!.on('data', (chunk: Buffer) => { stdout += chunk.toString('utf-8'); });
       const timer = setTimeout(() => {
         child.kill('SIGKILL');
-        reject(new Error(`codex exec timeout after ${opts.timeoutMs ?? 600_000}ms`));
-      }, opts.timeoutMs ?? 600_000);
+        reject(new Error(`coco exec timeout after ${timeoutMs}ms`));
+      }, timeoutMs);
       child.on('error', err => { clearTimeout(timer); reject(err); });
       child.on('exit', (code, sig) => {
         clearTimeout(timer);
         if (code === 0) resolve();
-        else reject(new Error(`codex exec exited code=${code} sig=${sig}`));
+        else reject(new Error(`coco exec exited code=${code} sig=${sig} stdout-bytes=${stdout.length}`));
       });
     });
   } catch (err: any) {
-    logger.warn(`[tilly-llm-analyzer] codex exec failed: ${err?.message ?? err}`);
+    logger.warn(`[tilly-llm-analyzer] coco exec failed: ${err?.message ?? err}`);
     rmSync(tmp, { recursive: true, force: true });
     return emptyDigest(false, [], String(err?.message ?? err));
   }
 
-  if (!existsSync(outFp)) {
+  if (!stdout.trim()) {
     rmSync(tmp, { recursive: true, force: true });
-    return emptyDigest(false, [], 'codex did not produce output file');
+    return emptyDigest(false, [], 'coco produced empty stdout');
+  }
+
+  // coco stdout = {session_id, agent_states, message: {role, content, ...}, stats}
+  // We want message.content which is the LLM's text response (should be JSON).
+  let cocoEnvelope: any;
+  try {
+    cocoEnvelope = JSON.parse(stdout);
+  } catch (err: any) {
+    logger.warn(`[tilly-llm-analyzer] failed to parse coco envelope: ${err?.message ?? err}; stdout[:200]=${stdout.slice(0, 200)}`);
+    rmSync(tmp, { recursive: true, force: true });
+    return emptyDigest(false, [], `coco envelope parse failed: ${err?.message ?? err}`);
+  }
+  const llmText = cocoEnvelope?.message?.content;
+  if (typeof llmText !== 'string' || !llmText.trim()) {
+    rmSync(tmp, { recursive: true, force: true });
+    return emptyDigest(false, [], 'coco envelope has no message.content');
   }
 
   let parsed: any;
   try {
-    const raw = readFileSync(outFp, 'utf-8');
     try {
-      parsed = JSON.parse(raw);
+      parsed = JSON.parse(llmText);
     } catch {
-      const m = raw.match(/\{[\s\S]*\}/);
-      if (!m) throw new Error('no JSON object in codex output');
+      const m = llmText.match(/\{[\s\S]*\}/);
+      if (!m) throw new Error('no JSON object in coco message.content');
       parsed = JSON.parse(m[0]);
     }
   } catch (err: any) {
-    logger.warn(`[tilly-llm-analyzer] failed to parse codex output: ${err?.message ?? err}`);
+    logger.warn(`[tilly-llm-analyzer] failed to parse LLM JSON response: ${err?.message ?? err}; content[:200]=${llmText.slice(0, 200)}`);
     rmSync(tmp, { recursive: true, force: true });
     return emptyDigest(false, [], `parse failed: ${err?.message ?? err}`);
   }
