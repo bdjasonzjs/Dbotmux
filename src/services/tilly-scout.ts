@@ -50,6 +50,24 @@ export interface FetchOpts {
   excludeChatIds?: string[];
   /** Optional override of lark-cli path (for testing). */
   larkCliPath?: string;
+  /** P0-1 privacy (2026-05-25): 显式 allowlist 模式 — 仅扫这些 chatId。
+   *  非空时优先于 excludeChatIds + includeP2P，其他全部排除。
+   *  通常通过 env BOTMUX_TILLY_ALLOWLIST_CHATS 设置。 */
+  allowlistChatIds?: string[];
+  /** P0-1: 是否包含 p2p (1:1 私聊)。默认 false（敏感内容不进 LLM）。
+   *  env BOTMUX_TILLY_INCLUDE_P2P=1 显式打开。 */
+  includeP2P?: boolean;
+}
+
+/** P0-1 (2026-05-25 妹妹 P0): 从 env 读 privacy 默认值。
+ *  - BOTMUX_TILLY_ALLOWLIST_CHATS=oc_a,oc_b → 只扫这些
+ *  - BOTMUX_TILLY_INCLUDE_P2P=1 → 显式打开 p2p 扫描
+ *  caller (daemon cron) 不传 opts 时这些 env 生效。 */
+function loadPrivacyDefaults(): { allowlist: string[]; includeP2P: boolean } {
+  const allowlistRaw = process.env.BOTMUX_TILLY_ALLOWLIST_CHATS?.trim();
+  const allowlist = allowlistRaw ? allowlistRaw.split(/[,\s]+/).filter(Boolean) : [];
+  const includeP2P = process.env.BOTMUX_TILLY_INCLUDE_P2P === '1';
+  return { allowlist, includeP2P };
 }
 
 interface LarkMessagesSearchResp {
@@ -148,11 +166,41 @@ export async function fetchRecentMessages(opts: FetchOpts): Promise<TillyMessage
     }
   }
 
-  // Apply chat exclusion filter
+  // P0-1 (2026-05-25): privacy filter — 默认排除 p2p，可 env override。
+  // 顺序：allowlist (非空时只保留这些) > p2p 过滤 > excludeChatIds 排除。
+  const envDefaults = loadPrivacyDefaults();
+  const allowlist = opts.allowlistChatIds ?? envDefaults.allowlist;
+  const allowlistSet = new Set(allowlist);
+  const includeP2P = opts.includeP2P ?? envDefaults.includeP2P;
   const excludeSet = new Set(opts.excludeChatIds ?? []);
-  const inScope = excludeSet.size > 0
-    ? messages.filter(m => !excludeSet.has(m.chatId))
-    : messages;
+  let inScope = messages;
+  let droppedAllowlist = 0;
+  let droppedP2P = 0;
+  let droppedExclude = 0;
+  if (allowlistSet.size > 0) {
+    inScope = inScope.filter(m => {
+      if (allowlistSet.has(m.chatId)) return true;
+      droppedAllowlist++;
+      return false;
+    });
+  }
+  if (!includeP2P) {
+    inScope = inScope.filter(m => {
+      if (m.chatType !== 'p2p') return true;
+      droppedP2P++;
+      return false;
+    });
+  }
+  if (excludeSet.size > 0) {
+    inScope = inScope.filter(m => {
+      if (!excludeSet.has(m.chatId)) return true;
+      droppedExclude++;
+      return false;
+    });
+  }
+  if (droppedAllowlist + droppedP2P + droppedExclude > 0) {
+    logger.info(`[tilly-scout] privacy filter dropped: allowlist=${droppedAllowlist} p2p=${droppedP2P} exclude=${droppedExclude} (mode: allowlist=${allowlistSet.size > 0 ? allowlist.join(',') : 'none'}, includeP2P=${includeP2P})`);
+  }
 
   // Dedup by tilly-message-store
   const unscannedIds = new Set(filterUnscanned(inScope.map(m => m.messageId)));
