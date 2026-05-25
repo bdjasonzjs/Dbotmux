@@ -2661,9 +2661,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         // (digest = 本次新增；cumulative = 今日累积；用 digest 算 delta)
         try {
           const claudeIdent = resolveBotIdent('claude');
+          // 松松 open_id 写在 CLAUDE.md 里 — 这里直接用常量。如果未来要
+          // 支持多 owner 可以从 allowlist 第一个 owner 取。
+          const OWNER_OPEN_ID = 'ou_974b9321334628537abee157413b33b6';
           await notifyClaudeIfImportant(digest, {
             larkAppId: claudeApp,
             claudeOpenId: claudeIdent.openId,
+            ownerOpenId: OWNER_OPEN_ID,
             cardMessageId: publishedCardId,
           });
         } catch (err) {

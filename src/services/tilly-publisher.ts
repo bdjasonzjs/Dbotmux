@@ -133,7 +133,7 @@ function isHighPriority(d: TillyDigest): { count: number; reason: string } {
  *  Returns false if no high-prio items OR throttled. */
 export async function notifyClaudeIfImportant(
   newTick: TillyDigest,
-  opts: PublishTillyOpts & { claudeOpenId: string; cardMessageId?: string | null },
+  opts: PublishTillyOpts & { claudeOpenId: string; ownerOpenId?: string; cardMessageId?: string | null },
 ): Promise<boolean> {
   const { count, reason } = isHighPriority(newTick);
   if (count === 0) return false;
@@ -145,21 +145,20 @@ export async function notifyClaudeIfImportant(
   const mainTopic = getMainTopicChatId();
   if (!mainTopic) return false;
 
-  // Plain text with at-mention. Lark text msg has special markup for at:
-  // <at user_id="ou_xxx"></at> or just inline. We use a simple text content
-  // with at object structure — sendMessage helper expects text/post format.
-  // Using text msg_type with at user_id syntax.
+  // 2026-05-25 (松松反馈): 同时 @ 松松 让他被 ping 看到通知（不然他不
+  // 知道哪个群在发）+ @ 克劳德 让分身被叫醒消化。
+  const ownerAt = opts.ownerOpenId ? `<at user_id="${opts.ownerOpenId}"></at> ` : '';
   const cardLink = opts.cardMessageId
     ? `\n\n查看完整扫读卡: 在主话题向上滑或搜 [缇蕾今日扫读]`
     : '';
   const textContent = JSON.stringify({
-    text: `<at user_id="${opts.claudeOpenId}"></at> 🐶 缇蕾刚扫到 ${reason}，请消化今日扫读卡并安排.${cardLink}`,
+    text: `${ownerAt}<at user_id="${opts.claudeOpenId}"></at> 🐶 缇蕾刚扫到 ${reason}，请消化今日扫读卡并安排.${cardLink}`,
   });
 
   try {
     const msgId = await sendMessage(opts.larkAppId, mainTopic, textContent, 'text');
     lastNotifyAt = now;
-    logger.info(`[tilly-publisher] notify sent (msg=${msgId}, ${reason}) to mainTopic ${mainTopic}`);
+    logger.info(`[tilly-publisher] notify sent (msg=${msgId}, ${reason}) to mainTopic ${mainTopic} with owner=${opts.ownerOpenId ?? 'none'}`);
     return true;
   } catch (err) {
     logger.warn(`[tilly-publisher] notify failed: ${err}`);
