@@ -219,6 +219,84 @@ describe('tilly-llm-analyzer (P3 commit #3)', () => {
     expect(r.analyzedMessageIds).not.toContain('om_new_000');
   });
 
+  describe('v2.1 commit 4: KNOWN_HANDLED_TOPICS prompt 注入', () => {
+    it('knownHandled 为空 → prompt 含 <KNOWN_HANDLED_TOPICS>[]</...>', async () => {
+      // 拦截 spawn args — coco 进程不真跑，只 echo argv 到 stderr
+      // 用 fake coco script 把 prompt 写到 tmp 文件给我们检查
+      const promptCapture = join(tempDir, 'captured-prompt.txt');
+      const fakeBody = `#!/bin/bash
+# 收 prompt (last argv) 写到文件然后回 fake JSON
+echo "$@" | awk '{ for(i=NF;i>=1;i--) { if($i ~ /^---/) break; print $i; exit } }' > /dev/null
+cat > '${promptCapture}' <<< "\${@: -1}"
+echo '{"session_id":"t","agent_states":{},"message":{"role":"assistant","content":"{\\"todos\\":[],\\"progress\\":[],\\"blockers\\":[],\\"noteworthy\\":[]}"},"stats":{}}'
+`;
+      const fp = join(tempDir, 'fake-coco-capture.sh');
+      writeFileSync(fp, fakeBody, 'utf-8');
+      chmodSync(fp, 0o755);
+      const { analyzeMessages } = await freshImport();
+      const messages = [{
+        messageId: 'om_a', chatId: 'oc_x', chatName: 'X', chatType: 'group',
+        senderId: 'u1', senderType: 'user', msgType: 'text', content: 'hello', createTime: '2026-05-25 22:00',
+      }];
+      await analyzeMessages(messages, { codexPath: fp });
+      const { readFileSync } = await import('node:fs');
+      const captured = readFileSync(promptCapture, 'utf-8');
+      expect(captured).toContain('<KNOWN_HANDLED_TOPICS>[]</KNOWN_HANDLED_TOPICS>');
+    });
+
+    it('knownHandled 非空 → prompt 含结构化 JSON + 截断 + 控字符清理', async () => {
+      const promptCapture = join(tempDir, 'captured-prompt.txt');
+      const fakeBody = `#!/bin/bash
+cat > '${promptCapture}' <<< "\${@: -1}"
+echo '{"session_id":"t","agent_states":{},"message":{"role":"assistant","content":"{\\"todos\\":[],\\"progress\\":[],\\"blockers\\":[],\\"noteworthy\\":[]}"},"stats":{}}'
+`;
+      const fp = join(tempDir, 'fake-coco-capture2.sh');
+      writeFileSync(fp, fakeBody, 'utf-8');
+      chmodSync(fp, 0o755);
+      const { analyzeMessages } = await freshImport();
+      const messages = [{
+        messageId: 'om_a', chatId: 'oc_x', chatName: 'X', chatType: 'group',
+        senderId: 'u1', senderType: 'user', msgType: 'text', content: 'hi', createTime: '2026-05-25 22:00',
+      }];
+      const longSummary = 'A'.repeat(300);  // 应被截 150
+      const controlSummary = 'cleanText\x00\x1bWithCtrl\x07';   // 应被剥到空格
+      await analyzeMessages(messages, {
+        codexPath: fp,
+        knownHandled: [
+          { category: 'blocker', payload: { summary: longSummary, sourceChatName: '群A' }, handledAt: '2026-05-26T01:00:00Z', status: 'dismissed' },
+          { category: 'todo', payload: { summary: controlSummary, sourceChatName: 'X'.repeat(40) }, handledAt: '2026-05-26T02:00:00Z', status: 'processed' },
+        ],
+      });
+      const { readFileSync } = await import('node:fs');
+      const captured = readFileSync(promptCapture, 'utf-8');
+      // 结构化 JSON 标记
+      expect(captured).toContain('<KNOWN_HANDLED_TOPICS>');
+      expect(captured).toContain('"category": "blocker"');
+      expect(captured).toContain('"category": "todo"');
+      expect(captured).toContain('"status": "dismissed"');
+      expect(captured).toContain('"status": "processed"');
+      expect(captured).toContain('"handledAt": "2026-05-26T01:00:00Z"');
+      // 截断: 300 char A 截到 150 — 不应有完整 300 个 A 连续
+      expect(captured).not.toMatch(/A{200}/);
+      // 控制字符被替换成空格 (不应再有 \x00 / \x1b / \x07 raw)
+      expect(captured).not.toContain('\x00');
+      expect(captured).not.toContain('\x1b');
+      expect(captured).not.toContain('\x07');
+      // sourceChatName 30 char 截断 (XX...XX 40 个 X 截到 30)
+      expect(captured).not.toMatch(/X{40}/);
+    });
+
+    it('PROMPT_PREFIX 含降噪规则文案 (不是 correctness gate)', async () => {
+      const { readFileSync } = await import('node:fs');
+      const { join } = await import('node:path');
+      const src = readFileSync(join(__dirname, '..', 'src', 'services', 'tilly-llm-analyzer.ts'), 'utf-8');
+      // prompt 必须明确告诉 LLM "相似已处理跳过, 新人类请求/新证据仍输出"
+      expect(src).toContain('相似已处理主题不要再次输出');
+      expect(src).toContain('仍然要输出');
+      expect(src).toContain('不是 correctness gate');
+    });
+  });
+
   it('2026-05-25 (松松): args 走 coco --print --output-format json + 禁所有 agentic tool', async () => {
     // Analyzer 切到 coco CLI (trae)；不需要 codex sandbox 那套，coco 自带
     // --disallowed-tool 控制。这条 test verify 源码用 coco 接口。

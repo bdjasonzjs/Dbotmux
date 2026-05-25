@@ -2683,7 +2683,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           }
           return;
         }
-        const digest = await analyzeMessages(fresh);
+        // v2.1 commit 4: 缇蕾 prompt 注入最近 24h dismissed/processed
+        // tilly_digest_high items, capped 20. LLM 跨 sourceMessageId
+        // 语义 dedup —— 不再反复报同一个已被人工处理的卡点。
+        const { listRecentHandledHigh } = await import('./services/main-bot-digest-store.js');
+        const knownHandled = listRecentHandledHigh({ maxAgeHours: 24, limit: 20 });
+        const digest = await analyzeMessages(fresh, { knownHandled });
         if (!digest.ok) {
           tickFailed = true;
           tickFailReason = `LLM analyze: ${digest.error}`;
