@@ -166,7 +166,7 @@ describe('escalation-rules', () => {
       const pings = new Map([['oc_dup', new Date(NOW - 45 * 60 * 1000).toISOString()]]);
       const inbox = {
         pending: [{
-          id: 'existing',
+          id: 'existing', type: 'escalation' as const,
           enqueuedAt: 'x',
           status: 'pending' as const,
           resolvedBy: null,
@@ -185,7 +185,7 @@ describe('escalation-rules', () => {
       const inbox = {
         pending: [],
         processed: [{
-          id: 'resolved-1',
+          id: 'resolved-1', type: 'escalation' as const,
           enqueuedAt: new Date(NOW - 10 * 60 * 1000).toISOString(),
           status: 'resolved' as const,
           resolvedBy: 'x',
@@ -206,13 +206,13 @@ describe('escalation-rules', () => {
         pending: [],
         processed: [
           {
-            id: 'old',
+            id: 'old', type: 'escalation' as const,
             enqueuedAt: new Date(NOW - 3 * 60 * 60 * 1000).toISOString(),  // 3h ago
             status: 'resolved' as const, resolvedBy: 'x', resolution: 'old',
             escalation: { ruleId: 'R3' as const, triggeredAt: 'x', chatId: 'oc_multi', context: 'c', payload: {} },
           },
           {
-            id: 'recent',
+            id: 'recent', type: 'escalation' as const,
             enqueuedAt: new Date(NOW - 10 * 60 * 1000).toISOString(),  // 10 min ago
             status: 'resolved' as const, resolvedBy: 'x', resolution: 'recent',
             escalation: { ruleId: 'R3' as const, triggeredAt: 'x', chatId: 'oc_multi', context: 'c', payload: {} },
@@ -228,7 +228,7 @@ describe('escalation-rules', () => {
       const inbox = {
         pending: [],
         processed: [{
-          id: 'old-1',
+          id: 'old-1', type: 'escalation' as const,
           enqueuedAt: new Date(NOW - 2 * 60 * 60 * 1000).toISOString(),  // 2h ago, past 1h cooldown
           status: 'resolved' as const,
           resolvedBy: 'x',
@@ -249,7 +249,7 @@ describe('escalation-rules', () => {
       ]);
       const inbox = {
         pending: [{
-          id: 'existing',
+          id: 'existing', type: 'escalation' as const,
           enqueuedAt: 'x',
           status: 'pending' as const,
           resolvedBy: null,
@@ -272,7 +272,7 @@ describe('escalation-rules', () => {
         // Existing pending R5:oc_stuck — runEscalationRules would suppress
         // a new entry, but evaluateRawConditions doesn't care.
         pending: [{
-          id: 'existing', enqueuedAt: 'x', status: 'pending' as const, resolvedBy: null, resolution: null,
+          id: 'existing', type: 'escalation' as const, enqueuedAt: 'x', status: 'pending' as const, resolvedBy: null, resolution: null,
           escalation: { ruleId: 'R5' as const, triggeredAt: 'x', chatId: 'oc_stuck', context: 'old', payload: {} },
         }],
         processed: [],

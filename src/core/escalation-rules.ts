@@ -71,8 +71,10 @@ export function runEscalationRules(input: RulesInput): Escalation[] {
   // prevents persistent-state rules (R3 idle group / R5 stuck keyword)
   // from re-firing every scout tick.
   const isRecentOrPending = (ruleId: Escalation['ruleId'], chatId: string): boolean => {
+    // 2026-05-25 Phase A v2: ScoutInbox 改 discriminated union 后只看
+    // type==='escalation' 的 item（tilly_digest_high 不参与 R1-R5 dedup）。
     if (input.inbox.pending.some(
-      it => it.escalation.ruleId === ruleId && it.escalation.chatId === chatId,
+      it => it.type === 'escalation' && it.escalation.ruleId === ruleId && it.escalation.chatId === chatId,
     )) return true;
     // Find the **most-recent** processed item per (ruleId, chatId) — scan
     // from the end since markResolved appends. Using Array.find would
@@ -81,7 +83,7 @@ export function runEscalationRules(input: RulesInput): Escalation[] {
     let recent: typeof input.inbox.processed[number] | undefined;
     for (let i = input.inbox.processed.length - 1; i >= 0; i--) {
       const it = input.inbox.processed[i];
-      if (it.escalation.ruleId === ruleId && it.escalation.chatId === chatId) {
+      if (it.type === 'escalation' && it.escalation.ruleId === ruleId && it.escalation.chatId === chatId) {
         recent = it;
         break;
       }

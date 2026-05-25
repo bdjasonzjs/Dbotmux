@@ -17,7 +17,7 @@
  */
 import {
   readInbox, markInProgress, markResolved,
-  type ScoutInboxItem, type EscalationRuleId,
+  type ScoutEscalationItem, type EscalationRuleId,
 } from '../services/main-bot-digest-store.js';
 import { sendMessage } from '../im/lark/client.js';
 import { getMainTopicChatId } from '../services/main-topic-config.js';
@@ -27,7 +27,7 @@ import { logger } from '../utils/logger.js';
 
 const HANDLER_SESSION_ID = `escalation-playbook-${process.pid}`;
 
-type PlaybookHandler = (item: ScoutInboxItem, larkAppId: string) => Promise<string>;
+type PlaybookHandler = (item: ScoutEscalationItem, larkAppId: string) => Promise<string>;
 
 /** Dispatch every pending item once. Calls per-rule handlers, swallows
  *  per-item exceptions, marks each as resolved (with success or error
@@ -37,10 +37,15 @@ export async function dispatchPendingEscalations(larkAppId: string): Promise<num
   const inbox = readInbox();
   let processed = 0;
 
+  // 2026-05-25 Phase A v2 妹妹 guard #1: ScoutInbox 改 discriminated union
+  // 后入口层显式过滤 type==='escalation'，不靠 loop body 'continue'。这样
+  // markInProgress / markResolved 只可能被 escalation item 调用，永远不会
+  // 误碰 tilly_digest_high item。
   for (const item of inbox.pending) {
+    if (item.type !== 'escalation') continue;
     if (item.status !== 'pending') continue;
     const claimed = markInProgress(item.id);
-    if (!claimed) continue;  // race lost — another dispatcher claimed it
+    if (!claimed || claimed.type !== 'escalation') continue;  // type guard + race
 
     let resolution: string;
     try {
@@ -48,7 +53,7 @@ export async function dispatchPendingEscalations(larkAppId: string): Promise<num
       // fires (best-effort, never blocks).
       resolution = await runHandlerWithRootSink(claimed, larkAppId);
     } catch (err) {
-      logger.error(`[escalation-playbook] R${item.escalation.ruleId} handler threw: ${err}`);
+      logger.error(`[escalation-playbook] R${claimed.escalation.ruleId} handler threw: ${err}`);
       resolution = `error: ${String(err).slice(0, 200)}`;
     }
     markResolved(claimed.id, HANDLER_SESSION_ID, resolution);
@@ -150,7 +155,7 @@ const PLAYBOOK: Record<EscalationRuleId, PlaybookHandler> = {
  *  All sends are best-effort: failure to talk to Lark is logged but does
  *  not throw — escalation processing continues. */
 async function pushEscalationToRootInbox(
-  item: ScoutInboxItem,
+  item: ScoutEscalationItem,
   larkAppId: string,
   oneLineSummary: string,
 ): Promise<void> {
@@ -182,7 +187,7 @@ async function pushEscalationToRootInbox(
  *  reminder) THEN root-inbox sink fires (with the handler's resolution
  *  string used as the 1-line summary). */
 async function runHandlerWithRootSink(
-  item: ScoutInboxItem,
+  item: ScoutEscalationItem,
   larkAppId: string,
 ): Promise<string> {
   const handler = PLAYBOOK[item.escalation.ruleId];
