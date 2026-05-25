@@ -20,9 +20,11 @@
 import { getMainTopicChatId } from './main-topic-config.js';
 import * as rootInbox from './root-inbox-store.js';
 import { sendOrUpdateCard, closeAndRenderClosed } from './root-inbox-card-renderer.js';
+import { sendMessage } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
 import type { CurrentDigestFile } from './tilly-digest-store.js';
 import { totalCount } from './tilly-digest-store.js';
+import type { TillyDigest } from './tilly-llm-analyzer.js';
 
 const TILLY_SUBCHAT_PLACEHOLDER = 'tilly-scout';   // not a real chat; tilly_digest is a daemon channel
 
@@ -101,6 +103,69 @@ export async function publishTillyDigest(
 }
 
 const TILLY_ALERT_ID = 'tilly_alert';
+
+/** 2026-05-25 (松松实拍): 缇蕾 update 同一张卡 → Lark UI 不上浮，
+ *  松松在 timeline 最新位置看不到卡（卡卡在第一次 send 的时间点）。+
+ *  克劳德分身没被 @ 也不知道扫读更新，问"小宝启动没"会答"没有"。
+ *
+ *  方案 B：本次 tick 有 high-prio 新增（新 high todo 或新 blocker）时
+ *  发一条独立 text 消息到主话题，@克劳德 bot + 带卡的 applink。
+ *
+ *  节流：5min 内只发 1 条（同 daemon 进程的 module-level last-sent ts）。 */
+const NOTIFY_THROTTLE_MS = 5 * 60 * 1000;
+let lastNotifyAt = 0;
+
+function isHighPriority(d: TillyDigest): { count: number; reason: string } {
+  let high = 0;
+  for (const t of d.todos) if (t.priority === 'high') high++;
+  const blockers = d.blockers.length;
+  const total = high + blockers;
+  const parts: string[] = [];
+  if (high > 0) parts.push(`${high} 个 high-prio todo`);
+  if (blockers > 0) parts.push(`${blockers} 个新 blocker`);
+  return { count: total, reason: parts.join(' + ') };
+}
+
+/** Send a notification text to mainTopic when this tick has high-priority
+ *  additions. claudeOpenId is @-mentioned so the Claude bot session in
+ *  Flumy main topic gets woken up to consume the tilly digest card.
+ *
+ *  Returns false if no high-prio items OR throttled. */
+export async function notifyClaudeIfImportant(
+  newTick: TillyDigest,
+  opts: PublishTillyOpts & { claudeOpenId: string; cardMessageId?: string | null },
+): Promise<boolean> {
+  const { count, reason } = isHighPriority(newTick);
+  if (count === 0) return false;
+  const now = Date.now();
+  if (now - lastNotifyAt < NOTIFY_THROTTLE_MS) {
+    logger.info(`[tilly-publisher] notify throttled (last sent ${Math.floor((now - lastNotifyAt) / 1000)}s ago, throttle=${NOTIFY_THROTTLE_MS / 1000}s)`);
+    return false;
+  }
+  const mainTopic = getMainTopicChatId();
+  if (!mainTopic) return false;
+
+  // Plain text with at-mention. Lark text msg has special markup for at:
+  // <at user_id="ou_xxx"></at> or just inline. We use a simple text content
+  // with at object structure — sendMessage helper expects text/post format.
+  // Using text msg_type with at user_id syntax.
+  const cardLink = opts.cardMessageId
+    ? `\n\n查看完整扫读卡: 在主话题向上滑或搜 [缇蕾今日扫读]`
+    : '';
+  const textContent = JSON.stringify({
+    text: `<at user_id="${opts.claudeOpenId}"></at> 🐶 缇蕾刚扫到 ${reason}，请消化今日扫读卡并安排.${cardLink}`,
+  });
+
+  try {
+    const msgId = await sendMessage(opts.larkAppId, mainTopic, textContent, 'text');
+    lastNotifyAt = now;
+    logger.info(`[tilly-publisher] notify sent (msg=${msgId}, ${reason}) to mainTopic ${mainTopic}`);
+    return true;
+  } catch (err) {
+    logger.warn(`[tilly-publisher] notify failed: ${err}`);
+    return false;
+  }
+}
 
 /** P0-2 (2026-05-25 妹妹): tilly tick 连续失败 >= 阈值时主话题发 alert
  *  卡。dedup id 固定（不带 date），所以多次失败 update 同一张卡（count++）。

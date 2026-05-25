@@ -2620,7 +2620,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         const { fetchRecentMessages } = await import('./services/tilly-scout.js');
         const { analyzeMessages } = await import('./services/tilly-llm-analyzer.js');
         const { mergeNewDigest } = await import('./services/tilly-digest-store.js');
-        const { publishTillyDigest, publishTillyAlert, dismissTillyAlert } = await import('./services/tilly-publisher.js');
+        const { publishTillyDigest, publishTillyAlert, dismissTillyAlert, notifyClaudeIfImportant } = await import('./services/tilly-publisher.js');
         const { markScanned } = await import('./services/tilly-message-store.js');
         const { resolveBotIdent } = await import('./core/main-bot-playbook.js');
         const claudeApp = resolveBotIdent('claude').larkAppId;
@@ -2649,10 +2649,25 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           return;
         }
         const cumulative = mergeNewDigest(digest);
+        let publishedCardId: string | null = null;
         try {
-          await publishTillyDigest(cumulative, { larkAppId: claudeApp });
+          const pub = await publishTillyDigest(cumulative, { larkAppId: claudeApp });
+          publishedCardId = pub.rootCardMessageId;
         } catch (err) {
           logger.warn(`[tilly/scout] publish failed (digest still stored): ${err}`);
+        }
+        // 2026-05-25 (松松实拍): 本次 tick 有 high-prio 新增时 @克劳德
+        // 分身上浮一条 text，让 Flumy 主话题分身被叫醒消化扫读卡。
+        // (digest = 本次新增；cumulative = 今日累积；用 digest 算 delta)
+        try {
+          const claudeIdent = resolveBotIdent('claude');
+          await notifyClaudeIfImportant(digest, {
+            larkAppId: claudeApp,
+            claudeOpenId: claudeIdent.openId,
+            cardMessageId: publishedCardId,
+          });
+        } catch (err) {
+          logger.warn(`[tilly/scout] notifyClaudeIfImportant failed (non-blocking): ${err}`);
         }
         // Success path — clear counter + dismiss alert if it's up
         if (tillyConsecutiveFails > 0) {
