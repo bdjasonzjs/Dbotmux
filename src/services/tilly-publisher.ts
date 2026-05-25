@@ -74,32 +74,24 @@ export function renderTillyCardContent(d: CurrentDigestFile): string {
   return [...headerLines, ...body].join('\n');
 }
 
-/** 2026-05-25 Phase A v2 (松松/妹妹 review): 之前 publishTillyDigest 每
- *  15min update 主话题一张 cumulative 大卡。松松实拍发现这卡卡死在第一
- *  次 send 的时间点 (Lark UI 不让 update 后的 message 上浮)，他完全看
- *  不到。妹妹 review #3: "完全停掉，不做'启动/恢复发 1 张状态卡'。
- *  状态卡会把老问题换个形式留下来"。
+/** @deprecated 2026-05-25 Phase A v2 commit 2 follow-up (妹妹 blocker):
+ *  之前 publishTillyDigest 每 15min update 主话题大卡 + 写
+ *  RootInbox `kind:'tilly_digest'` open item。妹妹 v2 #3 / commit 2 review:
+ *  - 主话题大卡完全停（松松实拍 UI 不上浮看不到）
+ *  - **RootInbox 也不能写** — 这把 cumulative digest 当 actionable open
+ *    item 展示在顶栏面板，违反 "RootInbox=action queue / tilly cumulative=
+ *    dashboard 追溯" 边界
  *
- *  Phase A 行为：完全不再 publish 主话题大卡。整体追溯改由 dashboard
- *  `/api/tilly-digest` 提供；群里只发 high-prio text 通知（独立 Lark
- *  消息会上浮，且 @ 松松+@ 克劳德 触发分身消化）+ failure alert。
- *
- *  本函数保留只是为了不破坏 caller import；现在只更新 root-inbox store
- *  里那条 tilly_digest 元信息（dashboard 用），完全不 send Lark。 */
+ *  cumulative digest 的真源已在 `mergeNewDigest()` 写的
+ *  `tilly-digest-current.json` 里（dashboard `/api/tilly-digest` 直接读，
+ *  commit 4 加路由）。本函数完全 no-op 保留只为不破坏 caller import；
+ *  daemon (commit 3) 也将不再调它。
+ */
 export async function publishTillyDigest(
-  digest: CurrentDigestFile,
+  _digest: CurrentDigestFile,
   _opts: PublishTillyOpts,
 ): Promise<{ rootCardMessageId: string | null; inserted: boolean }> {
-  const id = `tilly_digest:${digest.dateId}`;
-  const { item, inserted } = rootInbox.upsertOpen({
-    id,
-    kind: 'tilly_digest',
-    subChatId: TILLY_SUBCHAT_PLACEHOLDER,
-    subChatName: `缇蕾扫读 ${digest.dateId}`,
-    summary: `今日 ${totalCount(digest)} items / ${digest.tickCount} ticks`,
-  });
-  // 不再 sendOrUpdateCard — 群里完全静默（妹妹 v2 review #3）。
-  return { rootCardMessageId: item.rootCardMessageId, inserted };
+  return { rootCardMessageId: null, inserted: false };
 }
 
 /** 2026-05-25 Phase A v2 commit 2: 缇蕾本次 tick 出现的 high-prio item
@@ -196,8 +188,13 @@ export async function notifyClaudeAboutInboxItems(
   const reason = parts.join(' + ');
 
   const ownerAt = opts.ownerOpenId ? `<at user_id="${opts.ownerOpenId}"></at> ` : '';
-  // Top 3 item summaries 给个抢眼摘要
-  const top3 = all.slice(0, 3).map(i => `- [${i.category}] ${i.payload.summary}`).join('\n');
+  // 2026-05-25 commit 2 follow-up (妹妹 P1 #2): top3 summary 来自 LLM 输出，
+  // 可能含 `<at user_id=>` / HTML-like tag / 巨长文本 → 污染通知格式 + 误
+  // @ 别人。截 120 char + 替换 `<`/`>` 防注入。owner/Claude at 由我们显
+  // 式拼，不受影响。
+  const safeSummary = (s: string): string =>
+    s.replace(/[<>]/g, '').slice(0, 120);
+  const top3 = all.slice(0, 3).map(i => `- [${i.category}] ${safeSummary(i.payload.summary)}`).join('\n');
   const dashLink = '\n\n→ dashboard 协作面板「🐶 缇蕾扫读」tab 看完整 + dismiss';
   const text = `${ownerAt}<at user_id="${opts.claudeOpenId}"></at> 🐶 缇蕾扫到 ${reason}:\n${top3}${dashLink}`;
 
