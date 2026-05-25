@@ -167,7 +167,12 @@ export async function fetchRecentMessages(opts: FetchOpts): Promise<TillyMessage
   }
 
   // P0-1 (2026-05-25): privacy filter — 默认排除 p2p，可 env override。
-  // 顺序：allowlist (非空时只保留这些) > p2p 过滤 > excludeChatIds 排除。
+  // 顺序：
+  //   1. allowlist (非空时只保留这些 chatId) — 显式 opt-in，最强语义
+  //   2. p2p 过滤（仅当 allowlist 命中 OR includeP2P=true 时跳过）
+  //   3. excludeChatIds 排除
+  // 2026-05-25 妹妹 non-blocker 1: allowlist 命中的 p2p 不再被 p2p gate
+  // 丢掉 — 用户显式 allow 这条 chat = 知情同意，包含 p2p 也 ok。
   const envDefaults = loadPrivacyDefaults();
   const allowlist = opts.allowlistChatIds ?? envDefaults.allowlist;
   const allowlistSet = new Set(allowlist);
@@ -186,7 +191,8 @@ export async function fetchRecentMessages(opts: FetchOpts): Promise<TillyMessage
   }
   if (!includeP2P) {
     inScope = inScope.filter(m => {
-      if (m.chatType !== 'p2p') return true;
+      // 允许 allowlist 命中的 p2p 通过（显式同意）
+      if (m.chatType !== 'p2p' || allowlistSet.has(m.chatId)) return true;
       droppedP2P++;
       return false;
     });

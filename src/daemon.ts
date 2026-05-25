@@ -2629,7 +2629,16 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         const fresh = await fetchRecentMessages({ start, end });
         if (fresh.length === 0) {
           logger.info('[tilly/scout] tick — no new messages');
-          // 没新消息不算 success 也不算 fail — counter 保持原值
+          // 2026-05-25 妹妹 non-blocker 2: 没新消息 = fetch 成功 = scout 健康。
+          // 这里清 counter + dismiss alert（如果在）— 否则 alert 会"挂着等
+          // 一条新消息才关掉"，跟"恢复后自动 close" 直觉不符。LLM 路径没
+          // 验证 ok 但 fetch 本身 ok 已经说明 cron+lark 链路是通的。
+          if (tillyConsecutiveFails > 0) {
+            logger.info(`[tilly/scout] no-new-messages tick recovers from ${tillyConsecutiveFails} consecutive fails — dismissing alert`);
+            tillyConsecutiveFails = 0;
+            try { await dismissTillyAlert({ larkAppId: claudeApp }); }
+            catch (err) { logger.warn(`[tilly/scout] dismissTillyAlert failed: ${err}`); }
+          }
           return;
         }
         const digest = await analyzeMessages(fresh);

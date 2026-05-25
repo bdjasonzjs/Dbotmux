@@ -112,6 +112,21 @@ export function lookup(id: string): RootInboxItem | null {
   return read().items.find(it => it.id === id) ?? null;
 }
 
+/** P0-2 fix (2026-05-25 妹妹 blocker): 找 baseId 下当前 open 的那张
+ *  generation card（generation 后缀 `#N`），找不到返 null。专为
+ *  alert/digest 这种 singleton-with-reopen 设计的 dismiss helper —
+ *  避免 `lookup(baseId)` 在 reopen 后只看到 closed 的 generation 1 失效。
+ *
+ *  Returns latest open item where item.id === baseId || item.id startsWith baseId+'#'. */
+export function lookupOpenByBaseId(baseId: string): RootInboxItem | null {
+  const items = read().items;
+  const matches = items.filter(it => (it.id === baseId || it.id.startsWith(baseId + '#')) && it.status !== 'closed');
+  if (matches.length === 0) return null;
+  // 最新一条（按 lastUpdatedAt 倒序）
+  matches.sort((a, b) => new Date(b.lastUpdatedAt).getTime() - new Date(a.lastUpdatedAt).getTime());
+  return matches[0];
+}
+
 /** Build a dedup id from kind + relevant fields. Helper for callers. */
 export function buildId(opts:
   | { kind: 'escalation'; ruleId: EscalationRuleId; subChatId: string }

@@ -163,27 +163,57 @@ describe('tilly-llm-analyzer (P3 commit #3)', () => {
     expect(r.analyzedMessageIds.sort()).toEqual(['om_a', 'om_b']);
   });
 
-  it('P3-rev1 #2: cap at MAX_MESSAGES_IN_PROMPT — analyzedMessageIds includes ONLY kept ones (no leakage)', async () => {
+  it('G1 (2026-05-25): cap at MAX_MESSAGES_IN_PROMPT=100 — analyzedMessageIds includes ONLY kept ones', async () => {
     const fakeCodex = makeFakeCodex(JSON.stringify({ todos: [], progress: [], blockers: [], noteworthy: [] }));
     const { analyzeMessages } = await freshImport();
-    // 60 messages — cap is 50, so 10 should NOT appear in analyzedMessageIds
-    const messages = Array.from({ length: 60 }, (_, i) => ({
-      messageId: `om_${i.toString().padStart(2, '0')}`,
+    // 120 messages — cap raised to 100, so 20 oldest should NOT appear
+    const messages = Array.from({ length: 120 }, (_, i) => ({
+      messageId: `om_${i.toString().padStart(3, '0')}`,
       chatId: 'oc_x', chatName: 'X', chatType: 'group', senderId: 'u1', senderType: 'user',
       msgType: 'text', content: `msg ${i}`,
       // createTime: i larger = newer (zero-pad for stable lexicographic ordering)
       createTime: `2026-05-25 ${(20 + Math.floor(i / 60)).toString().padStart(2, '0')}:${(i % 60).toString().padStart(2, '0')}`,
     }));
     const r = await analyzeMessages(messages, { codexPath: fakeCodex });
-    expect(r.analyzedMessageIds).toHaveLength(50);
-    // Newest 50 kept (by createTime desc); the oldest 10 (i=0..9) should be excluded
-    for (let i = 0; i < 10; i++) {
-      expect(r.analyzedMessageIds).not.toContain(`om_${i.toString().padStart(2, '0')}`);
+    expect(r.analyzedMessageIds).toHaveLength(100);
+    // Newest 100 kept (by createTime desc); the oldest 20 (i=0..19) should be excluded
+    for (let i = 0; i < 20; i++) {
+      expect(r.analyzedMessageIds).not.toContain(`om_${i.toString().padStart(3, '0')}`);
     }
-    // Newest 10 (i=50..59) should be kept
-    for (let i = 50; i < 60; i++) {
-      expect(r.analyzedMessageIds).toContain(`om_${i.toString().padStart(2, '0')}`);
+    // Newest 20 (i=100..119) should be kept
+    for (let i = 100; i < 120; i++) {
+      expect(r.analyzedMessageIds).toContain(`om_${i.toString().padStart(3, '0')}`);
     }
+  });
+
+  it('G1 (2026-05-25): priority score — @松松 mention 把老消息拉到前面，挤掉新但低优先级的', async () => {
+    const fakeCodex = makeFakeCodex(JSON.stringify({ todos: [], progress: [], blockers: [], noteworthy: [] }));
+    const { analyzeMessages } = await freshImport();
+    const SONGSONG = 'ou_974b9321334628537abee157413b33b6';
+    // 前 5 条 @mention 但 createTime 最老；后 100 条普通新消息。
+    // newest-first 老算法会丢掉 5 条 mention（被新 100 顶掉）。score 排序后
+    // 5 条 mention (+10) 应在 top，挤掉最旧的 5 条普通消息。
+    const messages = [
+      ...Array.from({ length: 5 }, (_, i) => ({
+        messageId: `om_mention_${i}`,
+        chatId: 'oc_x', chatName: 'X', chatType: 'group', senderId: 'u1', senderType: 'user',
+        msgType: 'text', content: `<at id=${SONGSONG}></at> 关键事 ${i}`,
+        createTime: `2026-05-25 01:0${i}`,
+      })),
+      ...Array.from({ length: 100 }, (_, i) => ({
+        messageId: `om_new_${i.toString().padStart(3, '0')}`,
+        chatId: 'oc_x', chatName: 'X', chatType: 'group', senderId: 'u1', senderType: 'user',
+        msgType: 'text', content: `普通新消息 ${i}`,
+        createTime: `2026-05-25 ${(10 + Math.floor(i / 60)).toString().padStart(2, '0')}:${(i % 60).toString().padStart(2, '0')}`,
+      })),
+    ];
+    const r = await analyzeMessages(messages, { codexPath: fakeCodex });
+    expect(r.analyzedMessageIds).toHaveLength(100);
+    for (let i = 0; i < 5; i++) {
+      expect(r.analyzedMessageIds).toContain(`om_mention_${i}`);
+    }
+    // 5 条最老的普通新消息被挤掉（om_new_000..004，createTime 在 10:00..10:04）
+    expect(r.analyzedMessageIds).not.toContain('om_new_000');
   });
 
   it('P3-rev1 #3: codex args include read-only sandbox and explicit cwd (no dangerous bypass)', async () => {

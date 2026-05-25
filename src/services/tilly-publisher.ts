@@ -127,9 +127,15 @@ export async function publishTillyAlert(
 }
 
 /** P0-2: tilly tick 成功一次后 close alert 卡（如果存在），让健康卡显
- *  示「已恢复」状态。idempotent — 卡不存在/已关闭都 no-op。 */
+ *  示「已恢复」状态。idempotent — 卡不存在/已关闭都 no-op。
+ *
+ *  2026-05-25 妹妹 blocker fix: 不能用 lookup(baseId) — 因为 alert 是
+ *  allowReopen=true 的 singleton，第二轮 fail 后会创建 `tilly_alert#2`
+ *  generation；如果只看 baseId 会拿到已 closed 的 generation 1 然后
+ *  no-op，让 #2 常驻 open。改用 lookupOpenByBaseId 找当前 open 那张
+ *  generation 来 close。 */
 export async function dismissTillyAlert(opts: PublishTillyOpts): Promise<void> {
-  const existing = rootInbox.lookup(TILLY_ALERT_ID);
-  if (!existing || existing.status === 'closed') return;
-  await closeAndRenderClosed(TILLY_ALERT_ID, opts.larkAppId);
+  const openAlert = rootInbox.lookupOpenByBaseId(TILLY_ALERT_ID);
+  if (!openAlert) return;
+  await closeAndRenderClosed(openAlert.id, opts.larkAppId);
 }
