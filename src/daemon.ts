@@ -2602,6 +2602,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // overlapping. Cron is 15min; codex+fetch typically < 2min, so
     // overlap is rare but recovery is messy if it happens.
     let tillyTickInFlight = false;
+    // P0-2 (2026-05-25 妹妹): consecutive fail counter — daemon in-memory
+    // 即可（重启重置 acceptable，重启本身就是 fresh start）。>=3 时
+    // publish alert 到主话题；成功一次清零 + dismiss alert。
+    let tillyConsecutiveFails = 0;
+    const TILLY_ALERT_THRESHOLD = 3;
     const tillyHandle = setInterval(async () => {
       if (tillyTickInFlight) {
         logger.info('[tilly/scout] previous tick still in flight — skipping this interval');
@@ -2609,33 +2614,43 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       }
       tillyTickInFlight = true;
       const tickStartTime = Date.now();
+      let tickFailed = false;
+      let tickFailReason = '';
       try {
         const { fetchRecentMessages } = await import('./services/tilly-scout.js');
         const { analyzeMessages } = await import('./services/tilly-llm-analyzer.js');
         const { mergeNewDigest } = await import('./services/tilly-digest-store.js');
-        const { publishTillyDigest } = await import('./services/tilly-publisher.js');
+        const { publishTillyDigest, publishTillyAlert, dismissTillyAlert } = await import('./services/tilly-publisher.js');
         const { markScanned } = await import('./services/tilly-message-store.js');
         const { resolveBotIdent } = await import('./core/main-bot-playbook.js');
+        const claudeApp = resolveBotIdent('claude').larkAppId;
         const end = new Date();
         const start = new Date(end.getTime() - TILLY_TICK_INTERVAL_MS);
         const fresh = await fetchRecentMessages({ start, end });
         if (fresh.length === 0) {
           logger.info('[tilly/scout] tick — no new messages');
+          // 没新消息不算 success 也不算 fail — counter 保持原值
           return;
         }
         const digest = await analyzeMessages(fresh);
         if (!digest.ok) {
-          // Don't mark scanned — retry next tick; LLM failure is
-          // recoverable (e.g. codex restart, transient API issue).
+          tickFailed = true;
+          tickFailReason = `LLM analyze: ${digest.error}`;
           logger.warn(`[tilly/scout] LLM analyze failed (${fresh.length} msgs in window): ${digest.error}`);
           return;
         }
         const cumulative = mergeNewDigest(digest);
         try {
-          const claudeApp = resolveBotIdent('claude').larkAppId;
           await publishTillyDigest(cumulative, { larkAppId: claudeApp });
         } catch (err) {
           logger.warn(`[tilly/scout] publish failed (digest still stored): ${err}`);
+        }
+        // Success path — clear counter + dismiss alert if it's up
+        if (tillyConsecutiveFails > 0) {
+          logger.info(`[tilly/scout] recovered after ${tillyConsecutiveFails} consecutive fails — dismissing alert`);
+          tillyConsecutiveFails = 0;
+          try { await dismissTillyAlert({ larkAppId: claudeApp }); }
+          catch (err) { logger.warn(`[tilly/scout] dismissTillyAlert failed: ${err}`); }
         }
         // P3-rev1 v0.2 (妹妹补): mark-scanned strictly the messageIds that
         // LLM actually analyzed. No fallback to fresh.map — if analyzer
@@ -2647,9 +2662,30 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         const ms = Date.now() - tickStartTime;
         logger.info(`[tilly/scout] tick done in ${ms}ms: ${fresh.length} fresh / ${toMark.length} analyzed → +${digest.todos.length}t/${digest.progress.length}p/${digest.blockers.length}b/${digest.noteworthy.length}n (today total: ${cumulative.todos.length}/${cumulative.progress.length}/${cumulative.blockers.length}/${cumulative.noteworthy.length})`);
       } catch (err) {
+        tickFailed = true;
+        tickFailReason = `tick threw: ${err}`;
         logger.error(`[tilly/scout] tick failed: ${err}`);
       } finally {
         tillyTickInFlight = false;
+        // P0-2: 在 finally 里处理 fail counter (any code path that left
+        // tickFailed=true bumps it). 达阈值 publish alert。
+        if (tickFailed) {
+          tillyConsecutiveFails++;
+          logger.warn(`[tilly/scout] consecutive fails: ${tillyConsecutiveFails}/${TILLY_ALERT_THRESHOLD}`);
+          if (tillyConsecutiveFails >= TILLY_ALERT_THRESHOLD) {
+            try {
+              const { publishTillyAlert } = await import('./services/tilly-publisher.js');
+              const { resolveBotIdent } = await import('./core/main-bot-playbook.js');
+              await publishTillyAlert({
+                larkAppId: resolveBotIdent('claude').larkAppId,
+                consecutiveFails: tillyConsecutiveFails,
+                lastError: tickFailReason,
+              });
+            } catch (alertErr) {
+              logger.error(`[tilly/scout] publishTillyAlert itself failed: ${alertErr}`);
+            }
+          }
+        }
       }
     }, TILLY_TICK_INTERVAL_MS);
     process.on('SIGTERM', () => clearInterval(tillyHandle));

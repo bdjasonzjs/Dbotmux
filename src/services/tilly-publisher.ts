@@ -19,7 +19,7 @@
  */
 import { getMainTopicChatId } from './main-topic-config.js';
 import * as rootInbox from './root-inbox-store.js';
-import { sendOrUpdateCard } from './root-inbox-card-renderer.js';
+import { sendOrUpdateCard, closeAndRenderClosed } from './root-inbox-card-renderer.js';
 import { logger } from '../utils/logger.js';
 import type { CurrentDigestFile } from './tilly-digest-store.js';
 import { totalCount } from './tilly-digest-store.js';
@@ -93,4 +93,38 @@ export async function publishTillyDigest(
   const cardMarkdown = renderTillyCardContent(digest);
   const msgId = await sendOrUpdateCard(opts.larkAppId, mainTopic, item, { customMarkdown: cardMarkdown });
   return { rootCardMessageId: msgId, inserted };
+}
+
+const TILLY_ALERT_ID = 'tilly_alert';
+
+/** P0-2 (2026-05-25 妹妹): tilly tick 连续失败 >= 阈值时主话题发 alert
+ *  卡。dedup id 固定（不带 date），所以多次失败 update 同一张卡（count++）。
+ *  成功一次后 caller 调 dismissTillyAlert 关闭卡（已恢复）。 */
+export async function publishTillyAlert(
+  opts: PublishTillyOpts & { consecutiveFails: number; lastError: string },
+): Promise<{ rootCardMessageId: string | null; inserted: boolean }> {
+  const { item, inserted } = rootInbox.upsertOpen({
+    id: TILLY_ALERT_ID,
+    kind: 'tilly_alert',
+    subChatId: TILLY_SUBCHAT_PLACEHOLDER,
+    subChatName: '缇蕾健康检查',
+    summary: `连续 ${opts.consecutiveFails} 次 tick 失败 · 最近错误: ${opts.lastError.slice(0, 200)}`,
+    allowReopen: true,  // alert 是健康信号，恢复后又坏了必须能 reopen
+  });
+
+  const mainTopic = getMainTopicChatId();
+  if (!mainTopic) {
+    logger.info('[tilly-publisher] alert mainTopic not configured — alert stored only');
+    return { rootCardMessageId: item.rootCardMessageId, inserted };
+  }
+  const msgId = await sendOrUpdateCard(opts.larkAppId, mainTopic, item);
+  return { rootCardMessageId: msgId, inserted };
+}
+
+/** P0-2: tilly tick 成功一次后 close alert 卡（如果存在），让健康卡显
+ *  示「已恢复」状态。idempotent — 卡不存在/已关闭都 no-op。 */
+export async function dismissTillyAlert(opts: PublishTillyOpts): Promise<void> {
+  const existing = rootInbox.lookup(TILLY_ALERT_ID);
+  if (!existing || existing.status === 'closed') return;
+  await closeAndRenderClosed(TILLY_ALERT_ID, opts.larkAppId);
 }

@@ -28,7 +28,7 @@ const STORE_FILE = 'root-inbox.json';
 /** Escalation rule id — must match `EscalationRuleId` in main-bot-digest-store. */
 export type EscalationRuleId = 'R1' | 'R2' | 'R3' | 'R4' | 'R5';
 
-export type RootInboxKind = 'escalation' | 'progress' | 'request_decision' | 'tilly_digest';
+export type RootInboxKind = 'escalation' | 'progress' | 'request_decision' | 'tilly_digest' | 'tilly_alert';
 export type RootInboxStatus = 'open' | 'updated' | 'closed';
 
 export interface RootInboxItem {

@@ -21,6 +21,7 @@ const KIND_EMOJI: Record<rootInbox.RootInboxKind, string> = {
   progress: '✅',
   request_decision: '❓',
   tilly_digest: '🐶',
+  tilly_alert: '🚨',
 };
 
 const KIND_LABEL: Record<rootInbox.RootInboxKind, string> = {
@@ -28,6 +29,7 @@ const KIND_LABEL: Record<rootInbox.RootInboxKind, string> = {
   progress: '子群阶段进展',
   request_decision: '需要松松决策',
   tilly_digest: '缇蕾每日扫读',
+  tilly_alert: '缇蕾健康检查',
 };
 
 /** Render a RootInbox item as a Lark v2 interactive-card JSON string.
@@ -53,6 +55,28 @@ export function renderRootInboxCard(
 ): string {
   if (item.kind === 'tilly_digest') {
     const md = opts.customMarkdown ?? `_(no content — caller forgot customMarkdown)_`;
+    return JSON.stringify({
+      schema: '2.0',
+      config: { update_multi: true },
+      body: {
+        direction: 'vertical',
+        elements: [{ tag: 'markdown', content: md }],
+      },
+    });
+  }
+  // P0-2 (2026-05-25): 缇蕾连续 fail alert — 红色显眼卡，跟 digest 卡区分
+  // 开关：tilly tick 连续失败 >=3 触发；成功一次自动 close。
+  if (item.kind === 'tilly_alert') {
+    const closedBadge = item.status === 'closed' ? '（已恢复）' : '';
+    const md = [
+      `**${item.status === 'closed' ? '✅' : '🚨'} 缇蕾扫读连续失败${closedBadge}**`,
+      ``,
+      `${item.summary}`,
+      ``,
+      `首次失败 ${item.firstSeenAt.slice(11, 19)} UTC · 最新 ${item.lastUpdatedAt.slice(11, 19)} UTC · 累计 ${item.updateCount} 次`,
+      ``,
+      `_自动健康检查：定时任务恢复正常后此卡自动关闭_`,
+    ].join('\n');
     return JSON.stringify({
       schema: '2.0',
       config: { update_multi: true },
