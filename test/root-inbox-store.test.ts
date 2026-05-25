@@ -207,6 +207,46 @@ describe('root-inbox-store (P2 commit #1)', () => {
     });
   });
 
+  describe('lookupOpenByBaseId (2026-05-25 P0-2 fix — singleton-with-reopen helper)', () => {
+    const ID = 'tilly_alert';
+    it('no items at all → null', async () => {
+      const s = await freshImport();
+      expect(s.lookupOpenByBaseId(ID)).toBeNull();
+    });
+    it('only base open → returns base item', async () => {
+      const s = await freshImport();
+      s.upsertOpen({ id: ID, kind: 'tilly_alert', subChatId: 'x', subChatName: 'X', summary: 'fail x3', allowReopen: true });
+      const r = s.lookupOpenByBaseId(ID);
+      expect(r?.id).toBe(ID);
+      expect(r?.status).not.toBe('closed');
+    });
+    it('base closed + #2 open → returns #2 (the current open generation)', async () => {
+      const s = await freshImport();
+      s.upsertOpen({ id: ID, kind: 'tilly_alert', subChatId: 'x', subChatName: 'X', summary: 'fail x3', allowReopen: true });
+      s.close(ID);   // recovery, base closed
+      // Second failure cycle creates #2
+      s.upsertOpen({ id: ID, kind: 'tilly_alert', subChatId: 'x', subChatName: 'X', summary: 'fail again', allowReopen: true });
+      const r = s.lookupOpenByBaseId(ID);
+      expect(r?.id).toBe(`${ID}#2`);
+      expect(r?.status).not.toBe('closed');
+    });
+    it('all generations closed → null', async () => {
+      const s = await freshImport();
+      s.upsertOpen({ id: ID, kind: 'tilly_alert', subChatId: 'x', subChatName: 'X', summary: 'a', allowReopen: true });
+      s.close(ID);
+      s.upsertOpen({ id: ID, kind: 'tilly_alert', subChatId: 'x', subChatName: 'X', summary: 'b', allowReopen: true });
+      s.close(`${ID}#2`);
+      expect(s.lookupOpenByBaseId(ID)).toBeNull();
+    });
+    it('does not match other items whose id contains baseId as substring', async () => {
+      // Defensive: prefix matching uses `id === base || id startsWith base+'#'`,
+      // so an unrelated item like `tilly_alert_extra` should not match.
+      const s = await freshImport();
+      s.upsertOpen({ id: ID + '_extra', kind: 'tilly_alert', subChatId: 'y', subChatName: 'Y', summary: 'unrelated' });
+      expect(s.lookupOpenByBaseId(ID)).toBeNull();
+    });
+  });
+
   describe('closeAllForSubChat — bulk close by subChatId (P2 commit #3)', () => {
     it('closes only matching subChatId open items, returns count', async () => {
       const s = await freshImport();

@@ -104,6 +104,53 @@ describe('tilly-scout (P3 commit #2)', () => {
     expect(r.map(m => m.messageId)).toEqual(['om_keep']);
   });
 
+  describe('P0-1 privacy filter (2026-05-25)', () => {
+    const mkMsg = (id: string, chatType: 'group' | 'p2p', chatId: string) => ({
+      message_id: id, chat_id: chatId, chat_name: 'X', chat_type: chatType,
+      msg_type: 'text', content: 'x',
+      sender: { id: 'u1', sender_type: 'user' }, create_time: '',
+    });
+
+    it('default: drops p2p, keeps group', async () => {
+      const fake = makeFakeLarkCli({ ok: true, data: { messages: [
+        mkMsg('om_g', 'group', 'oc_g'),
+        mkMsg('om_p', 'p2p', 'oc_p'),
+      ] } });
+      const { scout } = await freshImports();
+      const r = await scout.fetchRecentMessages({ start: new Date(0), end: new Date(), larkCliPath: fake });
+      expect(r.map(m => m.messageId)).toEqual(['om_g']);
+    });
+
+    it('includeP2P=true: keeps both group and p2p', async () => {
+      const fake = makeFakeLarkCli({ ok: true, data: { messages: [
+        mkMsg('om_g', 'group', 'oc_g'),
+        mkMsg('om_p', 'p2p', 'oc_p'),
+      ] } });
+      const { scout } = await freshImports();
+      const r = await scout.fetchRecentMessages({
+        start: new Date(0), end: new Date(), larkCliPath: fake, includeP2P: true,
+      });
+      expect(r.map(m => m.messageId).sort()).toEqual(['om_g', 'om_p']);
+    });
+
+    it('allowlist mode: only matched chatIds kept (groups), allowlist p2p ALSO kept (override gate)', async () => {
+      // 2026-05-25 妹妹 non-blocker 1: allowlist 命中 = 显式同意 → 包含 p2p
+      const fake = makeFakeLarkCli({ ok: true, data: { messages: [
+        mkMsg('om_allow_g', 'group', 'oc_allow_g'),
+        mkMsg('om_allow_p', 'p2p', 'oc_allow_p'),
+        mkMsg('om_other_g', 'group', 'oc_other_g'),
+        mkMsg('om_other_p', 'p2p', 'oc_other_p'),
+      ] } });
+      const { scout } = await freshImports();
+      const r = await scout.fetchRecentMessages({
+        start: new Date(0), end: new Date(), larkCliPath: fake,
+        allowlistChatIds: ['oc_allow_g', 'oc_allow_p'],
+        // includeP2P 不设；allowlist 命中的 p2p 仍应通过
+      });
+      expect(r.map(m => m.messageId).sort()).toEqual(['om_allow_g', 'om_allow_p']);
+    });
+  });
+
   it('handles empty messages array', async () => {
     const fake = makeFakeLarkCli({ ok: true, data: { messages: [], total: 0 } });
     const { scout } = await freshImports();
