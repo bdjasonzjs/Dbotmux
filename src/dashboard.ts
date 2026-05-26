@@ -592,23 +592,22 @@ const server = createServer(async (req, res) => {
       const chatId = decodeURIComponent(mChatMode[1]);
       if (!isSafeChatId(chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
       const body = await readJsonBody<{ enabled?: boolean }>(req);
-      const { read, update, create } = await import('./services/chat-context-store.js');
+      const { read, update } = await import('./services/chat-context-store.js');
       const existing = read(chatId);
-      // toggle: 当前真值 (undefined/true → true) 反转; 显式传以 body 为准
-      const currentEnabled = existing?.chatModeGroup !== false;
-      const nextEnabled = typeof body?.enabled === 'boolean' ? body.enabled : !currentEnabled;
+      // 2026-05-26 commit 4 follow-up (妹妹 P1): no-ctx 拒 400 — 避免
+      // first-writer-wins 撞 dispatchChatCreated 让真实 ChatContext 被 skip。
+      // 默认 ON 的语义靠 helper (isChatModeGroupEnabled 无 ctx → true) 满足；
+      // 用户想关一个还没首个消息的 chat 这种情况罕见, 拒绝并提示 caller。
       if (!existing) {
-        // 没 ChatContext → 创一个 minimum 占位以便存 chatModeGroup
-        create(chatId, {
-          purpose: '(chat-mode toggle 占位)',
-          originType: 'human_created',
-          parentChatId: null,
-          participants: [],
-          chatModeGroup: nextEnabled,
+        return jsonRes(res, 400, {
+          ok: false,
+          error: 'no_chat_context',
+          hint: 'chat-mode toggle 仅作用于已有 ChatContext 的 chat (建群 / im.chat.created 触发后才存在). 默认 ON 行为已经生效, 无需手动 toggle。',
         });
-      } else {
-        update(chatId, { chatModeGroup: nextEnabled });
       }
+      const currentEnabled = existing.chatModeGroup !== false;
+      const nextEnabled = typeof body?.enabled === 'boolean' ? body.enabled : !currentEnabled;
+      update(chatId, { chatModeGroup: nextEnabled });
       return jsonRes(res, 200, { ok: true, chatModeGroup: nextEnabled });
     }
     // P2 commit #3: RootInbox manual close API + list.

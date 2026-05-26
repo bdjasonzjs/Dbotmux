@@ -652,9 +652,11 @@ export function renderTopologyPage(root: HTMLElement): () => void {
     // P1 commit #9: main-topic 设置按钮，放 drawer 顶部，drawer 内有 chat
     // 上下文最自然 (vs 全局顶栏没"当前 chat"概念)。
     const mainTopicBtn = `<button class="topo-v2-main-topic-btn" data-chat-id="${escapeHtml(ctx.chatId)}" title="设为 main-bot 派子任务的主话题">🌟 设为主话题</button>`;
-    // 2026-05-26 群聊模式 commit 4: chat-level toggle, undefined/true=ON
+    // 2026-05-26 群聊模式 commit 4 (commit 4 follow-up i18n): chat-level
+    // toggle, undefined/true=ON。文案走 i18n 双语。
     const chatModeOn = ctx.chatModeGroup !== false;
-    const chatModeBtn = `<button class="topo-v2-chat-mode-btn ${chatModeOn ? 'on' : 'off'}" data-chat-id="${escapeHtml(ctx.chatId)}" title="群聊模式：bot 被 @ 时是否拉群最近 20 条做上下文 (默认 ON, 关掉后 bot 只看 @ 它那一条)">${chatModeOn ? '🧠 群聊模式: ON' : '🧠 群聊模式: OFF'}</button>`;
+    const chatModeLabel = chatModeOn ? t('topo.action.chatModeOn') : t('topo.action.chatModeOff');
+    const chatModeBtn = `<button class="topo-v2-chat-mode-btn ${chatModeOn ? 'on' : 'off'}" data-chat-id="${escapeHtml(ctx.chatId)}" title="${escapeHtml(t('topo.action.chatModeTitle'))}">${escapeHtml(chatModeLabel)}</button>`;
     return `
       <div class="topo-v2-drawer-content">
         <header class="topo-v2-drawer-head">
@@ -740,14 +742,19 @@ export function renderTopologyPage(root: HTMLElement): () => void {
       btn.disabled = true;
       try {
         const r = await fetch(`/api/contexts/${encodeURIComponent(cid)}/chat-mode`, { method: 'POST' });
-        if (!r.ok) { alert(`切换失败 HTTP ${r.status}`); btn.disabled = false; return; }
+        if (!r.ok) {
+          const errBody = await r.json().catch(() => ({} as any));
+          alert(`${t('topo.action.chatModeToggleFailed')} ${r.status}: ${errBody.hint ?? errBody.error ?? r.statusText}`);
+          btn.disabled = false;
+          return;
+        }
         const j = await r.json();
         const on = j.chatModeGroup !== false;
         btn.classList.toggle('on', on);
         btn.classList.toggle('off', !on);
-        btn.textContent = on ? '🧠 群聊模式: ON' : '🧠 群聊模式: OFF';
+        btn.textContent = on ? t('topo.action.chatModeOn') : t('topo.action.chatModeOff');
       } catch (e) {
-        alert('网络错误: ' + e);
+        alert(`${t('topo.action.chatModeNetworkErr')}: ${e}`);
       } finally {
         btn.disabled = false;
       }
