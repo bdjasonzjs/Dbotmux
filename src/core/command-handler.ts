@@ -423,8 +423,11 @@ export async function handleCommand(
             const { buildNewTopicPrompt, getAvailableBots } = await import('./session-manager.js');
             const { buildAmbientForSpawn } = await import('../services/chat-recent-context.js');
             const pendingPrompt = ds.pendingPrompt ?? '';
-            // 2026-05-26 群聊模式 commit 3: ambient timeline 注入 (command-handler 路径 1)
-            const ambientBlock = await buildAmbientForSpawn(ds.larkAppId, ds.chatId, ds.session.chatType);
+            // 2026-05-26 commit 3 follow-up: 用 pendingTrigger 字段精准排掉触发
+            const ambientBlock = await buildAmbientForSpawn(
+              ds.larkAppId, ds.chatId, ds.session.chatType,
+              ds.pendingTriggerMessageId, ds.pendingTriggerCreateTime,
+            );
             const prompt = buildNewTopicPrompt(
               pendingPrompt,
               ds.session.sessionId,
@@ -446,6 +449,10 @@ export async function handleCommand(
             ds.pendingAttachments = undefined;
             ds.pendingMentions = undefined;
             ds.pendingSender = undefined;
+          ds.pendingTriggerMessageId = undefined;
+          ds.pendingTriggerCreateTime = undefined;
+            ds.pendingTriggerMessageId = undefined;
+            ds.pendingTriggerCreateTime = undefined;
             ds.pendingFollowUps = undefined;
             forkWorker(ds, prompt);
             await sessionReply(rootId, t('cmd.repo.selected_in_pending', { name: displayName }, loc));
@@ -508,8 +515,11 @@ export async function handleCommand(
           const { buildNewTopicPrompt, getAvailableBots } = await import('./session-manager.js');
           const { buildAmbientForSpawn } = await import('../services/chat-recent-context.js');
           const pendingPrompt = ds.pendingPrompt ?? '';
-          // 2026-05-26 群聊模式 commit 3: ambient timeline 注入 (command-handler 路径 2)
-          const ambientBlock = await buildAmbientForSpawn(ds.larkAppId, ds.chatId, ds.session.chatType);
+          // 2026-05-26 commit 3 follow-up: 用 pendingTrigger 字段精准排掉触发
+          const ambientBlock = await buildAmbientForSpawn(
+            ds.larkAppId, ds.chatId, ds.session.chatType,
+            ds.pendingTriggerMessageId, ds.pendingTriggerCreateTime,
+          );
           const prompt = buildNewTopicPrompt(
             pendingPrompt,
             ds.session.sessionId,
@@ -531,6 +541,8 @@ export async function handleCommand(
           ds.pendingAttachments = undefined;
           ds.pendingMentions = undefined;
           ds.pendingSender = undefined;
+          ds.pendingTriggerMessageId = undefined;
+          ds.pendingTriggerCreateTime = undefined;
           ds.pendingFollowUps = undefined;
           forkWorker(ds, prompt);
           const cwd = getSessionWorkingDir(ds);

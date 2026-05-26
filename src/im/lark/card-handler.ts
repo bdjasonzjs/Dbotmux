@@ -793,8 +793,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         // Skip repo selection — spawn CLI with default working dir
         ds.pendingRepo = false;
         const pendingPrompt = ds.pendingPrompt ?? '';
-        // 2026-05-26 群聊模式 commit 3: ambient timeline 注入 (card-handler skip-repo 路径)
-        const ambientBlock = await buildAmbientForSpawn(ds.larkAppId, ds.chatId, ds.session.chatType);
+        // 2026-05-26 群聊模式 commit 3 follow-up (妹妹 P1-1/-2): 用 daemon
+        // 存的 pendingTriggerMessageId/CreateTime 排掉触发消息 + before-cutoff
+        const ambientBlock = await buildAmbientForSpawn(
+          ds.larkAppId, ds.chatId, ds.session.chatType,
+          ds.pendingTriggerMessageId, ds.pendingTriggerCreateTime,
+        );
         const prompt = buildNewTopicPrompt(
           pendingPrompt,
           ds.session.sessionId,
@@ -817,6 +821,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         ds.pendingMentions = undefined;
         ds.pendingSender = undefined;
         ds.pendingFollowUps = undefined;
+        ds.pendingTriggerMessageId = undefined;
+        ds.pendingTriggerCreateTime = undefined;
         forkWorker(ds, prompt);
         const cwd = getSessionWorkingDir(ds);
         await sessionReply(rootId, t('cmd.skip.opened', { cwd }, locDs));
@@ -922,8 +928,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     // First-time repo selection — now spawn CLI with the original prompt
     targetDs.pendingRepo = false;
     const pendingPrompt = targetDs.pendingPrompt ?? '';
-    // 2026-05-26 群聊模式 commit 3: ambient timeline 注入 (card-handler repo-select 路径)
-    const ambientBlock = await buildAmbientForSpawn(targetDs.larkAppId, targetDs.chatId, targetDs.session.chatType);
+    // 2026-05-26 群聊模式 commit 3 follow-up: 用 daemon 存的 pendingTrigger
+    // 字段排掉触发消息 + before-cutoff
+    const ambientBlock = await buildAmbientForSpawn(
+      targetDs.larkAppId, targetDs.chatId, targetDs.session.chatType,
+      targetDs.pendingTriggerMessageId, targetDs.pendingTriggerCreateTime,
+    );
     const prompt = buildNewTopicPrompt(
       pendingPrompt,
       targetDs.session.sessionId,
@@ -946,6 +956,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     targetDs.pendingMentions = undefined;
     targetDs.pendingSender = undefined;
     targetDs.pendingFollowUps = undefined;
+    targetDs.pendingTriggerMessageId = undefined;
+    targetDs.pendingTriggerCreateTime = undefined;
     forkWorker(targetDs, prompt);
     await sessionReply(rootId, t('cmd.repo.selected_in_pending', { name: displayName }, locTarget));
     logger.info(`[${tag(targetDs)}] Repo selected: ${selectedPath}, spawning CLI`);

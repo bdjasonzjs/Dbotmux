@@ -58,6 +58,13 @@ export interface DaemonSession {
    *  matching the original caller, not the user who clicked the card. */
   pendingSender?: import('../im/lark/identity-cache.js').ResolvedSender;
   pendingFollowUps?: string[];         // buffered follow-up messages (enriched) sent while waiting for repo selection
+  /** 2026-05-26 群聊模式 commit 3 follow-up (妹妹 P1-1/-2): 延迟 repo 路径
+   *  spawn 时拿不到原 trigger 消息，导致 ambient timeline 没法排除触发那
+   *  条 (重复出现在 user_message + chat_recent_timeline) + 没法 beforeCreateTime
+   *  截断"@ 之后到达的消息"。daemon 创建 pendingRepo 时存这两个，
+   *  card-handler / command-handler spawn 时读出传 helper，spawn 后清掉。 */
+  pendingTriggerMessageId?: string;
+  pendingTriggerCreateTime?: string;
   ownerOpenId?: string;          // topic creator's open_id — receives write-enabled terminal link via DM
   streamCardId?: string;         // message_id of the streaming card in group (PATCHed with live output)
   streamCardNonce?: string;       // unique nonce for the current streaming card — embedded in button values to distinguish old vs current card
