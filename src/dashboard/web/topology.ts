@@ -61,6 +61,8 @@ interface ChatContext {
   rules: string[];
   injectionPolicy: string;
   updatedAt: string;
+  /** 2026-05-26 群聊模式: undefined/true = ON (default), false = OFF */
+  chatModeGroup?: boolean;
 }
 
 type CardStatus = 'needs_reply' | 'bot_working' | 'idle';
@@ -630,6 +632,7 @@ export function renderTopologyPage(root: HTMLElement): () => void {
       const ctx: ChatContext = await r.json();
       drawerEl.innerHTML = renderDrawer(ctx);
       wireMainTopicBtn();
+      wireChatModeBtn();
     } catch (err) {
       drawerEl.innerHTML = `<div class="topo-v2-drawer-err">加载失败: ${escapeHtml(String(err))}</div>`;
     }
@@ -649,6 +652,9 @@ export function renderTopologyPage(root: HTMLElement): () => void {
     // P1 commit #9: main-topic 设置按钮，放 drawer 顶部，drawer 内有 chat
     // 上下文最自然 (vs 全局顶栏没"当前 chat"概念)。
     const mainTopicBtn = `<button class="topo-v2-main-topic-btn" data-chat-id="${escapeHtml(ctx.chatId)}" title="设为 main-bot 派子任务的主话题">🌟 设为主话题</button>`;
+    // 2026-05-26 群聊模式 commit 4: chat-level toggle, undefined/true=ON
+    const chatModeOn = ctx.chatModeGroup !== false;
+    const chatModeBtn = `<button class="topo-v2-chat-mode-btn ${chatModeOn ? 'on' : 'off'}" data-chat-id="${escapeHtml(ctx.chatId)}" title="群聊模式：bot 被 @ 时是否拉群最近 20 条做上下文 (默认 ON, 关掉后 bot 只看 @ 它那一条)">${chatModeOn ? '🧠 群聊模式: ON' : '🧠 群聊模式: OFF'}</button>`;
     return `
       <div class="topo-v2-drawer-content">
         <header class="topo-v2-drawer-head">
@@ -658,6 +664,7 @@ export function renderTopologyPage(root: HTMLElement): () => void {
           </div>
           <div class="topo-v2-drawer-actions">
             ${mainTopicBtn}
+            ${chatModeBtn}
             <a href="${applink(ctx.chatId)}" target="_blank" class="topo-v2-applink">${t('topo.action.openInLark')}</a>
           </div>
         </header>
@@ -719,6 +726,30 @@ export function renderTopologyPage(root: HTMLElement): () => void {
         alert('网络错误: ' + e);
         btn.textContent = '🌟 设为主话题';
         btn.removeAttribute('disabled');
+      }
+    });
+  }
+
+  // 2026-05-26 群聊模式 commit 4: chat-level toggle.
+  function wireChatModeBtn(): void {
+    const btn = document.querySelector<HTMLButtonElement>('.topo-v2-chat-mode-btn');
+    if (!btn) return;
+    btn.addEventListener('click', async () => {
+      const cid = btn.dataset.chatId;
+      if (!cid) return;
+      btn.disabled = true;
+      try {
+        const r = await fetch(`/api/contexts/${encodeURIComponent(cid)}/chat-mode`, { method: 'POST' });
+        if (!r.ok) { alert(`切换失败 HTTP ${r.status}`); btn.disabled = false; return; }
+        const j = await r.json();
+        const on = j.chatModeGroup !== false;
+        btn.classList.toggle('on', on);
+        btn.classList.toggle('off', !on);
+        btn.textContent = on ? '🧠 群聊模式: ON' : '🧠 群聊模式: OFF';
+      } catch (e) {
+        alert('网络错误: ' + e);
+      } finally {
+        btn.disabled = false;
       }
     });
   }

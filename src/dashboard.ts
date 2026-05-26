@@ -584,6 +584,33 @@ const server = createServer(async (req, res) => {
       if (!r) return jsonRes(res, 404, { ok: false, error: 'context_not_found' });
       return jsonRes(res, 200, { ok: true, status: r.status });
     }
+    // 2026-05-26 群聊模式 commit 4: chat-level toggle. POST 切换 (body 缺
+    // 省 → 反转当前值; 显式 enabled:true/false 直接 set)。默认 ON (缺
+    // ChatContext 或字段 undefined 视为 ON), false 才显式关。
+    let mChatMode: RegExpMatchArray | null;
+    if (req.method === 'POST' && (mChatMode = url.pathname.match(/^\/api\/contexts\/([^/]+)\/chat-mode$/))) {
+      const chatId = decodeURIComponent(mChatMode[1]);
+      if (!isSafeChatId(chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
+      const body = await readJsonBody<{ enabled?: boolean }>(req);
+      const { read, update, create } = await import('./services/chat-context-store.js');
+      const existing = read(chatId);
+      // toggle: 当前真值 (undefined/true → true) 反转; 显式传以 body 为准
+      const currentEnabled = existing?.chatModeGroup !== false;
+      const nextEnabled = typeof body?.enabled === 'boolean' ? body.enabled : !currentEnabled;
+      if (!existing) {
+        // 没 ChatContext → 创一个 minimum 占位以便存 chatModeGroup
+        create(chatId, {
+          purpose: '(chat-mode toggle 占位)',
+          originType: 'human_created',
+          parentChatId: null,
+          participants: [],
+          chatModeGroup: nextEnabled,
+        });
+      } else {
+        update(chatId, { chatModeGroup: nextEnabled });
+      }
+      return jsonRes(res, 200, { ok: true, chatModeGroup: nextEnabled });
+    }
     // P2 commit #3: RootInbox manual close API + list.
     if (req.method === 'GET' && url.pathname === '/api/root-inbox') {
       const showClosed = url.searchParams.get('include_closed') === '1';

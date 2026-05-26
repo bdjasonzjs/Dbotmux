@@ -1301,6 +1301,16 @@ input.row-select,
 .topo-v2-main-topic-btn[disabled] { opacity: 0.65; cursor: not-allowed; }
 .topo-v2-main-topic-status { font-size: 12px; margin: 6px 0 12px; }
 
+/* 2026-05-26 群聊模式 toggle */
+.topo-v2-chat-mode-btn {
+  padding: 5px 10px; border-radius: 5px; font-size: 12px; cursor: pointer;
+  border: 1px solid #d1d5db; margin-left: 6px;
+}
+.topo-v2-chat-mode-btn.on { background: #ecfdf5; color: #065f46; border-color: #6ee7b7; }
+.topo-v2-chat-mode-btn.off { background: #f9fafb; color: #6b7280; border-color: #d1d5db; }
+.topo-v2-chat-mode-btn:hover:not([disabled]) { filter: brightness(1.05); }
+.topo-v2-chat-mode-btn[disabled] { opacity: 0.5; cursor: not-allowed; }
+
 /* P2 commit #6 — RootInbox panel */
 .topo-v2-stat.root-inbox-toggle { cursor: pointer; background: #ecfeff; border: 1px solid #67e8f9; color: #0e7490; padding: 3px 8px; border-radius: 4px; }
 .topo-v2-stat.root-inbox-toggle:hover { background: #cffafe; }
