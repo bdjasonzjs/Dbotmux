@@ -449,8 +449,6 @@ export async function handleCommand(
             ds.pendingAttachments = undefined;
             ds.pendingMentions = undefined;
             ds.pendingSender = undefined;
-          ds.pendingTriggerMessageId = undefined;
-          ds.pendingTriggerCreateTime = undefined;
             ds.pendingTriggerMessageId = undefined;
             ds.pendingTriggerCreateTime = undefined;
             ds.pendingFollowUps = undefined;
