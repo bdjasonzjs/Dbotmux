@@ -358,3 +358,44 @@ describe('buildNewTopicPrompt with multi-user follow-ups', () => {
     expect(fu1Match![1]).not.toContain('ou_alice');
   });
 });
+
+describe('buildNewTopicPrompt: ambientContextBlock (2026-05-26 群聊模式 commit 2)', () => {
+  const SESSION_ID = 'sid';
+  const AMBIENT = '<chat_recent_timeline>\nrecent timeline lines\n</chat_recent_timeline>';
+
+  it('ambientContextBlock 注入 user_message 后，chat_context 前 (顺序)', () => {
+    const prompt = buildNewTopicPrompt(
+      'hello', SESSION_ID, 'codex',
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      undefined,   // chatId
+      undefined,   // larkAppId
+      AMBIENT,
+    );
+    const userIdx = prompt.indexOf('<user_message>');
+    const ambientIdx = prompt.indexOf('<chat_recent_timeline>');
+    expect(userIdx).toBeGreaterThanOrEqual(0);
+    expect(ambientIdx).toBeGreaterThan(userIdx);
+    expect(prompt).toContain('recent timeline lines');
+  });
+
+  it('空 / undefined ambient → 不注入', () => {
+    const promptUndef = buildNewTopicPrompt('hi', SESSION_ID, 'codex');
+    const promptEmpty = buildNewTopicPrompt('hi', SESSION_ID, 'codex',
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, '');
+    const promptSpace = buildNewTopicPrompt('hi', SESSION_ID, 'codex',
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, '   \n  ');
+    for (const p of [promptUndef, promptEmpty, promptSpace]) {
+      expect(p).not.toContain('<chat_recent_timeline>');
+    }
+  });
+
+  it('ambient 块原文不被改写: caller 自己 sanitize 过 (我们只拼)', () => {
+    // 模拟 caller 已经 sanitize 过, 我们只拼不再处理
+    const prompt = buildNewTopicPrompt('hi', SESSION_ID, 'codex',
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, AMBIENT);
+    expect(prompt).toContain(AMBIENT);
+  });
+});

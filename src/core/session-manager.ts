@@ -291,6 +291,11 @@ export function buildNewTopicPrompt(
    *  matches mainTopicChatId AND larkAppId is Claude's, a `<main_bot_routing>`
    *  block is appended telling the bot to use subtask-create. */
   larkAppId?: string,
+  /** 2026-05-26 群聊模式 commit 2: 群聊上下文 timeline block (来自
+   *  buildRecentChatTimelineBlock). caller (spawn 路径) async fetch 后
+   *  传入; 空字符串 / undefined → 不注入。p2p 不应该传 (caller 自己
+   *  gate)，buildNewTopicPrompt 只负责拼。 */
+  ambientContextBlock?: string,
 ): string {
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
   // Non-Claude CLIs receive the botmux routing hints inline via the prompt
@@ -338,6 +343,13 @@ export function buildNewTopicPrompt(
 
   const userBlock = `<user_message>\n${userMessage}\n</user_message>`;
   const parts: string[] = [userBlock];
+
+  // 2026-05-26 群聊模式 commit 2: 紧跟 user_message 后注入 ambient
+  // chat timeline，让 bot 在读"被 @ 这条消息"时已经看到群里前后文
+  // (类比人类进群往上滑)。caller 已 gate (group chat + chat-mode ON)。
+  if (ambientContextBlock && ambientContextBlock.trim()) {
+    parts.push(ambientContextBlock);
+  }
 
   // P1 main-bot mode: append `<chat_context>` block when a ChatContext
   // exists for this chat. Spawned session reads it from the first user
