@@ -64,6 +64,12 @@ export interface ChatContext {
   rules: string[];
   /** When to dispatch the context card. */
   injectionPolicy: InjectionPolicy;
+  /** 2026-05-26 (松松): 群聊模式 — bot 被 @ spawn 新 session 时，daemon
+   *  会拉群最近 N 条 timeline 注入 system prompt 让 bot 看到上下文(默认
+   *  20)。这是默认行为，避免 bot 只看到被 @ 那一条不知前后文（缇蕾"妈
+   *  妈"事件根因）。chat-level 配置：缺省/true → ON；显式 false → OFF
+   *  (个别噪音群可关)。 */
+  chatModeGroup?: boolean;
   /** Lifecycle status. Default 'active' for back-compat with v0.1 files. */
   status?: ChatStatus;
   /** ISO timestamp when archived (null/undefined when status='active'). */
@@ -137,6 +143,8 @@ export interface CreateOpts {
   injectionPolicy?: InjectionPolicy;
   /** P1: optional task category for MainBotPlaybook-spawned chats. */
   taskType?: TaskType;
+  /** 2026-05-26 群聊模式 chat-level toggle (默认 true). */
+  chatModeGroup?: boolean;
 }
 
 /**
@@ -169,6 +177,7 @@ export function create(chatId: string, opts: CreateOpts): ChatContext {
     status: 'active',
     archivedAt: null,
     taskType: opts.taskType,
+    chatModeGroup: opts.chatModeGroup,
     updatedAt: new Date().toISOString(),
   };
   write(ctx);
