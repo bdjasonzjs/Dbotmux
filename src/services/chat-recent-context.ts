@@ -61,6 +61,12 @@ function extractText(raw: any): string {
 export interface BuildTimelineOpts {
   /** 触发本次 spawn 的 messageId — 不要再 echo 一次 (caller 自己已包到 prompt) */
   excludeMessageId?: string;
+  /** 触发消息的 create_time (lark epoch ms string). 传入后会被作为
+   *  "硬截止"传给 listAmbientChatMessages — 任何 create_time >= 此值
+   *  的并发到达消息都不会进 first prompt (避免把"被 @ 之后才到达"
+   *  的新消息当成"被 @ 前上下文")。spawn 路径拿不到时可省略，但
+   *  推荐尽量传。 */
+  beforeCreateTime?: string;
   /** 默认 20 (松松定的). */
   limit?: number;
 }
@@ -77,6 +83,7 @@ export async function buildRecentChatTimelineBlock(
   try {
     messages = await listAmbientChatMessages(larkAppId, chatId, limit, {
       excludeRootMessageId: opts.excludeMessageId,
+      beforeCreateTime: opts.beforeCreateTime,
     });
   } catch (err) {
     logger.warn(`[chat-recent-context] fetch failed (chat=${chatId.slice(0,12)}): ${err}`);
@@ -103,4 +110,34 @@ export async function buildRecentChatTimelineBlock(
     ...lines,
     '</chat_recent_timeline>',
   ].join('\n');
+}
+
+/** 2026-05-26 群聊模式 commit 3: spawn 路径 high-level helper。
+ *  把 group-only gate + chatMode gate + helper 调用 / safe fallback 合一,
+ *  让 daemon/card-handler/command-handler 9 个 callsite 不必重复 boilerplate。
+ *
+ *  spawn 路径 caller pattern:
+ *    const ambient = await buildAmbientForSpawn(larkAppId, chatId, chatType,
+ *      triggerMessageId, triggerCreateTime);
+ *    buildNewTopicPrompt(..., ambient);
+ *
+ *  gate (按顺序):
+ *  - chatType !== 'group' → '' (p2p 不注入，妹妹 commit 3 边界 #1)
+ *  - !isChatModeGroupEnabled(chatId) → '' (chat-level toggle 关)
+ *  - buildRecentChatTimelineBlock failure/empty → ''
+ */
+export async function buildAmbientForSpawn(
+  larkAppId: string,
+  chatId: string | undefined,
+  chatType: string | undefined,
+  triggerMessageId?: string,
+  triggerCreateTime?: string,
+): Promise<string> {
+  if (chatType !== 'group') return '';
+  if (!chatId) return '';
+  if (!isChatModeGroupEnabled(chatId)) return '';
+  return buildRecentChatTimelineBlock(larkAppId, chatId, {
+    excludeMessageId: triggerMessageId,
+    beforeCreateTime: triggerCreateTime,
+  });
 }

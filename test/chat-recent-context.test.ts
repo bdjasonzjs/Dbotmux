@@ -155,4 +155,52 @@ describe('buildRecentChatTimelineBlock', () => {
     const r = await mod.buildRecentChatTimelineBlock('app', 'oc_x');
     expect(r).toContain('[interactive]');
   });
+
+  it('beforeCreateTime 透传给 listAmbientChatMessages', async () => {
+    const { mod } = await freshImports();
+    listAmbientSpy.mockResolvedValue([]);
+    await mod.buildRecentChatTimelineBlock('app', 'oc_x', { beforeCreateTime: '1716696099999' });
+    expect(listAmbientSpy).toHaveBeenCalledWith('app', 'oc_x', 20, {
+      excludeRootMessageId: undefined,
+      beforeCreateTime: '1716696099999',
+    });
+  });
+});
+
+describe('buildAmbientForSpawn (commit 3 high-level helper)', () => {
+  it('p2p chatType → "" (group only, 妹妹 commit 3 边界 #1)', async () => {
+    const { mod } = await freshImports();
+    listAmbientSpy.mockResolvedValue([{ message_id: 'om_x', sender: { id: 'u', sender_type: 'user' }, msg_type: 'text', create_time: '1', body: { content: JSON.stringify({ text: 'p2p msg' }) } }]);
+    const r = await mod.buildAmbientForSpawn('app', 'oc_x', 'p2p', 'om_trigger');
+    expect(r).toBe('');
+    expect(listAmbientSpy).not.toHaveBeenCalled();
+  });
+
+  it('chatModeGroup=false → "" (用户显式关)', async () => {
+    const { mod, store } = await freshImports();
+    store.create('oc_off', { purpose: 'p', originType: 'human_created', parentChatId: null, participants: [], chatModeGroup: false });
+    const r = await mod.buildAmbientForSpawn('app', 'oc_off', 'group', 'om_trigger');
+    expect(r).toBe('');
+    expect(listAmbientSpy).not.toHaveBeenCalled();
+  });
+
+  it('group + chatMode ON → 调 listAmbient + 透传 excludeMessageId + beforeCreateTime', async () => {
+    const { mod } = await freshImports();
+    listAmbientSpy.mockResolvedValue([
+      { message_id: 'om_a', sender: { id: 'u1', sender_type: 'user' }, msg_type: 'text', create_time: '1716696000000', body: { content: JSON.stringify({ text: 'context msg' }) } },
+    ]);
+    const r = await mod.buildAmbientForSpawn('app', 'oc_x', 'group', 'om_trigger', '1716696099999');
+    expect(r).toContain('context msg');
+    expect(listAmbientSpy).toHaveBeenCalledWith('app', 'oc_x', 20, {
+      excludeRootMessageId: 'om_trigger',
+      beforeCreateTime: '1716696099999',
+    });
+  });
+
+  it('chatId undefined → ""', async () => {
+    const { mod } = await freshImports();
+    const r = await mod.buildAmbientForSpawn('app', undefined, 'group', 'om_trigger');
+    expect(r).toBe('');
+    expect(listAmbientSpy).not.toHaveBeenCalled();
+  });
 });

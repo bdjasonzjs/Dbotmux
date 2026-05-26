@@ -1014,7 +1014,11 @@ export async function executeScheduledTask(
   sessionStore.updateSession(session);
   messageQueue.ensureQueue(anchor);
 
-  const prompt = buildNewTopicPrompt(task.prompt, session.sessionId, bot.config.cliId, bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId }, localeForBot(larkAppId), undefined, session.chatId, larkAppId);
+  // 2026-05-26 群聊模式 commit 3: scheduled task spawn 也注入 ambient (尽管 task
+  // prompt 自带 context, 加上不害, chatType=p2p 时 helper 自己 return '')
+  const { buildAmbientForSpawn } = await import('../services/chat-recent-context.js');
+  const ambientBlock = await buildAmbientForSpawn(larkAppId, session.chatId, session.chatType);
+  const prompt = buildNewTopicPrompt(task.prompt, session.sessionId, bot.config.cliId, bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId }, localeForBot(larkAppId), undefined, session.chatId, larkAppId, ambientBlock);
 
   const ds: DaemonSession = {
     session,

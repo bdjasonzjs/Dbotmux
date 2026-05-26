@@ -28,6 +28,7 @@ import type { DaemonSession } from '../../core/types.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import { t, localeForBot } from '../../i18n/index.js';
 import { isTillyMainTopicConversationDenied } from '../../services/main-topic-config.js';
+import { buildAmbientForSpawn } from '../../services/chat-recent-context.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -792,6 +793,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         // Skip repo selection — spawn CLI with default working dir
         ds.pendingRepo = false;
         const pendingPrompt = ds.pendingPrompt ?? '';
+        // 2026-05-26 群聊模式 commit 3: ambient timeline 注入 (card-handler skip-repo 路径)
+        const ambientBlock = await buildAmbientForSpawn(ds.larkAppId, ds.chatId, ds.session.chatType);
         const prompt = buildNewTopicPrompt(
           pendingPrompt,
           ds.session.sessionId,
@@ -804,6 +807,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           { name: selfBot.botName, openId: selfBot.botOpenId },
           locDs,
           ds.pendingSender,
+          ds.chatId,
+          ds.larkAppId,
+          ambientBlock,
         );
         rememberLastCliInput(ds, pendingPrompt, prompt);
         ds.pendingPrompt = undefined;
@@ -916,6 +922,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     // First-time repo selection — now spawn CLI with the original prompt
     targetDs.pendingRepo = false;
     const pendingPrompt = targetDs.pendingPrompt ?? '';
+    // 2026-05-26 群聊模式 commit 3: ambient timeline 注入 (card-handler repo-select 路径)
+    const ambientBlock = await buildAmbientForSpawn(targetDs.larkAppId, targetDs.chatId, targetDs.session.chatType);
     const prompt = buildNewTopicPrompt(
       pendingPrompt,
       targetDs.session.sessionId,
@@ -928,6 +936,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       { name: selfBot.botName, openId: selfBot.botOpenId },
       locTarget,
       targetDs.pendingSender,
+      targetDs.chatId,
+      targetDs.larkAppId,
+      ambientBlock,
     );
     rememberLastCliInput(targetDs, pendingPrompt, prompt);
     targetDs.pendingPrompt = undefined;

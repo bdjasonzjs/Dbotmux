@@ -398,4 +398,33 @@ describe('buildNewTopicPrompt: ambientContextBlock (2026-05-26 群聊模式 comm
       undefined, undefined, AMBIENT);
     expect(prompt).toContain(AMBIENT);
   });
+
+  it('ambient 在 chat_context 之前 (妹妹 commit 2 P1 follow-up): 写 memfs fixture 让 chat-context-store 读到', async () => {
+    // node:fs 已被 memfs mock (line 21); chat-context-store 通过 config.session.dataDir
+    // (mock 为 '/tmp/test-sessions') 读 fixture。写好后 buildChatContextBlock 命中 → <chat_context> 块出现。
+    const { writeFileSync, mkdirSync, existsSync, rmSync } = await import('node:fs');
+    const dataDir = '/tmp/test-sessions';
+    const ctxDir = `${dataDir}/chat-contexts`;
+    const ctxFp = `${ctxDir}/oc_amb_ord_test.json`;
+    mkdirSync(ctxDir, { recursive: true });
+    writeFileSync(ctxFp, JSON.stringify({
+      chatId: 'oc_amb_ord_test', purpose: 'test', originType: 'human_created',
+      relatedRefs: [], participants: [], inheritedFrom: null,
+      activeTodoRefs: [], rules: [], injectionPolicy: 'eager',
+    }), 'utf-8');
+    try {
+      const prompt = buildNewTopicPrompt('hi', SESSION_ID, 'codex',
+        undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+        'oc_amb_ord_test', undefined, AMBIENT);
+      const idxUser = prompt.indexOf('<user_message>');
+      const idxAmbient = prompt.indexOf('<chat_recent_timeline>');
+      const idxCtx = prompt.indexOf('<chat_context>');
+      expect(idxUser).toBeGreaterThanOrEqual(0);
+      expect(idxAmbient).toBeGreaterThan(idxUser);
+      // chat_context 应该在 ambient 之后 (顺序 user → ambient → ctx)
+      expect(idxCtx).toBeGreaterThan(idxAmbient);
+    } finally {
+      if (existsSync(ctxFp)) rmSync(ctxFp);
+    }
+  });
 });
