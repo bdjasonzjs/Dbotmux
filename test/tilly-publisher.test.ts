@@ -26,6 +26,7 @@ vi.mock('../src/im/lark/client.js', () => ({
 }));
 vi.mock('../src/services/main-topic-config.js', () => ({
   getMainTopicChatId: () => fakeMainTopic,
+  isTillyMainTopicConversationDenied: () => false,
 }));
 vi.mock('../src/utils/logger.js', () => ({
   logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },

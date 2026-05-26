@@ -12,6 +12,7 @@ const fakeBotsByAppId = new Map<string, { config: { cliId: string } }>();
 
 vi.mock('../src/services/main-topic-config.js', () => ({
   getMainTopicChatId: () => fakeMainTopic,
+  isTillyMainTopicConversationDenied: () => false,
 }));
 
 vi.mock('../src/bot-registry.js', () => ({

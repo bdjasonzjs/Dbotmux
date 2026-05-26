@@ -54,6 +54,7 @@ vi.mock('../src/services/session-store.js', () => ({
 let fakeMainTopic: string | undefined;
 vi.mock('../src/services/main-topic-config.js', () => ({
   getMainTopicChatId: () => fakeMainTopic,
+  isTillyMainTopicConversationDenied: () => false,
 }));
 
 async function freshImport() {

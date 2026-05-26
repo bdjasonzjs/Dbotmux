@@ -115,3 +115,28 @@ export function syncRootChatIdFromConfig(): void {
 }
 
 export { ENV_VAR as MAIN_TOPIC_ENV_VAR };
+
+/** 2026-05-26 (松松实拍 + 妹妹 review): tilly (coco bot) 在 Flumy 主话题
+ *  被会话化创建了 active session，每次主话题 @ 触发 LLM 回话造成群噪音。
+ *  根源修复：daemon 路由层禁 tilly bot 在 mainTopicChatId 创 session/
+ *  adopt/resume。
+ *
+ *  约束 (妹妹 v2.1 commit 5 follow-up review):
+ *  1. 只禁 mainTopicChatId — 子群里 tilly 当执行 bot 仍可对话
+ *  2. 拒绝时静默 (caller 只 log 一行，不发卡片"我不能回话"再制造噪音)
+ *  3. escape hatch: env `BOTMUX_TILLY_ALLOW_MAIN_TOPIC_CHAT=1` debug only
+ *  4. 没配 mainTopicChatId 时返 false (不误杀)
+ *
+ *  cliId 'coco' 是 tilly bot 的稳定标识 (bots.json fixed key)，比按
+ *  openId 比对更稳 (openId 是 app-scoped 可能跨环境变)。 */
+export function isTillyMainTopicConversationDenied(
+  cliId: string | undefined,
+  chatId: string | undefined,
+): boolean {
+  if (cliId !== 'coco') return false;
+  if (!chatId) return false;
+  const mainTopic = getMainTopicChatId();
+  if (!mainTopic || chatId !== mainTopic) return false;
+  if (process.env.BOTMUX_TILLY_ALLOW_MAIN_TOPIC_CHAT === '1') return false;
+  return true;
+}

@@ -17,6 +17,7 @@ import { BOTMUX_REQUIRED_SCOPES, buildScopeDeepLink } from '../../setup/verify-p
 import { tryHandleGrantCommand } from './grant-command.js';
 import { buildGrantCard } from './card-builder.js';
 import { openPending, isThrottled } from './grant-pending.js';
+import { isTillyMainTopicConversationDenied } from '../../services/main-topic-config.js';
 import { localeForBot } from '../../i18n/index.js';
 import { handleChatMemberBotAdded } from './chat-created-handler.js';
 import { bumpMessage as topologyBumpMessage } from '../../services/chat-topology-store.js';
@@ -783,6 +784,20 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
               if (ctxIsArchived(chatId)) ctxUnarchive(chatId);
             } catch (err) { logger.debug(`[main-bot/L1] auto-unarchive failed: ${err}`); }
           }
+        }
+
+        // Main-topic isolation for Tilly / coco bot: the Flumy 主话题 is owned
+        // by the main bot (Claude). Tilly still runs scout cron + dashboard
+        // writes, but must not create/adopt/respond with interactive sessions in
+        // that chat — otherwise any @mention / keyword can revive a live
+        // conversation session and the root-cause bug reappears.
+        const botCliId = getBot(larkAppId).config.cliId;
+        if (isTillyMainTopicConversationDenied(botCliId, chatId)) {
+          logger.info(
+            `[${larkAppId}] mainTopic session routing disabled for coco bot; ` +
+            `ignoring msg=${messageId.substring(0, 12)} chat=${chatId.substring(0, 12)}`,
+          );
+          return;
         }
 
         // Bot-originated messages — bots historically only post inside threads

@@ -16,7 +16,7 @@ import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { getBot, getAllBots } from '../bot-registry.js';
-import { getMainTopicChatId } from '../services/main-topic-config.js';
+import { getMainTopicChatId, isTillyMainTopicConversationDenied } from '../services/main-topic-config.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { validateAdoptTarget } from './session-discovery.js';
 import type { LarkAttachment, LarkMention, ScheduledTask } from '../types.js';
@@ -611,6 +611,12 @@ export function restoreActiveSessions(activeSessions: Map<string, DaemonSession>
   logger.info(`Registering ${active.length} active session(s) (no CLI spawn until new messages arrive)...`);
 
   for (const session of active) {
+    if (isTillyMainTopicConversationDenied(session.cliId, session.chatId)) {
+      logger.info(`[${session.larkAppId ?? 'unknown'}] closing forbidden coco mainTopic session during restore (${session.sessionId.substring(0, 8)})`);
+      sessionStore.closeSession(session.sessionId);
+      continue;
+    }
+
     // Restored sessions persisted before the scope field was added default to
     // 'thread' — that matches the legacy thread-only behaviour.
     const scope: 'thread' | 'chat' = session.scope === 'chat' ? 'chat' : 'thread';
@@ -757,7 +763,7 @@ export function resumeSession(
   sessionId: string,
   activeSessions: Map<string, DaemonSession>,
 ): { ok: true; ds: DaemonSession }
-| { ok: false; error: 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported'; activeSessionId?: string } {
+| { ok: false; error: 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported' | 'conversation_denied'; activeSessionId?: string } {
   const session = sessionStore.getSession(sessionId);
   if (!session) return { ok: false, error: 'not_found' };
   if (session.status !== 'closed') return { ok: false, error: 'not_closed' };
@@ -767,6 +773,11 @@ export function resumeSession(
   // pane is meaningless.
   if (session.title?.startsWith('Adopt:') || session.adoptedFrom) {
     return { ok: false, error: 'adopt_unsupported' };
+  }
+
+  if (isTillyMainTopicConversationDenied(session.cliId, session.chatId)) {
+    logger.info(`[${session.larkAppId ?? 'unknown'}] denying resume in mainTopic for coco bot (chat=${session.chatId})`);
+    return { ok: false, error: 'conversation_denied' };
   }
 
   const scope: 'thread' | 'chat' = session.scope === 'chat' ? 'chat' : 'thread';

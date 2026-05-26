@@ -20,6 +20,7 @@ import { validateWorkingDir } from './working-dir.js';
 import { discoverAdoptableSessions, validateAdoptTarget, type AdoptableSession } from './session-discovery.js';
 import { generateAuthUrl, getTokenStatus } from '../utils/user-token.js';
 import { bindOncall, unbindOncall, getOncallStatus } from '../services/oncall-store.js';
+import { isTillyMainTopicConversationDenied } from '../services/main-topic-config.js';
 import { invalidWorkingDirs } from '../utils/working-dir.js';
 import type { LarkMessage, DaemonToWorker } from '../types.js';
 import { sessionKey, sessionAnchorId } from './types.js';
@@ -601,6 +602,10 @@ export async function handleCommand(
 
       case '/adopt': {
         const adoptArgs = message.content.replace(/^\/adopt\s*/i, '').trim();
+        if (ds && isTillyMainTopicConversationDenied(getBot(ds.larkAppId).config.cliId, ds.chatId)) {
+          logger.info(`[${ds.larkAppId}] ignoring /adopt in mainTopic for coco bot (chat=${ds.chatId})`);
+          break;
+        }
         if (ds?.adoptedFrom) {
           const adopted = ds.adoptedFrom;
           const cliName = getCliDisplayName(adopted.cliId ?? 'claude-code');
@@ -943,6 +948,12 @@ export async function startAdoptSession(
   const sessionReply = (rid: string, content: string, msgType?: string) =>
     deps.sessionReply(rid, content, msgType, larkAppId);
   const loc: Locale = localeForBot(ds.larkAppId ?? larkAppId);
+  const botCliId = getBot(ds.larkAppId ?? larkAppId ?? '').config.cliId;
+
+  if (isTillyMainTopicConversationDenied(botCliId, ds.chatId)) {
+    logger.info(`[${ds.larkAppId ?? larkAppId}] ignoring adopt in mainTopic for coco bot (chat=${ds.chatId})`);
+    return;
+  }
 
   if (!validateAdoptTarget(target.tmuxTarget, target.cliPid)) {
     await sessionReply(sessionAnchorId(ds), t('cmd.adopt.target_exited', undefined, loc));

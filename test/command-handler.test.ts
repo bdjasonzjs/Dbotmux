@@ -44,17 +44,21 @@ vi.mock('../src/config.js', () => ({
   },
 }));
 
+function defaultGetBotMock(id: string = 'app-1') {
+  return ({
+  botName: id === 'app-2' ? 'Codex' : 'Claude',
+  config: {
+    larkAppId: id,
+    larkAppSecret: 'secret-1',
+    cliId: id === 'app-2' ? ('codex' as const) : ('claude-code' as const),
+    workingDir: '~/projects',
+    workingDirs: ['~/projects'],
+  },
+  });
+}
+
 vi.mock('../src/bot-registry.js', () => ({
-  getBot: vi.fn((id: string = 'app-1') => ({
-    botName: id === 'app-2' ? 'Codex' : 'Claude',
-    config: {
-      larkAppId: id,
-      larkAppSecret: 'secret-1',
-      cliId: id === 'app-2' ? ('codex' as const) : ('claude-code' as const),
-      workingDir: '~/projects',
-      workingDirs: ['~/projects'],
-    },
-  })),
+  getBot: vi.fn(defaultGetBotMock),
   // Production runs ONE daemon per bot, so getAllBots() sees only this process's
   // own bot. Default to the Claude process; the split-brain test overrides this
   // to prove the /group election does NOT depend on getAllBots().
@@ -88,6 +92,11 @@ vi.mock('../src/services/session-store.js', () => ({
 
 vi.mock('../src/services/schedule-store.js', () => ({
   listTasks: vi.fn(() => []),
+}));
+
+const mockIsTillyMainTopicConversationDenied = vi.fn(() => false);
+vi.mock('../src/services/main-topic-config.js', () => ({
+  isTillyMainTopicConversationDenied: (...args: any[]) => mockIsTillyMainTopicConversationDenied(...args),
 }));
 
 vi.mock('../src/core/scheduler.js', () => ({
@@ -199,7 +208,7 @@ import * as scheduleStore from '../src/services/schedule-store.js';
 import * as scheduler from '../src/core/scheduler.js';
 import { deleteMessage, sendMessage, listChatBotMembers } from '../src/im/lark/client.js';
 import { createGroupWithBots } from '../src/services/group-creator.js';
-import { getAllBots } from '../src/bot-registry.js';
+import { getAllBots, getBot } from '../src/bot-registry.js';
 import { generateAuthUrl, getTokenStatus } from '../src/utils/user-token.js';
 import { bindOncall } from '../src/services/oncall-store.js';
 import { existsSync, statSync, readFileSync } from 'node:fs';
@@ -396,6 +405,8 @@ describe('parseForceTopicInvocation', () => {
 describe('handleCommand', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockIsTillyMainTopicConversationDenied.mockReturnValue(false);
+    vi.mocked(getBot).mockImplementation(defaultGetBotMock as any);
   });
 
   // ─── /close ─────────────────────────────────────────────────────────────
@@ -934,7 +945,31 @@ describe('handleCommand', () => {
 
   // ─── /adopt ─────────────────────────────────────────────────────────────
 
-  describe('/adopt', () => {
+describe('/adopt', () => {
+    it('should silently ignore /adopt in mainTopic for coco bot', async () => {
+      const botReg = await import('../src/bot-registry.js');
+      vi.mocked(botReg.getBot).mockImplementation((id: string = 'app-1') => ({
+        botName: id === 'app-tilly' ? 'Tilly' : 'Claude',
+        config: {
+          larkAppId: id,
+          larkAppSecret: 'secret-1',
+          cliId: id === 'app-tilly' ? ('coco' as const) : ('claude-code' as const),
+          workingDir: '~/projects',
+          workingDirs: ['~/projects'],
+        },
+      }) as any);
+      mockIsTillyMainTopicConversationDenied.mockReturnValueOnce(true);
+      const ds = makeDaemonSession({ larkAppId: 'app-tilly' as any, chatId: CHAT_ID });
+      const deps = makeDeps(ds);
+      deps.activeSessions.delete(sessionKey(ROOT_ID, LARK_APP_ID));
+      deps.activeSessions.set(sessionKey(ROOT_ID, 'app-tilly'), ds);
+
+      await handleCommand('/adopt', ROOT_ID, makeLarkMessage('/adopt'), deps, 'app-tilly');
+
+      expect(discoverAdoptableSessions).not.toHaveBeenCalled();
+      expect(deps.sessionReply).not.toHaveBeenCalled();
+    });
+
     it('should refuse re-adopt and prompt 断开 when ds.adoptedFrom is already set', async () => {
       const ds = makeDaemonSession({
         adoptedFrom: {

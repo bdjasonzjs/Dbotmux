@@ -134,4 +134,22 @@ describe('main-topic-config (P1 commit #2)', () => {
       expect(t2.updatedAt).toBe(t1.updatedAt);
     });
   });
+
+  describe('CFG-5 — isTillyMainTopicConversationDenied', () => {
+    it('returns true only for coco in configured mainTopic', async () => {
+      const { cfg } = await freshImport();
+      cfg.setMainTopicChatId('oc_main');
+      expect(cfg.isTillyMainTopicConversationDenied('coco', 'oc_main')).toBe(true);
+      expect(cfg.isTillyMainTopicConversationDenied('claude-code', 'oc_main')).toBe(false);
+      expect(cfg.isTillyMainTopicConversationDenied('coco', 'oc_other')).toBe(false);
+    });
+
+    it('escape hatch env disables the denial', async () => {
+      const { cfg } = await freshImport();
+      cfg.setMainTopicChatId('oc_main');
+      process.env.BOTMUX_TILLY_ALLOW_MAIN_TOPIC_CHAT = '1';
+      expect(cfg.isTillyMainTopicConversationDenied('coco', 'oc_main')).toBe(false);
+      delete process.env.BOTMUX_TILLY_ALLOW_MAIN_TOPIC_CHAT;
+    });
+  });
 });

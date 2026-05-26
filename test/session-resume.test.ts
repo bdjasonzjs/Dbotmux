@@ -81,6 +81,13 @@ vi.mock('../src/core/session-activity.js', () => ({
   markSessionActivity: vi.fn(),
 }));
 
+vi.mock('../src/services/main-topic-config.js', () => ({
+  getMainTopicChatId: vi.fn(() => undefined),
+  isTillyMainTopicConversationDenied: vi.fn((cliId: string | undefined, chatId: string | undefined) => (
+    cliId === 'coco' && chatId === 'oc_main_topic'
+  )),
+}));
+
 import { restoreActiveSessions, resumeSession } from '../src/core/session-manager.js';
 import { restoreUsageLimitRuntimeState } from '../src/core/worker-pool.js';
 import * as sessionStore from '../src/services/session-store.js';
@@ -145,6 +152,13 @@ describe('resumeSession', () => {
       const r = resumeSession(s.sessionId, new Map());
       expect(r.ok).toBe(false);
       if (!r.ok) expect(r.error).toBe('adopt_unsupported');
+    });
+
+    it('returns conversation_denied for coco sessions in mainTopic', () => {
+      const s = makeClosedSession({ chatId: 'oc_main_topic', cliId: 'coco' });
+      const r = resumeSession(s.sessionId, new Map());
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error).toBe('conversation_denied');
     });
 
     it('returns anchor_occupied when the in-memory Map already owns the anchor', () => {
@@ -218,6 +232,20 @@ describe('resumeSession', () => {
       const ds = map.get(sessionKey('om_limit', 'app_test'));
       expect(ds).toBeDefined();
       expect(restoreUsageLimitRuntimeState).toHaveBeenCalledWith(ds);
+    });
+
+    it('closes forbidden coco mainTopic sessions during restore instead of re-registering them', () => {
+      const s = sessionStore.createSession('oc_main_topic', 'om_main_topic', 'Forbidden topic');
+      s.larkAppId = 'app_test';
+      s.scope = 'thread';
+      s.cliId = 'coco';
+      sessionStore.updateSession(s);
+      const map = new Map<string, DaemonSession>();
+
+      restoreActiveSessions(map);
+
+      expect(map.size).toBe(0);
+      expect(sessionStore.getSession(s.sessionId)?.status).toBe('closed');
     });
 
     it('flips status back to active, clears closedAt, and registers in the Map (thread-scope)', () => {

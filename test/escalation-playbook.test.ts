@@ -27,6 +27,7 @@ vi.mock('../src/im/lark/client.js', () => ({
 let fakeMainTopicChatId: string | undefined;
 vi.mock('../src/services/main-topic-config.js', () => ({
   getMainTopicChatId: () => fakeMainTopicChatId,
+  isTillyMainTopicConversationDenied: () => false,
 }));
 
 vi.mock('../src/utils/logger.js', () => ({

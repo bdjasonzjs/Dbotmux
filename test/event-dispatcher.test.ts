@@ -59,6 +59,14 @@ vi.mock('../src/services/observed-bots-store.js', () => ({
   listObservedBots: (...args: any[]) => mockListObservedBots(...args),
 }));
 
+let mockMainTopicChatId: string | undefined;
+vi.mock('../src/services/main-topic-config.js', () => ({
+  getMainTopicChatId: () => mockMainTopicChatId,
+  isTillyMainTopicConversationDenied: (cliId: string | undefined, chatId: string | undefined) => (
+    cliId === 'coco' && !!chatId && !!mockMainTopicChatId && chatId === mockMainTopicChatId
+  ),
+}));
+
 // Capture the registered event handlers from EventDispatcher.register()
 let capturedHandlers: Record<string, Function> = {};
 
@@ -1187,6 +1195,7 @@ describe('im.message.receive_v1 — /introduce command', () => {
     capturedHandlers = {};
     setupBotState();
     handlers = makeHandlers();
+    mockMainTopicChatId = undefined;
     mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
     mockRecordObservedBots.mockReset();
     mockReplyMessage.mockReset().mockResolvedValue('ack-msg-id');
@@ -1454,6 +1463,89 @@ describe('im.message.receive_v1 — /introduce command', () => {
 
     expect(mockRecordObservedBots).toHaveBeenCalledTimes(1);
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+});
+
+describe('im.message.receive_v1 — coco main topic isolation', () => {
+  let handlers: ReturnType<typeof makeHandlers>;
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    handlers = makeHandlers();
+    mockMainTopicChatId = 'chat-main-topic';
+    mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
+    mockGetChatMode.mockResolvedValue('topic');
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+  });
+
+  it('does not create a new session for coco when @mentioned in mainTopic', async () => {
+    mockGetBot.mockReturnValue({
+      config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'coco' },
+      botOpenId: MY_OPEN_ID,
+      resolvedAllowedUsers: [USER_OPEN_ID],
+    });
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA 帮我看下这个问题' }),
+      chatId: 'chat-main-topic',
+      chatType: 'group',
+      messageId: 'msg-main-topic-1',
+      mentions: [{ key: '@_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('does not continue an owned session for coco in mainTopic either', async () => {
+    mockGetBot.mockReturnValue({
+      config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'coco' },
+      botOpenId: MY_OPEN_ID,
+      resolvedAllowedUsers: [USER_OPEN_ID],
+    });
+    handlers.isSessionOwner.mockReturnValue(true);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA 继续' }),
+      rootId: 'root-main-topic-1',
+      chatId: 'chat-main-topic',
+      chatType: 'group',
+      messageId: 'msg-main-topic-2',
+      mentions: [{ key: '@_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('still allows the main bot to route normally in mainTopic', async () => {
+    mockGetBot.mockReturnValue({
+      config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' },
+      botOpenId: MY_OPEN_ID,
+      resolvedAllowedUsers: [USER_OPEN_ID],
+    });
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA 帮我处理一下' }),
+      chatId: 'chat-main-topic',
+      chatType: 'group',
+      messageId: 'msg-main-topic-3',
+      mentions: [{ key: '@_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      chatId: 'chat-main-topic',
+      messageId: 'msg-main-topic-3',
+      scope: 'thread',
+      anchor: 'msg-main-topic-3',
+    }));
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
   });
 });

@@ -27,6 +27,7 @@ import { sessionKey, sessionAnchorId, frozenDisplayMode } from '../../core/types
 import type { DaemonSession } from '../../core/types.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import { t, localeForBot } from '../../i18n/index.js';
+import { isTillyMainTopicConversationDenied } from '../../services/main-topic-config.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -347,6 +348,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           await sessionReply(rootId, t('card.action.resume_anchor_occupied', { detail }, locDsResume));
         } else if (result.error === 'adopt_unsupported') {
           await sessionReply(rootId, t('card.action.resume_adopt_unsupported', undefined, locDsResume));
+        } else if (result.error === 'conversation_denied') {
+          logger.info(`[${ds?.larkAppId ?? larkAppId}] ignoring resume in mainTopic for coco bot`);
         }
       }
     }
@@ -836,6 +839,11 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const sKey = larkAppId ? sessionKey(rootId, larkAppId) : rootId;
     const ds = activeSessions.get(sKey);
     if (!ds) return;
+
+    if (isTillyMainTopicConversationDenied(getBot(ds.larkAppId).config.cliId, ds.chatId)) {
+      logger.info(`[${ds.larkAppId}] ignoring adopt_select in mainTopic for coco bot (chat=${ds.chatId})`);
+      return;
+    }
 
     // /adopt 是管理动作：下拉入口同样要求 canOperate（命令路径已在 daemon 层 gate）。
     if (!canOperate(ds.larkAppId, ds.chatId, operatorOpenId)) {
