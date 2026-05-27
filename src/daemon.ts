@@ -1940,7 +1940,12 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     ? `${tr('daemon.foreign_bot_mention_prefix', { botName: foreignBotName! }, localeForBot(larkAppId))}\n`
     : '';
 
-  const promptContent = buildQuoteHint(parsed, scope, anchor) + botSenderPrefix + parsed.content;
+  // 2026-05-27 Phase B.3 安全 strip: foreign-bot 消息进 prompt 前剥掉 file:// /
+  // data: / attachment:// scheme — 防 Claude harness 自动 fetch 远端 resource
+  // 内容注入 system-reminder。真用户输入不动 (sender_type=user 是 trust path).
+  const { stripResourceUrls } = await import('./utils/strip-resource-urls.js');
+  const sanitizedContent = isForeignBot ? stripResourceUrls(parsed.content) : parsed.content;
+  const promptContent = buildQuoteHint(parsed, scope, anchor) + botSenderPrefix + sanitizedContent;
   if (isForeignBot) {
     logger.info(
       `[${larkAppId}] foreign-bot @mention prefix attached: sender=${senderOpenIdForPrefix?.substring(0, 12)} ` +
