@@ -229,7 +229,11 @@ export async function dispatchChatCreated(opts: DispatchChatCreatedOpts): Promis
         patch.purpose = opts.purpose;
       }
       // 4) participants 空补: existing 空 + opts 非空
-      if (existing.participants.length === 0 && opts.participants && opts.participants.length > 0) {
+      //    妹妹 review blocker (2026-05-27): legacy / partial ChatContext 可能
+      //    没有 participants 字段 (虽然类型上 required), 直接 .length 会 crash
+      //    既有 test (chat-created-handler.test.ts:220/244)。array guard 兜底.
+      const existingParticipants = Array.isArray(existing.participants) ? existing.participants : [];
+      if (existingParticipants.length === 0 && opts.participants && opts.participants.length > 0) {
         patch.participants = opts.participants;
       }
       if (Object.keys(patch).length > 0) {

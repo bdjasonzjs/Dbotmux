@@ -187,4 +187,37 @@ describe('dispatchChatCreated sticky-merge (2026-05-27 松松实拍 bug)', () =>
     });
     expect(store.read('oc_child7')?.participants).toHaveLength(1);
   });
+
+  // 妹妹 review blocker (2026-05-27 commit 6bc448a 后): legacy / partial
+  // ChatContext 可能 participants=undefined (旧数据或测试 mock), 直接 .length
+  // 会 TypeError。array guard 锁住。
+  it('legacy / partial existing context (participants=undefined): sticky-merge 不 crash', async () => {
+    const { handler, store } = await freshImports();
+    // 直接用 store.create() 手造一个「legacy」context (participants 后 stripped)
+    store.create('oc_legacy', {
+      purpose: '（待 main-bot 自动推断）',
+      originType: 'bot_spawned',
+      parentChatId: null,
+      participants: [],
+    });
+    // 手动伪造 partial-write: 把 participants 字段从 disk 上抹掉 (模拟旧版本写过的数据)
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    const { config } = await import('../src/config.js');
+    const fp = path.join(config.session.dataDir, 'chat-contexts', 'oc_legacy.json');
+    const raw = JSON.parse(fs.readFileSync(fp, 'utf-8'));
+    delete raw.participants;
+    fs.writeFileSync(fp, JSON.stringify(raw), 'utf-8');
+    // 后到 dispatch 带 parent + participants — 不应 crash, 应 sticky-merge 补 parent + participants
+    await expect(handler.dispatchChatCreated({
+      chatId: 'oc_legacy',
+      larkAppId: 'app_x',
+      originType: 'bot_spawned',
+      parentChatId: 'oc_flumy',
+      participants: [{ openId: 'ou_real', role: 'owner' }],
+    })).resolves.not.toThrow();
+    const ctx = store.read('oc_legacy');
+    expect(ctx?.inheritedFrom?.parentChatId).toBe('oc_flumy');
+    expect(ctx?.participants).toHaveLength(1);
+  });
 });
