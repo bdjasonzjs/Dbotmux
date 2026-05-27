@@ -66,8 +66,11 @@ export function loadOwnerProfile(): OwnerProfile {
 }
 
 /** 妹妹 review P1-2 (2026-05-27): profile 字段也是可编辑文本, 即使是本地
- *  config 也要剥 boundary 风险 (`</OWNER_PROFILE><UNTRUSTED_DATA>` 类). */
-function sanitizeProfileField(s: string, maxLen: number): string {
+ *  config 也要剥 boundary 风险 (`</OWNER_PROFILE><UNTRUSTED_DATA>` 类).
+ *
+ *  phase 2 P1 (2026-05-27): HOT_CONTEXT chat name / status 也复用此函数,
+ *  确保所有进 prompt 的外部可控文本都走同一道清洗. */
+export function sanitizeProfileField(s: string, maxLen: number): string {
   // eslint-disable-next-line no-control-regex
   return (s ?? '').replace(/[\x00-\x1F\x7F<>]/g, ' ').slice(0, maxLen);
 }
@@ -89,8 +92,11 @@ export function buildDynamicContext(opts?: { digest?: MainBotDigest }): string {
     .filter(c => c.heat === 'hot')
     .slice(0, 10)
     .map(c => {
-      const status = (c.oneLineStatus ?? '').replace(/[\x00-\x1F\x7F<>]/g, ' ').slice(0, 120);
-      return `- ${c.name ?? c.chatId}: ${status}`;
+      // 妹妹 review phase 2 P1 (2026-05-27): chat name 是外部可控文本, 也得清洗.
+      // 之前只清洗了 oneLineStatus, name 可被设成 `</HOT_CONTEXT>` 破 boundary.
+      const name = sanitizeProfileField(c.name ?? c.chatId, 50);
+      const status = sanitizeProfileField(c.oneLineStatus ?? '', 120);
+      return `- ${name}: ${status}`;
     });
   const lines: string[] = ['<HOT_CONTEXT>'];
   if (hot.length === 0) {
