@@ -126,4 +126,65 @@ describe('dispatchChatCreated sticky-merge (2026-05-27 松松实拍 bug)', () =>
     expect(ctx?.originType).toBe('bot_spawned');
     expect(ctx?.inheritedFrom?.parentChatId).toBe('oc_flumy');
   });
+
+  // 妹妹 review (commit 479057f) 建议 2 (2026-05-27): existing 已是 bot_spawned,
+  // 后到 dispatch 是 human_created+parent → parent 应 backfill 但 originType
+  // 不降级 (信息量 bot_spawned > human_created, 单向升级)
+  it('originType 单向升级 (不降级): existing bot_spawned → 后到 human_created+parent, parent 补但 originType 保 bot_spawned', async () => {
+    const { handler, store } = await freshImports();
+    await handler.dispatchChatCreated({
+      chatId: 'oc_child5',
+      larkAppId: 'app_x',
+      originType: 'bot_spawned',
+    });
+    expect(store.read('oc_child5')?.originType).toBe('bot_spawned');
+    await handler.dispatchChatCreated({
+      chatId: 'oc_child5',
+      larkAppId: 'app_x',
+      originType: 'human_created',
+      parentChatId: 'oc_flumy',
+    });
+    const ctx = store.read('oc_child5');
+    expect(ctx?.originType).toBe('bot_spawned');                       // 不降级
+    expect(ctx?.inheritedFrom?.parentChatId).toBe('oc_flumy');         // parent 补上
+  });
+
+  // 妹妹 review 建议 1 (2026-05-27): 把 parent backfill 和 field enrichment
+  // 拆条件 — 没传 parent 但带真 purpose 时, purpose 仍应升级 (旧代码 enrichment
+  // 全绑 opts.parentChatId truthy → 此场景被错过)
+  it('field enrichment 不依赖 parent: 后到 dispatch 没 parent 但带真 purpose → purpose 升级', async () => {
+    const { handler, store } = await freshImports();
+    await handler.dispatchChatCreated({
+      chatId: 'oc_child6',
+      larkAppId: 'app_x',
+      originType: 'bot_spawned',
+    });
+    expect(store.read('oc_child6')?.purpose).toBe('（待 main-bot 自动推断）');
+    await handler.dispatchChatCreated({
+      chatId: 'oc_child6',
+      larkAppId: 'app_x',
+      originType: 'bot_spawned',
+      purpose: '真实 task purpose',
+      // 故意不传 parentChatId
+    });
+    expect(store.read('oc_child6')?.purpose).toBe('真实 task purpose');
+  });
+
+  it('field enrichment 不依赖 parent: 后到带 participants 但没 parent → participants 补', async () => {
+    const { handler, store } = await freshImports();
+    await handler.dispatchChatCreated({
+      chatId: 'oc_child7',
+      larkAppId: 'app_x',
+      originType: 'bot_spawned',
+    });
+    expect(store.read('oc_child7')?.participants).toHaveLength(0);
+    await handler.dispatchChatCreated({
+      chatId: 'oc_child7',
+      larkAppId: 'app_x',
+      originType: 'bot_spawned',
+      participants: [{ openId: 'ou_x', role: 'owner' }],
+      // 故意不传 parentChatId
+    });
+    expect(store.read('oc_child7')?.participants).toHaveLength(1);
+  });
 });

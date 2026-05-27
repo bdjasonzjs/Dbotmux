@@ -198,30 +198,48 @@ export async function dispatchChatCreated(opts: DispatchChatCreatedOpts): Promis
   // skip → ChatContext 永远丢 parent。
   //
   // ChatTopology 那段 (line 213-) 已有 sticky logic 处理同样问题。这里给
-  // ChatContext 也加 sticky merge: 如果 caller 这次带了 parentChatId 但
-  // existing ChatContext 的 inheritedFrom 是 null, 用 update() 把 parent
-  // 补回去 (含 parentDigest, originType bot_spawned 升级)。
-  if (!isFirstDispatch && opts.parentChatId) {
+  // ChatContext 也加 sticky-merge。妹妹 review (commit 65a05b9 phase 1 后)
+  // 建议把 parent backfill 和 field enrichment 拆成独立条件, 避免 「没传
+  // parent 但带真 purpose」 时 enrichment 被错过。
+  //
+  // 通用「非空补空」: 每个字段独立判断 (existing 是空 / 占位 ∧ opts 带真值
+  // → 补)。任何字段需要补, 才发一次 update。
+  if (!isFirstDispatch) {
     const existing = read(opts.chatId);
-    if (existing && !existing.inheritedFrom?.parentChatId) {
-      update(opts.chatId, {
-        inheritedFrom: { parentChatId: opts.parentChatId, parentDigest: opts.parentDigest ?? '' },
-        // 顺便升级 originType: 已存 human_created 但本次是 bot_spawned → 信本次
-        ...(existing.originType !== 'bot_spawned' && opts.originType === 'bot_spawned'
-          ? { originType: 'bot_spawned' as const }
-          : {}),
-        // purpose 也 sticky-merge: 已存占位符 "（待 main-bot 自动推断）" 但本次有真 purpose
-        ...(existing.purpose === '（待 main-bot 自动推断）' && opts.purpose && opts.purpose !== '（待 main-bot 自动推断）'
-          ? { purpose: opts.purpose }
-          : {}),
-        // participants 同理：空 → 用本次
-        ...(existing.participants.length === 0 && opts.participants && opts.participants.length > 0
-          ? { participants: opts.participants }
-          : {}),
-      });
-      logger.info(
-        `[chat-created-handler] sticky-merge: chat ${opts.chatId.slice(0,12)} parent backfilled from ${opts.parentChatId.slice(0,12)} (Lark event arrived before group-creator manual)`,
-      );
+    if (existing) {
+      const patch: Partial<Parameters<typeof update>[1]> = {};
+      // 1) parent backfill: existing inheritedFrom 空 + opts 带 parentChatId
+      if (!existing.inheritedFrom?.parentChatId && opts.parentChatId) {
+        patch.inheritedFrom = {
+          parentChatId: opts.parentChatId,
+          parentDigest: opts.parentDigest ?? '',
+        };
+      }
+      // 2) originType 单向升级: human_created → bot_spawned (信息量更大),
+      //    bot_spawned 不降级 (即使本次说 human_created)
+      if (existing.originType !== 'bot_spawned' && opts.originType === 'bot_spawned') {
+        patch.originType = 'bot_spawned';
+      }
+      // 3) purpose 占位升级: existing 是 "（待 main-bot 自动推断）" 占位 + opts 有真值
+      if (
+        existing.purpose === '（待 main-bot 自动推断）' &&
+        opts.purpose &&
+        opts.purpose !== '（待 main-bot 自动推断）'
+      ) {
+        patch.purpose = opts.purpose;
+      }
+      // 4) participants 空补: existing 空 + opts 非空
+      if (existing.participants.length === 0 && opts.participants && opts.participants.length > 0) {
+        patch.participants = opts.participants;
+      }
+      if (Object.keys(patch).length > 0) {
+        update(opts.chatId, patch);
+        const what = Object.keys(patch).join(',');
+        logger.info(
+          `[chat-created-handler] sticky-merge: chat ${opts.chatId.slice(0,12)} fields=${what}` +
+          (patch.inheritedFrom ? ` parent=${opts.parentChatId!.slice(0,12)}` : ''),
+        );
+      }
     }
   }
 
