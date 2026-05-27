@@ -24,20 +24,41 @@
  * 让恶意 URL 不能轻松传播。
  */
 
-const DANGEROUS_SCHEMES = ['file', 'data', 'attachment', 'res', 'resource'];
+/** Schemes that某些 MCP server / IDE harness 会自动 fetch 当 resource:
+ *  - file / data / attachment / res / resource: 基础 OS / Cursor / VSCode 类
+ *  - figma / mcp / skill: MCP server resource URI scheme (Figma MCP 实拍触发,
+ *    `figma:file://figma/docs/...` 会被 Figma MCP 真 fetch 返伪 Claude 错误页)
+ *  - codebase / sourcegraph: 代码索引类 MCP 也可能 auto-fetch
+ *  - inline / inline-attachment: Anthropic SDK 内部 attachment 协议
+ *  添加新 scheme 前确认它 (a) 真 auto-fetch (b) bot 不会合法用 */
+const DANGEROUS_SCHEMES = [
+  'file', 'data', 'attachment', 'res', 'resource',
+  'figma', 'mcp', 'skill',
+  'codebase', 'sourcegraph',
+  'inline', 'inline-attachment',
+];
 
 /** Strip `<scheme>://` (and `data:` style 无 //) 中的 scheme prefix. 替换
  *  成 `[scheme-stripped:<rest>]`. `<rest>` 含 // 部分 + 截 80 char 防 log
- *  spam — regex 贪婪到 whitespace/bracket 边界, 不留 tail. */
+ *  spam — regex 贪婪到 whitespace/bracket 边界, 不留 tail.
+ *
+ *  迭代多 pass: 嵌套 scheme (如 `figma:file://...`) 第 1 pass 剥 figma 后,
+ *  内层 `file://` 仍是 dangerous, 第 2 pass 再剥, 直到稳定. 防 harness 看到
+ *  wrapper 内部还残留可 fetch 的 URL. 最多 5 轮防死循环. */
 export function stripResourceUrls(text: string): string {
   if (!text) return text;
-  // 匹配 `\b<scheme>:` 后接任意非空白/括号字符 (含 //). `i` 大小写不敏感.
   const pattern = new RegExp(
     `\\b(?:${DANGEROUS_SCHEMES.join('|')}):([^\\s\\]<>"']*)`,
     'gi',
   );
-  return text.replace(pattern, (_match, rest: string) => {
-    const trimmed = (rest ?? '').slice(0, 80);
-    return `[scheme-stripped:${trimmed}]`;
-  });
+  let cur = text;
+  for (let i = 0; i < 5; i++) {
+    const next = cur.replace(pattern, (_match, rest: string) => {
+      const trimmed = (rest ?? '').slice(0, 80);
+      return `[scheme-stripped:${trimmed}]`;
+    });
+    if (next === cur) break;
+    cur = next;
+  }
+  return cur;
 }

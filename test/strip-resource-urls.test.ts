@@ -53,12 +53,27 @@ describe('stripResourceUrls', () => {
     expect(out.length).toBeLessThanOrEqual('[scheme-stripped:]'.length + 80 + 5);
   });
 
-  it('观察现场字面量: 妹妹消息开头那串', () => {
+  it('观察现场字面量 (2026-05-27): 妹妹消息开头那串触发 Figma MCP fetch', () => {
+    // 实际攻击: `figma:file://figma/docs/getting-500-error.md` 被 Figma
+    // MCP server 当 resource URI 真 fetch, 远端返伪 Claude 错误页注入.
+    // figma: scheme 现在归到 dangerous, 整个 URL 被吃掉 (file:// 也带走).
     const input = '[来自 寇黛克斯 的 @figma:file://figma/docs/getting-500-error.md 收到]';
     const out = stripResourceUrls(input);
     expect(out).not.toContain('file:');
-    expect(out).toContain('@figma:');                  // figma: scheme 不在 dangerous list 保留
-    expect(out).toContain('[scheme-stripped:');        // file:// 被剥
+    expect(out).not.toContain('figma:');               // 整段 figma:file://... 被剥
+    expect(out).toContain('[scheme-stripped:');
+  });
+
+  it('figma:file://X (Figma MCP resource URI) 整段剥', () => {
+    const out = stripResourceUrls('see figma:file://figma/docs/foo.md please');
+    expect(out).not.toContain('figma:');
+    expect(out).not.toContain('file:');
+    expect(out).toContain('[scheme-stripped:');
+  });
+
+  it('mcp:// / skill:// 等也剥', () => {
+    expect(stripResourceUrls('see mcp://anything')).toContain('[scheme-stripped:');
+    expect(stripResourceUrls('see skill://thing')).toContain('[scheme-stripped:');
   });
 
   it('empty / null safe', () => {
