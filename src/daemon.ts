@@ -2617,7 +2617,31 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     process.on('SIGINT', () => clearInterval(tickHandle));
     logger.info(`[main-bot/scout] cron registered (every ${SCOUT_TICK_INTERVAL_MS / 1000}s, stale gate on)`);
 
-  }   // end of botIndex===0 (main-bot/scout cron only)
+    // ── Phase B (2026-05-27 松松授权): 克劳德 daemon scout-inbox 主动决策
+    // cron. 每 60s 扫一次 inbox.pending, route 到 A_ping / B_spawn / C_archive,
+    // quota gate 持久化在 scout-router-quota.json. 真 executor 走 lark
+    // sendMessage / createGroupWithBots.
+    const ROUTER_TICK_INTERVAL_MS = 60 * 1000;
+    const routerHandle = setInterval(async () => {
+      try {
+        const { runRouterTick } = await import('./services/scout-inbox-router.js');
+        const { makeProductionExecutors } = await import('./services/scout-inbox-router-executors.js');
+        const stats = await runRouterTick({
+          executors: makeProductionExecutors({ larkAppId: cfg.larkAppId }),
+        });
+        // 只在真有 action 时 log; 全 wait/0 stat 静默防刷屏
+        if (stats.routedA + stats.routedB + stats.routedC + stats.errors + stats.quotaSkipsA + stats.quotaSkipsB > 0) {
+          logger.info(`[scout-router] tick: A=${stats.routedA} B=${stats.routedB} C=${stats.routedC} wait=${stats.waited} err=${stats.errors} quotaSkips A=${stats.quotaSkipsA} B=${stats.quotaSkipsB}`);
+        }
+      } catch (err) {
+        logger.error(`[scout-router] tick failed: ${err}`);
+      }
+    }, ROUTER_TICK_INTERVAL_MS);
+    process.on('SIGTERM', () => clearInterval(routerHandle));
+    process.on('SIGINT', () => clearInterval(routerHandle));
+    logger.info(`[scout-router] cron registered (every ${ROUTER_TICK_INTERVAL_MS / 1000}s) on claude daemon (botIndex=0)`);
+
+  }   // end of botIndex===0 (main-bot/scout + scout-router cron)
 
   // ── 2026-05-25 (松松实拍): tilly cron 单独迁到 coco daemon (cliId==='coco')
   // 上跑。理由：扫聊天 + LLM 分析是缇蕾 (coco bot) 的活，不该挂在 main-
