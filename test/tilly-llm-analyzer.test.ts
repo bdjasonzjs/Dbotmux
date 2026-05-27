@@ -292,7 +292,7 @@ echo '{"session_id":"t","agent_states":{},"message":{"role":"assistant","content
       const src = readFileSync(join(__dirname, '..', 'src', 'services', 'tilly-llm-analyzer.ts'), 'utf-8');
       // prompt 必须明确告诉 LLM "相似已处理跳过, 新人类请求/新证据仍输出"
       expect(src).toContain('相似已处理主题不要再次输出');
-      expect(src).toContain('仍然要输出');
+      expect(src).toContain('仍要输出');
       expect(src).toContain('不是 correctness gate');
       // v2.1 commit 4 follow-up (妹妹 P1): KNOWN_HANDLED_TOPICS 字段值
       // 也是数据 + tag-like 字符仅作数据看 的提醒
