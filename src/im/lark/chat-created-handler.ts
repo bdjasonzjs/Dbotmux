@@ -29,7 +29,7 @@
  */
 import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { create, read, type OriginType } from '../../services/chat-context-store.js';
+import { create, read, update, type OriginType } from '../../services/chat-context-store.js';
 import { upsertNode as topologyUpsertNode, getNode as topologyGetNode } from '../../services/chat-topology-store.js';
 import { getBot, getAllBots } from '../../bot-registry.js';
 import { config } from '../../config.js';
@@ -190,6 +190,40 @@ export async function dispatchChatCreated(opts: DispatchChatCreatedOpts): Promis
     parentDigest: opts.parentDigest,
     taskType: opts.taskType,
   });
+
+  // 2026-05-27 (松松实拍): "派生自: (无父群)" bug — root cause: dispatchChatCreated
+  // 可能被两条路径调用 (a) group-creator manual (带 parentChatId) (b) Lark
+  // im.chat.created event (parentChatId=undefined). ChatContext.create() 是
+  // first-writer-wins; 如果 (b) 先到, create 写入 parent=null, (a) 后到
+  // skip → ChatContext 永远丢 parent。
+  //
+  // ChatTopology 那段 (line 213-) 已有 sticky logic 处理同样问题。这里给
+  // ChatContext 也加 sticky merge: 如果 caller 这次带了 parentChatId 但
+  // existing ChatContext 的 inheritedFrom 是 null, 用 update() 把 parent
+  // 补回去 (含 parentDigest, originType bot_spawned 升级)。
+  if (!isFirstDispatch && opts.parentChatId) {
+    const existing = read(opts.chatId);
+    if (existing && !existing.inheritedFrom?.parentChatId) {
+      update(opts.chatId, {
+        inheritedFrom: { parentChatId: opts.parentChatId, parentDigest: opts.parentDigest ?? '' },
+        // 顺便升级 originType: 已存 human_created 但本次是 bot_spawned → 信本次
+        ...(existing.originType !== 'bot_spawned' && opts.originType === 'bot_spawned'
+          ? { originType: 'bot_spawned' as const }
+          : {}),
+        // purpose 也 sticky-merge: 已存占位符 "（待 main-bot 自动推断）" 但本次有真 purpose
+        ...(existing.purpose === '（待 main-bot 自动推断）' && opts.purpose && opts.purpose !== '（待 main-bot 自动推断）'
+          ? { purpose: opts.purpose }
+          : {}),
+        // participants 同理：空 → 用本次
+        ...(existing.participants.length === 0 && opts.participants && opts.participants.length > 0
+          ? { participants: opts.participants }
+          : {}),
+      });
+      logger.info(
+        `[chat-created-handler] sticky-merge: chat ${opts.chatId.slice(0,12)} parent backfilled from ${opts.parentChatId.slice(0,12)} (Lark event arrived before group-creator manual)`,
+      );
+    }
+  }
 
   // P4-fix: also write to ChatTopology so dashboard's topology page sees
   // the new chat (otherwise topology only gets nodes via onMessage hook,
