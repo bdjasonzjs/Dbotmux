@@ -1945,6 +1945,21 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   // 内容注入 system-reminder。真用户输入不动 (sender_type=user 是 trust path).
   const { stripResourceUrls } = await import('./utils/strip-resource-urls.js');
   const sanitizedContent = isForeignBot ? stripResourceUrls(parsed.content) : parsed.content;
+  // 妹妹 review follow-up (2026-05-27): hash diagnostic 日志, 验证 strip 是否
+  // 真生效 + 是否有别的入口绕过. 不 log 全文防再污染上下文。only foreign-bot
+  // path 才有意义打 (用户输入不 strip)。
+  if (isForeignBot) {
+    const { createHash } = await import('node:crypto');
+    const beforeHash = createHash('sha256').update(parsed.content).digest('hex').slice(0, 10);
+    const afterHash = createHash('sha256').update(sanitizedContent).digest('hex').slice(0, 10);
+    const changed = beforeHash !== afterHash;
+    const firstMatch = parsed.content.match(/\b(?:file|data|attachment|res|resource|figma|mcp|skill|codebase|sourcegraph|inline|inline-attachment):/i)?.[0] ?? '';
+    logger.info(
+      `[strip-diag] msg=${parsed.messageId?.slice(0, 14)} sender=${senderOpenIdForPrefix?.slice(0, 12)} ` +
+      `isForeignBot=true beforeHash=${beforeHash} afterHash=${afterHash} changed=${changed} ` +
+      `firstDangerousMatch=${firstMatch || '(none)'} contentLen=${parsed.content.length}→${sanitizedContent.length}`,
+    );
+  }
   const promptContent = buildQuoteHint(parsed, scope, anchor) + botSenderPrefix + sanitizedContent;
   if (isForeignBot) {
     logger.info(
