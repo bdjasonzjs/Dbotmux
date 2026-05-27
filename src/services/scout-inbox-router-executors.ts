@@ -19,6 +19,7 @@ import { sendMessage } from '../im/lark/client.js';
 import { getMainTopicChatId } from './main-topic-config.js';
 import { createGroupWithBots } from './group-creator.js';
 import { resolveBotIdent } from '../core/main-bot-playbook.js';
+import { getOrCompute } from './spawn-idempotency-store.js';
 import type { ScoutTillyHighItem } from './main-bot-digest-store.js';
 import type { RouterExecutors } from './scout-inbox-router.js';
 
@@ -73,25 +74,33 @@ export function makeProductionExecutors(opts: { larkAppId: string }): RouterExec
       if (item.payload.sourceMessageId) refs.push(`source-msg: ${item.payload.sourceMessageId}`);
       if (item.payload.sourceChatName) refs.push(`source-chat: ${clean(item.payload.sourceChatName, 30)}`);
       if (item.payload.sourceAppLink) refs.push(`applink: ${item.payload.sourceAppLink}`);
+      // 妹妹 review B2 (2026-05-27): 用 spawn-idempotency-store 包 createGroupWithBots,
+      // 防 crash window 内重复建群——若 createGroupWithBots 成功后进程挂掉,
+      // dispositionTillyHigh 没写, 下 tick 再跑会拿 cache hit 不再建。idempotency
+      // key 用 item.id 锁住 (同一 scout-inbox item 永远对应同一 spawn chat)。
+      const idempotencyKey = `scout-router:${item.id}`;
       try {
-        const result = await createGroupWithBots({
-          creatorLarkAppId: claudeApp,
-          larkAppIds: [claudeApp, codexApp, tillyApp],
-          name: `auto: ${summary}`.slice(0, 60),
-          sourceChatId: mainTopic,          // parent = main topic
-          purpose: `[scout-router auto-spawn] ${summary}`,
-          chatContext: {
-            taskType: 'misc',
-            relatedRefs: refs,
-            participants: [
-              { openId: resolveBotIdent('claude').openId, role: 'main bot' },
-              { openId: resolveBotIdent('codex').openId, role: 'reviewer/sister' },
-              { openId: resolveBotIdent('tilly').openId, role: 'scout' },
-            ],
-          },
+        const { entry, cacheHit } = await getOrCompute(idempotencyKey, async () => {
+          const result = await createGroupWithBots({
+            creatorLarkAppId: claudeApp,
+            larkAppIds: [claudeApp, codexApp, tillyApp],
+            name: `auto: ${summary}`.slice(0, 60),
+            sourceChatId: mainTopic,          // parent = main topic
+            purpose: `[scout-router auto-spawn] ${summary}`,
+            chatContext: {
+              taskType: 'misc',
+              relatedRefs: refs,
+              participants: [
+                { openId: resolveBotIdent('claude').openId, role: 'main bot' },
+                { openId: resolveBotIdent('codex').openId, role: 'reviewer/sister' },
+                { openId: resolveBotIdent('tilly').openId, role: 'scout' },
+              ],
+            },
+          });
+          return { key: idempotencyKey, chatId: result.chatId, createdAt: new Date().toISOString() };
         });
-        logger.info(`[scout-router-exec] spawnHandler ok: item=${item.id} → chat=${result.chatId}`);
-        return result.chatId;
+        logger.info(`[scout-router-exec] spawnHandler ${cacheHit ? 'CACHE_HIT' : 'NEW'}: item=${item.id} → chat=${entry.chatId}`);
+        return entry.chatId;
       } catch (err: any) {
         logger.error(`[scout-router-exec] spawnHandler failed for item ${item.id}: ${err?.message ?? err}`);
         return null;

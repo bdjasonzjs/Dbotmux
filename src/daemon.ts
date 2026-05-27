@@ -2626,8 +2626,18 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // cron. 每 60s 扫一次 inbox.pending, route 到 A_ping / B_spawn / C_archive,
     // quota gate 持久化在 scout-router-quota.json. 真 executor 走 lark
     // sendMessage / createGroupWithBots.
+    //
+    // 妹妹 review B1 (2026-05-27): in-flight guard. 单 tick 如果 sendMessage /
+    // createGroupWithBots 跑超 60s, 下个 tick 不能并发跑同一批 pending — 否则
+    // 上一 tick 还没 markTillyHighNotified / dispositionTillyHigh, 重复 ping/spawn。
     const ROUTER_TICK_INTERVAL_MS = 60 * 1000;
+    let routerTickInFlight = false;
     const routerHandle = setInterval(async () => {
+      if (routerTickInFlight) {
+        logger.info(`[scout-router] tick skipped — previous tick still in flight`);
+        return;
+      }
+      routerTickInFlight = true;
       try {
         const { runRouterTick } = await import('./services/scout-inbox-router.js');
         const { makeProductionExecutors } = await import('./services/scout-inbox-router-executors.js');
@@ -2640,6 +2650,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         }
       } catch (err) {
         logger.error(`[scout-router] tick failed: ${err}`);
+      } finally {
+        routerTickInFlight = false;
       }
     }, ROUTER_TICK_INTERVAL_MS);
     process.on('SIGTERM', () => clearInterval(routerHandle));
