@@ -1,0 +1,12 @@
+{
+  "_README": "owner-profile sample — 静态层「老板简介」。tilly v1.1「感受」用. 真运行路径 = ~/.botmux/data/owner-profile.json (不是 repo 这份). 部署/新机器时复制此文件到 ~/.botmux/data/ 并改成本机 owner.",
+  "_runtime_path": "~/.botmux/data/owner-profile.json",
+  "owner": {
+    "name": "YOUR_NAME（中文名 / 英文名 / 昵称都行）",
+    "open_id": "ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "responsibilities": {
+      "business": "你的业务职责一句话（如：豆包 computer use 开发）",
+      "technical": "你的技术职责一句话（如：团队 AI 工作流优化）"
+    }
+  }
+}

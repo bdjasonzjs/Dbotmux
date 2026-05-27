@@ -64,6 +64,15 @@ git tag -a v1.x.x-canary.0 -m "canary: 加诊断日志排查截图卡死
 git push origin v1.x.x-canary.0
 ```
 
+## 缇蕾 owner-profile（v1.1「感受」静态层）
+
+缇蕾秘书的「老板简介」由 `~/.botmux/data/owner-profile.json` 加载（**不是 repo 里的 data/**），分静态层 + 动态层注入 LLM prompt:
+
+- 静态层（手维护）: `~/.botmux/data/owner-profile.json` — `owner.{name, open_id, responsibilities.{business, technical}}`
+- 动态层（每次 tick 实时抽）: main-bot-digest 的 hot chats top 10 + 今日 cumulative digest (MEMORY_TODAY)
+
+**部署/新机器**: 把 repo 里的 `examples/owner-profile.sample.json` 复制到 `~/.botmux/data/owner-profile.json` 改填本机 owner。缺失或解析失败会走**保守 fallback**（除非 @ 老板或明确等他决策一律 drop）并打 logger.error。
+
 ## 添加新 CLI 适配器
 
 1. `src/adapters/cli/` 下创建新文件，实现 `CliAdapter` 接口
