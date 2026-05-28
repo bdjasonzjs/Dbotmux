@@ -138,14 +138,21 @@ export function buildMemoryTodayBlock(opts?: { digest?: CurrentDigestFile }): st
   if (grandTotal === 0) {
     return '<MEMORY_TODAY>\n(今日还未累积任何 item — 你刚开始今天的工作)\n</MEMORY_TODAY>';
   }
-  // 每类截最多 10 条 (压 prompt token), 优先保留最新 (push 顺序 = 时间顺序, slice -10)
+  // 2026-05-28 (松松实测反馈): 之前每类截 10 → 同一天 ty问题群 ClientHeartbeat
+  // 报了 5+ 次, 旧的被新的挤出 MEMORY_TODAY 窗口, 缇蕾"忘了"已经报过, 重报。
+  // 记忆是 cumulative dedup 的核心 — 不能为了省 token 把旧的丢了。
+  // 改成全列, 单条 summary 也压短 (cap 80), 单类 cap 80 条 (一天报 80+ 同
+  // 类已经是异常了, 再 cap 也好)。
+  const PER_ITEM_SUMMARY_CAP = 80;
+  const PER_CAT_HARD_CAP = 80;
   const renderCat = (label: string, items: Array<{ summary: string; sourceChatName?: string; sourceMessageId: string }>) => {
     if (items.length === 0) return `[${label}] (0)`;
-    const recent = items.slice(-10);
-    const lines = recent.map(it =>
-      `  - "${sanitizeMemoryText(it.summary, 120)}" (chat=${sanitizeMemoryText(it.sourceChatName ?? '', 24)}, msg=${sanitizeMemoryText(it.sourceMessageId ?? '', 30)})`
+    const shown = items.slice(-PER_CAT_HARD_CAP);
+    const lines = shown.map(it =>
+      `  - "${sanitizeMemoryText(it.summary, PER_ITEM_SUMMARY_CAP)}" (chat=${sanitizeMemoryText(it.sourceChatName ?? '', 24)})`
     );
-    const more = items.length > 10 ? `  ... (+${items.length - 10} more 已截)` : '';
+    const dropped = items.length > PER_CAT_HARD_CAP ? items.length - PER_CAT_HARD_CAP : 0;
+    const more = dropped > 0 ? `  ... (+${dropped} more, hard cap, 异常多)` : '';
     return [`[${label}] (${items.length}):`, ...lines, ...(more ? [more] : [])].join('\n');
   };
   return [

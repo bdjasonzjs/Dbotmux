@@ -203,7 +203,7 @@ describe('owner-profile buildMemoryTodayBlock (v1.1 记忆)', () => {
     expect(block).toContain('今日还未累积任何 item');
   });
 
-  it('有 item → 列每类 + 截到最近 10 条 + 显示 +N more', async () => {
+  it('2026-05-28 重写: 列每类全列 (新 cap 80, ≤80 全列), 不再 last-10 截断', async () => {
     const m = await freshImport();
     const mkItems = (n: number, label: string) => Array.from({ length: n }, (_, i) => ({
       summary: `${label}-${i}`,
@@ -221,25 +221,49 @@ describe('owner-profile buildMemoryTodayBlock (v1.1 记忆)', () => {
         lastTickAt: '2026-05-27T05:00:00Z', tickCount: 12,
       },
     });
-    // todos: 15, 截 10, 显示 +5 more
+    // todos: 15, 不截断 (≤80 cap), 全列
     expect(block).toContain('[todos] (15)');
-    expect(block).toContain('+5 more');
-    // 最新 10 应保留 (slice -10 = todo-5..todo-14)
+    expect(block).not.toContain('more,');
+    // 0..14 全在 (防 last-10 旧 ClientHeartbeat 类重报 regression)
+    expect(block).toContain('todo-0');
     expect(block).toContain('todo-14');
-    expect(block).toContain('todo-5');
-    expect(block).not.toContain('todo-4');
     // progress: 3 全列
     expect(block).toContain('[progress] (3)');
     expect(block).toContain('prog-0');
     expect(block).toContain('prog-2');
     // blockers: 0
     expect(block).toContain('[blockers] (0)');
-    // noteworthy: 8
+    // noteworthy: 8 全列
     expect(block).toContain('[noteworthy] (8)');
+    expect(block).toContain('note-0');
     expect(block).toContain('note-7');
     // header tick info
     expect(block).toContain('已跑 12 个 tick');
     expect(block).toContain('2026-05-27');
+  });
+
+  it('单类超 80 条 (异常多): hard cap, 显示 +N more', async () => {
+    const m = await freshImport();
+    const mkItems = (n: number, label: string) => Array.from({ length: n }, (_, i) => ({
+      summary: `${label}-${i}`,
+      sourceChatId: `oc_${i}`,
+      sourceChatName: `c-${i}`,
+      sourceMessageId: `om_${label}_${i}`,
+    }));
+    const block = m.buildMemoryTodayBlock({
+      digest: {
+        dateId: '2026-05-27',
+        todos: mkItems(100, 'todo'),
+        progress: [], blockers: [], noteworthy: [],
+        lastTickAt: 't', tickCount: 1,
+      },
+    });
+    expect(block).toContain('[todos] (100)');
+    expect(block).toContain('+20 more, hard cap, 异常多');
+    // 留最后 80 (slice -80 = todo-20 .. todo-99)
+    expect(block).toContain('todo-99');
+    expect(block).toContain('todo-20');
+    expect(block).not.toContain('todo-19');
   });
 
   it('memory item summary 含恶意 tag/控制字符 → 清洗', async () => {
