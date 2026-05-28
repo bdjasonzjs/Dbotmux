@@ -20,20 +20,24 @@ const JUDGE_TIMEOUT_MS = 120_000;
 const MSG_FETCH = 30;
 const MAX_CONTENT = 200;
 
-function clean(s: string, n: number): string {
+function clean(s: unknown, n: number): string {
+  // 2026-05-29 bug#3 实测修复: 群消息 body 解析出的 text 可能不是 string
+  // (interactive 卡片 / post 结构化内容 → object/array), 原来直接 .replace 抛
+  // "(s ?? '').replace is not a function" 让 judge 每 tick 都 err。强制 String 化。
+  const str = typeof s === 'string' ? s : (s == null ? '' : (() => { try { return JSON.stringify(s); } catch { return String(s); } })());
   // eslint-disable-next-line no-control-regex
-  return (s ?? '').replace(/[\x00-\x1F\x7F<>]/g, ' ').slice(0, n);
+  return str.replace(/[\x00-\x1F\x7F<>]/g, ' ').slice(0, n);
 }
 
 /** 从 lark message item 抽一行文本 (sender + 内容截断)。 */
 function renderMsg(m: any): string {
   const sender = m?.sender?.id ?? m?.sender?.sender_id?.open_id ?? '?';
-  let text = '';
+  let text: unknown = '';
   try {
     const body = typeof m?.body?.content === 'string' ? JSON.parse(m.body.content) : m?.body?.content;
     text = body?.text ?? body?.content ?? JSON.stringify(body ?? {});
-  } catch { text = String(m?.body?.content ?? ''); }
-  return `[${clean(String(sender), 16)}] ${clean(text, MAX_CONTENT)}`;
+  } catch { text = m?.body?.content ?? ''; }
+  return `[${clean(sender, 16)}] ${clean(text, MAX_CONTENT)}`;
 }
 
 const JUDGE_PROMPT = (watch: SubgroupWatch, rendered: string) => `你是缇蕾, 在盯一个子群任务的进展。判断这个群现在处于哪种状态, 只输出 JSON。
