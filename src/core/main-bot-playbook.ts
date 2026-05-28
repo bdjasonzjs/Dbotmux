@@ -274,17 +274,26 @@ export async function spawnSubTask(
   // 缇蕾身份发, @ claude+妹妹分身唤起。bot 不回复自己的 @, 所以 claude 不能
   // 自己唤自己。kickoff 失败不 fail spawn (群已建好, 失败可手动补发)。
   if (!cacheHit) {
+    const urgency = request.urgency ?? 'normal';
     try {
       const { sendSubgroupKickoff } = await import('../services/subgroup-kickoff.js');
       await sendSubgroupKickoff(entry.chatId, {
         purpose: request.purpose,
         taskType: request.taskType,
-        urgency: request.urgency ?? 'normal',
+        urgency,
         refs: request.relatedRefs,
         acceptance: request.acceptance,
       });
     } catch (err: any) {
       logger.warn(`[main-bot-playbook] kickoff send failed for ${entry.chatId} (群已建好, 不 fail spawn): ${err?.message ?? err}`);
+    }
+    // P2: 注册 watch, 缇蕾的 watch cron 会周期盯这个群 (按 urgency 频率) 并在
+    // 完成/卡死/需决策时升级 claude 主体。注册失败不 fail spawn。
+    try {
+      const { registerWatch } = await import('../services/subgroup-watch-store.js');
+      registerWatch({ chatId: entry.chatId, purpose: request.purpose, acceptance: request.acceptance, urgency });
+    } catch (err: any) {
+      logger.warn(`[main-bot-playbook] registerWatch failed for ${entry.chatId}: ${err?.message ?? err}`);
     }
   }
 

@@ -2834,6 +2834,33 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     process.on('SIGTERM', () => clearInterval(tillyHandle));
     process.on('SIGINT', () => clearInterval(tillyHandle));
     logger.info(`[tilly/scout] cron registered (every ${TILLY_TICK_INTERVAL_MS / 1000}s) on coco daemon`);
+
+    // ── 子群任务流程 P2 (2026-05-29 松松设计): 缇蕾盯群 watch cron。
+    // 每 5min 跑一次 runWatchTick, 但每个 watch 实际多久扫一次由 urgency 间隔
+    // 控制 (urgent 15min / normal 1h / low 4h, watcher 内部 isDue gate)。所以
+    // cron 5min 只是"检查有没有到期的", 真 coco 判断只在到期时发生 (省 token)。
+    // in-flight guard 防 coco 慢时重叠。
+    const WATCH_TICK_INTERVAL_MS = 5 * 60 * 1000;
+    let watchTickInFlight = false;
+    const watchHandle = setInterval(async () => {
+      if (watchTickInFlight) { logger.info('[subgroup-watch] previous tick in flight — skip'); return; }
+      watchTickInFlight = true;
+      try {
+        const { runWatchTick } = await import('./services/subgroup-watcher.js');
+        const { makeWatcherExecutors } = await import('./services/subgroup-watcher-executors.js');
+        const stats = await runWatchTick({ executors: makeWatcherExecutors() });
+        if (stats.checked + stats.errors > 0) {
+          logger.info(`[subgroup-watch] tick: checked=${stats.checked} inProgress=${stats.inProgress} done=${stats.escalatedDone} stuck=${stats.escalatedStuck} decision=${stats.escalatedDecision} err=${stats.errors} (skipped ${stats.skippedNotDue} not-due)`);
+        }
+      } catch (err) {
+        logger.error(`[subgroup-watch] tick failed: ${err}`);
+      } finally {
+        watchTickInFlight = false;
+      }
+    }, WATCH_TICK_INTERVAL_MS);
+    process.on('SIGTERM', () => clearInterval(watchHandle));
+    process.on('SIGINT', () => clearInterval(watchHandle));
+    logger.info(`[subgroup-watch] cron registered (every ${WATCH_TICK_INTERVAL_MS / 1000}s, per-watch interval gated) on coco daemon`);
   }
 
   logger.info('Daemon is running. Press Ctrl+C to stop.');
