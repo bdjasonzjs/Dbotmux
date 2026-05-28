@@ -4,7 +4,7 @@
  * Run:  pnpm vitest run test/main-bot-playbook-spawn-subtask.test.ts
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -57,6 +57,13 @@ vi.mock('../src/services/main-topic-config.js', () => ({
   isTillyMainTopicConversationDenied: () => false,
 }));
 
+// 2026-05-29: spawnSubTask 现在新建群后会发 kickoff (subgroup-kickoff)。
+// mock 掉避免单测打真 lark; kickoff 行为有独立单测 (subgroup-kickoff.test.ts)。
+const mockKickoff = vi.fn(async () => 'om_kickoff_test');
+vi.mock('../src/services/subgroup-kickoff.js', () => ({
+  sendSubgroupKickoff: (...args: any[]) => mockKickoff(...args),
+}));
+
 async function freshImport() {
   vi.resetModules();
   // Re-import store too so per-test temp dir takes effect
@@ -85,6 +92,14 @@ beforeEach(() => {
   fakeSessions.clear();
   fakeMainTopic = MAIN_TOPIC;
   vi.clearAllMocks();
+  // 2026-05-29: resolveBotIdent 改读 config.session.dataDir (= tempDir 经 mock)
+  // 后, 写 bots-info.json fixture 让它解析出 cli_claude/cli_codex/cli_tilly,
+  // 匹配 fake session 的 cli_claude (之前硬编码读真 ~/.botmux/data 永远不匹配)。
+  writeFileSync(join(tempDir, 'bots-info.json'), JSON.stringify([
+    { cliId: 'claude-code', larkAppId: 'cli_claude', botName: 'claude', botOpenId: 'ou_claude' },
+    { cliId: 'codex', larkAppId: 'cli_codex', botName: 'codex', botOpenId: 'ou_codex' },
+    { cliId: 'coco', larkAppId: 'cli_tilly', botName: 'tilly', botOpenId: 'ou_tilly' },
+  ]), 'utf-8');
 });
 afterEach(() => {
   rmSync(tempDir, { recursive: true, force: true });

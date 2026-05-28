@@ -15,8 +15,8 @@
  * 测试：test/main-bot-playbook-spawn-subtask.test.ts (P-S1~11)
  */
 import { existsSync, readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { config } from '../config.js';
 import { createGroupWithBots, type CreateGroupOpts } from '../services/group-creator.js';
 import { getOrCompute, type IdempotencyEntry } from '../services/spawn-idempotency-store.js';
 import { getMainTopicChatId } from '../services/main-topic-config.js';
@@ -43,6 +43,11 @@ export interface SpawnSubTaskRequest {
   relatedRefs?: string[];
   /** 24h digest of parent chat to seed warm context. */
   parentDigest?: string;
+  /** 子群任务流程 P1 (2026-05-29): 紧急度, 决定缇蕾盯群频率 + 升级阈值。
+   *  默认 'normal'。 */
+  urgency?: import('../services/subgroup-kickoff.js').SubgroupUrgency;
+  /** 验收标准 (什么算 done) — 进 kickoff, 让分身知道目标。 */
+  acceptance?: string;
 }
 
 export interface SpawnSubTaskResult {
@@ -104,7 +109,11 @@ const BOT_KEY_TO_ROLE: Record<'claude' | 'codex' | 'tilly', string> = {
  *  Falls back to bot-registry getAllBots() for own bot if file missing. */
 export function resolveBotIdent(key: 'claude' | 'codex' | 'tilly'): BotIdent {
   const targetCliId = BOT_KEY_TO_CLI_ID[key];
-  const dataDir = join(homedir(), '.botmux', 'data');
+  // 2026-05-29: 用 config.session.dataDir 不硬编码 homedir()/.botmux/data。
+  // 生产 daemon 设 SESSION_DATA_DIR=~/.botmux/data, 两者相等 (无差异); 但这
+  // 样 resolveBotIdent 才尊重 SESSION_DATA_DIR override + 让单测能隔离到
+  // tempDir (之前硬编码导致 7 个 spawn 单测读真 bots-info.json 永远不匹配)。
+  const dataDir = config.session.dataDir;
   // 1. bots-info.json: cross-app catalog of all running bots
   const botsInfoPath = join(dataDir, 'bots-info.json');
   if (!existsSync(botsInfoPath)) {
@@ -260,6 +269,24 @@ export async function spawnSubTask(
   });
 
   logger.info(`[main-bot-playbook] spawnSubTask ${cacheHit ? 'CACHE_HIT' : 'NEW'} chat=${entry.chatId} key=${idempotencyKey}`);
+
+  // 子群任务流程 P1 (2026-05-29 松松设计): 新建群才发 kickoff (cache hit 不重发)。
+  // 缇蕾身份发, @ claude+妹妹分身唤起。bot 不回复自己的 @, 所以 claude 不能
+  // 自己唤自己。kickoff 失败不 fail spawn (群已建好, 失败可手动补发)。
+  if (!cacheHit) {
+    try {
+      const { sendSubgroupKickoff } = await import('../services/subgroup-kickoff.js');
+      await sendSubgroupKickoff(entry.chatId, {
+        purpose: request.purpose,
+        taskType: request.taskType,
+        urgency: request.urgency ?? 'normal',
+        refs: request.relatedRefs,
+        acceptance: request.acceptance,
+      });
+    } catch (err: any) {
+      logger.warn(`[main-bot-playbook] kickoff send failed for ${entry.chatId} (群已建好, 不 fail spawn): ${err?.message ?? err}`);
+    }
+  }
 
   return {
     chatId: entry.chatId,
