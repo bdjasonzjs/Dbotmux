@@ -387,3 +387,163 @@ echo '{"session_id":"t","agent_states":{},"message":{"role":"assistant","content
     expect(r.todos[0].summary).toBe('ok');
   });
 });
+
+// Phase C.2 妹妹 P1 #2 (2026-05-28): coco --resume 集成路径 regression.
+// 覆盖 readTodaySession → args --resume → save/clear 这条路径,
+// 含妹妹 blocker (parse failure under --resume → clearTodaySession).
+describe('Phase C.2: coco --resume integration', () => {
+  let resumeTempDir: string;
+  beforeEach(() => { resumeTempDir = mkdtempSync(join(tmpdir(), 'tilly-resume-')); });
+  afterEach(() => { rmSync(resumeTempDir, { recursive: true, force: true }); });
+
+  async function freshImportWithMockedConfig() {
+    vi.resetModules();
+    vi.doMock('../src/config.js', () => ({
+      config: { get session() { return { dataDir: resumeTempDir }; } },
+    }));
+    return await import('../src/services/tilly-llm-analyzer.js');
+  }
+
+  // fake coco 把 argv 写到文件 + 返指定 envelope (含 session_id + content).
+  function makeArgvCapturingCoco(opts: {
+    argvOutPath: string;
+    envelopeSessionId: string;
+    contentJson: string;
+    exitCode?: number;
+  }): string {
+    const fp = join(resumeTempDir, `fake-coco-resume-${Math.random().toString(36).slice(2)}.sh`);
+    const envelope = JSON.stringify({
+      session_id: opts.envelopeSessionId,
+      agent_states: {},
+      message: { role: 'assistant', content: opts.contentJson },
+      stats: {},
+    }).replace(/'/g, "'\\''");
+    const body = `#!/bin/bash
+printf '%s\\n' "$@" > '${opts.argvOutPath}'
+cat <<'ENVELOPE'
+${envelope}
+ENVELOPE
+exit ${opts.exitCode ?? 0}
+`;
+    writeFileSync(fp, body, 'utf-8');
+    chmodSync(fp, 0o755);
+    return fp;
+  }
+
+  const validContent = '{"todos":[],"progress":[],"blockers":[],"noteworthy":[]}';
+  const messages = [{
+    messageId: 'om_a', chatId: 'oc_x', chatName: 'X', chatType: 'group' as const,
+    senderId: 'u1', senderType: 'user' as const, msgType: 'text' as const,
+    content: 'hi', createTime: '2026-05-28 10:00',
+  }];
+
+  it('无 today session → argv 不含 --resume', async () => {
+    const argvOut = join(resumeTempDir, 'argv.txt');
+    const { analyzeMessages } = await freshImportWithMockedConfig();
+    const fake = makeArgvCapturingCoco({
+      argvOutPath: argvOut, envelopeSessionId: 'sess_new_001', contentJson: validContent,
+    });
+    const r = await analyzeMessages(messages, { codexPath: fake });
+    expect(r.ok).toBe(true);
+    const { readFileSync } = await import('node:fs');
+    const argv = readFileSync(argvOut, 'utf-8');
+    // argv 是一行一个 arg (printf '%s\\n' "$@"). prompt 本身有"--resume"字串
+    // (安全 paragraph 提到 coco --resume), 所以检查"独立 arg --resume" 而非
+    // 含 substring.
+    const argLines = argv.split('\n');
+    expect(argLines).not.toContain('--resume');
+  });
+
+  it('save returned session_id after valid parse → 下个 freshImport 看到 stored session', async () => {
+    const argvOut = join(resumeTempDir, 'argv2.txt');
+    const { analyzeMessages } = await freshImportWithMockedConfig();
+    const fake = makeArgvCapturingCoco({
+      argvOutPath: argvOut, envelopeSessionId: 'sess_saved_001', contentJson: validContent,
+    });
+    await analyzeMessages(messages, { codexPath: fake });
+    // 用 store 直接读, 验证 session 已 persisted
+    vi.resetModules();
+    vi.doMock('../src/config.js', () => ({
+      config: { get session() { return { dataDir: resumeTempDir }; } },
+    }));
+    const store = await import('../src/services/coco-session-store.js');
+    const s = store.readTodaySession();
+    expect(s?.sessionId).toBe('sess_saved_001');
+  });
+
+  it('有 today session → 下次 analyze 的 argv 含 --resume <id>', async () => {
+    const { analyzeMessages: a1 } = await freshImportWithMockedConfig();
+    const argv1 = join(resumeTempDir, 'argv1.txt');
+    const fake1 = makeArgvCapturingCoco({
+      argvOutPath: argv1, envelopeSessionId: 'sess_persisted_42', contentJson: validContent,
+    });
+    await a1(messages, { codexPath: fake1 });
+    // 第二轮: 重 import, 应该读到 sess_persisted_42 并 --resume
+    const { analyzeMessages: a2 } = await freshImportWithMockedConfig();
+    const argv2 = join(resumeTempDir, 'argv2.txt');
+    const fake2 = makeArgvCapturingCoco({
+      argvOutPath: argv2, envelopeSessionId: 'sess_persisted_42', contentJson: validContent,
+    });
+    await a2(messages, { codexPath: fake2 });
+    const { readFileSync } = await import('node:fs');
+    const argv2Content = readFileSync(argv2, 'utf-8');
+    const argLines2 = argv2Content.split('\n');
+    expect(argLines2).toContain('--resume');
+    expect(argLines2).toContain('sess_persisted_42');
+  });
+
+  it('妹妹 blocker regression: parse failure under --resume → session cleared (下次 tick 起新 session)', async () => {
+    // Tick 1: 先存好 stored session
+    const { analyzeMessages: a1 } = await freshImportWithMockedConfig();
+    const fake1 = makeArgvCapturingCoco({
+      argvOutPath: join(resumeTempDir, 'a1.txt'),
+      envelopeSessionId: 'sess_will_be_cleared',
+      contentJson: validContent,
+    });
+    await a1(messages, { codexPath: fake1 });
+    // Tick 2: 用 invalid content (不是 JSON) → resume 模式下 parse fail → clearTodaySession
+    const { analyzeMessages: a2 } = await freshImportWithMockedConfig();
+    const fake2 = makeArgvCapturingCoco({
+      argvOutPath: join(resumeTempDir, 'a2.txt'),
+      envelopeSessionId: 'sess_will_be_cleared',
+      contentJson: 'this is not JSON at all',
+    });
+    const r = await a2(messages, { codexPath: fake2 });
+    expect(r.ok).toBe(false);
+    expect(r.error).toContain('parse failed');
+    // 验证 session 被 clear
+    vi.resetModules();
+    vi.doMock('../src/config.js', () => ({
+      config: { get session() { return { dataDir: resumeTempDir }; } },
+    }));
+    const store = await import('../src/services/coco-session-store.js');
+    expect(store.readTodaySession()).toBeNull();
+  });
+
+  it('exec failure under --resume → session cleared', async () => {
+    const { analyzeMessages: a1 } = await freshImportWithMockedConfig();
+    const fake1 = makeArgvCapturingCoco({
+      argvOutPath: join(resumeTempDir, 'a1.txt'),
+      envelopeSessionId: 'sess_exec_fail_test',
+      contentJson: validContent,
+    });
+    await a1(messages, { codexPath: fake1 });
+    // Tick 2: exit code != 0
+    const { analyzeMessages: a2 } = await freshImportWithMockedConfig();
+    const fake2 = makeArgvCapturingCoco({
+      argvOutPath: join(resumeTempDir, 'a2.txt'),
+      envelopeSessionId: 'sess_exec_fail_test',
+      contentJson: validContent,
+      exitCode: 1,
+    });
+    const r = await a2(messages, { codexPath: fake2 });
+    expect(r.ok).toBe(false);
+    // 验证 session 被 clear
+    vi.resetModules();
+    vi.doMock('../src/config.js', () => ({
+      config: { get session() { return { dataDir: resumeTempDir }; } },
+    }));
+    const store = await import('../src/services/coco-session-store.js');
+    expect(store.readTodaySession()).toBeNull();
+  });
+});

@@ -126,7 +126,13 @@ function sanitizeMemoryText(s: string, maxLen: number): string {
   return (s ?? '').replace(/[\x00-\x1F\x7F<>]/g, ' ').slice(0, maxLen);
 }
 
-export function buildMemoryTodayBlock(opts?: { digest?: CurrentDigestFile }): string {
+export function buildMemoryTodayBlock(opts?: {
+  digest?: CurrentDigestFile;
+  /** 妹妹 P1 (2026-05-28): caller 可传 char budget, 自动按 cap 缩, 防把固定
+   *  规则区 + 消息流挤爆 30KB 总 prompt 限制. 默认 cap=80 (≈ 6-12KB), 不传
+   *  budget 时按默认 cap 渲染. */
+  perCatHardCap?: number;
+}): string {
   const cur = opts?.digest ?? getCurrentDigest();
   const totals = {
     todos: cur.todos?.length ?? 0,
@@ -144,7 +150,7 @@ export function buildMemoryTodayBlock(opts?: { digest?: CurrentDigestFile }): st
   // 改成全列, 单条 summary 也压短 (cap 80), 单类 cap 80 条 (一天报 80+ 同
   // 类已经是异常了, 再 cap 也好)。
   const PER_ITEM_SUMMARY_CAP = 80;
-  const PER_CAT_HARD_CAP = 80;
+  const PER_CAT_HARD_CAP = opts?.perCatHardCap ?? 80;
   const renderCat = (label: string, items: Array<{ summary: string; sourceChatName?: string; sourceMessageId: string }>) => {
     if (items.length === 0) return `[${label}] (0)`;
     const shown = items.slice(-PER_CAT_HARD_CAP);
