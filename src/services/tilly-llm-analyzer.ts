@@ -348,7 +348,10 @@ export async function analyzeMessages(
   // stream, 之前没算 PROMPT_PREFIX + 4 个 block. 单 cat cap 80 可能让 MEMORY
   // 单独 30KB+。先用默认 cap 80 渲染, 装好总 prompt 后量大小; 超 50K (留
   // 容量给 message stream) 就按 80→40→20→10 退档重渲。
-  const MAX_TOTAL_PROMPT_CHARS = 80_000;
+  // 妹妹 P1 (2026-05-28): 总 prompt 安全 budget. coco 实际 context 远比这大,
+  // 但 prompt 越短 LLM 决策越准 + 速度越快. 40K 是 "MEMORY 80 cap (37K) +
+  // 固定 12K block = 49K, 加 message stream 可能 30K → 触发退档" 这条平衡线.
+  const MAX_TOTAL_PROMPT_CHARS = 40_000;
   let memoryCap = 80;
   let memoryBlock = opts.memoryToday ?? buildMemoryTodayBlock({ perCatHardCap: memoryCap });
   const assemblePrefix = (mem: string) => PROMPT_PREFIX
@@ -428,8 +431,8 @@ export async function analyzeMessages(
   } catch (err: any) {
     logger.warn(`[tilly-llm-analyzer] coco exec failed: ${err?.message ?? err}`);
     rmSync(tmp, { recursive: true, force: true });
-    // 2026-05-28: 如果是 --resume 失败 (session compacted / 不存在), 清掉
-    // stale session 让下次 tick 起新 session, 不要永远 fail。
+    // 妹妹 P1 (2026-05-28): exec failure 也走 helper (跟下面 envelope parse /
+    // no content / LLM JSON parse 四个出口同源 clear stale session).
     if (resumedSessionId) {
       logger.warn(`[tilly-llm-analyzer] coco exec with --resume failed; clearing stale session ${resumedSessionId.slice(0,16)}`);
       clearTodaySession();
@@ -437,8 +440,18 @@ export async function analyzeMessages(
     return emptyDigest(false, [], String(err?.message ?? err));
   }
 
+  // 妹妹 P1 (2026-05-28): 4 个 failure 出口都要在 resumed 模式下 clear stale
+  // session, 不只 exec / LLM-parse 两个. 抽个 helper 复用 (closure 抓 resumedSessionId).
+  const clearStaleIfResumed = (failReason: string) => {
+    if (resumedSessionId) {
+      logger.warn(`[tilly-llm-analyzer] ${failReason} under --resume; clearing stale session ${resumedSessionId.slice(0,16)}`);
+      clearTodaySession();
+    }
+  };
+
   if (!stdout.trim()) {
     rmSync(tmp, { recursive: true, force: true });
+    clearStaleIfResumed('coco empty stdout');
     return emptyDigest(false, [], 'coco produced empty stdout');
   }
 
@@ -450,11 +463,13 @@ export async function analyzeMessages(
   } catch (err: any) {
     logger.warn(`[tilly-llm-analyzer] failed to parse coco envelope: ${err?.message ?? err}; stdout[:200]=${stdout.slice(0, 200)}`);
     rmSync(tmp, { recursive: true, force: true });
+    clearStaleIfResumed('coco envelope parse failed');
     return emptyDigest(false, [], `coco envelope parse failed: ${err?.message ?? err}`);
   }
   const llmText = cocoEnvelope?.message?.content;
   if (typeof llmText !== 'string' || !llmText.trim()) {
     rmSync(tmp, { recursive: true, force: true });
+    clearStaleIfResumed('coco envelope has no message.content');
     return emptyDigest(false, [], 'coco envelope has no message.content');
   }
 
@@ -475,19 +490,10 @@ export async function analyzeMessages(
   } catch (err: any) {
     logger.warn(`[tilly-llm-analyzer] failed to parse LLM JSON response: ${err?.message ?? err}; content[:200]=${llmText.slice(0, 200)}`);
     rmSync(tmp, { recursive: true, force: true });
-    // resume 模式下 parse 失败 → 清掉 stale session, 下 tick 起新 session
-    if (resumedSessionId) {
-      logger.warn(`[tilly-llm-analyzer] parse failed under --resume; clearing stale session ${resumedSessionId.slice(0,16)}`);
-      clearTodaySession();
-    }
+    clearStaleIfResumed('LLM JSON parse failed');
     return emptyDigest(false, [], `parse failed: ${err?.message ?? err}`);
   }
   rmSync(tmp, { recursive: true, force: true });
-
-  // 现在 parse + enrich 都成功了再 save session_id。
-  if (typeof returnedSessionId === 'string' && returnedSessionId) {
-    saveTodaySession(returnedSessionId);
-  }
 
   // Build messageId → message map for fast lookup + sourceMessageId validation
   const byId = new Map(messages.map(m => [m.messageId, m]));
@@ -515,7 +521,7 @@ export async function analyzeMessages(
   const safe = (arr: any): TillyDigestItem[] =>
     (Array.isArray(arr) ? arr : []).map(enrich).filter((x): x is TillyDigestItem => x !== null).slice(0, 5);
 
-  return {
+  const result: TillyDigest = {
     todos: safe(parsed.todos),
     progress: safe(parsed.progress),
     blockers: safe(parsed.blockers),
@@ -525,4 +531,10 @@ export async function analyzeMessages(
     analyzedAt: new Date().toISOString(),
     ok: true,
   };
+  // 妹妹 review tail (2026-05-29): save 移到 return 前, parse + enrich 全
+  // 跑完了 result 真的能 ok=true 才落 session。
+  if (typeof returnedSessionId === 'string' && returnedSessionId) {
+    saveTodaySession(returnedSessionId);
+  }
+  return result;
 }

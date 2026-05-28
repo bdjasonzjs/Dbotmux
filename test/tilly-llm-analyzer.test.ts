@@ -520,6 +520,110 @@ exit ${opts.exitCode ?? 0}
     expect(store.readTodaySession()).toBeNull();
   });
 
+  it('妹妹 P1 (2026-05-29) envelope parse failure under --resume → session cleared', async () => {
+    // Tick 1: 存好 stored session
+    const { analyzeMessages: a1 } = await freshImportWithMockedConfig();
+    const fake1 = makeArgvCapturingCoco({
+      argvOutPath: join(resumeTempDir, 'a1.txt'),
+      envelopeSessionId: 'sess_envelope_fail_test',
+      contentJson: validContent,
+    });
+    await a1(messages, { codexPath: fake1 });
+    // Tick 2: 让 fake coco 直接吐 not-JSON 当 stdout, envelope parse 失败
+    const fp2 = join(resumeTempDir, 'fake-coco-envelope-fail.sh');
+    writeFileSync(fp2, `#!/bin/bash\necho 'this is not JSON envelope'\nexit 0\n`, 'utf-8');
+    chmodSync(fp2, 0o755);
+    vi.resetModules();
+    vi.doMock('../src/config.js', () => ({
+      config: { get session() { return { dataDir: resumeTempDir }; } },
+    }));
+    const { analyzeMessages: a2 } = await import('../src/services/tilly-llm-analyzer.js');
+    const r = await a2(messages, { codexPath: fp2 });
+    expect(r.ok).toBe(false);
+    expect(r.error).toContain('coco envelope parse failed');
+    vi.resetModules();
+    vi.doMock('../src/config.js', () => ({
+      config: { get session() { return { dataDir: resumeTempDir }; } },
+    }));
+    const store = await import('../src/services/coco-session-store.js');
+    expect(store.readTodaySession()).toBeNull();
+  });
+
+  it('妹妹 P1 (2026-05-29) envelope has no message.content under --resume → session cleared', async () => {
+    const { analyzeMessages: a1 } = await freshImportWithMockedConfig();
+    const fake1 = makeArgvCapturingCoco({
+      argvOutPath: join(resumeTempDir, 'a1.txt'),
+      envelopeSessionId: 'sess_no_content_test',
+      contentJson: validContent,
+    });
+    await a1(messages, { codexPath: fake1 });
+    // Tick 2: envelope 合法但没有 message.content
+    const fp2 = join(resumeTempDir, 'fake-coco-no-content.sh');
+    const envelopeNoContent = JSON.stringify({ session_id: 't', agent_states: {}, message: {}, stats: {} });
+    writeFileSync(fp2, `#!/bin/bash\ncat <<'ENVELOPE'\n${envelopeNoContent}\nENVELOPE\nexit 0\n`, 'utf-8');
+    chmodSync(fp2, 0o755);
+    vi.resetModules();
+    vi.doMock('../src/config.js', () => ({
+      config: { get session() { return { dataDir: resumeTempDir }; } },
+    }));
+    const { analyzeMessages: a2 } = await import('../src/services/tilly-llm-analyzer.js');
+    const r = await a2(messages, { codexPath: fp2 });
+    expect(r.ok).toBe(false);
+    expect(r.error).toContain('no message.content');
+    vi.resetModules();
+    vi.doMock('../src/config.js', () => ({
+      config: { get session() { return { dataDir: resumeTempDir }; } },
+    }));
+    const store = await import('../src/services/coco-session-store.js');
+    expect(store.readTodaySession()).toBeNull();
+  });
+
+  it('妹妹 P1 (2026-05-29) prompt budget 退档: 巨大 digest → MEMORY_TODAY 触发 cap 退档 log', async () => {
+    // 巨大 tilly-digest-current.json (4 类各 200 条, 80 char summary) 让 cap=80
+    // 时 MEMORY 单独 >80K 触发退档. 用 logger.warn 捕获 "shrunk to cap" 验证.
+    const todayId = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
+    }).format(new Date());
+    const longChat = 'X'.repeat(24);
+    const longSum = 'A'.repeat(80);
+    const huge = {
+      dateId: todayId,
+      todos: Array.from({ length: 500 }, (_, i) => ({ summary: `${longSum}_t${i}`, sourceChatId: 'oc', sourceChatName: longChat, sourceMessageId: `om_t${i}` })),
+      progress: Array.from({ length: 500 }, (_, i) => ({ summary: `${longSum}_p${i}`, sourceChatId: 'oc', sourceChatName: longChat, sourceMessageId: `om_p${i}` })),
+      blockers: Array.from({ length: 500 }, (_, i) => ({ summary: `${longSum}_b${i}`, sourceChatId: 'oc', sourceChatName: longChat, sourceMessageId: `om_b${i}` })),
+      noteworthy: Array.from({ length: 500 }, (_, i) => ({ summary: `${longSum}_n${i}`, sourceChatId: 'oc', sourceChatName: longChat, sourceMessageId: `om_n${i}` })),
+      lastTickAt: new Date().toISOString(),
+      tickCount: 1,
+    };
+    writeFileSync(join(resumeTempDir, 'tilly-digest-current.json'), JSON.stringify(huge), 'utf-8');
+
+    // 自定义 logger mock 捕获 warn
+    const warnCalls: string[] = [];
+    vi.resetModules();
+    vi.doMock('../src/config.js', () => ({
+      config: { get session() { return { dataDir: resumeTempDir }; } },
+    }));
+    vi.doMock('../src/utils/logger.js', () => ({
+      logger: {
+        info: () => {},
+        warn: (msg: string) => { warnCalls.push(msg); },
+        error: () => {},
+        debug: () => {},
+      },
+    }));
+    const { analyzeMessages } = await import('../src/services/tilly-llm-analyzer.js');
+    const fakeFp = join(resumeTempDir, 'fake-coco-budget.sh');
+    const envelope = JSON.stringify({
+      session_id: 'sess_budget', agent_states: {}, message: { role: 'assistant', content: validContent }, stats: {},
+    });
+    writeFileSync(fakeFp, `#!/bin/bash\ncat <<'ENVELOPE'\n${envelope}\nENVELOPE\nexit 0\n`, 'utf-8');
+    chmodSync(fakeFp, 0o755);
+    await analyzeMessages(messages, { codexPath: fakeFp });
+    // 至少触发了一次 "shrunk to cap" warn (cap 80 → 40 或更低)
+    const shrunkLogs = warnCalls.filter(m => m.includes('MEMORY_TODAY shrunk to cap'));
+    expect(shrunkLogs.length).toBeGreaterThanOrEqual(1);
+  });
+
   it('exec failure under --resume → session cleared', async () => {
     const { analyzeMessages: a1 } = await freshImportWithMockedConfig();
     const fake1 = makeArgvCapturingCoco({
