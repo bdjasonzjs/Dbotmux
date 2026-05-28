@@ -10,6 +10,15 @@ import { join } from 'node:path';
 
 let tempDir: string;
 
+// 2026-05-29 (修 test 卫生 bug): base describe 的老 test 调 analyzeMessages →
+// 成功路径会 saveTodaySession. 不 mock config 的话 saveTodaySession 写进真
+// ~/.botmux/data/coco-tilly-session.json (实测污染过, sessionId=test 让真
+// daemon 去 `coco --resume test`)。mock config 指 tempDir, getter 延迟读取
+// 所以即使 vi.mock hoist 也能拿到 beforeEach 赋的 tempDir。Phase C.2 describe
+// 用 vi.doMock per-test 覆盖, 不受影响。
+vi.mock('../src/config.js', () => ({
+  config: { get session() { return { dataDir: tempDir }; } },
+}));
 vi.mock('../src/utils/logger.js', () => ({
   logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
 }));
