@@ -30,6 +30,13 @@ export interface SubgroupWatch {
   purpose: string;
   acceptance?: string;
   urgency: SubgroupUrgency;
+  /** 2026-05-29: kickoff 资料存在 watch 里, 因为 kickoff 要由 coco daemon
+   *  (缇蕾本地) 发 — claude daemon 借不到缇蕾 bot client。 */
+  taskType: 'prd' | 'bug' | 'misc';
+  refs?: string[];
+  /** kickoff 是否已发 (缇蕾 @ claude+妹妹分身唤起)。watch cron 首次见到
+   *  kickoffSent=false 的 watch 时补发, 然后才开始 judge。 */
+  kickoffSent: boolean;
   createdAt: string;
   /** 上次缇蕾扫这个群的时间; null = 还没扫过 */
   lastCheckedAt: string | null;
@@ -87,6 +94,8 @@ export function registerWatch(opts: {
   purpose: string;
   acceptance?: string;
   urgency: SubgroupUrgency;
+  taskType: 'prd' | 'bug' | 'misc';
+  refs?: string[];
 }): SubgroupWatch {
   const s = read();
   const existing = s.watches.find(w => w.chatId === opts.chatId);
@@ -96,6 +105,9 @@ export function registerWatch(opts: {
     purpose: opts.purpose,
     acceptance: opts.acceptance,
     urgency: opts.urgency,
+    taskType: opts.taskType,
+    refs: opts.refs,
+    kickoffSent: false,
     createdAt: new Date().toISOString(),
     lastCheckedAt: null,
     noProgressCount: 0,

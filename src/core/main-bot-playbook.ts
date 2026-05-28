@@ -275,23 +275,20 @@ export async function spawnSubTask(
   // 自己唤自己。kickoff 失败不 fail spawn (群已建好, 失败可手动补发)。
   if (!cacheHit) {
     const urgency = request.urgency ?? 'normal';
-    try {
-      const { sendSubgroupKickoff } = await import('../services/subgroup-kickoff.js');
-      await sendSubgroupKickoff(entry.chatId, {
-        purpose: request.purpose,
-        taskType: request.taskType,
-        urgency,
-        refs: request.relatedRefs,
-        acceptance: request.acceptance,
-      });
-    } catch (err: any) {
-      logger.warn(`[main-bot-playbook] kickoff send failed for ${entry.chatId} (群已建好, 不 fail spawn): ${err?.message ?? err}`);
-    }
-    // P2: 注册 watch, 缇蕾的 watch cron 会周期盯这个群 (按 urgency 频率) 并在
-    // 完成/卡死/需决策时升级 claude 主体。注册失败不 fail spawn。
+    // 2026-05-29 实测发现的 bug 修复: kickoff **不能**在这里发 — spawnSubTask
+    // 跑在 claude daemon, 借不到缇蕾 bot client (Bot not registered: coco app)。
+    // 改成只注册 watch (含 kickoff 资料), 由 coco daemon 的 watch cron 首次处理
+    // 这个 watch 时用缇蕾本地身份发 kickoff。注册失败不 fail spawn。
     try {
       const { registerWatch } = await import('../services/subgroup-watch-store.js');
-      registerWatch({ chatId: entry.chatId, purpose: request.purpose, acceptance: request.acceptance, urgency });
+      registerWatch({
+        chatId: entry.chatId,
+        purpose: request.purpose,
+        acceptance: request.acceptance,
+        urgency,
+        taskType: request.taskType,
+        refs: request.relatedRefs,
+      });
     } catch (err: any) {
       logger.warn(`[main-bot-playbook] registerWatch failed for ${entry.chatId}: ${err?.message ?? err}`);
     }

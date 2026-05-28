@@ -32,6 +32,10 @@ export interface JudgeResult {
 }
 
 export interface WatcherExecutors {
+  /** 2026-05-29: 发 kickoff (缇蕾 @ claude+妹妹分身唤起)。必须由 coco daemon
+   *  执行 (缇蕾 bot client 只在 coco daemon)。watch cron 首次见 kickoffSent=false
+   *  的 watch 时调。 */
+  sendKickoff(watch: SubgroupWatch): Promise<void>;
   /** 读群 + LLM 判 4 态。watcher 传 watch (含 lastSeenMessageId), executor 拉
    *  该群消息、给 coco 判、返结果。 */
   judgeProgress(watch: SubgroupWatch): Promise<JudgeResult>;
@@ -42,6 +46,7 @@ export interface WatcherExecutors {
 export interface WatchTickResult {
   checked: number;       // 本 tick 实际扫了几个 (到期的)
   skippedNotDue: number; // 未到间隔跳过
+  kickoffsSent: number;  // 本 tick 补发的 kickoff 数
   inProgress: number;
   escalatedDone: number;
   escalatedStuck: number;
@@ -61,7 +66,7 @@ export async function runWatchTick(opts: {
 }): Promise<WatchTickResult> {
   const now = opts.now ?? new Date();
   const stats: WatchTickResult = {
-    checked: 0, skippedNotDue: 0, inProgress: 0,
+    checked: 0, skippedNotDue: 0, kickoffsSent: 0, inProgress: 0,
     escalatedDone: 0, escalatedStuck: 0, escalatedDecision: 0, errors: 0,
   };
   const active = listActiveWatches();
@@ -70,6 +75,14 @@ export async function runWatchTick(opts: {
     if (!isDue(watch, now)) { stats.skippedNotDue++; continue; }
     stats.checked++;
     try {
+      // 2026-05-29: kickoff 没发过 → 先发 (缇蕾本地 on coco daemon), 标记,
+      // 本轮不 judge (刚 @ 醒分身, 还没东西判)。下轮才开始 judge 进展。
+      if (!watch.kickoffSent) {
+        await opts.executors.sendKickoff(watch);
+        updateWatch(watch.chatId, { kickoffSent: true, lastCheckedAt: now.toISOString() });
+        stats.kickoffsSent++;
+        continue;
+      }
       const result = await opts.executors.judgeProgress(watch);
 
       // 先按"有没有新消息"维护 noProgress 计数 (粗判, LLM state 是细判)

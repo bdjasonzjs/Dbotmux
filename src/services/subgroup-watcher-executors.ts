@@ -96,6 +96,18 @@ async function cocoJudge(prompt: string): Promise<{ state: ProgressState; reason
 export function makeWatcherExecutors(): WatcherExecutors {
   const tilly = resolveBotIdent('tilly');
   return {
+    async sendKickoff(watch: SubgroupWatch): Promise<void> {
+      // 2026-05-29: kickoff 在 coco daemon 发 (缇蕾 bot client 本地)。
+      const { sendSubgroupKickoff } = await import('./subgroup-kickoff.js');
+      await sendSubgroupKickoff(watch.chatId, {
+        purpose: watch.purpose,
+        taskType: watch.taskType,
+        urgency: watch.urgency,
+        refs: watch.refs,
+        acceptance: watch.acceptance,
+      });
+    },
+
     async judgeProgress(watch: SubgroupWatch): Promise<JudgeResult> {
       // 缇蕾在子群里, 用缇蕾 client 拉群消息
       const msgs = await listChatMessages(tilly.larkAppId, watch.chatId, MSG_FETCH);
