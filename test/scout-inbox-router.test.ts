@@ -34,6 +34,7 @@ function mkItem(opts: {
   priority?: 'high' | 'med' | 'low';
   enqueuedAt: string;
   notifiedAt?: string | null;
+  routerPingedAt?: string | null;
   status?: 'pending' | 'processed' | 'dismissed';
 }): any {
   return {
@@ -50,6 +51,7 @@ function mkItem(opts: {
     },
     status: opts.status ?? 'pending',
     notifiedAt: opts.notifiedAt ?? null,
+    routerPingedAt: opts.routerPingedAt ?? null,
     handledBy: null,
     handledAt: null,
     resolution: null,
@@ -74,10 +76,24 @@ describe('decideAction — pure decision matrix', () => {
     expect(d.reason).toContain('not pending');
   });
 
-  it('blocker 任何年龄 → A_ping (notifiedAt 仍 null)', async () => {
+  it('blocker 任何年龄 → A_ping (routerPingedAt 仍 null)', async () => {
     const { router } = await freshImports();
     const d = router.decideAction(mkItem({
       id: 'x2', category: 'blocker', enqueuedAt: now.toISOString(),
+    }), { now, policy });
+    expect(d.action).toBe('A_ping');
+  });
+
+  // Phase C.1 (2026-05-28) 核心 regression: tilly-publisher 自己 set 的
+  // notifiedAt 不应阻挡 router path A——之前撞同字段导致 router 静默 0 action。
+  it('Phase C.1: tilly-publisher 设了 notifiedAt 但 routerPingedAt 仍 null → A_ping (router 还要 ping)', async () => {
+    const { router } = await freshImports();
+    const d = router.decideAction(mkItem({
+      id: 'tilly_notified_but_router_not',
+      category: 'blocker',
+      enqueuedAt: now.toISOString(),
+      notifiedAt: '2026-05-28T09:00:00Z',     // tilly 发卡片了
+      // routerPingedAt 仍 null
     }), { now, policy });
     expect(d.action).toBe('A_ping');
   });
@@ -90,11 +106,11 @@ describe('decideAction — pure decision matrix', () => {
     expect(d.action).toBe('A_ping');
   });
 
-  it('blocker 已 notified → wait (不重 ping)', async () => {
+  it('blocker 已被 router ping → wait (不重 ping)', async () => {
     const { router } = await freshImports();
     const d = router.decideAction(mkItem({
       id: 'x4', category: 'blocker', enqueuedAt: now.toISOString(),
-      notifiedAt: '2026-05-27T09:00:00Z',
+      routerPingedAt: '2026-05-27T09:00:00Z',
     }), { now, policy });
     expect(d.action).toBe('wait');
     expect(d.reason).toContain('awaiting');
@@ -172,7 +188,7 @@ describe('runRouterTick — end-to-end with mocked executors', () => {
     const finalInbox = store.readInbox();
     expect(finalInbox.pending).toHaveLength(1);            // blocker 仍 pending (只 notify, 没 process)
     expect(finalInbox.pending[0].id).toBe('b1');
-    expect((finalInbox.pending[0] as any).notifiedAt).not.toBeNull();
+    expect((finalInbox.pending[0] as any).routerPingedAt).not.toBeNull();
     expect(finalInbox.processed).toHaveLength(2);
     const processedIds = finalInbox.processed.map(i => i.id).sort();
     expect(processedIds).toEqual(['m1', 'o1']);
@@ -195,8 +211,8 @@ describe('runRouterTick — end-to-end with mocked executors', () => {
     expect(stats.quotaSkipsA).toBe(3);
     // 留 pending 不重 notify
     const finalInbox = store.readInbox();
-    const notified = finalInbox.pending.filter(i => (i as any).notifiedAt !== null);
-    expect(notified).toHaveLength(2);
+    const pinged = finalInbox.pending.filter(i => (i as any).routerPingedAt != null);
+    expect(pinged).toHaveLength(2);
   });
 
   it('quota 跨 tick 持久化: 第 1 tick 用 2/2, 第 2 tick 不能再 ping', async () => {
@@ -257,7 +273,7 @@ describe('runRouterTick — end-to-end with mocked executors', () => {
     expect(store.readInbox().pending).toHaveLength(1);
   });
 
-  it('pingJason throws → 不 mark notifiedAt, 不消耗 quota', async () => {
+  it('pingJason throws → 不 mark routerPingedAt, 不消耗 quota', async () => {
     const { router, store } = await freshImports();
     store.writeInbox({
       pending: [mkItem({ id: 'b1', category: 'blocker', enqueuedAt: now.toISOString() })],
@@ -270,6 +286,6 @@ describe('runRouterTick — end-to-end with mocked executors', () => {
     expect(stats.errors).toBeGreaterThanOrEqual(1);
     expect(stats.routedA).toBe(0);
     expect(router.readQuota().pingsUsed).toBe(0);
-    expect((store.readInbox().pending[0] as any).notifiedAt).toBeNull();
+    expect((store.readInbox().pending[0] as any).routerPingedAt ?? null).toBeNull();
   });
 });

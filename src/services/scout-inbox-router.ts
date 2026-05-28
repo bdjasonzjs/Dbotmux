@@ -25,7 +25,7 @@ import {
   readInbox,
   writeInbox,
   dispositionTillyHigh,
-  markTillyHighNotified,
+  markTillyHighRouterPinged,
   type ScoutInboxItem,
   type ScoutTillyHighItem,
 } from './main-bot-digest-store.js';
@@ -120,8 +120,10 @@ export function decideAction(
   }
 
   // 路径 A: blocker 永远要 ping (任何 age); high-prio todo 也 ping
-  // notifiedAt 已 set 的不重复 ping
-  if (item.notifiedAt === null) {
+  // Phase C.1 (2026-05-28): gate 从 notifiedAt 改 routerPingedAt——前者
+  // 是 tilly-publisher 发卡片时间, 跟 router path A 无关; 之前撞同字段导致
+  // router 静默 0 action (tilly 先 set notifiedAt → router 看「已 ping」)。
+  if (!item.routerPingedAt) {
     if (item.category === 'blocker') {
       return { itemId: item.id, action: 'A_ping', reason: 'blocker 任何年龄都 ping' };
     }
@@ -200,9 +202,11 @@ export async function runRouterTick(opts: {
   if (aItems.length > 0) {
     try {
       await opts.executors.pingJason(aItems);
-      // ping 成功后, 每条 mark notifiedAt + quota +1 (按 item 数而非按消息数, 防一次 batch 偷过 quota)
+      // ping 成功后, 每条 mark routerPingedAt + quota +1 (按 item 数而非按消息数, 防一次 batch 偷过 quota)
+      // Phase C.1: 用 routerPingedAt 不用 notifiedAt——后者是 tilly-publisher 发
+      // 卡片用的, 跟 router path A 无关。
       for (const it of aItems) {
-        markTillyHighNotified(it.id);
+        markTillyHighRouterPinged(it.id);
         quota = { ...quota, pingsUsed: quota.pingsUsed + 1 };
       }
       writeQuota(quota);

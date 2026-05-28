@@ -93,8 +93,15 @@ export interface ScoutTillyHighItem {
     priority?: 'high' | 'med' | 'low';
   };
   status: 'pending' | 'processed' | 'dismissed';
-  /** 通知发送时间戳；null = 还没发（throttle 或失败），后续 tick 可补发 */
+  /** tilly-publisher 把「N 条 high-prio」卡片发到主话题的时间戳。
+   *  null = 还没发（throttle/失败）, 下个 tick 补发。**不**代表 scout-router
+   *  path A 已 ping 松松——那是 routerPingedAt。 */
   notifiedAt: string | null;
+  /** Phase C.1 (2026-05-28): scout-router path A 真正 ping 松松的时间戳.
+   *  跟 tilly-publisher 的 notifiedAt 解耦——之前撞同字段导致 router 静默
+   *  0 action (tilly 先 set notifiedAt → router 看「已 notified」 → wait)。
+   *  null = router 还没决定 ping 这条 (新逻辑下应该不久内被 path A 处理). */
+  routerPingedAt?: string | null;
   /** 处理者标识（克劳德 handler session / 松松 manual dismiss / etc） */
   handledBy: string | null;
   /** 处理时间 */
@@ -312,6 +319,18 @@ export function markTillyHighNotified(itemId: string): ScoutTillyHighItem | null
   const item = inbox.pending.find(i => i.id === itemId && i.type === 'tilly_digest_high') as ScoutTillyHighItem | undefined;
   if (!item) return null;
   item.notifiedAt = new Date().toISOString();
+  writeInbox(inbox);
+  return item;
+}
+
+/** Phase C.1 (2026-05-28): scout-router path A 真 ping 松松后 mark.
+ *  跟 notifiedAt 解耦, 不串。Router 重启/重 tick 看 routerPingedAt 判断
+ *  「我 ping 过了吗」, 不看 tilly-publisher 的 notifiedAt。 */
+export function markTillyHighRouterPinged(itemId: string): ScoutTillyHighItem | null {
+  const inbox = readInbox();
+  const item = inbox.pending.find(i => i.id === itemId && i.type === 'tilly_digest_high') as ScoutTillyHighItem | undefined;
+  if (!item) return null;
+  item.routerPingedAt = new Date().toISOString();
   writeInbox(inbox);
   return item;
 }
