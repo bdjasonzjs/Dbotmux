@@ -3278,6 +3278,11 @@ switch (command) {
     await cmdSubtaskCreate(process.argv.slice(3));
     break;
   }
+  case 'subtask-close': {
+    const { cmdSubtaskClose } = await import('./cli/subtask-close.js');
+    await cmdSubtaskClose(process.argv.slice(3));
+    break;
+  }
   case 'progress-report': {
     const { cmdProgressReport } = await import('./cli/progress-report.js');
     await cmdProgressReport(process.argv.slice(3));

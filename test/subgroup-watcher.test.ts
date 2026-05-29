@@ -72,6 +72,86 @@ describe('subgroup-watch-store', () => {
   });
 });
 
+// 主体感知"在跟子群" (2026-05-29 松松)
+describe('subgroup-watch-store aware list / close / prune', () => {
+  const now = new Date('2026-05-29T10:00:00Z');
+
+  it('listAwareWatches: watching + escalated_stuck + escalated_decision 都算在跟; done/closed 不算', async () => {
+    const { store } = await fresh();
+    store.registerWatch({ chatId: 'oc_w', purpose: 'watching', urgency: 'normal', ...REG });
+    store.registerWatch({ chatId: 'oc_s', purpose: 'stuck', urgency: 'urgent', ...REG });
+    store.registerWatch({ chatId: 'oc_d', purpose: 'decision', urgency: 'normal', ...REG });
+    store.registerWatch({ chatId: 'oc_done', purpose: 'done', urgency: 'low', ...REG });
+    store.stopWatch('oc_s', 'escalated_stuck', 'x');
+    store.stopWatch('oc_d', 'escalated_decision', 'x');
+    store.stopWatch('oc_done', 'escalated_done', 'x');
+    const aware = store.listAwareWatches().map((w: any) => w.chatId).sort();
+    expect(aware).toEqual(['oc_d', 'oc_s', 'oc_w']);   // done 不在
+  });
+
+  it('closeWatch → 移出在跟列表 + status=closed + 审计 by', async () => {
+    const { store } = await fresh();
+    store.registerWatch({ chatId: 'oc_a', purpose: 'p', urgency: 'normal', ...REG });
+    store.stopWatch('oc_a', 'escalated_stuck', 'x');
+    expect(store.listAwareWatches()).toHaveLength(1);   // stuck 还在跟
+    store.closeWatch('oc_a', 'jason', '搞定了');
+    expect(store.listAwareWatches()).toHaveLength(0);   // close 后移出
+    expect(store.getWatch('oc_a')?.status).toBe('closed');
+    expect(store.getWatch('oc_a')?.escalationReason).toContain('closed by jason');
+  });
+
+  it('pruneStale: escalated_done 超 24h 被清; 24h 内保留', async () => {
+    const { store } = await fresh();
+    store.registerWatch({ chatId: 'oc_old', purpose: 'old', urgency: 'normal', ...REG });
+    store.registerWatch({ chatId: 'oc_fresh', purpose: 'fresh', urgency: 'normal', ...REG });
+    store.stopWatch('oc_old', 'escalated_done', 'x');
+    store.updateWatch('oc_old', { escalatedAt: '2026-05-27T00:00:00Z', lastCheckedAt: '2026-05-27T00:00:00Z' });  // 2天前
+    store.stopWatch('oc_fresh', 'escalated_done', 'x');
+    store.updateWatch('oc_fresh', { escalatedAt: now.toISOString(), lastCheckedAt: now.toISOString() });
+    const removed = store.pruneStale(now);
+    expect(removed).toBe(1);
+    expect(store.getWatch('oc_old')).toBeNull();        // 老 done 清掉
+    expect(store.getWatch('oc_fresh')).not.toBeNull();  // 新 done 保留
+  });
+
+  it('pruneStale: 任何状态超 7d 没动 → 清 (死群兜底)', async () => {
+    const { store } = await fresh();
+    store.registerWatch({ chatId: 'oc_dead', purpose: 'dead', urgency: 'normal', ...REG });
+    store.updateWatch('oc_dead', { lastCheckedAt: '2026-05-20T00:00:00Z' });  // 9天前, 仍 watching
+    expect(store.pruneStale(now)).toBe(1);
+    expect(store.getWatch('oc_dead')).toBeNull();
+  });
+
+  it('buildActiveSubtasksBlock: 空 → 提示无在跟', async () => {
+    const { store } = await fresh();
+    expect(store.buildActiveSubtasksBlock({ now })).toContain('当前没有分身在跟');
+  });
+
+  it('buildActiveSubtasksBlock: stuck/decision 排在 watching 前 + 含 chatId + 计数', async () => {
+    const { store } = await fresh();
+    store.registerWatch({ chatId: 'oc_w', purpose: '进行中任务', urgency: 'normal', ...REG });
+    store.updateWatch('oc_w', { lastCheckedAt: now.toISOString() });
+    store.registerWatch({ chatId: 'oc_s', purpose: '卡住任务', urgency: 'urgent', ...REG });
+    store.stopWatch('oc_s', 'escalated_stuck', 'x');
+    store.updateWatch('oc_s', { lastCheckedAt: now.toISOString() });
+    const block = store.buildActiveSubtasksBlock({ now });
+    expect(block).toContain('共 2 个在跟');
+    expect(block).toContain('oc_s');
+    expect(block).toContain('oc_w');
+    expect(block).toContain('卡住任务');
+    // stuck 排在 watching 前
+    expect(block.indexOf('卡住任务')).toBeLessThan(block.indexOf('进行中任务'));
+  });
+
+  it('buildActiveSubtasksBlock: 超 cap 显示 +N', async () => {
+    const { store } = await fresh();
+    for (let i = 0; i < 12; i++) store.registerWatch({ chatId: `oc_${i}`, purpose: `t${i}`, urgency: 'normal', ...REG });
+    const block = store.buildActiveSubtasksBlock({ now, cap: 10 });
+    expect(block).toContain('共 12 个在跟');
+    expect(block).toContain('另 2 个');
+  });
+});
+
 describe('runWatchTick', () => {
   // judge 测试前把 kickoff 标已发, 否则首 tick 只发 kickoff 不 judge
   function regJudgeReady(store: any, chatId = 'oc_a', urgency = 'normal') {

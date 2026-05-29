@@ -20,9 +20,10 @@ import type { SubgroupUrgency } from './subgroup-kickoff.js';
 
 export type WatchStatus =
   | 'watching'           // 正常盯着
-  | 'escalated_done'     // 已升级"完成"
-  | 'escalated_stuck'    // 已升级"卡死"
-  | 'escalated_decision' // 已升级"需松松决策"
+  | 'escalated_done'     // 已升级"完成" (24h 后 prune)
+  | 'escalated_stuck'    // 已升级"卡死" (仍算在跟, 等处理)
+  | 'escalated_decision' // 已升级"需松松决策" (仍算在跟, 等拍板)
+  | 'closed'             // 真正关闭 (主体/松松 确认彻底完事) — 移出在跟列表
   | 'stopped';           // 人工停止
 
 export interface SubgroupWatch {
@@ -144,6 +145,95 @@ export function updateWatch(chatId: string, patch: Partial<Omit<SubgroupWatch, '
 /** 人工/完成后停止盯 (status 不为 watching 即不再被 cron 扫)。 */
 export function stopWatch(chatId: string, status: Exclude<WatchStatus, 'watching'>, reason: string): SubgroupWatch | null {
   return updateWatch(chatId, { status, escalatedAt: new Date().toISOString(), escalationReason: reason });
+}
+
+// ─── 主体感知"在跟任务" (2026-05-29 松松) ─────────────────────────────
+
+/** 主体应该"惦记着"的在跟任务: 正在跟 (watching) + 已升级但没真关闭
+ *  (stuck / 需决策)。**关键**: escalated_stuck / escalated_decision 也算在跟
+ *  —— 升级 ≠ 解决, 这些恰是主体最该看的。escalated_done / closed / stopped
+ *  不在内 (完成的不算"在跟")。 */
+export function listAwareWatches(): SubgroupWatch[] {
+  const aware: WatchStatus[] = ['watching', 'escalated_stuck', 'escalated_decision'];
+  return read().watches.filter(w => aware.includes(w.status));
+}
+
+/** 真正关闭一个子群任务 (主体确认完事 / 松松说关掉) → 移出在跟列表, 缇蕾也
+ *  不再盯。by = 'claude' | 'jason' | 其他标识, 进 escalationReason 审计。 */
+export function closeWatch(chatId: string, by: string, note?: string): SubgroupWatch | null {
+  return updateWatch(chatId, {
+    status: 'closed',
+    escalatedAt: new Date().toISOString(),
+    escalationReason: `closed by ${by}${note ? ': ' + note : ''}`,
+  });
+}
+
+/** 自动清理 (cron 调): escalated_done 超 24h prune; 任何 watch 超 7d 没动
+ *  (lastCheckedAt / createdAt) 也 prune, 防列表堆垃圾 / 死群常驻。
+ *  返清理掉的数量。 */
+export function pruneStale(now: Date = new Date()): number {
+  const DONE_TTL_MS = 24 * 60 * 60 * 1000;
+  const DEAD_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+  const s = read();
+  const before = s.watches.length;
+  s.watches = s.watches.filter(w => {
+    const lastTouch = new Date(w.lastCheckedAt ?? w.escalatedAt ?? w.createdAt).getTime();
+    const age = now.getTime() - lastTouch;
+    // done 超 24h → 丢
+    if (w.status === 'escalated_done' && age > DONE_TTL_MS) return false;
+    // 任何状态超 7d 没动 → 丢 (死群兜底)
+    if (age > DEAD_TTL_MS) return false;
+    return true;
+  });
+  const removed = before - s.watches.length;
+  if (removed > 0) {
+    write(s);
+    logger.info(`[subgroup-watch-store] pruned ${removed} stale watch(es)`);
+  }
+  return removed;
+}
+
+const STATUS_ICON: Record<WatchStatus, string> = {
+  watching: '🟢',
+  escalated_stuck: '🚧',
+  escalated_decision: '🙋',
+  escalated_done: '✅',
+  closed: '☑️',
+  stopped: '⏹',
+};
+
+const URGENCY_ICON: Record<SubgroupUrgency, string> = { urgent: '🔴', normal: '🟡', low: '⚪' };
+
+/** 渲染主体上下文里的「当前在跟任务」块。按 卡住/待决策 优先, cap N。
+ *  age 用 lastCheckedAt (多久没进展) 给主体一个新鲜度感。 */
+export function buildActiveSubtasksBlock(opts?: { now?: Date; cap?: number }): string {
+  const now = opts?.now ?? new Date();
+  const cap = opts?.cap ?? 10;
+  const aware = listAwareWatches();
+  if (aware.length === 0) {
+    return '<active_subtasks>\n(当前没有分身在跟的子群任务)\n</active_subtasks>';
+  }
+  // 排序: stuck/decision (等处理的) 优先, 再按 urgency, 再按最久没动
+  const rank = (w: SubgroupWatch) =>
+    (w.status === 'escalated_stuck' || w.status === 'escalated_decision' ? 0 : 1) * 100
+    + ({ urgent: 0, normal: 1, low: 2 }[w.urgency]);
+  const sorted = aware.slice().sort((a, b) => {
+    const r = rank(a) - rank(b);
+    if (r !== 0) return r;
+    const aT = new Date(a.lastCheckedAt ?? a.createdAt).getTime();
+    const bT = new Date(b.lastCheckedAt ?? b.createdAt).getTime();
+    return aT - bT;   // 久没动的在前
+  });
+  const shown = sorted.slice(0, cap);
+  const lines = shown.map(w => {
+    const since = w.lastCheckedAt ? Math.round((now.getTime() - new Date(w.lastCheckedAt).getTime()) / 60000) : null;
+    const ageStr = since == null ? '还没扫过' : since < 60 ? `${since}min前看过` : `${Math.round(since / 60)}h前看过`;
+    const purpose = (w.purpose ?? '').replace(/[\x00-\x1F\x7F<>]/g, ' ').slice(0, 60);
+    return `${STATUS_ICON[w.status]} ${URGENCY_ICON[w.urgency]} ${purpose} — ${ageStr} [${w.chatId}]`;
+  });
+  const more = sorted.length > cap ? `\n... 另 ${sorted.length - cap} 个` : '';
+  const hint = '\n(🚧=卡住等处理 🙋=等松松拍板 🟢=进行中; 某个确认彻底完事了用 `botmux subtask-close --chat-id <id>` 关掉)';
+  return `<active_subtasks> (共 ${aware.length} 个在跟)\n${lines.join('\n')}${more}${hint}\n</active_subtasks>`;
 }
 
 /** 测试用。 */

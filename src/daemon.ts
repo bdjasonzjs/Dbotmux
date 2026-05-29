@@ -1367,6 +1367,24 @@ ipcRoute('POST', '/api/spawn-subtask', async (req, res) => {
   }
 });
 
+// 2026-05-29: 关闭一个在跟的子群任务 (主体确认完事 / 松松说关) → closeWatch
+// → 移出主体在跟列表。低风险 (只改 watch 状态), 不走 authzCheck。
+ipcRoute('POST', '/api/subtask-close', async (req, res) => {
+  let body: { chatId?: string; by?: string; note?: string };
+  try { body = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (!body.chatId) return jsonRes(res, 400, { ok: false, error: 'missing chatId' });
+  try {
+    const { closeWatch, getWatch } = await import('./services/subgroup-watch-store.js');
+    const existing = getWatch(body.chatId);
+    if (!existing) return jsonRes(res, 404, { ok: false, error: 'watch not found for chatId' });
+    const w = closeWatch(body.chatId, body.by ?? 'claude', body.note);
+    return jsonRes(res, 200, { ok: true, chatId: body.chatId, status: w?.status });
+  } catch (err: any) {
+    return jsonRes(res, 500, { ok: false, error: String(err?.message ?? err) });
+  }
+});
+
 ipcRoute(
   'POST',
   '/api/workflows/runs/:runId/attempts/:activityId/:attemptId/resume',
@@ -2871,6 +2889,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       try {
         const { runWatchTick } = await import('./services/subgroup-watcher.js');
         const { makeWatcherExecutors } = await import('./services/subgroup-watcher-executors.js');
+        // 2026-05-29: 顺手清理 stale watch (done>24h / 死群>7d), 防 active
+        // 列表堆垃圾。
+        const { pruneStale } = await import('./services/subgroup-watch-store.js');
+        pruneStale();
         const stats = await runWatchTick({ executors: makeWatcherExecutors() });
         if (stats.checked + stats.errors > 0) {
           logger.info(`[subgroup-watch] tick: checked=${stats.checked} inProgress=${stats.inProgress} done=${stats.escalatedDone} stuck=${stats.escalatedStuck} decision=${stats.escalatedDecision} err=${stats.errors} (skipped ${stats.skippedNotDue} not-due)`);

@@ -133,11 +133,29 @@ export async function buildAmbientForSpawn(
   triggerMessageId?: string,
   triggerCreateTime?: string,
 ): Promise<string> {
-  if (chatType !== 'group') return '';
-  if (!chatId) return '';
-  if (!isChatModeGroupEnabled(chatId)) return '';
-  return buildRecentChatTimelineBlock(larkAppId, chatId, {
-    excludeMessageId: triggerMessageId,
-    beforeCreateTime: triggerCreateTime,
-  });
+  const parts: string[] = [];
+
+  // 1. 群聊模式 timeline (group-only + chatMode gate)
+  if (chatType === 'group' && chatId && isChatModeGroupEnabled(chatId)) {
+    const tl = await buildRecentChatTimelineBlock(larkAppId, chatId, {
+      excludeMessageId: triggerMessageId,
+      beforeCreateTime: triggerCreateTime,
+    });
+    if (tl) parts.push(tl);
+  }
+
+  // 2. 主体感知"在跟子群" (2026-05-29 松松): 只在主话题注入 —— 主话题是主体
+  //    的指挥台, 让它每次醒来都知道现在有哪几摊分身在跟 (含卡住/待决策的)。
+  //    不受 chatMode gate 影响 (这是主体协调能力, 不是群聊上下文)。
+  if (chatId) {
+    try {
+      const { getMainTopicChatId } = await import('./main-topic-config.js');
+      if (chatId === getMainTopicChatId()) {
+        const { buildActiveSubtasksBlock } = await import('./subgroup-watch-store.js');
+        parts.push(buildActiveSubtasksBlock());
+      }
+    } catch { /* 注入失败不阻塞 spawn */ }
+  }
+
+  return parts.join('\n\n');
 }
