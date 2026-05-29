@@ -554,7 +554,7 @@ function extractCardContent(rawContent: string, numberer?: ImgNumberer): string 
 // ─── Complete card resolution: union of both Lark representations ──────────
 
 /** Sentinel key carrying pre-merged card text through extractCardContent. */
-const RESOLVED_TEXT_KEY = '__botmux_card_text__';
+export const RESOLVED_TEXT_KEY = '__botmux_card_text__';
 
 /**
  * Marker for sub-cards Lark renders only client-side (collapsible panels,

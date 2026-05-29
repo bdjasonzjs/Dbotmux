@@ -11,7 +11,7 @@ import { config } from '../../config.js';
 import { getChatInfo, getChatMode, listChatBotMembers, replyMessage, sendUserMessage } from './client.js';
 import { logger } from '../../utils/logger.js';
 import { parseForceTopicInvocation } from '../../core/command-handler.js';
-import { stripLeadingMentions } from './message-parser.js';
+import { stripLeadingMentions, resolveNonsupportMessage, RESOLVED_TEXT_KEY } from './message-parser.js';
 import { recordObservedBots } from '../../services/observed-bots-store.js';
 import { BOTMUX_REQUIRED_SCOPES, buildScopeDeepLink } from '../../setup/verify-permissions.js';
 import { tryHandleGrantCommand } from './grant-command.js';
@@ -476,6 +476,81 @@ export function isBotMentioned(larkAppId: string, message: any, _senderOpenId: s
   return false;
 }
 
+// ─── 急急如律令 唤醒 ───────────────────────────────────────────────────────
+//
+// base 以松松身份转发的消息是纯文本，没法带真正的 Lark @ 元素；bot 自己 @
+// 自己又会被自循环过滤（见 wake-subgroup-clone）。约定：消息以
+// `急急如律令：【名字/名字/…】<正文>` 开头时，名单里命中自己 botName 的 daemon
+// 把它当成"被 @ 了"一样响应，喂给 CLI 的正文 = 剥掉前缀后的 <正文>。
+// push 推全量群消息（已验证：chat-topology messages24h 由 push handler 在 @
+// 判定之前 bump、无轮询调用方）是这套的基石——纯文本消息也会到达每个 daemon。
+
+/** botName → 可接受的触发别名（小写）。匹配时 botName 自身也算。 */
+const SUMMON_ALIASES: Record<string, string[]> = {
+  克劳德: ['claude'],
+  缇蕾: ['coco', '小宝'],
+  蔻黛克斯: ['寇黛克斯', 'codex'],
+};
+
+/** 解析 `急急如律令：【A/B/…】正文`。无匹配返 null。
+ *  兼容全/半角冒号(：:)、全角【】、分隔符 / ／ 、 , ， 及空白。 */
+export function parseUrgentSummon(
+  text: string | null | undefined,
+): { names: string[]; body: string } | null {
+  if (!text) return null;
+  const m = /^\s*急急如律令\s*[：:]\s*【\s*([^】]+?)\s*】\s*([\s\S]*)$/.exec(text);
+  if (!m) return null;
+  const names = m[1].split(/[/／、,，\s]+/).map(s => s.trim()).filter(Boolean);
+  if (names.length === 0) return null;
+  return { names, body: m[2].trim() };
+}
+
+/** 触发名单里的某个名字是否指向 botName（含别名表，大小写不敏感）。 */
+function summonNameMatchesBot(name: string, botName: string): boolean {
+  const n = name.toLowerCase();
+  if (n === botName.toLowerCase()) return true;
+  const aliases = SUMMON_ALIASES[botName];
+  return !!aliases && aliases.includes(n);
+}
+
+export const URGENT_SUMMON_TAG = '急急如律令';
+
+/** 从一条消息里抽出"可能含 summon 指令"的文本。覆盖三种形态：
+ *  - text / post：复用 extractMessageTextForRouting
+ *  - interactive 卡片（base 转发实测以卡片发，不是纯文本）：原始 content.title
+ *    （WS 偶尔直给），或已被 resolveNonsupportMessage 解析后写入 RESOLVED_TEXT_KEY
+ *    的完整文本。 */
+function extractSummonText(message: any): string | null {
+  const t = extractMessageTextForRouting(message);
+  if (t) return t;
+  try {
+    const obj = JSON.parse(message?.content ?? '{}');
+    if (typeof obj?.[RESOLVED_TEXT_KEY] === 'string') return obj[RESOLVED_TEXT_KEY];
+    if (typeof obj?.title === 'string') return obj.title;
+  } catch { /* malformed — skip */ }
+  return null;
+}
+
+/** 这条消息是不是一个"急急如律令"且点名了本 daemon 的 bot（同步判定，不含卡片
+ *  REST 解析——interactive 场景由调用方先 resolveNonsupportMessage 再调本函数）。
+ *  命中返 body（剥前缀后的正文），否则 null。 */
+export function urgentSummonBodyForBot(larkAppId: string, message: any): string | null {
+  const botName = getBot(larkAppId).botName;
+  if (!botName) return null;
+  const parsed = parseUrgentSummon(extractSummonText(message));
+  if (!parsed) return null;
+  if (!parsed.names.some(n => summonNameMatchesBot(n, botName))) return null;
+  return parsed.body;
+}
+
+/** 把消息就地规整成干净 text 消息（content={text} + message_type='text'）。
+ *  既剥掉 summon 前缀，又把 interactive 卡片转成 text——下游 resolveNonsupportMessage
+ *  不再 resolve、parseEventMessage 直接拿到正文。 */
+export function normalizeToTextMessage(message: any, body: string): void {
+  message.content = JSON.stringify({ text: body });
+  message.message_type = 'text';
+}
+
 // ─── Permission gates ────────────────────────────────────────────────────
 //
 // Two gates:
@@ -872,6 +947,46 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         // 否则会被当成 prompt 喂给 CLI 会话。
         if (await tryHandleGrantCommand(larkAppId, message, senderOpenId)) {
           return;
+        }
+
+        // 急急如律令 唤醒：纯文本/卡片(无真 @)以约定格式点名本 bot → 当成被 @ 一样
+        // 路由响应，绕过多 bot 群的 @ 闸门。push 推全量群消息使这条事件能到达本 daemon。
+        // base 转发实测以 interactive 卡片发，真实文本要先 resolve——便宜预筛：原始
+        // content 串里没有 "急急如律令" 就跳过，避免给每条卡片白调一次 REST。
+        // 安全闸：仍要求发送者 canTalk（松松是 owner 会过；陌生人不过）。
+        {
+          let summonBody = urgentSummonBodyForBot(larkAppId, message);
+          if (
+            summonBody === null &&
+            message.message_type === 'interactive' &&
+            typeof message.content === 'string' &&
+            message.content.includes(URGENT_SUMMON_TAG)
+          ) {
+            try { await resolveNonsupportMessage(data, larkAppId); } catch (err) {
+              logger.debug(`[${larkAppId}] 急急如律令 card resolve failed: ${err}`);
+            }
+            summonBody = urgentSummonBodyForBot(larkAppId, message);
+          }
+          if (summonBody !== null) {
+            if (!isAllowed) {
+              logger.debug(`[${larkAppId}] 急急如律令 from non-allowed sender ${senderOpenId} — ignored`);
+              return;
+            }
+            // 剥前缀 + 把卡片规整成 text，让 CLI 拿到干净指令。
+            normalizeToTextMessage(message, summonBody);
+            const summonRouting = await decideRouting(larkAppId, message);
+            const ownsSummonSession = handlers.isSessionOwner?.(summonRouting.anchor, larkAppId) ?? false;
+            logger.info(
+              `[${larkAppId}] 急急如律令 summon matched (scope=${summonRouting.scope}, ownsSession=${ownsSummonSession}): ` +
+              `routing msg=${messageId.substring(0, 12)} chat=${chatId.substring(0, 12)}`,
+            );
+            const summonCtx: RoutingContext = { chatId, messageId, chatType, larkAppId, ...summonRouting };
+            (ownsSummonSession
+              ? handlers.handleThreadReply(data, summonCtx)
+              : handlers.handleNewTopic(data, summonCtx)
+            ).catch(err => logger.error(`Error handling 急急如律令 summon: ${err}`));
+            return;
+          }
         }
 
         logger.debug('Received message:', message);

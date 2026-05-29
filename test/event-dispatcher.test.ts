@@ -89,7 +89,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 
 // ─── Imports (must be after mocks) ──────────────────────────────────────────
 
-import { isBotMentioned, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
+import { isBotMentioned, startLarkEventDispatcher, writeBotInfoFile, parseUrgentSummon, urgentSummonBodyForBot, normalizeToTextMessage, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -1620,5 +1620,203 @@ describe('writeBotInfoFile — multi-daemon merge', () => {
     const written = JSON.parse(mockWriteFileSync.mock.calls[0][1]);
     expect(written).toHaveLength(1);
     expect(written[0].larkAppId).toBe(MY_APP_ID);
+  });
+});
+
+// ─── 急急如律令 唤醒 ─────────────────────────────────────────────────────────
+
+describe('parseUrgentSummon', () => {
+  it('parses single name + body (half-width colon)', () => {
+    expect(parseUrgentSummon('急急如律令:【克劳德】修一下单测')).toEqual({
+      names: ['克劳德'], body: '修一下单测',
+    });
+  });
+
+  it('parses full-width colon + full-width brackets', () => {
+    expect(parseUrgentSummon('急急如律令：【缇蕾】盯一下群')).toEqual({
+      names: ['缇蕾'], body: '盯一下群',
+    });
+  });
+
+  it('splits multiple names on / ／ 、 , ， and whitespace', () => {
+    expect(parseUrgentSummon('急急如律令：【克劳德/缇蕾、蔻黛克斯 codex】干活')!.names)
+      .toEqual(['克劳德', '缇蕾', '蔻黛克斯', 'codex']);
+  });
+
+  it('keeps multi-line body intact', () => {
+    expect(parseUrgentSummon('急急如律令：【克劳德】第一行\n第二行')!.body)
+      .toBe('第一行\n第二行');
+  });
+
+  it('tolerates leading whitespace + spaces inside brackets', () => {
+    expect(parseUrgentSummon('  急急如律令： 【 克劳德 】 hi ')).toEqual({
+      names: ['克劳德'], body: 'hi',
+    });
+  });
+
+  it('returns null for non-summon text', () => {
+    expect(parseUrgentSummon('克劳德你好')).toBeNull();
+    expect(parseUrgentSummon('急急如律令 克劳德 做X')).toBeNull(); // 缺【】
+    expect(parseUrgentSummon('')).toBeNull();
+    expect(parseUrgentSummon(null)).toBeNull();
+    expect(parseUrgentSummon(undefined)).toBeNull();
+  });
+
+  it('returns null when brackets are empty', () => {
+    expect(parseUrgentSummon('急急如律令：【】做X')).toBeNull();
+  });
+
+  it('allows empty body', () => {
+    expect(parseUrgentSummon('急急如律令：【克劳德】')).toEqual({ names: ['克劳德'], body: '' });
+  });
+});
+
+describe('urgentSummonBodyForBot', () => {
+  const APP = 'app-claude';
+  function msg(text: string) {
+    return { content: JSON.stringify({ text }) };
+  }
+  function setBotName(botName: string | null) {
+    mockGetBot.mockReturnValue({ botName, config: { larkAppId: APP } });
+  }
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  it('returns body when this bot name is in the list', () => {
+    setBotName('克劳德');
+    expect(urgentSummonBodyForBot(APP, msg('急急如律令：【克劳德】做X'))).toBe('做X');
+  });
+
+  it('matches via alias (codex → 蔻黛克斯), case-insensitive', () => {
+    setBotName('蔻黛克斯');
+    expect(urgentSummonBodyForBot(APP, msg('急急如律令：【CODEX】review'))).toBe('review');
+  });
+
+  it('matches coco / 小宝 alias for 缇蕾', () => {
+    setBotName('缇蕾');
+    expect(urgentSummonBodyForBot(APP, msg('急急如律令：【小宝】盯群'))).toBe('盯群');
+    expect(urgentSummonBodyForBot(APP, msg('急急如律令：【coco】盯群'))).toBe('盯群');
+  });
+
+  it('picks self out of a multi-name list', () => {
+    setBotName('缇蕾');
+    expect(urgentSummonBodyForBot(APP, msg('急急如律令：【克劳德/缇蕾】一起上'))).toBe('一起上');
+  });
+
+  it('returns null when this bot is not named', () => {
+    setBotName('克劳德');
+    expect(urgentSummonBodyForBot(APP, msg('急急如律令：【缇蕾】盯群'))).toBeNull();
+  });
+
+  it('returns null for non-summon message', () => {
+    setBotName('克劳德');
+    expect(urgentSummonBodyForBot(APP, msg('克劳德帮我看下'))).toBeNull();
+  });
+
+  it('returns null when botName unknown (startup race)', () => {
+    setBotName(null);
+    expect(urgentSummonBodyForBot(APP, msg('急急如律令：【克劳德】做X'))).toBeNull();
+  });
+
+  it('reads a resolved interactive card (RESOLVED_TEXT_KEY)', () => {
+    setBotName('克劳德');
+    // resolveNonsupportMessage 解析卡片后把完整文本写进 __botmux_card_text__
+    const card = { content: JSON.stringify({ __botmux_card_text__: '急急如律令：【克劳德】卡片正文' }) };
+    expect(urgentSummonBodyForBot(APP, card)).toBe('卡片正文');
+  });
+
+  it('reads a raw interactive card title (base-relay shape)', () => {
+    setBotName('克劳德');
+    const card = { content: JSON.stringify({ title: '急急如律令：【克劳德】标题正文', elements: [] }) };
+    expect(urgentSummonBodyForBot(APP, card)).toBe('标题正文');
+  });
+});
+
+describe('normalizeToTextMessage', () => {
+  it('rewrites a text-shape message to the clean body', () => {
+    const m: any = { content: JSON.stringify({ text: '急急如律令：【克劳德】做X' }), message_type: 'text' };
+    normalizeToTextMessage(m, '做X');
+    expect(JSON.parse(m.content).text).toBe('做X');
+    expect(m.message_type).toBe('text');
+  });
+
+  it('converts an interactive card to a clean text message', () => {
+    const m: any = {
+      content: JSON.stringify({ title: '急急如律令：【克劳德】做X', elements: [] }),
+      message_type: 'interactive',
+    };
+    normalizeToTextMessage(m, '做X');
+    expect(JSON.parse(m.content)).toEqual({ text: '做X' });
+    expect(m.message_type).toBe('text'); // 转成 text，下游不再 resolve 卡片
+  });
+});
+
+describe('im.message.receive_v1 — 急急如律令 summon routing', () => {
+  let handlers: ReturnType<typeof makeHandlers>;
+  const SUMMON_USER = 'ou_jason';
+
+  function setupClaudeBot(opts?: { allowed?: string[] }) {
+    mockGetBot.mockReturnValue({
+      config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' },
+      botOpenId: MY_OPEN_ID,
+      botName: '克劳德',
+      resolvedAllowedUsers: opts?.allowed ?? [],
+    });
+  }
+
+  /** A plain text message from a human (sender_type='user'), top-level (no
+   *  thread) in a multi-bot 普通群 — exactly the base-relay shape. Without the
+   *  summon hook this would hit the multi-bot @ gate and be ignored. */
+  function makeUserSummon(text: string) {
+    return {
+      message: {
+        message_id: 'msg-summon',
+        chat_id: 'chat-summon',
+        chat_type: 'group',
+        content: JSON.stringify({ text }),
+      },
+      sender: { sender_type: 'user', sender_id: { open_id: SUMMON_USER } },
+    };
+  }
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    setupClaudeBot();
+    handlers = makeHandlers();
+    mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
+    mockGetChatMode.mockResolvedValue('group');
+    mockReadFileSync.mockReturnValue('[]');
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+  });
+
+  it('routes a summon naming this bot (no real @) past the multi-bot gate', async () => {
+    const event = makeUserSummon('急急如律令：【克劳德】报个数');
+    await capturedHandlers['im.message.receive_v1'](event);
+    expect(handlers.handleNewTopic).toHaveBeenCalled();
+    // 前缀被剥，CLI 拿到干净正文
+    expect(JSON.parse(event.message.content).text).toBe('报个数');
+  });
+
+  it('feeds an already-owned session via handleThreadReply', async () => {
+    handlers.isSessionOwner.mockReturnValue(true);
+    const event = makeUserSummon('急急如律令：【克劳德】继续');
+    await capturedHandlers['im.message.receive_v1'](event);
+    expect(handlers.handleThreadReply).toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('ignores a summon naming a different bot, leaving content untouched', async () => {
+    const event = makeUserSummon('急急如律令：【缇蕾】盯群');
+    await capturedHandlers['im.message.receive_v1'](event);
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(JSON.parse(event.message.content).text).toBe('急急如律令：【缇蕾】盯群');
+  });
+
+  it('ignores a summon from a non-allowed sender (canTalk gate)', async () => {
+    setupClaudeBot({ allowed: ['ou_someone_else'] }); // SUMMON_USER 不在白名单
+    const event = makeUserSummon('急急如律令：【克劳德】报个数');
+    await capturedHandlers['im.message.receive_v1'](event);
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
   });
 });

@@ -115,7 +115,8 @@
 - **2026-05-24 01:39** · P2/6 ChatTopology store + L1 metrics (9d34f16)
 - **2026-05-24 01:40** · P2/7 MainBotDigest + ScoutInbox stores + stale tracking (5ab2e9e)
 - **2026-05-24 01:45** · P2/8a L1 onMessage hook 接通 (f0843c6) — event-dispatcher 接入 bumpMessage + markStale
-- ⚠️ P2/8a e2e 部分验证：单测 156 pass；真 daemon e2e onMessage 触发受 Lark 推送规则限制（只 @bot 触发）需要松松醒来手动 @ 蔻黛克斯发消息才能 e2e
+- ⚠️ P2/8a e2e 部分验证：单测 156 pass；真 daemon e2e onMessage 当时没能跑（松松睡了），当时**推断**"Lark 推送只 @bot 触发"——**此推断 2026-05-30 已证伪见下**
+- ✅ **2026-05-30 证伪**：读 `~/.botmux/data/chat-topology.json`（`messages24h` 由 push handler 在 @ 判定**之前** bump，且 `bumpMessage` 全仓**仅** event-dispatcher L772 一个调用方、无轮询）发现 oc_3dabc5b=894、oc_6358ecd1=1411 等满量计数 ≈ 缇蕾轮询数。结论：**push 推全量群消息，不是只推 @bot 消息**。这是"急急如律令唤醒"特性可行的基石。
 - **2026-05-24 02:01** · P2/8b scout-spawner + P2/10+11 escalation 5 规则 (6c44af2) — in-process v0.1，16 escalation 单测 pass
 - **2026-05-24 02:04** · P3/12+13 L3 escalation playbook (76e81b0) — 5 handler + dispatchPendingEscalations + 6 单测
 - **2026-05-24 02:06** · P4/14 dashboard 5 个 API routes + 6 smoke 单测 (d1d31cd)
@@ -124,6 +125,91 @@
 - 🎉 **全 17 commits 完成 · main-bot 模式 v1.0 实现 done**
 - ⚠️ v0.1 不 spawn 真 LLM：L2 缇蕾 scout 用规则模板 / L3 克劳德 consume 用 in-process handler；LLM 接入是 v1.1 升级
 - 🟡 **下一步** · 给松松完整验收清单 + 让他验证
+
+---
+
+## 特性 · 急急如律令唤醒（2026-05-30 松松授权开干）
+
+### 动机 / Why
+
+用 base 转发以松松身份发的消息**是纯文本**，无法注入真正的 Lark `@` 元素，所以没法用"@分身"唤起子群里待命的克劳德/缇蕾/蔻黛克斯分身（bot 自己 @ 自己又会被自循环过滤——[[reference_wake_subgroup_clone_via_other_bot]]）。需要一个**纯文本约定**让 botmux 把它当成 @ 来处理。
+
+### 约定格式
+
+消息以 `急急如律令：【名字/名字/…】<正文>` 开头时：
+- 解析【】里的 bot 名（`/ ／ 、 , ， 空格` 任一分隔）
+- 每个 bot 的 daemon **各自独立**判断自己的 `botName` 在不在名单里
+- 命中 → 当成"被 @ 了"一样路由进 CLI 响应，喂给 CLI 的正文 = 剥掉前缀后的 `<正文>`
+- 全角/半角冒号 `：:`、全角【】 都兼容
+
+### 可行性基石（已验证）
+
+push 推全量群消息（见上方 2026-05-30 证伪记录）。所以纯文本 `急急如律令：【克劳德】…`（无真 @）由松松/ base 发进多 bot 群后，**每个 bot 的 daemon 都会收到这条 push 事件**，可在 handler 里 format-match 后自行响应。
+
+### 实现点（event-dispatcher.ts `im.message.receive_v1` user 分支）
+
+1. 新增纯函数 `parseUrgentSummon(text)` → `{ names: string[], body: string } | null`
+2. 新增 `isUrgentSummonForBot(larkAppId, message)` → 用 `extractMessageTextForRouting` 取文本 + parse + 比对 `getBot(larkAppId).botName`（大小写不敏感 + 别名表）
+3. 在 `/grant` 拦截之后、`decideRouting` 之前加一个**自包含分支**：命中 summon-for-me →
+   - 把 `message.content` 的文本改写成 `body`（剥前缀，CLI 拿干净指令）
+   - `decideRouting` → 按 `isSessionOwner` 选 `handleThreadReply`/`handleNewTopic`
+   - **绕过多 bot 群的 @ 闸门**，但仍要过 `canTalk`（松松是 owner 会过；陌生人不过）
+4. 单测覆盖 `parseUrgentSummon` 各种分隔符/冒号/括号/无匹配/别名
+
+### 别名表（botName ↔ 触发名）
+
+| daemon botName | 可接受触发名 |
+|---|---|
+| 克劳德 | 克劳德 / claude |
+| 缇蕾 | 缇蕾 / coco / 小宝 |
+| 蔻黛克斯 | 蔻黛克斯 / 寇黛克斯 / codex |
+
+### 风险
+
+- `canTalk` 必须保留：否则任何人发"急急如律令"都能唤起 bot（安全闸）
+- 老路径 0 改动，summon 不命中时完全走原逻辑
+
+### Live 测试发现（2026-05-30，"不要写完就算了"）
+
+1. ⚠️ **base 转发发的是 interactive 卡片，不是纯文本**！实测消息 content =
+   `{"title":"急急如律令：【克劳德】…","elements":[img]}`（卡片，正文在 title）。
+   单测用 `{"text":…}` 跟现实不符 → 第一轮真失败。**这就是为什么必须 live 测**。
+   修复：interactive 消息先 `content.includes('急急如律令')` 便宜预筛 →
+   `resolveNonsupportMessage` 解析卡片（写入 RESOLVED_TEXT_KEY）→ 再判 →
+   `normalizeToTextMessage` 命中后把卡片整成干净 text（下游不再 resolve）。
+2. ✅ **克劳德 summon 通了**：daemon-0 日志 `急急如律令 summon matched
+   (scope=chat, ownsSession=true)`，正文剥前缀后喂进会话。
+3. ⚠️ **ownsSession=true 时塞进已有会话排队**：若该 bot 在目标群已有在跑会话，
+   summon 把正文喂进去排队（忙时不秒回）；子群无现成会话则 handleNewTopic 拉新分身秒应。
+   —— 真实使用场景（子群唤分身）走的是后者，没问题；同群已有会话是 demo 的干扰。
+4. ⚠️ **缇蕾(coco)可能收不到无@卡片**：coco app 疑似没有"接收群全部消息"推送权限
+   （缇蕾本就靠轮询）；克劳德 app 有（topology 满量计数证实）。要让缇蕾/蔻黛克斯
+   也能被 summon，需确认它们 app 的事件订阅权限——**未验，待办**。
+
+### 通用化：所有 bot 都能被 summon —— 不需要改权限（2026-05-30 结论）
+
+✅ **最终结论：summon 对所有 bot 都通，无需任何权限改动。** 三个 bot 全部 live 实测通过
+（日志 `急急如律令 summon matched` + 剥前缀正文喂进会话 + 发响应到群）：
+- 克劳德 cli_a9771799（daemon-0）✅
+- 缇蕾 cli_aa9aab67（daemon-2）✅
+- 蔻黛克斯 cli_a97448b8（daemon-1）✅
+三个 bot 本来都有 `im:message.group_msg`（都收到了无@卡片）。之前的权限折腾是误判，已撤回。
+
+⚠️ **我（克劳德）犯过的判断错误，记下防再犯**：第一轮测缇蕾是在修"卡片解析"bug **之前**，
+那次缇蕾没响应跟克劳德第一轮一样、是卡片没解析的问题，我却**归因成"缺权限"、且没在修复后重测就下结论**，
+还让松松去后台折腾权限。松松一句"212002 说明本来就有权限，你试一下缇蕾"点破了。
+**教训：失败原因没排除干净（尤其刚改过代码）就别下因果结论；改完一定重测，别拿旧代码的失败当新结论的证据。** [[feedback_verify_before_concluding]]
+
+权限排查留档（供参考，非阻塞）：
+- `scope.apply()` 返回 212002「unauthorized scopes were empty」= 没有未授权 scope = 本来就有权限（被误读成"卡在审批"）。
+- ⚠️ scope.list（app token）的 grant_status 不可靠：三个 bot 都返回 granted=0、全 status=1，连在用的克劳德也是 → 别信这字段，用**行为**判断。
+- 全套权限清单在 `src/setup/lark-scopes.json`（含 `im:message.group_msg`），批量导入格式，增量。
+
+### 部署拓扑变化（2026-05-30）
+
+`node dist/cli.js restart` 把 pm2 autostart 路径同步成**当前 cli.js 路径**，3 个 daemon
+现在直接跑 `~/work/Dbotmux/dist/index-daemon.js`（不再是安装版 `~/.npm-global/.../botmux/dist`）。
+所以部署 = `pnpm build` + `node dist/cli.js restart`，无需 rsync。重启会恢复 active sessions。
 
 ---
 
