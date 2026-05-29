@@ -25,6 +25,12 @@ const MAX_CAP = 50_000;
 interface StoreFile {
   scannedIds: string[];   // FIFO order (head = oldest)
   updatedAt: string;
+  /** 2026-05-29 (松松实拍漏消息根因修复): 上次成功 tick 拉到的窗口 end
+   *  (ISO)。下个 tick 用 [lastFetchEnd - overlap, now] 当窗口, 而不是
+   *  [now - 15min, now] —— 后者在 tick 节奏不稳 (实际 ~30min/次) 时窗口
+   *  不连续, 中间漏掉一半消息。高水位 + overlap 保证不漏 + filterUnscanned
+   *  兜重叠去重。 */
+  lastFetchEnd?: string;
 }
 
 function filePath(): string {
@@ -87,6 +93,24 @@ export function filterUnscanned(messageIds: string[]): string[] {
   const store = read();
   const have = new Set(store.scannedIds);
   return messageIds.filter(id => !have.has(id));
+}
+
+/** 2026-05-29: 上次成功 tick 的 fetch 窗口 end (高水位)。null = 还没成功
+ *  跑过 (首次 tick 回退到 now-interval)。 */
+export function getLastFetchEnd(): Date | null {
+  const raw = read().lastFetchEnd;
+  if (!raw) return null;
+  const d = new Date(raw);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+/** 成功 tick 后推进高水位。只在 fetch+analyze 都成功 (或确认无新消息) 后调,
+ *  失败不推进 → 下个 tick 重拉同窗口, 消息不丢。 */
+export function setLastFetchEnd(end: Date): void {
+  const store = read();
+  store.lastFetchEnd = end.toISOString();
+  store.updatedAt = new Date().toISOString();
+  write(store);
 }
 
 /** Stats: count, oldest/newest entry (lark messageId is sortable). */

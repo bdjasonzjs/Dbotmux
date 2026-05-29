@@ -90,4 +90,41 @@ describe('tilly-message-store (P3 commit #1)', () => {
     s.markScanned([]);
     expect(s.stats().count).toBe(0);
   });
+
+  // 2026-05-29 高水位 fetch 窗口 (松松实拍漏消息根因修复)
+  describe('lastFetchEnd 高水位', () => {
+    it('fresh store → getLastFetchEnd 返 null (首次回退 now-interval)', async () => {
+      const s = await freshImport();
+      expect(s.getLastFetchEnd()).toBeNull();
+    });
+
+    it('set → get round-trip (毫秒精度 ISO)', async () => {
+      const s = await freshImport();
+      s.setLastFetchEnd(new Date('2026-05-29T02:53:08.704Z'));
+      expect(s.getLastFetchEnd()!.toISOString()).toBe('2026-05-29T02:53:08.704Z');
+    });
+
+    it('setLastFetchEnd 不破坏 scannedIds', async () => {
+      const s = await freshImport();
+      s.markScanned(['om_a', 'om_b']);
+      s.setLastFetchEnd(new Date('2026-05-29T03:00:00.000Z'));
+      expect(s.isScanned('om_a')).toBe(true);
+      expect(s.isScanned('om_b')).toBe(true);
+      expect(s.getLastFetchEnd()!.toISOString()).toBe('2026-05-29T03:00:00.000Z');
+    });
+
+    it('markScanned 不清掉已存的 lastFetchEnd', async () => {
+      const s = await freshImport();
+      s.setLastFetchEnd(new Date('2026-05-29T03:00:00.000Z'));
+      s.markScanned(['om_x']);
+      expect(s.getLastFetchEnd()!.toISOString()).toBe('2026-05-29T03:00:00.000Z');
+    });
+
+    it('损坏的 lastFetchEnd → getLastFetchEnd 返 null 不抛', async () => {
+      const s = await freshImport();
+      const { writeFileSync } = await import('node:fs');
+      writeFileSync(join(tempDir, 'tilly-scanned-messages.json'), JSON.stringify({ scannedIds: [], updatedAt: 'x', lastFetchEnd: 'not-a-date' }), 'utf-8');
+      expect(s.getLastFetchEnd()).toBeNull();
+    });
+  });
 });

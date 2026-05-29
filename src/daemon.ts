@@ -2715,7 +2715,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         // pushHighPriorityToScoutInbox 写 scout-inbox + notifyClaudeAboutInboxItems
         // 绑 inbox insert 结果通知。
         const { publishTillyAlert, dismissTillyAlert, pushHighPriorityToScoutInbox, notifyClaudeAboutInboxItems } = await import('./services/tilly-publisher.js');
-        const { markScanned } = await import('./services/tilly-message-store.js');
+        const { markScanned, getLastFetchEnd, setLastFetchEnd } = await import('./services/tilly-message-store.js');
         const { resolveBotIdent } = await import('./core/main-bot-playbook.js');
         // 2026-05-25 (松松实拍): 之前用 claudeApp 发卡 → 群里 sender 显示
         // 克劳德，缇蕾 bot identity 一次都没用过。从 P3 commit #5 起就
@@ -2725,11 +2725,23 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         const claudeIdent = resolveBotIdent('claude');
         // v2.1 commit 2: 之前 notify 会 @ OWNER_OPEN_ID (松松)，现在不再 @，
         // 常量删除。主 bot 自己决定要不要找松松。
+        // 2026-05-29 (松松实拍漏消息根因修复): 窗口用高水位, 不用 now-15min。
+        // 实际 tick ~30min 一次但窗口只 15min → 之前窗口不连续漏一半消息。
+        // start = 上次成功 fetch 的 end - overlap (兜飞书搜索索引延迟); 首次
+        // 回退 now-interval。重叠的消息靠 fetchRecentMessages 内部 filterUnscanned
+        // 去重, 不会重复分析。
+        const HIGH_WATER_OVERLAP_MS = 5 * 60 * 1000;
         const end = new Date();
-        const start = new Date(end.getTime() - TILLY_TICK_INTERVAL_MS);
+        const lastEnd = getLastFetchEnd();
+        const start = lastEnd
+          ? new Date(lastEnd.getTime() - HIGH_WATER_OVERLAP_MS)
+          : new Date(end.getTime() - TILLY_TICK_INTERVAL_MS);
+        const windowMin = Math.round((end.getTime() - start.getTime()) / 60000);
         const fresh = await fetchRecentMessages({ start, end });
         if (fresh.length === 0) {
-          logger.info('[tilly/scout] tick — no new messages');
+          logger.info(`[tilly/scout] tick — no new messages (window ${windowMin}min, high-water=${lastEnd ? 'on' : 'first-run'})`);
+          // fetch 成功且无新消息 → 推进高水位 (这段时间确认没漏)
+          setLastFetchEnd(end);
           // 2026-05-25 妹妹 non-blocker 2: 没新消息 = fetch 成功 = scout 健康。
           // 这里清 counter + dismiss alert（如果在）— 否则 alert 会"挂着等
           // 一条新消息才关掉"，跟"恢复后自动 close" 直觉不符。LLM 路径没
@@ -2802,6 +2814,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         // full mark and永久漏扫超 cap 消息).
         const toMark = digest.analyzedMessageIds;
         markScanned(toMark);
+        // 2026-05-29: 全流程成功 (fetch+analyze+markScanned) 才推进高水位。
+        // analyze 失败 (上面 !digest.ok return) / 异常 (catch) 都不推进 →
+        // 下个 tick 重拉同窗口, 消息不丢。
+        setLastFetchEnd(end);
         const ms = Date.now() - tickStartTime;
         logger.info(`[tilly/scout] tick done in ${ms}ms: ${fresh.length} fresh / ${toMark.length} analyzed → +${digest.todos.length}t/${digest.progress.length}p/${digest.blockers.length}b/${digest.noteworthy.length}n (today total: ${cumulative.todos.length}/${cumulative.progress.length}/${cumulative.blockers.length}/${cumulative.noteworthy.length}) · scout-inbox +${newlyInserted.length}`);
       } catch (err) {
