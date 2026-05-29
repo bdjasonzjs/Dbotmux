@@ -2814,10 +2814,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         // full mark and永久漏扫超 cap 消息).
         const toMark = digest.analyzedMessageIds;
         markScanned(toMark);
-        // 2026-05-29: 全流程成功 (fetch+analyze+markScanned) 才推进高水位。
-        // analyze 失败 (上面 !digest.ok return) / 异常 (catch) 都不推进 →
-        // 下个 tick 重拉同窗口, 消息不丢。
-        setLastFetchEnd(end);
+        // 2026-05-29: 全流程成功才推进高水位。analyze 失败 (上面 !digest.ok
+        // return) / 异常 (catch) 都不推进 → 下个 tick 重拉同窗口, 消息不丢。
+        // 边角 (b): 若 fresh 超 100/轮上限 (analyzed < fresh), 被切掉的低优消息
+        // 没分析也没 markScanned; 此时**不推进高水位** → 下轮重拉同窗口,
+        // 已分析的靠 filterUnscanned 去重, 剩下的继续分析, 几轮收敛不丢。
+        const capHit = digest.analyzedMessageIds.length < fresh.length;
+        if (!capHit) {
+          setLastFetchEnd(end);
+        } else {
+          logger.warn(`[tilly/scout] cap hit (${digest.analyzedMessageIds.length} analyzed < ${fresh.length} fresh) — 不推进高水位, 下轮重拉补扫剩余`);
+        }
         const ms = Date.now() - tickStartTime;
         logger.info(`[tilly/scout] tick done in ${ms}ms: ${fresh.length} fresh / ${toMark.length} analyzed → +${digest.todos.length}t/${digest.progress.length}p/${digest.blockers.length}b/${digest.noteworthy.length}n (today total: ${cumulative.todos.length}/${cumulative.progress.length}/${cumulative.blockers.length}/${cumulative.noteworthy.length}) · scout-inbox +${newlyInserted.length}`);
       } catch (err) {
