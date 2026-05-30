@@ -154,4 +154,16 @@ finish_subtask(taskId,expectedVersion) / supplement_subtask(taskId,content,expec
   - **dispatcher 上报卡接线**：childToParentText 从"MCP query_subtask(taskId)"改成精确 `botmux subtask-query --command-id <cmdId>`。
   - 蔻黛克斯 4 边界全落：① 卡片用 commandId 不用 taskId（ack 绑 child_to_parent command）② skill 权限分层（父群主bot start/query/finish/supplement；子群分身只 report）③ expected-version 来源写死(query→task.version)+force 仅人工 ④ 2 回归(skill 含 botmux-subtask 且不含 MCP/query_subtask；childToParentText 含精确命令)。
   - **上线说明**：新 skill 需 restart/新会话才生效（长活 session 靠上报卡内联命令补 report-response 入口）。
-  - **Phase 6 待做**：真 E2E，逐环看日志验证不假装。
+- **Phase 6 真 E2E** · 部署 + 跑通 + 抓 bug（2026-05-30）
+  - 部署：commit（2）→ build → rsync 全局 botmux → `botmux restart`（pm2 重启 botmux-0/1/2+dashboard，
+    会话靠 tmux backend 存活）→ observer/dispatcher cron 上线（日志实证）→ 3 IPC 路由 smoke test 通过。
+  - **闭环主线验证通过（真 artifact）**：subtask-start（借主话题 session）→ 真建子群 oc_8e33… →
+    coco 观测判 need_help → 上报投递主话题（deliveredMessageId）→ **真·主话题克劳德自己 query+ack+finish**
+    （skill+上报卡接线让真主bot 自主走完决策）；冗余 finish 返回 alreadyFinished 验了幂等。
+  - **E2E 抓到 2 个真问题（133 单测漏掉）**：
+    1. 🐞 **finish 命令被自己的终态守卫 skip**（已修）：planDispatch 对 parent→child+终态一律 skip，但 finish
+       本就该在 task finished 时通知子群 → 改成 `commandType!=='finish'` 才 skip；纠正了一条把错误行为断言成
+       正确的旧单测 + 补 finish 真 deliver 回归。135 单测。
+    2. ⚠️ **v2 create 没给子群 kickoff**（follow-up）：registerWatch 被 skip 防双管，但没补激活消息 →
+       子群 bot 空转，coco 正确判"信息不足"。需要 v2 自己的 kickoff（产品链路缺口，非 dispatcher bug）。
+- **上线前必修 TODO**：subtask-store read() corrupt 文件 hard-fail（防误清库）；v2 kickoff（finding #2）。

@@ -46,8 +46,11 @@ export function planDispatch(cmd: OutboxCommand, task: SubTask | null): Dispatch
   if (!task) return { action: 'skip', reason: 'orphan-task-gone' };
   if (cmd.supersededBy != null) return { action: 'skip', reason: 'superseded' }; // 双保险
   if (cmd.deliveryStatus !== 'pending') return { action: 'skip', reason: `status-${cmd.deliveryStatus}` };
-  // parent→child (finish/supplement) 投给子群，但 task 已终态 → 没意义，作废
-  if (cmd.direction === 'parent_to_child' && (task.status === 'finished' || task.status === 'stopped')) {
+  // E2E 抓到的 bug: finish 命令必须**豁免**终态 skip —— 它的语义就是"通知子群任务已 finished"，
+  // task 进 finished 后才会产生 finish 命令，若被终态守卫 skip 掉，子群永远收不到结束通知。
+  // 只 skip 非 finish 的 parent→child (= supplement)：finished/stopped 后再补充输入没意义 (保留 TOCTOU 防线)。
+  if (cmd.direction === 'parent_to_child' && cmd.commandType !== 'finish'
+    && (task.status === 'finished' || task.status === 'stopped')) {
     return { action: 'skip', reason: `task-terminal-${task.status}` };
   }
   return { action: 'send' };

@@ -67,10 +67,15 @@ describe('planDispatch', () => {
   it('非 pending → skip', () => {
     expect(planDispatch({ deliveryStatus: 'sent', supersededBy: null } as any, { status: 'observing' } as any).action).toBe('skip');
   });
-  it('parent→child 但 task 已终态 → skip (投子群没意义)', () => {
-    const cmd = { deliveryStatus: 'pending', supersededBy: null, direction: 'parent_to_child' } as any;
+  it('parent→child supplement + task 已终态 → skip (补充无意义)', () => {
+    const cmd = { deliveryStatus: 'pending', supersededBy: null, direction: 'parent_to_child', commandType: 'supplement' } as any;
     expect(planDispatch(cmd, { status: 'finished' } as any).action).toBe('skip');
     expect(planDispatch(cmd, { status: 'stopped' } as any).action).toBe('skip');
+  });
+  it('E2E 修复: parent→child finish + task 已 finished → send (finish 豁免终态 skip, 必须通知子群)', () => {
+    const cmd = { deliveryStatus: 'pending', supersededBy: null, direction: 'parent_to_child', commandType: 'finish' } as any;
+    expect(planDispatch(cmd, { status: 'finished' } as any).action).toBe('send');
+    expect(planDispatch(cmd, { status: 'stopped' } as any).action).toBe('send');
   });
   it('正常 pending child→parent → send', () => {
     const cmd = { deliveryStatus: 'pending', supersededBy: null, direction: 'child_to_parent' } as any;
@@ -198,8 +203,8 @@ describe('runDispatcherTick', () => {
     expect(stats.sent).toBe(1); // child→parent 不因 task 终态 skip
   });
 
-  it('parent→child 命令 + task 终态 → skip + supersede (投子群没意义)', async () => {
-    const { cmdId, taskId } = await mkTaskWithCommand({ direction: 'parent_to_child', commandType: 'finish' });
+  it('parent→child supplement + task 终态 → skip + supersede (补充无意义)', async () => {
+    const { cmdId, taskId } = await mkTaskWithCommand({ direction: 'parent_to_child', commandType: 'supplement' });
     await transitionStatus(taskId, 'reported_done');
     await transitionStatus(taskId, 'finished');
     const exec = mkDeliver();
@@ -209,8 +214,20 @@ describe('runDispatcherTick', () => {
     expect(getCommand(cmdId)!.supersededBy).not.toBeNull();
   });
 
-  it('P1-2 TOCTOU: claim 后 task 被终态化 → 复核 skip + supersede + 不 deliver', async () => {
+  it('E2E 修复: parent→child finish + task 已 finished → 真 deliver (子群收到结束通知)', async () => {
     const { cmdId, taskId } = await mkTaskWithCommand({ direction: 'parent_to_child', commandType: 'finish' });
+    await transitionStatus(taskId, 'reported_done');
+    await transitionStatus(taskId, 'finished');
+    const exec = mkDeliver(async () => ({ ok: true, messageId: 'om_finish' }));
+    const stats = await runDispatcherTick(new Date(), exec);
+    expect(stats.sent).toBe(1);                       // finish 没被终态 skip 掉
+    expect(exec.deliver).toHaveBeenCalled();
+    expect(getCommand(cmdId)!.deliveryStatus).toBe('sent');
+    expect(getCommand(cmdId)!.deliveredMessageId).toBe('om_finish');
+  });
+
+  it('P1-2 TOCTOU: claim 后 task 被终态化 → 复核 skip + supersede + 不 deliver (supplement)', async () => {
+    const { cmdId, taskId } = await mkTaskWithCommand({ direction: 'parent_to_child', commandType: 'supplement' });
     const real = getSubTask(taskId)!;
     // 初筛读到 observing(→send)，claim 后复核读到 finished(→skip)
     const spy = vi.spyOn(store, 'getSubTask')
