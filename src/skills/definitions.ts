@@ -802,6 +802,79 @@ humanGate：
 - executor 名不是默认三种之一且用户没确认：不要猜。
 `;
 
+const SUBTASK_SKILL = `---
+name: botmux-subtask
+description: 子任务编排 v2 —— 主 bot 在主话题把一件事派成独立子群任务，脚本自动观测子群进展，子群需要协助/完成时上报回主话题，主 bot 查询后决策（结束/补充）。触发场景：用户说"建个子任务/子群做 X"、"派给子群"、"分一个独立任务出去"；或你收到一张「🛰️ 子任务状态变化」卡片 @你（带 taskId + commandId）。也用于子群分身手动上报进展。命令族：botmux subtask-{start,report,query,finish,supplement}。
+---
+
+# botmux-subtask — 子任务编排 v2
+
+主 bot 一句话把一件事派成**独立子群任务**：自动建子群+拉 bot+激活 → 缇蕾脚本定时观测子群 →
+子群需协助/完成时**上报回主话题** → 主 bot 查询详情后决策（结束 / 补充输入）。
+
+全部走 \`botmux subtask-*\` shell 命令。\`--session-id\` 通常自动从 env 推断，不用手传。
+
+## 权限分层（重要）
+
+- **父群主 bot**（你在主话题里）：用 \`start\` / \`query\` / \`finish\` / \`supplement\`。
+- **子群内执行分身**（你被拉进某个子任务群干活）：**只用 \`report\`**，把进展喊回主话题。
+  **不要** finish / supplement 自己所在的子任务——结束/补充是父群主 bot 的决策权，子群分身随手调会被鉴权挡（403），也不该这么干。
+
+## 作为主 bot：派一个子任务
+
+主话题里用户要你"建个子任务做 X / 派给子群"时：
+
+\`\`\`bash
+botmux subtask-start --goal "修登录态丢失问题" --task-type bug \\
+  [--acceptance "复现路径不再丢登录态"] [--bots c,k,t] [--name "群名"] [--related-refs url1,url2]
+\`\`\`
+
+- \`--goal\` 必传（一句话任务目标）；\`--task-type\` prd|bug|misc。
+- \`--bots\` 逗号分隔 c|k|t（claude/codex/tilly），默认全拉三个。
+- 返回 \`{taskId, chatId, isNew}\`。子群建好后缇蕾会自动观测，你**不用**盯着子群——它有事会上报回主话题。
+
+## 作为主 bot：收到「🛰️ 子任务状态变化」卡片
+
+卡片会 @你，带 \`taskId\` 和 \`commandId\`（需要协助 / 已完成待确认）。**别凭卡片字面就决策**，先查详情：
+
+\`\`\`bash
+botmux subtask-query --command-id <commandId>
+\`\`\`
+
+- 返回 \`{task, observations, commands, ackedCommandId}\`。**这一步会 ack 这条上报**（你已接手，不会再重复通知你）。
+- 读 \`task.status\` 和 **\`task.version\`**（下一步 finish/supplement 要带它防 stale）。\`observations\` 是脚本历次判断+证据。
+
+然后据此决策（**expected-version 默认必传**，传上一步读到的 \`task.version\`）：
+
+\`\`\`bash
+# 确认完成 → 结束子任务（通知子群收尾）
+botmux subtask-finish --task-id <taskId> --expected-version <task.version> [--note "验收说明"]
+
+# 需要补充输入 / 回应子群的求助 → 把内容下发给子群，任务继续
+botmux subtask-supplement --task-id <taskId> --expected-version <task.version> --content "用这个 token：xxx"
+\`\`\`
+
+- **expected-version**：从 query 的 \`task.version\` 读。它防止你基于过期观察下发决策；版本对不上会返回 409，重新 query 拿最新再来。
+- \`--force\`：极少数人工强制场景（不带 expected-version 直接结束/补充）。默认别用，老实走 version。
+- 幂等：同一条 finish/supplement 重试安全（按命令去重，不会重复执行）。
+
+## 作为子群分身：手动上报
+
+你是子群里的执行分身，想立刻把"卡住了 / 做完了"喊给主话题（不等脚本下一轮观测）：
+
+\`\`\`bash
+botmux subtask-report --task-id <taskId> --type need_help|done --summary "一句话" [--source-message-ids m1,m2]
+\`\`\`
+
+- 只能从**该子任务的子群**里、且你是该任务参与 bot 时调用。
+- 这是观测脚本的**补充**显式信号；常规进展不用手动报，脚本会自动判。
+
+## 输出与排错
+
+- 所有命令 stdout 透传 daemon JSON；\`ok:false\` + \`error\` 时按错误处理。
+- 409 = 版本/状态冲突 → 重新 query 拿最新状态再决策。403 = 鉴权（非主话题主 bot / 非该子群参与者）。
+`;
+
 export const BUILTIN_SKILLS: SkillDef[] = [
   { name: 'botmux-schedule', content: SCHEDULE_SKILL },
   { name: 'botmux-history', content: HISTORY_SKILL },
@@ -809,6 +882,7 @@ export const BUILTIN_SKILLS: SkillDef[] = [
   { name: 'botmux-send', content: SEND_SKILL },
   { name: 'botmux-bots', content: BOTS_SKILL },
   { name: 'botmux-workflow-create', content: WORKFLOW_CREATE_SKILL },
+  { name: 'botmux-subtask', content: SUBTASK_SKILL },
 ];
 
 /** Skills that earlier botmux versions installed but no longer ship. The

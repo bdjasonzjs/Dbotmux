@@ -1,0 +1,120 @@
+/**
+ * CLI `botmux subtask-{start,report,query,finish,supplement}` — 子任务编排 v2 薄壳
+ * (Phase 4)。纯 IPC 客户端：解析 args → POST 到 Claude daemon 的 /api/subtask-orch-* →
+ * 透传 JSON。鉴权/幂等/版本全在 daemon service 侧 (authzCheck/session-store 反查，CLI 不能伪造)。
+ *
+ * sessionId 取自 --session-id 或 env BOTMUX_SESSION_ID (runtime spawn worker 时注入)。
+ */
+import { readdirSync, readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+
+const REGISTRY_DIR = join(homedir(), '.botmux', 'data', 'dashboard-daemons');
+const CLAUDE_BOT_NAME_ZH = '克劳德';
+
+interface DaemonInfoFile { botName: string; ipcPort: number; lastHeartbeat: number; }
+
+const VERB_ROUTE: Record<string, string> = {
+  start: '/api/subtask-orch-create',
+  report: '/api/subtask-orch-report',
+  query: '/api/subtask-orch-query',
+  finish: '/api/subtask-orch-finish',
+  supplement: '/api/subtask-orch-supplement',
+};
+const NUM_FLAGS = new Set(['expectedVersion']);
+const LIST_FLAGS = new Set(['bots', 'sourceMessageIds', 'relatedRefs']);
+const BOOL_FLAGS = new Set(['force']);
+/** bot 简写 → service 认的完整 key (review P2: help 写 c/k/t 但 service 只认 claude|codex|tilly)。 */
+const BOT_SHORT: Record<string, 'claude' | 'codex' | 'tilly'> = {
+  c: 'claude', claude: 'claude', k: 'codex', codex: 'codex', t: 'tilly', tilly: 'tilly',
+};
+
+function kebabToCamel(s: string): string {
+  return s.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+}
+
+function findClaudeDaemonPort(): number | null {
+  let files: string[];
+  try { files = readdirSync(REGISTRY_DIR).filter(f => f.endsWith('.json')); }
+  catch { return null; }
+  const now = Date.now(); const STALE = 90_000;
+  for (const f of files) {
+    try {
+      const d = JSON.parse(readFileSync(join(REGISTRY_DIR, f), 'utf-8')) as DaemonInfoFile;
+      if (d.botName !== CLAUDE_BOT_NAME_ZH) continue;
+      if (now - d.lastHeartbeat > STALE) continue;
+      return d.ipcPort;
+    } catch { /* skip corrupt */ }
+  }
+  return null;
+}
+
+function parseBody(argv: string[]): { body: Record<string, unknown> } | { error: string } {
+  const body: Record<string, unknown> = {};
+  let i = 0;
+  while (i < argv.length) {
+    const a = argv[i];
+    if (!a.startsWith('--')) return { error: `unexpected arg: ${a}` };
+    const key = kebabToCamel(a.slice(2));
+    if (BOOL_FLAGS.has(key)) { body[key] = true; i += 1; continue; } // boolean flag, 无 value
+    const val = argv[i + 1];
+    if (val === undefined) return { error: `missing value for ${a}` };
+    if (NUM_FLAGS.has(key)) body[key] = Number(val);
+    else if (LIST_FLAGS.has(key)) body[key] = val.split(',').map(s => s.trim()).filter(Boolean);
+    else body[key] = val;
+    i += 2;
+  }
+  // P2: bots 简写 c/k/t → 完整 key
+  if (Array.isArray(body.bots)) {
+    const mapped: string[] = [];
+    for (const b of body.bots as string[]) {
+      const full = BOT_SHORT[b.toLowerCase()];
+      if (!full) return { error: `unknown bot ref: ${b} (use c|k|t or claude|codex|tilly)` };
+      mapped.push(full);
+    }
+    body.bots = mapped;
+  }
+  if (!body.sessionId) body.sessionId = process.env.BOTMUX_SESSION_ID;
+  if (!body.sessionId) return { error: 'missing --session-id <sid> or env BOTMUX_SESSION_ID' };
+  return { body };
+}
+
+const HELP = `botmux subtask-{start|report|query|finish|supplement} — 子任务编排 v2
+
+  subtask-start      --goal "<任务>" [--acceptance "<验收>"] [--bots c,k,t]
+                     [--task-type prd|bug|misc] [--name "<群名>"] [--related-refs a,b]
+  subtask-report     --task-id <id> --type need_help|done --summary "<一句话>" [--source-message-ids m1,m2]
+  subtask-query      (--task-id <id> | --command-id <id>)
+  subtask-finish     --task-id <id> --expected-version <n> [--note "<说明>"] [--force]
+  subtask-supplement --task-id <id> --content "<补充>" --expected-version <n> [--force]
+                     (expected-version 默认必传守 stale；人工强制结束/补充才加 --force)
+
+通用: [--session-id <sid>]（缺省取 env BOTMUX_SESSION_ID）。
+鉴权/幂等/版本在 daemon service 侧；CLI 仅透传。`;
+
+export async function cmdSubtaskOrch(verb: string, argv: string[]): Promise<void> {
+  const route = VERB_ROUTE[verb];
+  if (!route || argv.includes('--help') || argv.includes('-h')) {
+    console.error(HELP);
+    process.exit(route ? 0 : 2);
+  }
+
+  const parsed = parseBody(argv);
+  if ('error' in parsed) { console.error(`❌ ${parsed.error}`); process.exit(2); }
+
+  const port = findClaudeDaemonPort();
+  if (!port) { console.error(`❌ 找不到 Claude daemon（${REGISTRY_DIR} 无新鲜注册）`); process.exit(1); }
+
+  let res: Response;
+  try {
+    res = await fetch(`http://127.0.0.1:${port}${route}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(parsed.body),
+    });
+  } catch (err: any) { console.error(`❌ 连不上 daemon (port ${port}): ${err.message}`); process.exit(1); }
+
+  const json = await res.json().catch(() => ({ ok: false, error: 'invalid_json_response' }));
+  console.log(JSON.stringify(json));
+  process.exit(res.ok && (json as any).ok !== false ? 0 : 1);
+}

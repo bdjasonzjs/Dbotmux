@@ -600,6 +600,31 @@ export async function listChatMessages(
   return allMessages.slice(0, pageSize).reverse();
 }
 
+/** 子任务观测专用：从 startTimeSec 起、**ByCreateTimeAsc(老→新)** 拉一页消息。
+ *  返 {items 老→新, hasMore}。配合 subtask-observer 的"连续增量"合约 (蔻黛克斯 review):
+ *  调用方拿 afterMessageId 的 create_time 当 startTimeSec，再切掉自身及更早，得到连续窗口；
+ *  hasMore=true 表示还有积压 (complete=false)，cursor 只能推到本批末尾。 */
+export async function listMessagesAsc(
+  larkAppId: string, chatId: string,
+  opts: { startTimeSec?: string; pageSize?: number; pageToken?: string } = {},
+): Promise<{ items: any[]; nextPageToken: string | null }> {
+  const c = getBotClient(larkAppId);
+  const res = await c.im.v1.message.list({
+    params: {
+      container_id_type: 'chat' as any,
+      container_id: chatId,
+      page_size: Math.min(opts.pageSize ?? 40, LARK_MESSAGE_LIST_MAX_PAGE),
+      sort_type: 'ByCreateTimeAsc' as any,
+      ...(opts.startTimeSec ? { start_time: opts.startTimeSec } : {}),
+      ...(opts.pageToken ? { page_token: opts.pageToken } : {}),
+    },
+  });
+  if (res.code !== 0) {
+    throw new Error(`listMessagesAsc failed: ${res.msg} (code: ${res.code})`);
+  }
+  return { items: res.data?.items ?? [], nextPageToken: res.data?.has_more ? (res.data?.page_token ?? null) : null };
+}
+
 export interface AmbientChatMessageOptions {
   /**
    * Exclude messages at/after this timestamp (Lark create_time, milliseconds as

@@ -1385,6 +1385,33 @@ ipcRoute('POST', '/api/subtask-close', async (req, res) => {
   }
 });
 
+// ── 子任务编排 v2 · Phase 4 IPC routes (2026-05-30): 5 个能力的 daemon 入口。
+// CLI (botmux subtask-*) 薄壳打到这里 → service 层做鉴权(authzCheck/session-store 反查)+
+// 幂等 + 版本。每个 service 抛 HttpError → 映射对应 4xx。
+const SUBTASK_ORCH_ROUTES: Array<[string, string]> = [
+  ['/api/subtask-orch-create', 'createSubtask'],
+  ['/api/subtask-orch-report', 'reportProgress'],
+  ['/api/subtask-orch-query', 'querySubtask'],
+  ['/api/subtask-orch-finish', 'finishSubtask'],
+  ['/api/subtask-orch-supplement', 'supplementSubtask'],
+];
+for (const [path, fnName] of SUBTASK_ORCH_ROUTES) {
+  ipcRoute('POST', path, async (req, res) => {
+    let body: any;
+    try { body = await readJsonBody(req); }
+    catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+    try {
+      const orch = await import('./services/subtask-orchestrator.js');
+      const fn = (orch as any)[fnName] as (b: any) => Promise<any>;
+      const result = await fn(body);
+      return jsonRes(res, 200, { ok: true, ...result });
+    } catch (err: any) {
+      const status = err && err.name === 'HttpError' ? err.status : 500;
+      return jsonRes(res, status, { ok: false, error: String(err?.message ?? err) });
+    }
+  });
+}
+
 ipcRoute(
   'POST',
   '/api/workflows/runs/:runId/attempts/:activityId/:attemptId/resume',
@@ -2935,6 +2962,57 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     process.on('SIGTERM', () => clearInterval(monitorHandle));
     process.on('SIGINT', () => clearInterval(monitorHandle));
     logger.info(`[group-monitor] cron registered (every ${MONITOR_TICK_INTERVAL_MS / 1000}s, per-monitor throttle) on coco daemon`);
+
+    // ── 子任务编排 · Phase 2 观测脚本 cron (2026-05-30): 缇蕾按 committedCursor
+    // 读子群增量 → coco 判 → 原子提交 (落 Observation + 上报命令入 outbox + 推 cursor)。
+    // per-task 节流在 observer 内 (MIN_OBSERVE_INTERVAL_MS)。in-flight guard 防 coco 慢时重叠。
+    const SUBTASK_OBSERVE_TICK_MS = 60 * 1000;
+    let subtaskTickInFlight = false;
+    const subtaskHandle = setInterval(async () => {
+      if (subtaskTickInFlight) { logger.info('[subtask-observer] previous tick in flight — skip'); return; }
+      subtaskTickInFlight = true;
+      try {
+        const { runObserverTick } = await import('./services/subtask-observer.js');
+        const { makeObserverExecutors } = await import('./services/subtask-observer-executors.js');
+        const { pruneFinished } = await import('./services/subtask-store.js');
+        await pruneFinished();
+        const stats = await runObserverTick(new Date(), makeObserverExecutors());
+        if (stats.checked + stats.errors > 0) {
+          logger.info(`[subtask-observer] tick: checked=${stats.checked} committed=${stats.committed} errors=${stats.errors}`);
+        }
+      } catch (err) {
+        logger.error(`[subtask-observer] tick failed: ${err}`);
+      } finally {
+        subtaskTickInFlight = false;
+      }
+    }, SUBTASK_OBSERVE_TICK_MS);
+    process.on('SIGTERM', () => clearInterval(subtaskHandle));
+    process.on('SIGINT', () => clearInterval(subtaskHandle));
+    logger.info(`[subtask-observer] cron registered (every ${SUBTASK_OBSERVE_TICK_MS / 1000}s, per-task throttle) on coco daemon`);
+
+    // ── 子任务编排 · Phase 3 投递 cron (2026-05-30): 缇蕾直发把 outbox pending 命令
+    // 投到父群(上报)/子群(finish/supplement)。claim/lease 防重复投、退避重试。比观测更勤跑。
+    const SUBTASK_DISPATCH_TICK_MS = 20 * 1000;
+    let dispatchTickInFlight = false;
+    const dispatchHandle = setInterval(async () => {
+      if (dispatchTickInFlight) { logger.info('[outbox-dispatcher] previous tick in flight — skip'); return; }
+      dispatchTickInFlight = true;
+      try {
+        const { runDispatcherTick } = await import('./services/outbox-dispatcher.js');
+        const { makeDispatchExecutors } = await import('./services/outbox-dispatcher-executors.js');
+        const stats = await runDispatcherTick(new Date(), makeDispatchExecutors());
+        if (stats.sent + stats.retried + stats.failed > 0) {
+          logger.info(`[outbox-dispatcher] tick: sent=${stats.sent} retried=${stats.retried} failed=${stats.failed} skipped=${stats.skipped}`);
+        }
+      } catch (err) {
+        logger.error(`[outbox-dispatcher] tick failed: ${err}`);
+      } finally {
+        dispatchTickInFlight = false;
+      }
+    }, SUBTASK_DISPATCH_TICK_MS);
+    process.on('SIGTERM', () => clearInterval(dispatchHandle));
+    process.on('SIGINT', () => clearInterval(dispatchHandle));
+    logger.info(`[outbox-dispatcher] cron registered (every ${SUBTASK_DISPATCH_TICK_MS / 1000}s, claim/lease + retry) on coco daemon`);
   }
 
   logger.info('Daemon is running. Press Ctrl+C to stop.');

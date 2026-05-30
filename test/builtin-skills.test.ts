@@ -45,6 +45,29 @@ describe('built-in botmux-quoted skill', () => {
   });
 });
 
+describe('built-in botmux-subtask skill (Phase 5)', () => {
+  it('exists, teaches the 5 CLI 命令, 不出现 MCP/query_subtask 字样', () => {
+    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-subtask');
+    expect(skill).toBeDefined();
+    // 5 个 CLI 命令
+    expect(skill!.content).toContain('botmux subtask-start');
+    expect(skill!.content).toContain('botmux subtask-query --command-id');
+    expect(skill!.content).toContain('botmux subtask-finish');
+    expect(skill!.content).toContain('botmux subtask-supplement');
+    expect(skill!.content).toContain('botmux subtask-report');
+    // expected-version 来源 + force 说明
+    expect(skill!.content).toContain('expected-version');
+    expect(skill!.content).toContain('task.version');
+    expect(skill!.content).toContain('--force');
+    // 权限分层: 子群分身只 report
+    expect(skill!.content).toContain('只用');
+    expect(skill!.content).toContain('report');
+    // 边界4: 纯 CLI，不教 MCP
+    expect(skill!.content).not.toContain('MCP');
+    expect(skill!.content).not.toContain('query_subtask');
+  });
+});
+
 describe('built-in botmux-workflow-create skill', () => {
   it('exists and teaches validate + current workflow binding constraints', () => {
     const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-workflow-create');

@@ -3283,6 +3283,15 @@ switch (command) {
     await cmdSubtaskClose(process.argv.slice(3));
     break;
   }
+  case 'subtask-start':
+  case 'subtask-report':
+  case 'subtask-query':
+  case 'subtask-finish':
+  case 'subtask-supplement': {
+    const { cmdSubtaskOrch } = await import('./cli/subtask-orch.js');
+    await cmdSubtaskOrch(command.replace('subtask-', ''), process.argv.slice(3));
+    break;
+  }
   case 'progress-report': {
     const { cmdProgressReport } = await import('./cli/progress-report.js');
     await cmdProgressReport(process.argv.slice(3));
