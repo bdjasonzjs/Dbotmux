@@ -2906,6 +2906,35 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     process.on('SIGTERM', () => clearInterval(watchHandle));
     process.on('SIGINT', () => clearInterval(watchHandle));
     logger.info(`[subgroup-watch] cron registered (every ${WATCH_TICK_INTERVAL_MS / 1000}s, per-watch interval gated) on coco daemon`);
+
+    // ── 群实时监控 (2026-05-30 松松设计): 缇蕾盯指定群 + 自定义监控目标, 命中"该
+    // 上报的事件"就写报告 + @ 唤醒克劳德主会话去读。read-only (不发被监控群)。
+    // 跟 subgroup-watch 互补: 那个面向编排建的群判通用进展, 这个面向任意指定群 +
+    // 自定义目标。每 60s tick, per-monitor 最短判断间隔节流真 coco 调用 (省 token);
+    // poll-fallback 补漏戳。in-flight guard 防 coco 慢时重叠。
+    const MONITOR_TICK_INTERVAL_MS = 60 * 1000;
+    let monitorTickInFlight = false;
+    const monitorHandle = setInterval(async () => {
+      if (monitorTickInFlight) { logger.info('[group-monitor] previous tick in flight — skip'); return; }
+      monitorTickInFlight = true;
+      try {
+        const { runMonitorTick, runReportPollFallback } = await import('./services/group-monitor.js');
+        const { makeMonitorExecutors } = await import('./services/group-monitor-executors.js');
+        const { pruneReports } = await import('./services/group-monitor-store.js');
+        pruneReports();
+        const exec = makeMonitorExecutors();
+        const now = new Date();
+        await runMonitorTick(now, exec);
+        await runReportPollFallback(now, exec);
+      } catch (err) {
+        logger.error(`[group-monitor] tick failed: ${err}`);
+      } finally {
+        monitorTickInFlight = false;
+      }
+    }, MONITOR_TICK_INTERVAL_MS);
+    process.on('SIGTERM', () => clearInterval(monitorHandle));
+    process.on('SIGINT', () => clearInterval(monitorHandle));
+    logger.info(`[group-monitor] cron registered (every ${MONITOR_TICK_INTERVAL_MS / 1000}s, per-monitor throttle) on coco daemon`);
   }
 
   logger.info('Daemon is running. Press Ctrl+C to stop.');

@@ -3288,6 +3288,25 @@ switch (command) {
     await cmdProgressReport(process.argv.slice(3));
     break;
   }
+  case 'group-monitor': {
+    // 先固定 dataDir 再 import store, 否则 store 读默认 <repo>/data 而非 daemon 的 ~/.botmux/data
+    process.env.SESSION_DATA_DIR ??= resolveDataDir();
+    const { cmdGroupMonitor } = await import('./cli/group-monitor.js');
+    await cmdGroupMonitor(process.argv[3] ?? '', process.argv.slice(4));
+    break;
+  }
+  case 'monitor-reports': {
+    process.env.SESSION_DATA_DIR ??= resolveDataDir();
+    const { cmdMonitorReports } = await import('./cli/group-monitor.js');
+    await cmdMonitorReports(process.argv.slice(3));
+    break;
+  }
+  case 'monitor-report-consume': {
+    process.env.SESSION_DATA_DIR ??= resolveDataDir();
+    const { cmdMonitorReportConsume } = await import('./cli/group-monitor.js');
+    await cmdMonitorReportConsume(process.argv.slice(3));
+    break;
+  }
   case 'bots':     await cmdBots(process.argv[3] ?? 'list', process.argv.slice(4)); break;
   case 'history':  await cmdHistory(process.argv.slice(3)); break;
   case 'quoted':   await cmdQuoted(process.argv.slice(3)); break;
