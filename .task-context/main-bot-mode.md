@@ -213,6 +213,32 @@ push 推全量群消息（见上方 2026-05-30 证伪记录）。所以纯文本
 
 ---
 
+## 特性 · group-monitor 群实时监控（2026-05-30 落地, commit 450f2b7）
+
+松松要的"子群感知"优化的落地。跟 subgroup-watch 互补: 那个面向编排建的群判通用
+进展, 这个面向**任意指定群 + 自定义监控目标**, 缇蕾 read-only。
+
+链路: 缇蕾(coco daemon 60s cron) 拉目标群新消息(按 id 高水位防漏/防重判)+ 节流
+(同群最短判断间隔, 省 coco token) → coco 按 goal 判有无该上报事件 → 命中写报告
+JSON(带 seen 标记)+ 缇蕾 **@克劳德**发主话题唤醒主会话去读(真 @, bot-to-bot peer
+路由, 复用 escalateToClaude; **不是 summon**——summon 是给 base/松松 无@场景的)。
+poll-fallback: 戳过但 10min 没消费 → 补戳(≤3 次)。read-only: 绝不发被监控群。
+
+文件: group-monitor-store / group-monitor(决策逻辑+poll-fallback) /
+group-monitor-executors / daemon cron 接线 / cli (group-monitor add·list·remove +
+monitor-reports + monitor-report-consume)。13 单测。
+
+### E2E 完整闭环已验证（暗号法, 逐环日志）
+
+缇蕾监控 → coco 判暗号该上报 → 写报告 → @唤醒主话题克劳德会话 → 它读+核实+
+**`botmux monitor-report-consume` 标记 consumed**。全链路实测跑通。
+
+⚠️ **部署裂口教训**: 第一次 E2E 时被唤醒会话跑 `botmux monitor-report-consume`
+失败——因为**全局 `botmux` 命令指向旧安装版 v2.25.1**(没新命令), 而 daemon 跑的是
+新 Dbotmux/dist。修复: `rsync Dbotmux/dist → ~/.npm-global/.../botmux/dist`。
+**记住: 改了 CLI 命令后, 光 daemon 重启不够, 全局 `botmux` 还是旧的, 要 rsync 到
+安装版; bot 用的是全局 `botmux`, 不是 `node dist/cli.js`。** [[reference_base_message_relay]]
+
 ## Norms（本任务的工作规则）
 
 ### 工作模式
