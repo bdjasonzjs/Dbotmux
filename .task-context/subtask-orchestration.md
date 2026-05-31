@@ -1,9 +1,11 @@
 # Task Context · subtask-orchestration（子任务编排系统）
 
-> **Status**: 🟢 Active · Activated 2026-05-30 · Owner: 克劳德
+> **Status**: 🟢 Active · Activated 2026-05-30 · **v3 设计纠偏 2026-05-31** · Owner: 克劳德
 > **Mode**: 一步一步实现，phase by phase，不动作变形（松松 2026-05-30 强约束）
-> **设计依据**: 技术方案 v0.2（含可靠性底座，蔻黛克斯 review 后）
+> **设计依据**: 技术方案 v0.2（含可靠性底座，蔻黛克斯 review 后）+ **v3 纠偏（见下方红节，最高优先级）**
 > https://bytedance.larkoffice.com/docx/PQFddm7dQosKbrxiQLtcMHAxnIb
+> **⚠️ 阅读顺序**：先读「🔴 v3 设计纠偏」节——它**覆盖** Phase 3 的「缇蕾直发」实现；下方 Phase 3-6 进度里
+> 凡涉及「缇蕾直发投递身份」的描述均已**作废**，以 v3 为准。可靠性底座（store/outbox/cursor/claim/lease/状态机）保留。
 
 ## 一句话
 
@@ -11,6 +13,88 @@
 需协助/完成时上报**父群** → 主 bot 查询+决策（结束/补充）。靠 Message 链路(base
 转发) + MCP 工具 + 数据结构 驱动。脚本化观测牺牲实时换低成本，**前提是 outbox +
 cursor + ack 做扎实**，否则失败被藏更深（蔻黛克斯 review 核心结论）。
+
+## 🔴 v3 设计纠偏（2026-05-31，松松对齐，最高优先级）
+
+### 纠偏背景
+Phase 3 把「主↔子通信」实现成了**缇蕾直发纯文本**（我+蔻黛克斯 review 时拍板，没回去跟松松对齐），
+**偏离了松松原始方案**。松松强反馈：「最最优先的是尊重我的设计……不能自己跑去瞎改」。
+连带 bug：缇蕾直发纯文本**唤不醒**子群 bot（Phase 6 finding #2「子群空转」的根因）。
+→ 整个**投递层 + 工具执行模型**按下面的 v3 架构重做。教训见 memory [[bot-consensus-not-design-authority]]。
+
+### 核心模型：内存共享式通信（松松定调）
+- **subtask-store = 共享内存**。所有 bot（主/子）只 **读/写 store**，**不互相直接发消息**。
+- **coco LLM API = 急急如律令的唯一触发器**。任何「唤醒某个 bot」的动作，都由 coco 观测到
+  store 状态变化后，**发急急如律令（base relay，以松松身份发 `急急如律令：【botname】正文`）**触发。
+- **bot 之间不直连**：没有 bot-to-bot 直接 IPC / 直接发消息 / service 替 bot 行动。
+- **通信三步**：① bot 写 store（求助/完成/下发）→ ② coco 观测到 → 发急急如律令 → ③ 目标 bot 被唤醒 → 读 store → 决策 → 写 store。
+
+### 主↔子通信必须走 msg 链路（急急如律令），强制
+- **主→子 / 子→主，全部走急急如律令**（base relay），**不是**缇蕾直发纯文本。
+- **MCP/CLI 工具也必须走这个 msg 链路**（松松强制：「工程上确保必须实现成这样」）。
+  禁止 CLI-direct-IPC 让 service 直接替 bot 完成跨会话动作、绕过 bot 参与。
+- **bot 真参与**：「要让 bot 真正参与，否则链路不通」——目标 bot 的 LLM session 必须被**真唤醒、真读 store、真决策**。
+  service 代码不许替 bot 思考/行动。
+
+### askforhelp 工具 = 只写信息（内存共享式）
+- 子群执行 bot 调 askforhelp = **把求助信息写进 store**（共享内存），仅此而已。
+- 激活主 bot 的链路**不变**，仍由 coco LLM 观测到后触发急急如律令。
+- 松松原话：「这个求助就只是一个存信息的行为，本质上是一种内存共享式的通信」。askforhelp **不直接发消息、不直接唤主 bot**。
+
+### 观测层：coco LLM API，保留不动
+- 观测判断**用 LLM API（coco）即可，不必真 bot**——松松确认。
+- 两条硬约束（已在 Phase 2 实现，**保留**）：① **上下文连续性**：每次总结判断都知道自己之前的总结结果
+  （recentObservations）② **不漏消息**：committedCursor 推进。
+- `subtask-observer.ts` **保持不变**；`subtask-observer-executors.ts` 2026-05-31 修过卡片解码 bug，见 ↓。
+
+### ⚠️ observer 卡片解码坑（2026-05-31 实战暴露 + 已修）
+- **现象**：真实子任务 st_961bb3f6（合 MR）干完了，observer 却从 07:44 冻 8 小时不 escalate，松松判「观察逻辑没 work」。
+- **根因**：观察循环一直在跑（coco 每 60s tick），但 `renderMsg` 裸读 `body.content`，对 `msg_type==='interactive'`（子 bot 的完成/进度卡片）飞书返回降级占位文「请升级至最新版本客户端以查看内容」→ coco 每轮只看到占位文 → 判 `signal:normal` → 永不 escalate。完成/求助信号被这层占位文吞掉。
+- **修复**：`renderMsg` 改用 `parseApiMessage(m).content`（复用 message-parser `extractCardContent` 解码卡片真 body）；命中纯占位 sentinel（`isPureCardUpgradeFallback`）再 `getMessageDetail(...,{userCardContent:true})` 重取兜底。`renderMsg` 改 async，调用点 `Promise.all`。新增 3 单测。
+- **教训**：observer 靠「读子群消息」感知进度，子 bot 输出几乎全是 interactive 卡片——**任何「读消息内容」的环节都必须走卡片解码，不能裸读 `body.content`**。
+- ⚠️ **不回溯**：修复只对**未来新消息**生效；已 committed 的旧消息 cursor 已追平，不会被重判。卡死的旧任务要救活需手动制造新消息触发重观察。
+
+### kickoff：coco 急急如律令唤醒子群
+- create 建群后，coco 观测到新子任务 → 发急急如律令唤醒子群执行 bot（带子任务目标）。
+- **不能缇蕾直发纯文本**（唤不醒，Phase 6 finding #2 根因）。
+
+### `<subtask_member_routing>` prompt 注入（子群每轮小尾巴）
+- MCP 工具不是 skill，多轮对话后 bot 会丢失「可以向主 bot 求助」等信息 →
+  借 botmux 给 CLI 注入 prompt 的机制（现有 `<main_bot_routing>`/`<botmux_routing>` 同款），子任务子群**每轮补注入**。
+- 注入点：`session-manager.ts buildNewTopicPrompt`，检测 chatId ∈ 子任务子群（`subtask-store.getByChatId`）。
+- **5 部分内容**：
+  ① **子任务目标 / 验收标准**（这个群在干什么）
+  ② **你的角色职责**（按 bot 身份，见下方角色分工）
+  ③ **群里还有哪些 bot + 各自职责**（协作上下文）
+  ④ **求助机制**：可用 askforhelp 向主 bot 求助；**别硬扛、别编**。
+  ⑤ **逐级上报铁律**（独立 `<subtask_escalation_protocol>` 块，2026-05-31 松松下达）：子 bot **无权直接 @ / 找邹劲松拍板**；任何卡点 / 待决策（MR 合不合、选 A/B、是否继续）只能 askforhelp 写 store 上报父群 → 父群主 bot 感知 → 主 bot 判断是否惊动松松。链路「子群 → 父群主 bot →（主 bot 判断）→ 邹劲松」，**严禁跨级**。
+
+### 角色分工（注入进 ②③，每个 bot 知道自己 + 别人的角色）
+- **克劳德（claude）= 执行者**：负责**方案的制定** + **方案的落地**。
+- **蔻黛克斯（codex）= Reviewer**：审**方案的合理性** + 审**代码是否正确、有没有逻辑硬伤**。
+- **缇蕾（coco）= 超级 Subagent**：Token 不限量，承接 **token 消耗量巨大但相对简单**的活。
+
+### 可靠性底座：全部保留
+subtask-store（共享内存数据层）/ OutboxCommand outbox / observer cursor（committedCursor）/
+claim/lease / CAS completeDispatch / 状态机 / 乐观版本锁 / 幂等。
+**dispatcher 的可靠性决策逻辑保留**，只把 deliver IO（缇蕾直发 → coco 急急如律令 base relay）换掉。
+
+### 任务发起入口（理解，实现时如有疑问精准问松松）
+- **松松 → 主话题克劳德**：松松本人正常 @ 主话题克劳德下任务即可（他本人发消息天然触发主 bot，不需要急急如律令唤醒）。
+- **主 bot → 子群 / 子群 → 主 bot**：才走急急如律令 msg 链路。
+- 即「松松→主」用正常消息，「主↔子」用急急如律令；create 入口若松松要求也走急急如律令再调整。
+
+### v3 实现进度（2026-05-31，松松授权自主推进）
+- ✅ **投递层重做 (#81)**：新建 `base-relay.ts`（急急如律令发送侧：spawn `lark-cli base` 写记录→owner 身份发→轮询「已发送」，配置走环境变量 `SUBTASK_RELAY_BASE_TOKEN`/`SUBTASK_RELAY_TABLE_ID`，不硬编码）；`outbox-dispatcher-executors.ts` deliver 改 `sendAsOwner`，文案改急急如律令纯文本格式（无 `<at>`，前缀 `急急如律令：【botname】`）。**dispatcher 决策/可靠性逻辑保留不动**。9 单测重写绿。
+- ✅ **askforhelp 工具 (#82)**：`subtask-orchestrator.askForHelp`（= reportProgress(need_help) 的执行者别名，写 report_help command 进 store）+ CLI `subtask-askforhelp` + IPC route `/api/subtask-orch-askforhelp`。
+- ✅ **防误清库 (#87)**：`subtask-store.read()` corrupt → 备份 `.corrupt-<ts>` + 抛 `StoreCorruptError`（**不返空库**）。
+- ✅ **kickoff (#83)**：createSubtask 建群+observing 后 enqueue commandType='kickoff'，dispatcher 急急如律令唤子群执行 bot（带 goal/验收/askforhelp 提示）。store CommandType 加 'kickoff'。executors + orchestrator 测试绿。
+- ✅ **子群每轮注入 (#84)**：`session-manager.buildSubtaskMemberBlock` 检测子任务子群 → 注入 `<subtask_member_routing>`（初版 4 部分：目标·验收/角色/其他bot职责/askforhelp 求助；2026-05-31 加第 ⑤ 逐级上报铁律 `<subtask_escalation_protocol>`，见上）。挂首轮 `buildNewTopicPrompt` + 每轮 `buildFollowUpContent`（daemon.ts:2334 + 包装函数传 chatId/larkAppId）。getByChatId corrupt try/catch 不阻塞 spawn。角色 claude-code=执行者/codex=Reviewer/coco=超级Subagent。build 绿；靠 E2E 验证注入（未加单测，session-manager 隔离成本高）。
+- ✅ **5 工具复核 (#85)**：工具层已符合 v3——5 工具+askforhelp 都 bot 自己调、写 store，跨会话靠 dispatcher 急急如律令投递，无 service 替 bot 绕过。无需改造。
+- ✅ **#86 E2E 核心链路已验证**：base relay → 急急如律令 → executor 唤醒（3.5s 内），物理通道打通。base relay 用蔻黛克斯「用户身份发消息」表（PXxSb3sPhabVB7swXZacrQxentf / tblxlPHT2sgdy3q0）。坑：① daemon 带 HTTPS_PROXY，spawn lark-cli 必须 `LARK_CLI_NO_PROXY=1`；② owner 必须是目标子群成员，否则 base relay 报 800030410。
+- ✅ **observer 卡片解码 + 逐级上报铁律 (2026-05-31，真实 case 暴露)**：见上「⚠️ observer 卡片解码坑」+ 注入第 ⑤ 部分。escalate 目标核实=已发父群（`child_to_parent` → `parentChatId` → 急急如律令唤主 bot 自判，**不直连松松**），符合铁律未改。
+- ✅ **顺手修 botmux 既有转发 bug (2026-05-31)**：`claude-transcript.ts extractAssistantText` 的 array-form text block 分支未过滤工具调用块 → 群里刷 XML 乱码（154 处泄漏全在此分支，之前只修了 string-form 分支所以对真实群没生效）。现两分支都过滤 + 残缺块兜底正则。
+- 🔴 **构建血泪教训**：`pnpm build | tail`（或任何管道）会吞掉 tsc 的非零退出码、返回 tail 的 0——**构建绝不接管道**。这个坑曾让 #84 一个 type error 被长期掩盖、部署的根本不是新代码。
 
 ## 三块数据模型（v0.2，蔻黛克斯 review 加固后）
 
@@ -96,9 +180,10 @@ finish_subtask(taskId,expectedVersion) / supplement_subtask(taskId,content,expec
   - 蔻黛克斯 P1（已在 Phase 3 落，见下）：reported_help no-respam 要看旧 help command 的 ack/超时/失败。
 - **Phase 3 投递+ack** · 实现完成，79 单测过（+dispatcher 15 +dispatcher-exec 5），**蔻黛克斯 review 中**
   - outbox-dispatcher.ts（纯逻辑）：runDispatcherTick / planDispatch / planBackoff(30s→cap10min)。
-  - outbox-dispatcher-executors.ts（IO）：**缇蕾直发**（蔻黛克斯+邹劲松拍板，不走 send-as-jason）；
-    child→parent @主bot 中性文案(只给 taskId/commandId+query指引)；parent→child @执行bot 带 finish/supplement。
-  - **身份决策**：投递身份从 v0.2"base 转发"改为缇蕾直发——系统 observer 上报非邹劲松本人下令，缇蕾更可审计。
+  - ~~outbox-dispatcher-executors.ts（IO）：**缇蕾直发**~~ ⚠️ **v3 作废**（见上方🔴红节）：缇蕾直发偏离松松设计 +
+    唤不醒子群 bot（finding #2 根因）。投递层重做为「**coco 触发急急如律令 base relay**」。
+    child→parent / parent→child 的**文案与可靠性逻辑可复用**，但**投递身份/机制全换**成急急如律令。
+  - ~~**身份决策**：改缇蕾直发~~ ⚠️ **作废**：松松原始设计就是 base 转发（急急如律令），bot review「缇蕾更可审计」**不构成改设计授权**。
   - 蔻黛克斯 3 硬约束全落 + 单测：
     ① claim/lease 防重复投：store 加 dispatchingUntil/dispatchAttemptId；claimCommandForDispatch 锁内原子抢占 +
        completeDispatch CAS 回写(lease 被抢走不覆盖)；listPendingCommands 加 lease 过滤。

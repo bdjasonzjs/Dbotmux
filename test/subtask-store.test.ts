@@ -3,7 +3,7 @@
  * Run: pnpm vitest run test/subtask-store.test.ts
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -20,7 +20,7 @@ import {
   updateCommand, claimCommandForDispatch, completeDispatch, transitionAndEnqueueCommand,
   helpReportDelivery, staleHelpCommandIds,
   listObservations, pruneFinished, VersionConflictError, TaskNotFoundError, CommandRetryMismatchError, ACTIVE_STATUSES,
-  __resetForTesting, type SubTaskBot,
+  StoreCorruptError, __resetForTesting, type SubTaskBot,
 } from '../src/services/subtask-store.js';
 
 const BOTS: SubTaskBot[] = [
@@ -44,6 +44,21 @@ async function mkObserving(key = 'k1', chat = 'oc_sub') {
 beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), 'st-test-'));
   __resetForTesting();
+});
+
+describe('防误清库 (read corrupt hard-fail)', () => {
+  it('corrupt store → 抛 StoreCorruptError, 不当空库, 备份留证, 原文件不被清空', async () => {
+    await mk('k1');                                       // 先写入一条合法记录
+    const fp = join(tempDir, 'subtasks.json');
+    writeFileSync(fp, '{ this is broken json', 'utf-8');  // 弄坏文件
+    // read() (getSubTask 触发) 必须抛 —— 绝不返回空库 (否则下次 write 覆盖 = 清库)
+    expect(() => getSubTask('whatever')).toThrow(StoreCorruptError);
+    // 原 corrupt 文件没被空库覆盖 (内容还在)
+    expect(readFileSync(fp, 'utf-8')).toContain('broken');
+    // corrupt 文件被备份成 .corrupt-<ts> 留证
+    const backups = readdirSync(tempDir).filter(f => f.includes('subtasks.json.corrupt-'));
+    expect(backups.length).toBeGreaterThan(0);
+  });
 });
 
 describe('SubTask CRUD + 幂等', () => {

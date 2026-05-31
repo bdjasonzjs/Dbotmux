@@ -20,6 +20,7 @@ const VERB_ROUTE: Record<string, string> = {
   query: '/api/subtask-orch-query',
   finish: '/api/subtask-orch-finish',
   supplement: '/api/subtask-orch-supplement',
+  askforhelp: '/api/subtask-orch-askforhelp',
 };
 const NUM_FLAGS = new Set(['expectedVersion']);
 const LIST_FLAGS = new Set(['bots', 'sourceMessageIds', 'relatedRefs']);
@@ -88,6 +89,8 @@ const HELP = `botmux subtask-{start|report|query|finish|supplement} — 子任�
   subtask-finish     --task-id <id> --expected-version <n> [--note "<说明>"] [--force]
   subtask-supplement --task-id <id> --content "<补充>" --expected-version <n> [--force]
                      (expected-version 默认必传守 stale；人工强制结束/补充才加 --force)
+  subtask-askforhelp --task-id <id> --summary "<卡在哪/需要什么>" [--source-message-ids m1,m2]
+                     (子群执行 bot 向主 bot 求助：写求助进 store，由 coco 触发急急如律令唤主 bot)
 
 通用: [--session-id <sid>]（缺省取 env BOTMUX_SESSION_ID）。
 鉴权/幂等/版本在 daemon service 侧；CLI 仅透传。`;

@@ -106,6 +106,17 @@ describe('createSubtask', () => {
     expect(getByChatId('oc_sub_new')!.taskId).toBe(res.taskId); // getByChatId 命中 = 归新 observer
   });
 
+  it('v3 kickoff: create 后 enqueue 一条 kickoff (parent→child, 投子群, 幂等不重复)', async () => {
+    mainSession();
+    const res = await createSubtask({ sessionId: 'sess_main', goal: '修登录 bug', taskType: 'bug' });
+    const kickoff = listCommands(res.taskId).find(c => c.commandType === 'kickoff');
+    expect(kickoff).toBeTruthy();
+    expect(kickoff!.direction).toBe('parent_to_child');
+    expect(kickoff!.targetChatId).toBe('oc_sub_new');         // 投子群唤执行 bot
+    await createSubtask({ sessionId: 'sess_main', goal: '修登录 bug', taskType: 'bug' }); // cacheHit
+    expect(listCommands(res.taskId).filter(c => c.commandType === 'kickoff')).toHaveLength(1);
+  });
+
   it('边界4 crash window: 建群成功但登记缺失 → 重试复用 chatId + 补登记, 不重复建群', async () => {
     mainSession();
     // 预置 idempotency cache (模拟"上次建群成功但 createSubTask 前崩了")

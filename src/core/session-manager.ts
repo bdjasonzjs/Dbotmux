@@ -29,6 +29,7 @@ import { usageLimitStateKey } from '../utils/cli-usage-limit.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
 import { parseWorkingDirList } from '../utils/working-dir.js';
 import * as chatContextStore from '../services/chat-context-store.js';
+import * as subtaskStore from '../services/subtask-store.js';
 
 function sessionCreatedAtMs(session: { createdAt?: string }): number {
   return session.createdAt ? (Date.parse(session.createdAt) || Date.now()) : Date.now();
@@ -242,6 +243,67 @@ export function buildMainBotPromptBlock(chatId: string | undefined, larkAppId: s
 </main_bot_routing>`;
 }
 
+/**
+ * 子任务子群成员注入 (v3 #84，见 task-context「🔴 v3 设计纠偏」)：检测 chatId 是某个 **active**
+ * 子任务的子群 → 注入 `<subtask_member_routing>`（4 部分：子任务目标/验收、你的角色职责、群里其他
+ * bot 职责、求助机制）。**每轮注入**（首轮 buildNewTopicPrompt + 后续 buildFollowUpContent）——
+ * 因为 MCP 工具不是 skill，多轮对话后 bot 会丢失「可以向主 bot 求助」「自己/别人的角色」等信息。
+ * getByChatId corrupt 会抛 StoreCorruptError → try/catch 兜住，**注入失败绝不阻塞 spawn / 发消息**。
+ */
+export function buildSubtaskMemberBlock(chatId: string | undefined, larkAppId: string | undefined): string {
+  if (!chatId || !larkAppId) return '';
+  let task: ReturnType<typeof subtaskStore.getByChatId>;
+  try { task = subtaskStore.getByChatId(chatId); }
+  catch (err) { logger.warn(`[session-manager] subtask member lookup failed for ${chatId}: ${err}`); return ''; }
+  if (!task) return '';
+  if (task.status === 'finished' || task.status === 'stopped') return ''; // 终态不再注入
+
+  // 角色定义 (v3：claude=执行者 / codex=Reviewer / coco=超级Subagent)
+  const ROLE_BY_CLI: Record<string, string> = {
+    'claude-code': '执行者 —— 负责方案的制定 + 方案的落地',
+    codex: 'Reviewer —— 审方案的合理性、审代码是否正确 / 有没有逻辑硬伤',
+    coco: '超级 Subagent —— Token 不限量，承接 token 消耗大但相对简单的活',
+  };
+  const ROLE_BY_NAME: Record<string, string> = {
+    克劳德: ROLE_BY_CLI['claude-code'], 蔻黛克斯: ROLE_BY_CLI['codex'], 缇蕾: ROLE_BY_CLI['coco'],
+  };
+  let selfOpenId: string | null = null;
+  let selfRole = '(未识别角色，按子任务目标干活)';
+  try { const b = getBot(larkAppId); selfOpenId = b.botOpenId ?? null; selfRole = ROLE_BY_CLI[b.config.cliId] ?? selfRole; } catch { /* xref 缺失 → 用兜底 */ }
+
+  const others = task.bots
+    .filter(b => b.openId !== selfOpenId)
+    .map(b => `  - ${b.name}：${ROLE_BY_NAME[b.name] ?? (b.role === 'observer' ? '观测/盯群、触发唤醒（不参与执行）' : '协作')}`);
+  const accLine = task.acceptance ? `\n【验收标准】${task.acceptance}` : '';
+
+  return `<subtask_member_routing>
+你现在在一个**子任务子群**里干活（不是主话题，零主话题上下文，背景以这里为准）。
+
+【子任务目标】${task.goal}${accLine}
+
+【你的角色】${selfRole}
+
+【群里其他成员】
+${others.length ? others.join('\n') : '  (只有你和观测者)'}
+
+【卡住 / 缺信息怎么办】
+- 用 \`botmux subtask-askforhelp --task-id ${task.taskId} --summary "卡在哪/需要什么"\` 向主 bot 求助。
+- 求助会写进共享内存，由观测者(缇蕾/coco)触发急急如律令唤主 bot 来处理 —— 你不用自己 @ 谁。
+- **别硬扛、别编**：信息不足就求助，不要臆测或编造结果。
+</subtask_member_routing>
+
+<subtask_escalation_protocol>
+你是子任务群的成员，在这个子群和共享 store 上完成被指派的子任务。关于「找人决策」有一条铁律：
+
+- 你**无权直接惊动项目 owner（邹劲松）**。子群里任何卡点、岔路、需要人拍板的决策（例如「MR 要不要合并」「方案选 A 还是 B」「是否继续往下做」），一律**不能**直接 @ 他、不能在消息里问他、不能停下来等他回复。
+- 需要决策或卡住时，唯一正确的动作是**逐级上报**：用 \`subtask-askforhelp\`（或进度上报）把「卡点 / 待决策项」写进共享 store，上报到**父群**。
+- 之后由**父群的主 bot** 感知这个信号，并自行判断是否需要惊动邹劲松。是否真的请他介入，**由父群主 bot 决定，不由你决定**。
+- 链路：**子群（你）→ 父群主 bot →（主 bot 判断后）→ 邹劲松**。你只负责把信号准确送到父群这一跳，**严禁跨级**直接找人。
+
+所以，干完一个阶段、或遇到需要人决策的岔路口，正确动作是「写 store 上报父群、等主 bot 接管」，而**不是**「停下来问邹劲松 A/B/C」。
+</subtask_escalation_protocol>`;
+}
+
 export function buildChatContextBlock(chatId: string): string {
   try {
     const ctx = chatContextStore.read(chatId);
@@ -365,6 +427,10 @@ export function buildNewTopicPrompt(
   const mainBotBlock = buildMainBotPromptBlock(chatId, larkAppId);
   if (mainBotBlock) parts.push(mainBotBlock);
 
+  // v3 #84: 子任务子群成员注入（目标/角色/其他bot/求助机制）。首轮。
+  const subtaskMemberBlock = buildSubtaskMemberBlock(chatId, larkAppId);
+  if (subtaskMemberBlock) parts.push(subtaskMemberBlock);
+
   const senderBlock = renderSenderTag(sender);
   if (senderBlock) parts.push(senderBlock);
 
@@ -398,7 +464,7 @@ export function buildNewTopicPrompt(
 export function buildFollowUpContent(
   content: string,
   sessionId: string,
-  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender },
+  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; chatId?: string; larkAppId?: string },
 ): string {
   const parts: string[] = [`<user_message>\n${content}\n</user_message>`];
 
@@ -426,6 +492,10 @@ export function buildFollowUpContent(
     });
     parts.push(`<mentions>\n${items.join('\n')}\n</mentions>`);
   }
+
+  // v3 #84: 子任务子群成员注入（每轮）—— 多轮对话会丢这些信息，每条后续消息也补一次。
+  const subtaskMemberBlock = buildSubtaskMemberBlock(opts?.chatId, opts?.larkAppId);
+  if (subtaskMemberBlock) parts.push(subtaskMemberBlock);
 
   parts.push(`<botmux_reminder>${t('ai.followup.reminder', undefined, opts?.locale)}</botmux_reminder>`);
 
@@ -563,6 +633,8 @@ export function buildReforkPrompt(
     cliPathOverride: opts?.cliPathOverride,
     locale,
     sender: opts?.sender,
+    chatId: ds.session.chatId,
+    larkAppId: ds.larkAppId,
   });
 }
 

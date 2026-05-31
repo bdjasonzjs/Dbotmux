@@ -33,7 +33,7 @@ export type SubTaskStatus =
 export type DeliveryStatus = 'pending' | 'sent' | 'acked' | 'failed';
 export type Signal = 'normal' | 'need_help' | 'done';
 export type OutboxDirection = 'child_to_parent' | 'parent_to_child';
-export type CommandType = 'report_help' | 'report_done' | 'finish' | 'supplement';
+export type CommandType = 'report_help' | 'report_done' | 'finish' | 'supplement' | 'kickoff';
 
 export interface SubTaskBot { openId: string; name: string; role: 'main' | 'observer' | 'collab'; }
 
@@ -125,6 +125,16 @@ export function isTransitionAllowed(from: SubTaskStatus, to: SubTaskStatus): boo
 }
 
 // ─── IO（跨进程安全）─────────────────────────────────────────────────────────
+
+/** store 文件存在但 parse 失败。**绝不当空库**——否则后续 write 覆盖 = 清库 (reliability-core
+ *  不能这样)。corrupt 文件先备份留证，再抛本错误让上层 skip 本轮 (observer/dispatcher 有 try/catch)。 */
+export class StoreCorruptError extends Error {
+  constructor(public backupPath: string | null, cause: unknown) {
+    super(`subtask-store corrupt (backed up to ${backupPath ?? 'N/A'}); HARD FAIL, not treating as empty. cause: ${cause}`);
+    this.name = 'StoreCorruptError';
+  }
+}
+
 function fp(): string { return join(config.session.dataDir, 'subtasks.json'); }
 function ensureDir(): void {
   const d = dirname(fp());
@@ -132,12 +142,18 @@ function ensureDir(): void {
 }
 function read(): StoreFile {
   if (!existsSync(fp())) return { subtasks: [], commands: [], observations: [] };
+  const raw = readFileSync(fp(), 'utf-8');
   try {
-    const s = JSON.parse(readFileSync(fp(), 'utf-8')) as Partial<StoreFile>;
+    const s = JSON.parse(raw) as Partial<StoreFile>;
     return { subtasks: s.subtasks ?? [], commands: s.commands ?? [], observations: s.observations ?? [] };
   } catch (err) {
-    logger.error(`[subtask-store] parse failed: ${err}; treating as empty`);
-    return { subtasks: [], commands: [], observations: [] };
+    // 上线前必修 (蔻黛克斯 review)：corrupt **绝不**返回空库 (会被下一次 write 覆盖 = 清库)。
+    // 先把 corrupt 文件备份成 .corrupt-<ts> 留证，再 hard fail —— 上层 skip 本轮而非静默清库。
+    let backup: string | null = `${fp()}.corrupt-${Date.now()}`;
+    try { writeFileSync(backup, raw, 'utf-8'); }
+    catch (bkErr) { logger.error(`[subtask-store] corrupt backup failed: ${bkErr}`); backup = null; }
+    logger.error(`[subtask-store] parse failed: ${err}; backed up to ${backup ?? 'N/A'}; HARD FAIL (refuse to wipe store)`);
+    throw new StoreCorruptError(backup, err);
   }
 }
 function write(s: StoreFile): void {

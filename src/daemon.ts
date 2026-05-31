@@ -1394,6 +1394,7 @@ const SUBTASK_ORCH_ROUTES: Array<[string, string]> = [
   ['/api/subtask-orch-query', 'querySubtask'],
   ['/api/subtask-orch-finish', 'finishSubtask'],
   ['/api/subtask-orch-supplement', 'supplementSubtask'],
+  ['/api/subtask-orch-askforhelp', 'askForHelp'],
 ];
 for (const [path, fnName] of SUBTASK_ORCH_ROUTES) {
   ipcRoute('POST', path, async (req, res) => {
@@ -2337,6 +2338,8 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
           cliId: dsBotCfgForMsg.cliId,
           cliPathOverride: dsBotCfgForMsg.cliPathOverride,
           sender: await getThreadSender(),
+          chatId: ds.session.chatId,
+          larkAppId: ds.larkAppId,
         });
     beginNewTurn(ds, parsed.content);
     rememberLastCliInput(ds, promptContent, msgContent);

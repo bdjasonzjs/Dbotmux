@@ -131,6 +131,14 @@ export async function createSubtask(req: CreateSubtaskReq): Promise<{ taskId: st
   // 群已建好 = 激活成功 → creating 转 observing 让 observer 接管。已 observing 不重复转。
   if (task.status === 'creating') await transitionStatus(task.taskId, 'observing');
 
+  // v3 kickoff (finding #2 修复)：建群+observing 后 enqueue 一条急急如律令 kickoff 唤子群执行 bot 开干，
+  // 由 dispatcher(coco) 投递时发 base relay 唤醒 (v2 之前没 kickoff → 子群空转)。
+  // idempotencyKey task-scoped，重复 create(cacheHit) / create 重试都不重复 kickoff。
+  await enqueueCommand({
+    taskId: task.taskId, direction: 'parent_to_child', targetChatId: task.chatId,
+    commandType: 'kickoff', payload: {}, idempotencyKey: `kickoff-${task.taskId}`, expectedTaskVersion: null,
+  });
+
   // 边界3: v2 故意**不** registerWatch —— 这个群归新 observer，不让旧 watcher 也来管。
   logger.info(`[subtask-orch] create ${task.taskId} chat=${entry.chatId.slice(0, 12)} ${cacheHit ? 'CACHE_HIT' : 'NEW'}`);
   return { taskId: task.taskId, chatId: entry.chatId, isNew: !cacheHit };
@@ -173,6 +181,25 @@ export async function reportProgress(req: ReportProgressReq): Promise<{ cmdId: s
   });
   logger.info(`[subtask-orch] report_progress ${task.taskId} type=${req.type} cmd=${cmd.cmdId}`);
   return { cmdId: cmd.cmdId, taskId: task.taskId };
+}
+
+// ─── askforhelp ────────────────────────────────────────────────────────────────
+export interface AskForHelpReq {
+  sessionId: string;
+  taskId: string;
+  summary: string;
+  sourceMessageIds?: string[];
+  idempotencyKey?: string;
+}
+
+/**
+ * askforhelp (v3, 见 task-context「🔴 v3 设计纠偏」)：子群执行 bot **主动求助** ——
+ * 把求助信息**写进 store**(report_help command 入队)，仅此而已。激活主 bot 的链路不变，
+ * 由 coco(dispatcher) 异步触发急急如律令 base relay 唤主 bot。「本质上是一种内存共享式的通信」(松松)。
+ * 等价 reportProgress(type='need_help')，但语义面向执行者 (注入小尾巴里告诉子 bot「卡住用 askforhelp、别硬扛」)。
+ */
+export async function askForHelp(req: AskForHelpReq): Promise<{ cmdId: string; taskId: string }> {
+  return reportProgress({ sessionId: req.sessionId, taskId: req.taskId, type: 'need_help', summary: req.summary, sourceMessageIds: req.sourceMessageIds, idempotencyKey: req.idempotencyKey });
 }
 
 // ─── query_subtask ────────────────────────────────────────────────────────────

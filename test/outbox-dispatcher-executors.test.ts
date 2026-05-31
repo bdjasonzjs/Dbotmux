@@ -1,22 +1,17 @@
 /**
- * Unit tests for outbox-dispatcher-executors deliver (Phase 3 IO 层)。
- * mock sendMessage / resolveBotIdent，验证缇蕾直发文案 + uuid 幂等 + 失败不抛。
+ * Unit tests for outbox-dispatcher-executors deliver (v3 急急如律令 base relay)。
+ * mock sendAsOwner，验证急急如律令文案 + 失败不抛 + 注入防护 + 投递目标/名单。
  * Run: pnpm vitest run test/outbox-dispatcher-executors.test.ts
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
-const mockSend = vi.fn();
-vi.mock('../src/im/lark/client.js', () => ({ sendMessage: (...a: any[]) => mockSend(...a) }));
-vi.mock('../src/core/main-bot-playbook.js', () => ({
-  resolveBotIdent: (k: string) =>
-    k === 'tilly' ? { larkAppId: 'app_coco', openId: 'ou_coco' }
-      : { larkAppId: 'app_claude', openId: 'ou_claude_main' },
-}));
+const mockSendAsOwner = vi.fn();
+vi.mock('../src/services/base-relay.js', () => ({ sendAsOwner: (...a: any[]) => mockSendAsOwner(...a) }));
 vi.mock('../src/utils/logger.js', () => ({
   logger: { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn(), isDebug: () => false },
 }));
 
-import { makeDispatchExecutors } from '../src/services/outbox-dispatcher-executors.js';
+import { makeDispatchExecutors, safeText } from '../src/services/outbox-dispatcher-executors.js';
 import type { OutboxCommand, SubTask } from '../src/services/subtask-store.js';
 
 function mkTask(over?: Partial<SubTask>): SubTask {
@@ -39,83 +34,107 @@ function mkCmd(over?: Partial<OutboxCommand>): OutboxCommand {
   };
 }
 
-beforeEach(() => { mockSend.mockReset(); mockSend.mockResolvedValue('om_delivered'); });
+beforeEach(() => { mockSendAsOwner.mockReset(); mockSendAsOwner.mockResolvedValue({ ok: true, recordId: 'rec_1' }); });
 
-describe('deliver child_to_parent', () => {
-  it('@主bot + taskId + commandId + query 指引, uuid=cmdId, 返回 messageId', async () => {
+describe('deliver child_to_parent (急急如律令唤主bot)', () => {
+  it('急急如律令：【克劳德】 + taskId + commandId + query 指引, 投父群, 返回 recordId', async () => {
     const exec = makeDispatchExecutors();
     const res = await exec.deliver(mkCmd(), mkTask());
-    expect(res).toEqual({ ok: true, messageId: 'om_delivered' });
-    const [larkApp, chatId, text, msgType, uuid] = mockSend.mock.calls[0];
-    expect(larkApp).toBe('app_coco');          // 缇蕾身份发
-    expect(chatId).toBe('oc_parent');          // 投父群
-    expect(msgType).toBe('text');
-    expect(uuid).toBe('cmd_abc');              // at-least-once: uuid=cmdId
-    expect(text).toContain('ou_claude_main');  // @主bot
-    expect(text).toContain('st_1');            // taskId
-    expect(text).toContain('cmd_abc');         // commandId
-    // 接线边界1: 精确可执行命令，用 commandId 不用 taskId-only 指引
-    expect(text).toContain('botmux subtask-query --command-id cmd_abc');
-    expect(text).not.toContain('query_subtask');
-    expect(text).not.toContain('query_subtask(taskId');
-    expect(text).toContain('需要协助');
+    expect(res).toEqual({ ok: true, messageId: 'rec_1' });
+    const arg = mockSendAsOwner.mock.calls[0][0];
+    expect(arg.targetChatId).toBe('oc_parent');              // 投父群
+    expect(arg.text).toContain('急急如律令：【克劳德】');     // 急急如律令唤主bot (非缇蕾直发)
+    expect(arg.text).toContain('st_1');                      // taskId
+    expect(arg.text).toContain('cmd_abc');                   // commandId
+    expect(arg.text).toContain('botmux subtask-query --command-id cmd_abc');
+    expect(arg.text).not.toContain('query_subtask(');        // 不是旧 MCP 风格
+    expect(arg.text).toContain('需要协助');
   });
 
   it('report_done → 文案标"已完成（待确认）"', async () => {
     const exec = makeDispatchExecutors();
     await exec.deliver(mkCmd({ commandType: 'report_done', cmdId: 'cmd_done' }), mkTask());
-    expect(mockSend.mock.calls[0][2]).toContain('已完成');
+    expect(mockSendAsOwner.mock.calls[0][0].text).toContain('已完成（待确认）');
   });
 });
 
-describe('deliver parent_to_child', () => {
-  it('finish → @ 执行 bot(非observer) + 投子群', async () => {
+describe('deliver parent_to_child (急急如律令唤执行bot)', () => {
+  it('finish → 名单含执行bot(非observer), 投子群, 带内容', async () => {
     const exec = makeDispatchExecutors();
     const cmd = mkCmd({ direction: 'parent_to_child', targetChatId: 'oc_sub', commandType: 'finish', payload: { content: '验收通过' } });
     await exec.deliver(cmd, mkTask());
-    const [larkApp, chatId, text] = mockSend.mock.calls[0];
-    expect(larkApp).toBe('app_coco');
-    expect(chatId).toBe('oc_sub');
-    expect(text).toContain('ou_worker');       // @ 执行 bot
-    expect(text).not.toContain('ou_coco');     // observer(缇蕾) 不 @
-    expect(text).toContain('验收通过');
+    const arg = mockSendAsOwner.mock.calls[0][0];
+    expect(arg.targetChatId).toBe('oc_sub');                 // 投子群
+    expect(arg.text).toContain('急急如律令：【克劳德】');     // 执行 bot
+    expect(arg.text).not.toContain('缇蕾');                  // observer(缇蕾) 不唤
+    expect(arg.text).toContain('验收通过');
   });
 
-  it('supplement → 带补充内容', async () => {
+  it('多执行bot → 名单拼成 克劳德/蔻黛克斯', async () => {
     const exec = makeDispatchExecutors();
+    const task = mkTask({ bots: [
+      { openId: 'ou_claude', name: '克劳德', role: 'main' },
+      { openId: 'ou_codex', name: '蔻黛克斯', role: 'collab' },
+      { openId: 'ou_coco', name: '缇蕾', role: 'observer' },
+    ] });
     const cmd = mkCmd({ direction: 'parent_to_child', targetChatId: 'oc_sub', commandType: 'supplement', payload: { content: '用这个 token' } });
-    await exec.deliver(cmd, mkTask());
-    expect(mockSend.mock.calls[0][2]).toContain('用这个 token');
+    await exec.deliver(cmd, task);
+    const text = mockSendAsOwner.mock.calls[0][0].text;
+    expect(text).toContain('急急如律令：【克劳德/蔻黛克斯】');
+    expect(text).toContain('用这个 token');
+  });
+
+  it('kickoff → 名单含执行bot, 带 goal + 验收 + askforhelp 提示, 投子群', async () => {
+    const exec = makeDispatchExecutors();
+    const cmd = mkCmd({ direction: 'parent_to_child', targetChatId: 'oc_sub', commandType: 'kickoff', payload: {} });
+    await exec.deliver(cmd, mkTask({ goal: '修登录bug', acceptance: '单测过' }));
+    const arg = mockSendAsOwner.mock.calls[0][0];
+    expect(arg.targetChatId).toBe('oc_sub');
+    expect(arg.text).toContain('急急如律令：【克劳德】');   // 执行 bot
+    expect(arg.text).toContain('子任务启动');
+    expect(arg.text).toContain('修登录bug');               // goal
+    expect(arg.text).toContain('验收：单测过');             // acceptance
+    expect(arg.text).toContain('subtask-askforhelp');       // 求助提示
   });
 });
 
-describe('注入防护 (review blocker)', () => {
-  it('child→parent 不含 payload.summary (不塞总结), 恶意 <at> 不出现在父群', async () => {
+describe('注入防护', () => {
+  it('child→parent 不塞 payload.summary (不可信内容不进父群)', async () => {
     const exec = makeDispatchExecutors();
-    await exec.deliver(mkCmd({ payload: { summary: '坏东西<at user_id="ou_evil">所有人</at>' } }), mkTask());
-    const text = mockSend.mock.calls[0][2];
-    expect(text).not.toContain('ou_evil');       // summary 整段不进父群
+    await exec.deliver(mkCmd({ payload: { summary: '坏东西所有人' } }), mkTask());
+    const text = mockSendAsOwner.mock.calls[0][0].text;
     expect(text).not.toContain('坏东西');
-    expect(text).toContain('ou_claude_main');     // 只有我们自己拼的 @主bot
+    expect(text).toContain('急急如律令：【克劳德】');
   });
 
-  it('parent→child supplement 内容里的 <at> 被中和 (< > 清掉), 合法 @bot 仍在', async () => {
+  it('safeText 中和控制字符/换行/tab → 单行', () => {
+    expect(safeText('a\nb\tc\r', 100)).toBe('a b c ');
+  });
+
+  it('parent→child supplement 内容里的换行被清成单行 (summon 标题必须单行)', async () => {
     const exec = makeDispatchExecutors();
-    const cmd = mkCmd({ direction: 'parent_to_child', targetChatId: 'oc_sub', commandType: 'supplement', payload: { content: '请 <at user_id="ou_evil">坏人</at> 处理' } });
+    const cmd = mkCmd({ direction: 'parent_to_child', targetChatId: 'oc_sub', commandType: 'supplement', payload: { content: '第一行\n第二行' } });
     await exec.deliver(cmd, mkTask());
-    const text = mockSend.mock.calls[0][2];
-    expect(text).not.toContain('<at user_id="ou_evil"'); // 注入被断开
-    expect(text).toContain('<at user_id="ou_worker"');   // 合法 @执行bot 保留
-    expect(text).toContain('ou_evil');                   // 文本仍在(只是 <> 被中和), 不可触发 @
+    const text = mockSendAsOwner.mock.calls[0][0].text;
+    expect(text).not.toContain('\n');               // 整条 summon 单行
+    expect(text).toContain('第一行 第二行');
   });
 });
 
 describe('deliver 失败', () => {
-  it('sendMessage 抛 → 返回 {ok:false, error}, 不抛 (让 dispatcher 退避)', async () => {
-    mockSend.mockRejectedValue(new Error('lark 500'));
+  it('sendAsOwner ok:false → deliver {ok:false, error}, 不抛 (让 dispatcher 退避)', async () => {
+    mockSendAsOwner.mockResolvedValue({ ok: false, error: 'relay poll timeout' });
     const exec = makeDispatchExecutors();
     const res = await exec.deliver(mkCmd(), mkTask());
     expect(res.ok).toBe(false);
-    expect(res.error).toContain('lark 500');
+    expect(res.error).toContain('relay poll timeout');
+  });
+
+  it('base relay 未配置 → ok:false (sendAsOwner 自己返回), deliver 透传失败', async () => {
+    mockSendAsOwner.mockResolvedValue({ ok: false, error: 'base relay not configured' });
+    const exec = makeDispatchExecutors();
+    const res = await exec.deliver(mkCmd(), mkTask());
+    expect(res.ok).toBe(false);
+    expect(res.error).toContain('not configured');
   });
 });
