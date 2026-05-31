@@ -285,6 +285,53 @@ describe('stripToolUseBlocks / tool-call leak guard', () => {
     expect(extractAssistantText(ev)).toBe('hello');
   });
 
+  it('strips the orphan "court" start-marker fragment left before a tool-call block (real leak)', () => {
+    // Real on-disk leak: the model lost the `<function_calls>` open marker
+    // and left the detokenized fragment "court" alone on its own line,
+    // directly before a bare <invoke>. The angle-bracket passes removed the
+    // <invoke> body but left "court\n" stuck to the prose, which leaked to
+    // Lark as `…是什么现象。\n\ncourt`. The whole thing must strip to just
+    // the prose.
+    const ev: TranscriptEvent = {
+      type: 'assistant',
+      uuid: 'a',
+      message: {
+        role: 'assistant',
+        content: [
+          {
+            type: 'text',
+            text:
+              '松松说又有"消息断开"问题,让我看。先看他 quote 的那条消息是什么现象。\n\n' +
+              'court\n' +
+              '<invoke name="Bash">\n' +
+              '<parameter name="command">cd /home/zoujinsong.jason && botmux quoted om_x 2>&1 | head -60</parameter>\n' +
+              '<parameter name="description">View the quoted message about disconnection</parameter>\n' +
+              '</invoke>',
+          },
+        ],
+      },
+    };
+    expect(extractAssistantText(ev)).toBe(
+      '松松说又有"消息断开"问题,让我看。先看他 quote 的那条消息是什么现象。',
+    );
+  });
+
+  it('does NOT strip the word "court" when it is normal prose (not before a tool call)', () => {
+    // The marker-strip must be anchored to a following tool-call tag. A
+    // sentence that legitimately ends in / contains "court" must survive.
+    const ev: TranscriptEvent = {
+      type: 'assistant',
+      uuid: 'a',
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'The case is going to court.\n\ncourt\nis a normal word here.' },
+        ],
+      },
+    };
+    expect(extractAssistantText(ev)).toBe('The case is going to court.\n\ncourt\nis a normal word here.');
+  });
+
   it('leaves prose that merely mentions the tag names untouched when not a real block', () => {
     // A text block discussing the format in prose (no actual open/close pair)
     // should keep readable words. We only strip matched tag structures and

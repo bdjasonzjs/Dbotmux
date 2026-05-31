@@ -190,14 +190,34 @@ export function pickAssistantTextEvents(events: TranscriptEvent[]): TranscriptEv
  *   - dangling fragments left by malformed/truncated calls: an unclosed
  *     `<function_calls>` opener, or stray `<parameter …>…</parameter>` /
  *     orphan closing tags after the invoke body was already removed.
+ *   - a stray bare word the model emitted *in place of* the lost
+ *     `<function_calls>` open marker, sitting on its own line directly
+ *     before the tool-call block — observed on disk as the literal token
+ *     "court" (a detokenized fragment of the tool-call start marker). Real
+ *     example: `…是什么现象。\n\ncourt\n<invoke name="Bash">…`. The angle-
+ *     bracket passes strip the `<invoke>` body but leave the orphan
+ *     "court\n" stuck to the prose. We only remove this marker word when it
+ *     is alone on its line AND immediately followed (next non-blank line) by
+ *     a tool-call open tag, so a sentence that legitimately ends in the word
+ *     "court" is never touched.
  *
- * Order matters: remove the well-formed wrappers first, then bare invokes,
- * then sweep any residual fragments, then collapse the blank lines left
- * behind. Non-greedy `[\s\S]*?` matches across lines and prefers leaving
- * real prose intact.
+ * Order matters: strip the orphan start-marker word (anchored to the
+ * following tool-call tag) FIRST while the `<invoke>`/`<function_calls>`
+ * anchor still exists, then remove the well-formed wrappers, then bare
+ * invokes, then sweep any residual fragments, then collapse the blank lines
+ * left behind. Non-greedy `[\s\S]*?` matches across lines and prefers
+ * leaving real prose intact.
  */
 export function stripToolUseBlocks(text: string): string {
   return text
+    // Orphan tool-call start-marker word ("court") left where the
+    // `<function_calls>` opener was lost: only when it's alone on its line
+    // and the very next non-blank content is a tool-call open tag. Anchored
+    // to that tag so prose ending in "court" survives.
+    .replace(
+      /(?:^|\n)[ \t]*court[ \t]*(?=\n+[ \t]*<(?:antml:)?(?:function_calls|invoke|parameter)\b)/g,
+      '\n',
+    )
     // Well-formed wrappers (with nested invoke/parameter).
     .replace(/<(?:antml:)?function_calls>[\s\S]*?<\/(?:antml:)?function_calls>/g, '')
     // Bare invoke blocks not wrapped by function_calls.
