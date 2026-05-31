@@ -15,7 +15,7 @@
 import { logger } from '../utils/logger.js';
 import {
   listSubTasks, listObservations, listCommands, commitObservationTransaction,
-  helpReportDelivery, staleHelpCommandIds,
+  helpReportDelivery, staleHelpCommandIds, latestHelpReport,
   CursorConflictError, InvalidCursorCommitError, VersionConflictError, ACTIVE_STATUSES,
   type SubTask, type SubTaskStatus, type Signal, type HelpDelivery,
 } from './subtask-store.js';
@@ -50,6 +50,10 @@ export const MIN_OBSERVE_INTERVAL_MS = 90_000;
 const FETCH_LIMIT = 40;
 /** 求助投出后多久没被主 bot ack 就当"石沉大海"，允许补发 (P1)。 */
 export const HELP_ACK_TIMEOUT_MS = 10 * 60_000;
+/** 超时兜底重报阈值 (松松)：同一 blocker 已上报、无新进展时本不重复上报；但若距上次**实际投出**的
+ *  求助已超过此阈值、且**仍没人响应**(未 ack 且主 bot 没补充)、blocker 仍在 → 兜底再报一次。
+ *  默认 2h，可调。 */
+export const STALE_REREPORT_MS = 2 * 60 * 60 * 1000;
 
 export async function runObserverTick(now: Date, exec: ObserverExecutors): Promise<{ checked: number; committed: number; errors: number }> {
   const stats = { checked: 0, committed: 0, errors: 0 };
@@ -102,6 +106,12 @@ async function tickOne(t: SubTask, now: Date, exec: ObserverExecutors): Promise<
     // P1: reported_help+need_help 是否补发，绑 help 命令投递生命周期 (不只看 status)
     () => helpReportDelivery(t.taskId, now, HELP_ACK_TIMEOUT_MS),
     () => staleHelpCommandIds(t.taskId),
+    // B 方案 + 超时兜底: observing 路径再判 need_help 时是否该上报 —— 相对上次 help 有新实质进展
+    // (新证据 / 诉求变化)，**或** 距上次投出已超 2h 仍没人响应 (兜底重报)。
+    () => {
+      const prev = latestHelpReport(t.taskId);
+      return hasNewHelpProgress(prev, analyzedMessageIds, judged.summary) || shouldStaleRereport(prev, now);
+    },
   );
 
   try {
@@ -132,6 +142,62 @@ interface CommitPlan {
   supersedeCommandIds?: string[];
 }
 
+/** 上次实际上报的 help 摘要 (= store.latestHelpReport 的返回形状)，用于 observing 路径去重 + 超时兜底。 */
+export interface PrevHelpReport {
+  summary: string;
+  sourceMessageIds: string[];
+  sentAt: string | null;
+  acked: boolean;
+  respondedBySupplement: boolean;
+}
+
+/** 归一化 help 诉求文本做实质性比较：去空白/标点/控制字符、小写化。
+ *  让"同一 blocker 换个说法"也算无实质变化，避免 LLM 措辞抖动触发误报。 */
+function normalizeAsk(s: string): string {
+  // eslint-disable-next-line no-control-regex
+  return s.replace(/[\s\x00-\x1F\x7F]+/g, '').replace(/[。，、,.!！?？;；:：]/g, '').toLowerCase();
+}
+
+/**
+ * B 方案核心：observing 路径再次判 need_help 时，是否相对**上次实际上报的 help** 有「新实质进展」。
+ *
+ * supplement 把状态切回 observing 后，子群同一未解 blocker 会让 coco 反复判 need_help。无脑再 enqueue
+ * = 反复惊动父群 (根因：planCommit observing 分支原本无条件 escalate)。这里据两条**或**门槛判新进展：
+ *   ① 证据增量：本轮 analyzedMessageIds 里存在**上次 help 没覆盖过**的证据消息 (子群确有新动静)；
+ *   ② 诉求变化：本轮 need_help 的 summary 归一化后与上次 help 的 summary **不同** (blocker 实质变了)。
+ * 任一成立 → 有新进展、该再上报；都不成立 (新消息全是上次已覆盖的、且诉求没变) → 静默不重复上报。
+ * 没有任何历史 help (prev=null) → 视为新进展 (首次上报，必须发)。
+ */
+export function hasNewHelpProgress(
+  prev: PrevHelpReport | null,
+  curAnalyzedIds: string[],
+  curSummary: string,
+): boolean {
+  if (!prev) return true; // 没上报过 → 首次，必须发
+  const prevIds = new Set(prev.sourceMessageIds);
+  const hasNewEvidence = curAnalyzedIds.some(id => !prevIds.has(id));
+  if (hasNewEvidence) return true; // ① 子群有上次没覆盖过的新证据消息
+  const askChanged = normalizeAsk(curSummary) !== normalizeAsk(prev.summary);
+  return askChanged;             // ② 诉求实质变化才算新进展，否则同一 blocker → 静默
+}
+
+/**
+ * 超时兜底重报 (松松)：「已上报过的别重复，除非真的隔了很久(两三小时)还没人响应再上报。」
+ * 无新进展时，若**同时**满足 → 兜底重报一次：
+ *   ① 距上次**实际投出**的求助 (sentAt) 已超 STALE_REREPORT_MS (默认 2h)；
+ *   ② 仍**没人响应**——未被 ack 且主 bot 没在该 help 之后下发 supplement (任一=已介入则不重报)；
+ *   ③ blocker 仍在 (调用方保证只在本轮 signal===need_help 时问)。
+ * sentAt=null (从没投出) → 不算 stale (在路上/失败由 helpReportDelivery 那条线管，不归这里)。
+ * 重报后会 enqueue 新 help，其 sentAt 投出后即刷新 2h 基准，下轮不会立刻又报。
+ */
+export function shouldStaleRereport(prev: PrevHelpReport | null, now: Date): boolean {
+  if (!prev || !prev.sentAt) return false;           // 没上报过 / 从没真投出 → 不兜底
+  if (prev.acked || prev.respondedBySupplement) return false; // 有人响应/介入 → 别重报
+  const sentMs = new Date(prev.sentAt).getTime();
+  if (!Number.isFinite(sentMs)) return false;        // 脏 sentAt → 保守不重报 (避免误触发)
+  return now.getTime() - sentMs > STALE_REREPORT_MS;  // 超 2h 仍没人响应 → 兜底
+}
+
 /** 纯决策：当前状态 + signal → 要不要上报 / 转什么状态 / supersede 哪些旧命令。可单测。
  *  helpDelivery/staleHelpCmdIds (P1) 默认给"已 acked + 无旧命令"，等价旧行为；
  *  observer tickOne 注入真实值，让 reported_help no-respam 绑 command lifecycle。 */
@@ -140,6 +206,9 @@ export function planCommit(
   pendingDoneCmdIds: () => string[],
   helpDelivery: () => HelpDelivery = () => 'acked',
   staleHelpCmdIds: () => string[] = () => [],
+  // B 方案: observing 路径再判 need_help 时是否有"新实质进展"(相对上次 help)。
+  // 默认 true = 旧行为 (无条件上报)，observer tickOne 注入真实判断。
+  observingHelpHasNewProgress: () => boolean = () => true,
 ): CommitPlan {
   const helpReport = { commandType: 'report_help' as const, idempotencyKey: `help_${readToCursor}` };
   const doneReport = { commandType: 'report_done' as const, idempotencyKey: `done_${readToCursor}` };
@@ -170,7 +239,13 @@ export function planCommit(
   }
 
   // observing
-  if (signal === 'need_help') return { report: helpReport, statusTo: 'reported_help' };
+  if (signal === 'need_help') {
+    // B 方案: supplement 把状态切回 observing 后，同一未解 blocker 会反复判 need_help。
+    // 只有相对上次 help **有新实质进展** (新证据消息 / 诉求实质变化) 才再 enqueue + 转 reported_help；
+    // 否则静默 (只记观测、推进 cursor)，不重复惊动父群。首次上报 prev=null → 恒 true，照常发。
+    if (!observingHelpHasNewProgress()) return {};
+    return { report: helpReport, statusTo: 'reported_help' };
+  }
   if (signal === 'done') return { report: doneReport, statusTo: 'reported_done' };
   return {}; // normal → 只记观测 + 推进 cursor
 }

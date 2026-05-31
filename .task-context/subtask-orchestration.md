@@ -93,7 +93,10 @@ claim/lease / CAS completeDispatch / 状态机 / 乐观版本锁 / 幂等。
 - ✅ **5 工具复核 (#85)**：工具层已符合 v3——5 工具+askforhelp 都 bot 自己调、写 store，跨会话靠 dispatcher 急急如律令投递，无 service 替 bot 绕过。无需改造。
 - ✅ **#86 E2E 核心链路已验证**：base relay → 急急如律令 → executor 唤醒（3.5s 内），物理通道打通。base relay 用蔻黛克斯「用户身份发消息」表（PXxSb3sPhabVB7swXZacrQxentf / tblxlPHT2sgdy3q0）。坑：① daemon 带 HTTPS_PROXY，spawn lark-cli 必须 `LARK_CLI_NO_PROXY=1`；② owner 必须是目标子群成员，否则 base relay 报 800030410。
 - ✅ **observer 卡片解码 + 逐级上报铁律 (2026-05-31，真实 case 暴露)**：见上「⚠️ observer 卡片解码坑」+ 注入第 ⑤ 部分。escalate 目标核实=已发父群（`child_to_parent` → `parentChatId` → 急急如律令唤主 bot 自判，**不直连松松**），符合铁律未改。
+- ✅ **主群每轮注入 (2026-05-31，问题2)**：`buildMainBotPromptBlock`（`<main_bot_routing>`，自 a550e76 引入）原本只在首轮 `buildNewTopicPrompt` 注入、follow-up 漏注 → 主话题克劳德多轮后丢「复杂任务拉子群」路由提示。修：`buildFollowUpContent` 也补 `mainBotBlock`（session-manager.ts:499-500）。gate 在 `buildMainBotPromptBlock` 内（`chatId===mainTopic` 且 `cliId==='claude-code'`）→ **自动只对主话题主 bot（克劳德）注入**，蔻黛克斯/缇蕾拿空串不注入。
+- ✅ **observer 反复上报去重 + 超时兜底 (2026-05-31，问题1)**：supplement 把状态 `reported_help→observing` 重开观测后，同一未解 blocker 在 observing 路径**无条件重 enqueue report_help**（去重只在 reported_help 分支），反复惊动父群。修（松松定方案 **B=按进展去重 + 超时兜底**）：observing+need_help 上报前判 `hasNewHelpProgress`（相对上次 help 有无新证据消息 / 诉求 summary 是否变化），无新进展则静默；**例外**超 `STALE_REREPORT_MS`(2h，可调) 且该 help 未被响应（`acked` 为空且无 supplement 介入）且 blocker 仍在 → 兜底重报一次并重置计时。done 路径有 superseded 机制未动。`subtask-observer.ts hasNewHelpProgress/shouldStaleRereport` + `subtask-store.latestHelpReport`，9+ 测试覆盖三态。
 - ✅ **顺手修 botmux 既有转发 bug (2026-05-31)**：`claude-transcript.ts extractAssistantText` 的 array-form text block 分支未过滤工具调用块 → 群里刷 XML 乱码（154 处泄漏全在此分支，之前只修了 string-form 分支所以对真实群没生效）。现两分支都过滤 + 残缺块兜底正则。
+- ✅ **再修转发 court 残片 (2026-05-31)**：正文结尾残留字面 `court`——模型生成工具调用时 `function_calls` 起始标记偶尔塌成不带尖括号的孤立 `court`（后跟正常 `<invoke>` 块），上次 strip 只切带尖括号标签所以漏。修：`stripToolUseBlocks` 加 anchored 规则，只切「单独成行 + 后向断言紧接 `function_calls|invoke|parameter` open tag」的 court，不误伤正文里正常的 court。测试含真实样本 + 不误伤断言。
 - 🔴 **构建血泪教训**：`pnpm build | tail`（或任何管道）会吞掉 tsc 的非零退出码、返回 tail 的 0——**构建绝不接管道**。这个坑曾让 #84 一个 type error 被长期掩盖、部署的根本不是新代码。
 
 ## 三块数据模型（v0.2，蔻黛克斯 review 加固后）

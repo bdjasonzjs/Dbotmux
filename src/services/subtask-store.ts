@@ -595,6 +595,38 @@ export function staleHelpCommandIds(taskId: string): string[] {
     .map(c => c.cmdId);
 }
 
+/** 该任务**最近一次**上报的 report_help（含已 superseded —— 我们要的是"上次实际惊动父群的求助"，
+ *  无论它后来有没有被新 help 取代）。用于 observing 路径按"新进展"去重（B 方案）+ 超时兜底重报：
+ *  supplement 把状态切回 observing 后，对比本轮 need_help 的诉求/证据是否相对上次有实质新增；
+ *  以及距上次上报是否已久且仍没人响应。
+ *
+ *  字段：
+ *   - summary / sourceMessageIds：上次求助诉求 + 覆盖的证据消息（"新进展"判断）
+ *   - sentAt：上次求助**实际投出**时间（超时兜底基准；未投出=null）
+ *   - acked：是否已被主 bot query 回写 ack（= 有人在处理）
+ *   - respondedBySupplement：该 help **之后**主 bot 是否下发过 supplement（= 主 bot 已实质介入）
+ *  没有任何 help 上报过则 null。 */
+export function latestHelpReport(taskId: string): {
+  summary: string; sourceMessageIds: string[];
+  sentAt: string | null; acked: boolean; respondedBySupplement: boolean;
+} | null {
+  const all = read().commands;
+  const helps = all
+    .filter(c => c.taskId === taskId && c.commandType === 'report_help')
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  const latest = helps[helps.length - 1];
+  if (!latest) return null;
+  // 主 bot 在该 help 之后下发过 supplement（parent→child）→ 视为已实质介入（不再兜底重报）。
+  const respondedBySupplement = all.some(c =>
+    c.taskId === taskId && c.commandType === 'supplement' &&
+    c.createdAt.localeCompare(latest.createdAt) > 0,
+  );
+  return {
+    summary: latest.payload.summary ?? '', sourceMessageIds: latest.payload.sourceMessageIds ?? [],
+    sentAt: latest.sentAt, acked: latest.ackedAt != null, respondedBySupplement,
+  };
+}
+
 // ─── Observation ─────────────────────────────────────────────────────────────
 
 export function listObservations(taskId: string, limit?: number): Observation[] {
