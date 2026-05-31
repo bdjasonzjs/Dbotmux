@@ -493,6 +493,12 @@ export function buildFollowUpContent(
     parts.push(`<mentions>\n${items.join('\n')}\n</mentions>`);
   }
 
+  // 主话题主 bot 路由注入（每轮）—— 多轮对话后主 bot 会丢失「复杂任务 subtask-create 拉子群」
+  // 的路由提示。gate 在 buildMainBotPromptBlock 内（chatId===mainTopic 且 cliId==='claude-code'），
+  // 蔻黛克斯/缇蕾因 cliId 不是 claude-code 拿空串 —— 自动只对主话题主 bot（克劳德）注入。
+  const mainBotBlock = buildMainBotPromptBlock(opts?.chatId, opts?.larkAppId);
+  if (mainBotBlock) parts.push(mainBotBlock);
+
   // v3 #84: 子任务子群成员注入（每轮）—— 多轮对话会丢这些信息，每条后续消息也补一次。
   const subtaskMemberBlock = buildSubtaskMemberBlock(opts?.chatId, opts?.larkAppId);
   if (subtaskMemberBlock) parts.push(subtaskMemberBlock);

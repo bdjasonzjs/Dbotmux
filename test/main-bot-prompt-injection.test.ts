@@ -96,6 +96,21 @@ describe('PR-4 — worker-pool env injection contract', () => {
   });
 });
 
+describe('PR-6 — main-bot routing injected per-round (follow-up path too)', () => {
+  // 主话题主 bot 多轮对话后会丢 <main_bot_routing>（只首轮注入）→ 复杂任务不再拉子群。
+  // 契约：buildFollowUpContent 也必须调用 buildMainBotPromptBlock（gate 自带，只对主 bot 生效）。
+  it('buildFollowUpContent calls buildMainBotPromptBlock (so the block is re-injected each round)', () => {
+    const src = readFileSync(join(__dirname, '..', 'src', 'core', 'session-manager.ts'), 'utf-8');
+    const fnStart = src.indexOf('export function buildFollowUpContent');
+    expect(fnStart).toBeGreaterThan(-1);
+    // 取该函数体到下一个 top-level export 之前，确认注入点在 follow-up 函数内部。
+    const after = src.slice(fnStart);
+    const nextExport = after.indexOf('\nexport ', 1);
+    const body = nextExport > -1 ? after.slice(0, nextExport) : after;
+    expect(body).toContain('buildMainBotPromptBlock(');
+  });
+});
+
 describe('PR-5 — architecture contract: no ad-hoc worker fork outside worker-pool', () => {
   it('no other src/ file calls child_process.fork to spawn the worker', () => {
     const { readdirSync, statSync } = require('node:fs');
