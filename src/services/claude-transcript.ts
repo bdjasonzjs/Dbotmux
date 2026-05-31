@@ -168,19 +168,72 @@ export function pickAssistantTextEvents(events: TranscriptEvent[]): TranscriptEv
 }
 
 /**
+ * Strip Claude Code tool-use XML blocks from an assistant message's visible
+ * text — applied to BOTH the bare-string content form AND each `type:'text'`
+ * block of the array form.
+ *
+ * Why both forms need this: empirically (verified against real on-disk
+ * transcripts) Claude Code records tool calls as structured `tool_use`
+ * blocks, BUT the model also sometimes emits the raw tool-call XML *inside a
+ * `type:'text'` block* — e.g. when it writes a malformed call (missing the
+ * `<function_calls>` wrapper, just a bare `<invoke>`) the harness can't
+ * promote it to a structured block, so the XML lands in the visible text and
+ * leaks straight to Lark. The array-form `type:'text'` filter alone does NOT
+ * catch this; it must be stripped here too.
+ *
+ * Real-world leak shapes this must cover (all observed un-prefixed on disk —
+ * Claude Code normalises the wire-format `antml:` namespace away before
+ * writing JSONL; the optional `(?:antml:)?` prefix is defensive insurance
+ * against a future format change, not something seen today):
+ *   - well-formed `<function_calls>…</function_calls>` wrappers
+ *   - bare `<invoke name="…">…</invoke>` blocks (no wrapping function_calls)
+ *   - dangling fragments left by malformed/truncated calls: an unclosed
+ *     `<function_calls>` opener, or stray `<parameter …>…</parameter>` /
+ *     orphan closing tags after the invoke body was already removed.
+ *
+ * Order matters: remove the well-formed wrappers first, then bare invokes,
+ * then sweep any residual fragments, then collapse the blank lines left
+ * behind. Non-greedy `[\s\S]*?` matches across lines and prefers leaving
+ * real prose intact.
+ */
+export function stripToolUseBlocks(text: string): string {
+  return text
+    // Well-formed wrappers (with nested invoke/parameter).
+    .replace(/<(?:antml:)?function_calls>[\s\S]*?<\/(?:antml:)?function_calls>/g, '')
+    // Bare invoke blocks not wrapped by function_calls.
+    .replace(/<(?:antml:)?invoke\b[\s\S]*?<\/(?:antml:)?invoke>/g, '')
+    // Residual fragments from malformed/truncated calls: an unclosed
+    // function_calls opener (consume to end), stray parameter blocks, and
+    // any orphan open/close tags the above passes couldn't pair up.
+    .replace(/<(?:antml:)?function_calls>[\s\S]*$/g, '')
+    .replace(/<(?:antml:)?parameter\b[\s\S]*?<\/(?:antml:)?parameter>/g, '')
+    .replace(/<\/?(?:antml:)?(?:function_calls|invoke|parameter)\b[^>]*>/g, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+/**
  * Extract the visible text from one assistant event. Walks all `type:'text'`
  * blocks in `message.content` (or the bare string) and joins them with
  * blank lines. Returns '' if no text blocks.
+ *
+ * Each text block is run through `stripToolUseBlocks` because the model can
+ * embed raw tool-call XML *inside* a `type:'text'` block (notably malformed
+ * calls the harness couldn't promote to a structured `tool_use` block). The
+ * `type:'text'` filter alone keeps those blocks — without stripping, the XML
+ * leaks to Lark. A block that was *only* tool-call XML strips to '' and is
+ * dropped so it doesn't produce a stray blank join entry.
  */
 export function extractAssistantText(event: TranscriptEvent): string {
   const content = event.message?.content;
   if (!content) return '';
-  if (typeof content === 'string') return content;
+  if (typeof content === 'string') return stripToolUseBlocks(content);
   if (!Array.isArray(content)) return '';
   const parts: string[] = [];
   for (const block of content) {
     if (block && block.type === 'text' && typeof block.text === 'string' && block.text.length > 0) {
-      parts.push(block.text);
+      const stripped = stripToolUseBlocks(block.text);
+      if (stripped.length > 0) parts.push(stripped);
     }
   }
   return parts.join('\n\n');

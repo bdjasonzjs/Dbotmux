@@ -171,6 +171,138 @@ describe('extractAssistantText / joinAssistantText', () => {
   });
 });
 
+// ─── Tool-call XML must never leak to Lark ─────────────────────────────────
+//
+// Live failure: the bot's tool-call blocks were forwarded to the Lark group
+// as assistant prose (spam / garbled XML). Verified against real on-disk
+// transcripts: Claude Code records normal tool calls as structured
+// `tool_use` blocks, but the model ALSO sometimes emits raw tool-call XML
+// *inside a `type:'text'` block* — especially when it writes a malformed
+// call (missing the `<function_calls>` wrapper, just a bare `<invoke>`),
+// which the harness can't promote to a structured block. The array-form
+// `type:'text'` filter alone keeps those blocks; extractAssistantText must
+// run each text block through stripToolUseBlocks.
+//
+// All tags observed un-prefixed on disk (Claude Code normalises the
+// wire-format `antml:` namespace away before writing JSONL). The `antml:`
+// cases below are defensive insurance against a future format change.
+describe('stripToolUseBlocks / tool-call leak guard', () => {
+  it('strips a well-formed function_calls wrapper, keeps surrounding prose', () => {
+    const ev: TranscriptEvent = {
+      type: 'assistant',
+      uuid: 'a',
+      message: {
+        role: 'assistant',
+        content: [
+          {
+            type: 'text',
+            text:
+              'Here is my plan.\n\n' +
+              '<function_calls>\n<invoke name="Bash">\n<parameter name="command">ls -la</parameter>\n</invoke>\n</function_calls>\n\n' +
+              'Done.',
+          },
+        ],
+      },
+    };
+    expect(extractAssistantText(ev)).toBe('Here is my plan.\n\nDone.');
+  });
+
+  it('strips a bare <invoke> block with no function_calls wrapper (real malformed leak)', () => {
+    // Real on-disk shape: model wrote a stray text token then a bare
+    // <invoke> (no <function_calls> opener). The structured-block filter
+    // can't catch it; the stripper must.
+    const ev: TranscriptEvent = {
+      type: 'assistant',
+      uuid: 'a',
+      message: {
+        role: 'assistant',
+        content: [
+          {
+            type: 'text',
+            text:
+              '给松松一份精简的 todo 梳理。\n\n' +
+              '<invoke name="Bash">\n' +
+              '<parameter name="command">botmux send --mention ou_xxx <<\'EOF\'\n📋 今明 todo\nEOF</parameter>\n' +
+              '<parameter name="description">给松松的 todo</parameter>\n' +
+              '</invoke>',
+          },
+        ],
+      },
+    };
+    expect(extractAssistantText(ev)).toBe('给松松一份精简的 todo 梳理。');
+  });
+
+  it('strips tool-call XML carrying the antml: namespace prefix (defensive)', () => {
+    // Built from fragments so the literal close tags below don't have to be
+    // hand-typed adjacent to the open tags. `O`/`C` = open/close angle.
+    const open = (tag: string) => `<${tag}>`;
+    const close = (tag: string) => `<` + `/antml:${tag}>`;
+    const xml =
+      open('function_calls') + '\n' +
+      `<invoke name="Read">` + '\n' +
+      `<parameter name="file_path">/tmp/x` + close('parameter') + '\n' +
+      close('invoke') + '\n' +
+      close('function_calls');
+    const ev: TranscriptEvent = {
+      type: 'assistant',
+      uuid: 'a',
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'Prefix text.\n\n' + xml + '\n\nSuffix text.' },
+        ],
+      },
+    };
+    expect(extractAssistantText(ev)).toBe('Prefix text.\n\nSuffix text.');
+  });
+
+  it('drops a text block that is ONLY tool-call XML (no stray blank join entry)', () => {
+    const ev: TranscriptEvent = {
+      type: 'assistant',
+      uuid: 'a',
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'Real reply.' },
+          { type: 'text', text: '<function_calls>\n<invoke name="Bash">\n<parameter name="command">ls</parameter>\n</invoke>\n</function_calls>' },
+          { type: 'text', text: 'More reply.' },
+        ],
+      },
+    };
+    // The pure-XML block strips to '' and must not produce 'Real reply.\n\n\n\nMore reply.'.
+    expect(extractAssistantText(ev)).toBe('Real reply.\n\nMore reply.');
+  });
+
+  it('string-form content is stripped too (legacy schema regression)', () => {
+    const ev: TranscriptEvent = {
+      type: 'assistant',
+      uuid: 'a',
+      message: {
+        role: 'assistant',
+        content: ('hello\n\n<invoke name="Bash">\n<parameter name="command">ls</parameter>\n</invoke>') as any,
+      },
+    };
+    expect(extractAssistantText(ev)).toBe('hello');
+  });
+
+  it('leaves prose that merely mentions the tag names untouched when not a real block', () => {
+    // A text block discussing the format in prose (no actual open/close pair)
+    // should keep readable words. We only strip matched tag structures and
+    // orphan tags, not the bare words.
+    const ev: TranscriptEvent = {
+      type: 'assistant',
+      uuid: 'a',
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'I need to use the function_calls wrapper and the invoke tag.' },
+        ],
+      },
+    };
+    expect(extractAssistantText(ev)).toBe('I need to use the function_calls wrapper and the invoke tag.');
+  });
+});
+
 describe('findLatestJsonl', () => {
   let projectDir: string;
 
