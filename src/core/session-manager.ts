@@ -206,7 +206,7 @@ export function formatAttachmentsHint(attachments?: LarkAttachment[], locale?: L
  *   - bot is the main bot (cliId='claude-code')
  *
  * Tells the spawned Claude session it's in main-bot mode and should
- * route complex tasks via `botmux subtask-create` instead of doing them
+ * route complex tasks via `botmux subtask-start` instead of doing them
  * inline. Heuristic (松松 Q3=b): short Q's get answered directly; PRDs /
  * bug lists / multi-bot collab get spawned subgroups.
  *
@@ -230,8 +230,8 @@ export function buildMainBotPromptBlock(chatId: string | undefined, larkAppId: s
 **定位：你是 CEO** —— 以**决策和分派**为主。能交给子群解决的问题就**尽量分派出去**，自己不必亲自下场干每件细活。邹劲松是**董事长**：只有**真正重要的问题**（重大方向 / 高风险 / 不可逆决策）才找他拍板；其余不是非常重要的事，你**自行决断、自主推进**，别事事等他。
 
 **任务分派（核心，默认倾向分派）**：
-- 能用子群解决的 → **尽量 subtask-create 分派出去**（这是常态，不是例外）。复杂任务（PRD 分析 / bug 清单 / 跨多群事项 / 需多 bot 协作 / 预期多轮）尤其要拉子群。
-  → 调用 \`botmux subtask-create --purpose "..." --task-type prd|bug|misc\`
+- 能用子群解决的 → **尽量 subtask-start 分派出去**（这是常态，不是例外）。复杂任务（PRD 分析 / bug 清单 / 跨多群事项 / 需多 bot 协作 / 预期多轮）尤其要拉子群。
+  → 调用 \`botmux subtask-start --goal "..." [--acceptance "..."] [--bots c,k,t]\`（可选 \`--task-type prd|bug|misc\`、\`--name "<群名>"\`）
   → 阻塞等待返回 chatId
   → 主话题简短回报「✅ 已建子群 [群名]（oc_xxx），进展会自动汇报回来」
 - 只有一句话能搞定的即时答疑 / 闲聊（拉群纯属浪费）才自己直接答。
@@ -239,7 +239,7 @@ export function buildMainBotPromptBlock(chatId: string | undefined, larkAppId: s
 **决策与上报**：
 - 不是非常重要的问题 → **自行决断、自主推进**，不必上报
 - 真正重要的（重大 / 高风险 / 不可逆）→ 才找邹劲松；走 RootInbox（P2），**不在子群直接 @ 他**（他不在群里）
-- 同一任务不重复调 subtask-create（idempotencyKey 自动夹）
+- 同一任务不重复调 subtask-start（idempotencyKey 自动夹）
 
 工具自动从 env 注入 sessionId — 你**不需要**手动带 \`--session-id\` flag。
 </main_bot_routing>`;
@@ -353,7 +353,7 @@ export function buildNewTopicPrompt(
   chatId?: string,
   /** P1 commit #8: larkAppId of the spawning bot. When provided AND chatId
    *  matches mainTopicChatId AND larkAppId is Claude's, a `<main_bot_routing>`
-   *  block is appended telling the bot to use subtask-create. */
+   *  block is appended telling the bot to use subtask-start. */
   larkAppId?: string,
   /** 2026-05-26 群聊模式 commit 2: 群聊上下文 timeline block (来自
    *  buildRecentChatTimelineBlock). caller (spawn 路径) async fetch 后
@@ -424,7 +424,7 @@ export function buildNewTopicPrompt(
   }
 
   // P1 commit #8: when this is the main bot (Claude) running in the
-  // configured main topic, append routing guidance (subtask-create
+  // configured main topic, append routing guidance (subtask-start
   // heuristic). Returns '' when conditions don't match.
   const mainBotBlock = buildMainBotPromptBlock(chatId, larkAppId);
   if (mainBotBlock) parts.push(mainBotBlock);
@@ -495,7 +495,7 @@ export function buildFollowUpContent(
     parts.push(`<mentions>\n${items.join('\n')}\n</mentions>`);
   }
 
-  // 主话题主 bot 路由注入（每轮）—— 多轮对话后主 bot 会丢失「复杂任务 subtask-create 拉子群」
+  // 主话题主 bot 路由注入（每轮）—— 多轮对话后主 bot 会丢失「复杂任务 subtask-start 拉子群」
   // 的路由提示。gate 在 buildMainBotPromptBlock 内（chatId===mainTopic 且 cliId==='claude-code'），
   // 蔻黛克斯/缇蕾因 cliId 不是 claude-code 拿空串 —— 自动只对主话题主 bot（克劳德）注入。
   const mainBotBlock = buildMainBotPromptBlock(opts?.chatId, opts?.larkAppId);

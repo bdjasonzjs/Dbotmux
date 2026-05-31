@@ -48,7 +48,7 @@ describe('buildMainBotPromptBlock (P1 commit #8)', () => {
       const block = buildMainBotPromptBlock('oc_flumy', 'cli_claude');
       expect(block).toContain('<main_bot_routing>');
       expect(block).toContain('Flumy 主话题');
-      expect(block).toContain('botmux subtask-create');
+      expect(block).toContain('botmux subtask-start');
     });
   });
 
