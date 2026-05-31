@@ -108,3 +108,64 @@ describe('fetchSince 连续性 (分页)', () => {
     expect(mockGetDetail).not.toHaveBeenCalled(); // 无 cursor 不查消息时间
   });
 });
+
+describe('interactive 卡片解码 (修卡片 bug 2026-05-31)', () => {
+  /** 一条 interactive 卡片消息 (简化 Format A: title + elements[[{tag,text}]])。 */
+  function cardMsg(id: string, title: string, lines: string[]): any {
+    return {
+      message_id: id, create_time: '1700000000000', msg_type: 'interactive',
+      sender: { id: 'cli_claude' },
+      body: { content: JSON.stringify({ title, elements: lines.map(t => [{ tag: 'text', text: t }]) }) },
+    };
+  }
+  /** 退化成「请升级客户端」占位的卡片 (listMessagesAsc 不带 user_card_content 时的样子：
+   *  简化 Format A，正文里只有一句升级占位文)。 */
+  function upgradeFallbackCard(id: string): any {
+    return {
+      message_id: id, create_time: '1700000000000', msg_type: 'interactive',
+      sender: { id: 'cli_claude' },
+      body: { content: JSON.stringify({ elements: [[{ tag: 'text', text: '请升级至最新版本客户端，以查看内容' }]] }) },
+    };
+  }
+
+  it('卡片真实正文被解码出来, 不再是 boilerplate / 占位文', async () => {
+    const real = cardMsg('m2', '子任务核查完成', ['✅ MR 79772 已建好', '等你 review 拍板', 'A/B/C?']);
+    mockListAsc.mockImplementation(async (_app: string, _chat: string, opts: any) =>
+      opts.pageToken ? { items: [], nextPageToken: null } : { items: [real], nextPageToken: null });
+    const exec = makeObserverExecutors();
+    const res = await exec.fetchSince('oc_sub', null, 40);
+    expect(res.messages).toHaveLength(1);
+    expect(res.messages[0].rendered).toContain('MR 79772 已建好');
+    expect(res.messages[0].rendered).toContain('A/B/C');
+    expect(res.messages[0].rendered).not.toContain('请升级');
+    expect(mockGetDetail).not.toHaveBeenCalled(); // 简化 content 已可解码, 无需 REST 重取
+  });
+
+  it('卡片退化成纯「请升级客户端」占位 → REST 重取真 body 再解码', async () => {
+    const fallback = upgradeFallbackCard('m2');
+    mockListAsc.mockImplementation(async (_app: string, _chat: string, opts: any) =>
+      opts.pageToken ? { items: [], nextPageToken: null } : { items: [fallback], nextPageToken: null });
+    // getMessageDetail(userCardContent:true) 返回真 body
+    mockGetDetail.mockResolvedValue({ items: [{
+      message_id: 'm2', msg_type: 'interactive', sender: { id: 'cli_claude' },
+      body: { content: JSON.stringify({ title: '完成', elements: [[{ tag: 'text', text: 'MR 已合好真实正文' }]] }) },
+    }] });
+    const exec = makeObserverExecutors();
+    const res = await exec.fetchSince('oc_sub', null, 40);
+    expect(res.messages).toHaveLength(1);
+    expect(res.messages[0].rendered).toContain('MR 已合好真实正文');
+    expect(res.messages[0].rendered).not.toContain('请升级');
+    expect(mockGetDetail).toHaveBeenCalledWith('app', 'm2', { userCardContent: true });
+  });
+
+  it('占位卡片 REST 重取仍是占位 → 不崩, 保留占位文 (best-effort)', async () => {
+    const fallback = upgradeFallbackCard('m2');
+    mockListAsc.mockImplementation(async (_app: string, _chat: string, opts: any) =>
+      opts.pageToken ? { items: [], nextPageToken: null } : { items: [fallback], nextPageToken: null });
+    mockGetDetail.mockResolvedValue({ items: [upgradeFallbackCard('m2')] });
+    const exec = makeObserverExecutors();
+    const res = await exec.fetchSince('oc_sub', null, 40);
+    expect(res.messages).toHaveLength(1); // 不抛、不丢消息
+    expect(mockGetDetail).toHaveBeenCalledWith('app', 'm2', { userCardContent: true });
+  });
+});

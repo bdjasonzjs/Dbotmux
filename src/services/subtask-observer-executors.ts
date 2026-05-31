@@ -10,6 +10,7 @@ import { spawn } from 'node:child_process';
 import { logger } from '../utils/logger.js';
 import { listMessagesAsc, getMessageDetail } from '../im/lark/client.js';
 import { resolveBotIdent } from '../core/main-bot-playbook.js';
+import { parseApiMessage, isPureCardUpgradeFallback } from '../im/lark/message-parser.js';
 import type { ObserverExecutors, JudgeContext, JudgeResult } from './subtask-observer.js';
 
 /** afterMessageId 翻页扫到尾仍找不到 (消息被删/cursor 失效)。重试不会变好 → 不空返。 */
@@ -30,13 +31,41 @@ function clean(s: unknown, n: number): string {
   // eslint-disable-next-line no-control-regex
   return str.replace(/[\x00-\x1F\x7F<>]/g, ' ').slice(0, n);
 }
-function renderMsg(m: any): string {
+
+/**
+ * 渲染一条 API 消息成「[sender] 正文」。
+ *
+ * 关键修复 (2026-05-31)：子 bot 的完成/进度上报都是 `msg_type:interactive` 卡片。
+ * 走 `parseApiMessage`(→ extractCardContent) 解码卡片真实正文，而**不是**裸读
+ * `body.content` 把卡片 JSON dump 成 200 字 boilerplate。
+ *
+ * listMessagesAsc 不带 `card_msg_content_type=user_card_content`，所以 botmux 富文本卡片
+ * 在列表里会退化成 Lark 的「请升级至最新版本客户端」占位文 (= 旧 bug 里 coco 看到的"客户端
+ * 升级提示")。命中纯占位 (isPureCardUpgradeFallback) 时，对该条单独 `getMessageDetail`
+ * (userCardContent:true) 拿回真 body 再解码 —— sentinel 兜底。
+ */
+async function renderMsg(m: any, larkAppId: string): Promise<string> {
   const sender = m?.sender?.id ?? m?.sender?.sender_id?.open_id ?? '?';
-  let text: unknown = '';
+  let text = '';
   try {
-    const body = typeof m?.body?.content === 'string' ? JSON.parse(m.body.content) : m?.body?.content;
-    text = body?.text ?? body?.content ?? body?.title ?? JSON.stringify(body ?? {});
-  } catch { text = m?.body?.content ?? ''; }
+    text = parseApiMessage(m).content ?? '';
+  } catch (err) {
+    logger.warn(`[subtask-observer-exec] parseApiMessage failed for ${m?.message_id}: ${err}`);
+    text = typeof m?.body?.content === 'string' ? m.body.content : '';
+  }
+  // interactive 卡片退化成「请升级客户端」占位 → 单条 REST 重取真 body 再解码。
+  if (m?.msg_type === 'interactive' && isPureCardUpgradeFallback(text)) {
+    try {
+      const detail = await getMessageDetail(larkAppId, m.message_id, { userCardContent: true });
+      const real = detail?.items?.[0];
+      if (real) {
+        const recovered = parseApiMessage(real).content ?? '';
+        if (recovered && !isPureCardUpgradeFallback(recovered)) text = recovered;
+      }
+    } catch (err) {
+      logger.warn(`[subtask-observer-exec] card re-resolve failed for ${m.message_id}: ${err}`);
+    }
+  }
   return `[${clean(sender, 16)}] ${clean(text, MAX_CONTENT)}`;
 }
 
@@ -140,8 +169,11 @@ export function makeObserverExecutors(): ObserverExecutors {
       // 翻到尾 (或 MAX_PAGES) 仍没找到 cursor → cursor 失效，抛 (重试无用)
       if (!found) throw new CursorNotFoundError(chatId, afterMessageId!);
 
+      const messages = await Promise.all(
+        collected.map(async (m: any) => ({ id: m.message_id, rendered: await renderMsg(m, tilly.larkAppId) })),
+      );
       return {
-        messages: collected.map((m: any) => ({ id: m.message_id, rendered: renderMsg(m) })),
+        messages,
         // review P1: complete 只在【真翻到群尾】才 true。收满 limit / MAX_PAGES 停 →
         // 没读到尾 → false，绝不把"没读完"伪装成完成 (cursor 安全推到本批末尾、下轮接着读)。
         complete: reachedTail,
