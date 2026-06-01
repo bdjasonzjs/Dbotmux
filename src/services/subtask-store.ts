@@ -605,10 +605,14 @@ export function staleHelpCommandIds(taskId: string): string[] {
  *   - sentAt：上次求助**实际投出**时间（超时兜底基准；未投出=null）
  *   - acked：是否已被主 bot query 回写 ack（= 有人在处理）
  *   - respondedBySupplement：该 help **之后**主 bot 是否下发过 supplement（= 主 bot 已实质介入）
+ *   - lastRespondedAt：父群对该 help 的**最近一次响应时刻** = max(该 help 的 ackedAt, 该 help 之后最新一条
+ *     supplement 的 createdAt)。无任何响应=null。超时兜底(shouldStaleRereport)以它为基准重新起算 2h，
+ *     既给执行者按 supplement 推进的时间、又不会把"响应后仍卡死"的求助永久埋掉（蔻黛克斯 review）。
  *  没有任何 help 上报过则 null。 */
 export function latestHelpReport(taskId: string): {
   summary: string; sourceMessageIds: string[];
   sentAt: string | null; acked: boolean; respondedBySupplement: boolean;
+  lastRespondedAt: string | null;
 } | null {
   const all = read().commands;
   const helps = all
@@ -616,14 +620,21 @@ export function latestHelpReport(taskId: string): {
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   const latest = helps[helps.length - 1];
   if (!latest) return null;
-  // 主 bot 在该 help 之后下发过 supplement（parent→child）→ 视为已实质介入（不再兜底重报）。
-  const respondedBySupplement = all.some(c =>
-    c.taskId === taskId && c.commandType === 'supplement' &&
-    c.createdAt.localeCompare(latest.createdAt) > 0,
-  );
+  // 主 bot 在该 help 之后下发过 supplement（parent→child）→ 视为已实质介入。
+  const supplementsAfter = all
+    .filter(c => c.taskId === taskId && c.commandType === 'supplement' &&
+      c.createdAt.localeCompare(latest.createdAt) > 0)
+    .map(c => c.createdAt);
+  const respondedBySupplement = supplementsAfter.length > 0;
+  // 最近一次响应时刻：ack 与"该 help 之后的 supplement"取较晚者。
+  const respondedTimes = [...supplementsAfter];
+  if (latest.ackedAt) respondedTimes.push(latest.ackedAt);
+  const lastRespondedAt = respondedTimes.length
+    ? respondedTimes.sort((a, b) => a.localeCompare(b))[respondedTimes.length - 1]
+    : null;
   return {
     summary: latest.payload.summary ?? '', sourceMessageIds: latest.payload.sourceMessageIds ?? [],
-    sentAt: latest.sentAt, acked: latest.ackedAt != null, respondedBySupplement,
+    sentAt: latest.sentAt, acked: latest.ackedAt != null, respondedBySupplement, lastRespondedAt,
   };
 }
 

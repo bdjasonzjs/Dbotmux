@@ -45,7 +45,7 @@ vi.mock('../src/bot-registry.js', () => ({
 }));
 
 // Stub session-store — register sessions per-test
-const fakeSessions = new Map<string, { sessionId: string; chatId: string; larkAppId: string; rootMessageId: string }>();
+const fakeSessions = new Map<string, { sessionId: string; chatId: string; larkAppId: string; rootMessageId: string; ownerOpenId?: string }>();
 vi.mock('../src/services/session-store.js', () => ({
   getSession: (sid: string) => fakeSessions.get(sid),
 }));
@@ -84,6 +84,7 @@ function registerMainBotSession(sessionId: string, rootMsg = 'om_root_test') {
     chatId: MAIN_TOPIC,
     larkAppId: CLAUDE_APP,
     rootMessageId: rootMsg,
+    ownerOpenId: 'ou_jason',
   });
 }
 
@@ -148,6 +149,7 @@ describe('MainBotPlaybook.spawnSubTask (P1 commit #6)', () => {
         chatId: 'oc_some_other_chat',
         larkAppId: CLAUDE_APP,
         rootMessageId: 'om_x',
+        ownerOpenId: 'ou_jason',
       });
       await expect(pb.spawnSubTask({ sessionId: 's4', purpose: 'x', taskType: 'misc' }))
         .rejects.toThrow(/only allowed from main topic chat/);
@@ -178,13 +180,13 @@ describe('MainBotPlaybook.spawnSubTask (P1 commit #6)', () => {
     });
   });
 
-  describe('P-S7 — userOpenIds/transferOwnerTo/notifyOwnerOpenId never passed', () => {
-    it('createGroupWithBots opts do NOT contain those 3 fields', async () => {
+  describe('P-S7 — relay owner joins subgroup, without transfer/notify side effects', () => {
+    it('createGroupWithBots opts invite session owner but do not transfer owner or notify', async () => {
       const { pb } = await freshImport();
       registerMainBotSession('s7');
       await pb.spawnSubTask({ sessionId: 's7', purpose: 'x', taskType: 'misc' });
       const callOpts = mockCreateGroup.mock.calls[0][0];
-      expect(callOpts.userOpenIds).toBeUndefined();
+      expect(callOpts.userOpenIds).toEqual(['ou_jason']);
       expect(callOpts.transferOwnerTo).toBeUndefined();
       expect(callOpts.notifyOwnerOpenId).toBeUndefined();
     });

@@ -31,8 +31,9 @@ export interface DispatchExecutors {
 export const MAX_RETRY = 5;
 const BASE_BACKOFF_MS = 30_000;
 const MAX_BACKOFF_MS = 600_000;
-/** 单条投递 lease 时长，须 ≥ 一次 deliver IO 的最坏耗时，过期后别的进程可重 claim。 */
-export const DISPATCH_LEASE_MS = 60_000;
+/** 单条投递 lease 时长，须 ≥ 一次 deliver IO 的最坏耗时，过期后别的进程可重 claim。
+ *  kickoff 可能在 base relay 内等待新群 group-id 字段 ready，再轮询「已发送」，因此要大于 60s。 */
+export const DISPATCH_LEASE_MS = 120_000;
 
 /** 第 attempt 次重试 (1-based) 的退避间隔：30s,60s,120s,240s,480s → cap 10min。 */
 export function planBackoff(attempt: number): number {
@@ -49,6 +50,9 @@ export function planDispatch(cmd: OutboxCommand, task: SubTask | null): Dispatch
   // E2E 抓到的 bug: finish 命令必须**豁免**终态 skip —— 它的语义就是"通知子群任务已 finished"，
   // task 进 finished 后才会产生 finish 命令，若被终态守卫 skip 掉，子群永远收不到结束通知。
   // 只 skip 非 finish 的 parent→child (= supplement)：finished/stopped 后再补充输入没意义 (保留 TOCTOU 防线)。
+  if (cmd.direction === 'child_to_parent' && (task.status === 'finished' || task.status === 'stopped')) {
+    return { action: 'skip', reason: `task-terminal-${task.status}` };
+  }
   if (cmd.direction === 'parent_to_child' && cmd.commandType !== 'finish'
     && (task.status === 'finished' || task.status === 'stopped')) {
     return { action: 'skip', reason: `task-terminal-${task.status}` };

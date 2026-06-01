@@ -110,7 +110,9 @@ async function tickOne(t: SubTask, now: Date, exec: ObserverExecutors): Promise<
     // (新证据 / 诉求变化)，**或** 距上次投出已超 2h 仍没人响应 (兜底重报)。
     () => {
       const prev = latestHelpReport(t.taskId);
-      return hasNewHelpProgress(prev, analyzedMessageIds, judged.summary) || shouldStaleRereport(prev, now);
+      // parentResponded: 父群已对上次求助下发过 supplement → observing 路径不再因"新证据"重复上报 (见 hasNewHelpProgress)。
+      return hasNewHelpProgress(prev, analyzedMessageIds, judged.summary, prev?.respondedBySupplement ?? false)
+        || shouldStaleRereport(prev, now);
     },
   );
 
@@ -149,6 +151,7 @@ export interface PrevHelpReport {
   sentAt: string | null;
   acked: boolean;
   respondedBySupplement: boolean;
+  lastRespondedAt: string | null;
 }
 
 /** 归一化 help 诉求文本做实质性比较：去空白/标点/控制字符、小写化。
@@ -172,12 +175,20 @@ export function hasNewHelpProgress(
   prev: PrevHelpReport | null,
   curAnalyzedIds: string[],
   curSummary: string,
+  parentResponded = false,
 ): boolean {
   if (!prev) return true; // 没上报过 → 首次，必须发
+  const askChanged = normalizeAsk(curSummary) !== normalizeAsk(prev.summary);
+  // bug 修复 (2026-05-31 子任务工作流): 父群已通过 supplement **回应过**上次求助后，子群随后产生的新消息
+  // 绝大多数是"正在执行 supplement / 正常推进"的产物，而非新 blocker。若仍把这些新消息当"新证据"再上报，
+  // 就会出现「主 bot 刚 supplement 停了 need_help，同一 blocker 立刻又被反复上报刷屏」(本 bug 核心现象)。
+  // 故 parentResponded 时**只认诉求实质变化**(换了个 blocker) 才再上报，纯新消息一律静默。
+  // 注意：这不是永久压制 —— 同 blocker 真卡死时仍有两条逃生路：① 执行者显式 askforhelp (诉求/cmd 会变)；
+  // ② shouldStaleRereport 以"最近一次响应"为基准 2h 兜底重报。见各自实现。
+  if (parentResponded) return askChanged;
   const prevIds = new Set(prev.sourceMessageIds);
   const hasNewEvidence = curAnalyzedIds.some(id => !prevIds.has(id));
   if (hasNewEvidence) return true; // ① 子群有上次没覆盖过的新证据消息
-  const askChanged = normalizeAsk(curSummary) !== normalizeAsk(prev.summary);
   return askChanged;             // ② 诉求实质变化才算新进展，否则同一 blocker → 静默
 }
 
@@ -192,10 +203,19 @@ export function hasNewHelpProgress(
  */
 export function shouldStaleRereport(prev: PrevHelpReport | null, now: Date): boolean {
   if (!prev || !prev.sentAt) return false;           // 没上报过 / 从没真投出 → 不兜底
-  if (prev.acked || prev.respondedBySupplement) return false; // 有人响应/介入 → 别重报
   const sentMs = new Date(prev.sentAt).getTime();
   if (!Number.isFinite(sentMs)) return false;        // 脏 sentAt → 保守不重报 (避免误触发)
-  return now.getTime() - sentMs > STALE_REREPORT_MS;  // 超 2h 仍没人响应 → 兜底
+  // bug 修复 (2026-05-31 子任务工作流，蔻黛克斯 review): 兜底基准 = max(求助投出, 父群最近一次响应)。
+  // 旧逻辑 `if (acked || respondedBySupplement) return false` 是**永久**关闭兜底 —— 父群一旦 ack/supplement，
+  // 哪怕那次响应没真正解决、blocker 又卡了三五个小时，也永远不再兜底重报，求助被静默埋掉。
+  // 改为：父群响应过 → 从**响应时刻**重新起算 2h（给执行者按响应推进的时间，不刚回应就重报）；
+  // 超 2h 同 blocker 仍判 need_help（调用方保证只在 signal===need_help 时问）→ 兜底重报一次。
+  let baseMs = sentMs;
+  if (prev.lastRespondedAt) {
+    const r = new Date(prev.lastRespondedAt).getTime();
+    if (Number.isFinite(r)) baseMs = Math.max(baseMs, r);
+  }
+  return now.getTime() - baseMs > STALE_REREPORT_MS;
 }
 
 /** 纯决策：当前状态 + signal → 要不要上报 / 转什么状态 / supersede 哪些旧命令。可单测。

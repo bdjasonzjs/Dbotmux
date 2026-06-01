@@ -46,7 +46,7 @@ import {
 } from '../src/services/subtask-orchestrator.js';
 import {
   createSubTask, getSubTask, getByChatId, transitionStatus, enqueueCommand, listCommands,
-  getCommand, listObservations, __resetForTesting, type SubTaskBot,
+  getCommand, listObservations, __resetForTesting, ackCommand, type SubTaskBot,
 } from '../src/services/subtask-store.js';
 
 const BOTS: SubTaskBot[] = [
@@ -98,6 +98,7 @@ describe('createSubtask', () => {
     const groupOpts = mockCreateGroup.mock.calls[0][0];
     expect(groupOpts.chatContext.relatedRefs).toContain(V2_MARKER);
     expect(groupOpts.sourceChatId).toBe('oc_main');
+    expect(groupOpts.userOpenIds).toEqual(['ou_jason']);
     // 边界2: 登记进 store + observing
     const task = getSubTask(res.taskId)!;
     expect(task.status).toBe('observing');
@@ -188,6 +189,36 @@ describe('reportProgress', () => {
     subSession();
     const res = await reportProgress({ sessionId: 'sess_sub', taskId: t.taskId, type: 'done', summary: '完成' });
     expect(getCommand(res.cmdId)!.commandType).toBe('report_done');
+  });
+
+  it('need_help 已 pending → 返回既有 report_help, 不重复入队刷父群', async () => {
+    const t = await mkTask();
+    subSession();
+    const r1 = await reportProgress({ sessionId: 'sess_sub', taskId: t.taskId, type: 'need_help', summary: '卡住了' });
+    const r2 = await reportProgress({ sessionId: 'sess_sub', taskId: t.taskId, type: 'need_help', summary: '还是卡住了' });
+    expect(r2.cmdId).toBe(r1.cmdId);
+    expect(listCommands(t.taskId).filter(c => c.commandType === 'report_help')).toHaveLength(1);
+  });
+
+  // bug 修复 (2026-05-31 蔻黛克斯 review): ack 只表示父群看过上一轮，不代表后续主动求助无效。
+  // 已 acked 后执行者**显式**再求助应作为新 help 正常入队、重新唤父群，而不是被合并回旧 acked cmd。
+  it('need_help 已 acked → 显式再求助 emit 新 help (重新唤父群, 不再永久 dedup 到旧 acked cmd)', async () => {
+    const t = await mkTask();
+    subSession();
+    const r1 = await reportProgress({ sessionId: 'sess_sub', taskId: t.taskId, type: 'need_help', summary: '卡住了' });
+    await ackCommand(r1.cmdId);
+    const r2 = await reportProgress({ sessionId: 'sess_sub', taskId: t.taskId, type: 'need_help', summary: '响应了但还是不行' });
+    expect(r2.cmdId).not.toBe(r1.cmdId);
+    expect(listCommands(t.taskId).filter(c => c.commandType === 'report_help')).toHaveLength(2);
+  });
+
+  it('task 已 finished → 拒绝 need_help, 不入队', async () => {
+    const t = await mkTask();
+    await transitionStatus(t.taskId, 'finished');
+    subSession();
+    await expect(reportProgress({ sessionId: 'sess_sub', taskId: t.taskId, type: 'need_help', summary: '卡住了' }))
+      .rejects.toMatchObject({ status: 409 });
+    expect(listCommands(t.taskId).filter(c => c.commandType === 'report_help')).toHaveLength(0);
   });
 
   it('鉴权: 不是从该子群上报 (session.chatId≠task.chatId) → 403', async () => {

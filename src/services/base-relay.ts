@@ -30,8 +30,10 @@ export function relayConfig(): RelayConfig | null {
 
 const CLI_TIMEOUT_MS = 20_000;
 const POLL_INTERVAL_MS = 2_000;
-/** 轮询「已发送」的默认上限。必须 < dispatch lease (60s)，留出余量给 dispatcher CAS 回写。 */
+/** 轮询「已发送」的默认上限。必须 < dispatch lease，留出余量给 dispatcher CAS 回写。 */
 export const DEFAULT_POLL_TIMEOUT_MS = 35_000;
+export const GROUP_NOT_FOUND_RETRY_INTERVAL_MS = 5_000;
+export const DEFAULT_GROUP_NOT_FOUND_RETRY_TIMEOUT_MS = 10_000;
 
 function sleep(ms: number): Promise<void> { return new Promise(r => setTimeout(r, ms)); }
 
@@ -56,8 +58,32 @@ function parseJsonLoose(s: string): any | null {
   try { return JSON.parse(s.slice(i)); } catch { return null; }
 }
 
+function parseAnyJsonLoose(...parts: string[]): any | null {
+  for (const p of parts) {
+    const d = parseJsonLoose(p);
+    if (d) return d;
+  }
+  return null;
+}
+
+export function isGroupFieldNotFoundError(out: { stdout: string; stderr: string }): boolean {
+  const d = parseAnyJsonLoose(out.stdout, out.stderr);
+  const code = d?.error?.code ?? d?.code;
+  const message = d?.error?.message ?? d?.message;
+  if (code === 800030410 && message === 'not_found') return true;
+  const raw = `${out.stdout}\n${out.stderr}`;
+  return raw.includes('800030410') && raw.includes('not_found');
+}
+
+interface UpsertResult {
+  ok: boolean;
+  recordId?: string;
+  retryableGroupNotReady?: boolean;
+  error?: string;
+}
+
 /** 写一条「状态=已确认待发送」记录，触发 base 自动化以 owner 身份发。返回 record_id 或 null。 */
-async function upsertRecord(cfg: RelayConfig, title: string, targetChatId: string): Promise<string | null> {
+async function upsertRecordOnce(cfg: RelayConfig, title: string, targetChatId: string): Promise<UpsertResult> {
   const isGroup = targetChatId.startsWith('oc_');
   const recvKey = isGroup ? '接收群组' : '接收人员';
   const recvType = isGroup ? '群组' : '人员';
@@ -71,10 +97,31 @@ async function upsertRecord(cfg: RelayConfig, title: string, targetChatId: strin
     ['base', '+record-upsert', '--as', 'user', '--base-token', cfg.baseToken, '--table-id', cfg.tableId, '--json', json, '--jq', '.'],
     CLI_TIMEOUT_MS,
   );
-  if (out.code !== 0) { logger.warn(`[base-relay] upsert failed code=${out.code}: ${out.stderr.slice(0, 200)}`); return null; }
+  if (out.code !== 0) {
+    const retryableGroupNotReady = isGroup && isGroupFieldNotFoundError(out);
+    const error = retryableGroupNotReady ? 'group field target not ready (800030410 not_found)' : `upsert failed code=${out.code}`;
+    if (!retryableGroupNotReady) logger.warn(`[base-relay] upsert failed code=${out.code}: ${out.stderr.slice(0, 200)}`);
+    return { ok: false, retryableGroupNotReady, error };
+  }
   const d = parseJsonLoose(out.stdout);
   const rid = d?.data?.record?.record_id_list?.[0];
-  return typeof rid === 'string' && rid ? rid : null;
+  if (typeof rid === 'string' && rid) return { ok: true, recordId: rid };
+  return { ok: false, error: 'upsert returned no record_id' };
+}
+
+async function upsertRecord(cfg: RelayConfig, title: string, targetChatId: string, groupNotFoundRetryTimeoutMs: number): Promise<UpsertResult> {
+  const deadline = Date.now() + Math.max(0, groupNotFoundRetryTimeoutMs);
+  let attempts = 0;
+  while (true) {
+    attempts += 1;
+    const res = await upsertRecordOnce(cfg, title, targetChatId);
+    if (res.ok || !res.retryableGroupNotReady || Date.now() >= deadline) {
+      if (!res.ok) logger.warn(`[base-relay] upsert failed after ${attempts} attempt(s): ${res.error ?? 'unknown error'}`);
+      return res;
+    }
+    logger.info(`[base-relay] group target not ready for ${targetChatId.slice(0, 12)}; retry ${attempts} in ${GROUP_NOT_FOUND_RETRY_INTERVAL_MS / 1000}s`);
+    await sleep(Math.min(GROUP_NOT_FOUND_RETRY_INTERVAL_MS, Math.max(0, deadline - Date.now())));
+  }
 }
 
 /** record-get 的 fields(列名) + data[0](行值) 配对取「状态」(单选字段值可能是 list)。 */
@@ -113,12 +160,13 @@ export interface SendAsOwnerResult { ok: boolean; recordId?: string; error?: str
  * 写记录 → 阻塞轮询确认「已发送」(待定1 决策：复用 dispatcher 退避/重试模型，可靠性不变)。
  * 失败/超时返 {ok:false}，**不抛** —— 让 dispatcher 走 claim/退避/重试。
  */
-export async function sendAsOwner(opts: { targetChatId: string; text: string; pollTimeoutMs?: number }): Promise<SendAsOwnerResult> {
+export async function sendAsOwner(opts: { targetChatId: string; text: string; pollTimeoutMs?: number; groupNotFoundRetryTimeoutMs?: number }): Promise<SendAsOwnerResult> {
   const cfg = relayConfig();
   if (!cfg) return { ok: false, error: 'base relay not configured (set SUBTASK_RELAY_BASE_TOKEN / SUBTASK_RELAY_TABLE_ID)' };
   try {
-    const recordId = await upsertRecord(cfg, opts.text, opts.targetChatId);
-    if (!recordId) return { ok: false, error: 'upsert returned no record_id' };
+    const upsert = await upsertRecord(cfg, opts.text, opts.targetChatId, opts.groupNotFoundRetryTimeoutMs ?? 0);
+    if (!upsert.ok || !upsert.recordId) return { ok: false, error: upsert.error ?? 'upsert returned no record_id' };
+    const recordId = upsert.recordId;
     const status = await pollStatus(cfg, recordId, opts.pollTimeoutMs ?? DEFAULT_POLL_TIMEOUT_MS);
     if (status === 'sent') return { ok: true, recordId };
     if (status === 'cancelled') return { ok: false, recordId, error: 'relay record cancelled (not sent)' };

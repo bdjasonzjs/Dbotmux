@@ -25,6 +25,7 @@ import type { Session } from '../types.js';
 import {
   createSubTask, getSubTask, getCommand, transitionStatus, enqueueCommand, ackCommand,
   transitionAndEnqueueCommand, listObservations, listCommands,
+  helpReportDelivery,
   VersionConflictError, CommandRetryMismatchError,
   type SubTask, type SubTaskBot, type SubTaskStatus, type OutboxCommand, type Observation,
 } from './subtask-store.js';
@@ -108,6 +109,9 @@ export async function createSubtask(req: CreateSubtaskReq): Promise<{ taskId: st
     const result = await createGroupWithBots({
       creatorLarkAppId: claudeApp,
       larkAppIds,
+      // base relay 以 owner 身份写「接收群组」字段；owner 不在目标群时，
+      // Base 会把该 oc_id 判为 800030410/not_found，kickoff/supplement 永远投不出。
+      userOpenIds: session?.ownerOpenId ? [session.ownerOpenId] : undefined,
       name: req.name ?? `子任务·${req.goal.slice(0, 20)}`,
       sourceChatId: ctx.callerChatId,
       purpose: req.goal,
@@ -168,8 +172,26 @@ export async function reportProgress(req: ReportProgressReq): Promise<{ cmdId: s
     throw new HttpError(403, `reporting bot (larkAppId=${session.larkAppId}) is not a participant of this subtask`);
   }
   if (!req.summary?.trim()) throw new HttpError(400, 'missing summary');
+  if (task.status === 'finished' || task.status === 'stopped') {
+    throw new HttpError(409, `subtask already ${task.status}; ${req.type} report suppressed`);
+  }
   // 边界5: 手动上报走 enqueueCommand，**不推 committedCursor、不建 Observation**，跟 observer 高水位分离。
   const commandType = req.type === 'done' ? 'report_done' : 'report_help';
+  if (commandType === 'report_help') {
+    const latestHelp = listCommands(task.taskId)
+      .filter(c => c.commandType === 'report_help' && c.direction === 'child_to_parent' && c.supersededBy == null)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+      .at(-1);
+    const delivery = helpReportDelivery(task.taskId, new Date(), 10 * 60_000);
+    // 只对**仍在途**的求助去重 (pending=未投 / sent_unacked_fresh=投出 10min 内还没人 ack) —— 这两种是
+    // "上一条还在飞、别叠发"。bug 修复 (2026-05-31 蔻黛克斯 review): **不再**对 'acked' 去重 ——
+    // ack 只表示父群看过上一轮，不代表执行者后续的主动求助无效；继续把 acked help 当去重锚点会让子群显式
+    // askforhelp 永远被合并回旧 cmd、再也唤不起父群。acked 后的显式求助应作为新 help 正常 enqueue。
+    if (latestHelp && (delivery === 'pending' || delivery === 'sent_unacked_fresh')) {
+      logger.info(`[subtask-orch] report_progress ${task.taskId} need_help deduped via ${latestHelp.cmdId} (${delivery})`);
+      return { cmdId: latestHelp.cmdId, taskId: task.taskId };
+    }
+  }
   // review 设计点: 无稳定来源 (sourceMessageIds/显式 key) 时用 randomUUID，避免 `manual-{type}-na`
   // 在同一 task 内把后续合法手动上报永久 dedup 成一条。
   const idempotencyKey = req.idempotencyKey

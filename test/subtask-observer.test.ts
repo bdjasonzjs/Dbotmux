@@ -15,7 +15,7 @@ vi.mock('../src/utils/logger.js', () => ({
 
 import {
   createSubTask, transitionStatus, getSubTask, listCommands, listObservations,
-  commitObservationTransaction, getCommand, updateCommand, latestHelpReport, __resetForTesting,
+  commitObservationTransaction, getCommand, updateCommand, latestHelpReport, enqueueCommand, __resetForTesting,
   type SubTaskBot, type HelpDelivery,
 } from '../src/services/subtask-store.js';
 import {
@@ -29,6 +29,7 @@ function mkPrev(over: Partial<PrevHelpReport> = {}): PrevHelpReport {
   return {
     summary: '卡在 X', sourceMessageIds: ['m1', 'm2'],
     sentAt: new Date().toISOString(), acked: false, respondedBySupplement: false,
+    lastRespondedAt: null,
     ...over,
   };
 }
@@ -160,6 +161,19 @@ describe('hasNewHelpProgress', () => {
     const prev = mkPrev({ summary: '卡在 X', sourceMessageIds: ['m1', 'm2'] });
     expect(hasNewHelpProgress(prev, ['m1'], '现在卡在 Y 了')).toBe(true);
   });
+  // ── parentResponded=true: 父群已 supplement 回应 → 只认"诉求变化"，纯新证据静默 (bug 修复 2026-05-31) ──
+  it('父群已响应 + 同 blocker(诉求未变) + 仅有新证据消息 → 静默 (不因新消息重复刷屏)', () => {
+    const prev = mkPrev({ summary: '卡在 X', sourceMessageIds: ['m1', 'm2'] });
+    // m3 是新消息，旧逻辑会判 true 刷屏；parentResponded 下应静默
+    expect(hasNewHelpProgress(prev, ['m2', 'm3'], '卡在 X', true)).toBe(false);
+  });
+  it('父群已响应 + 诉求实质变化(换了 blocker) → 仍上报 (新 blocker 该唤父群)', () => {
+    const prev = mkPrev({ summary: '卡在 X', sourceMessageIds: ['m1', 'm2'] });
+    expect(hasNewHelpProgress(prev, ['m1'], '现在卡在 Y 了', true)).toBe(true);
+  });
+  it('父群已响应 + prev=null(首次) → 仍发', () => {
+    expect(hasNewHelpProgress(null, ['m1'], '卡住了', true)).toBe(true);
+  });
 });
 
 // ─── shouldStaleRereport 超时兜底 (松松追加) ──────────────────────────────────
@@ -174,11 +188,24 @@ describe('shouldStaleRereport', () => {
   it('超 2h + 未 ack + 没 supplement → 兜底重报', () => {
     expect(shouldStaleRereport(mkPrev({ sentAt: longAgo() }), new Date())).toBe(true);
   });
-  it('超 2h 但已 ack (有人在处理) → 不重报', () => {
-    expect(shouldStaleRereport(mkPrev({ sentAt: longAgo(), acked: true }), new Date())).toBe(false);
+  // ── 父群响应 = 重新起算 2h，而非永久关闭兜底 (bug 修复 2026-05-31，蔻黛克斯 review) ──
+  it('求助很久前投出但父群**刚**响应过 (lastRespondedAt 新) → 不重报 (给执行者推进时间)', () => {
+    expect(shouldStaleRereport(
+      mkPrev({ sentAt: longAgo(), acked: true, lastRespondedAt: new Date().toISOString() }),
+      new Date(),
+    )).toBe(false);
   });
-  it('超 2h 但主 bot 已 supplement 介入 → 不重报', () => {
-    expect(shouldStaleRereport(mkPrev({ sentAt: longAgo(), respondedBySupplement: true }), new Date())).toBe(false);
+  it('父群响应也已超 2h + 同 blocker 仍卡 → 兜底重报 (响应没解决，不能永久埋掉)', () => {
+    expect(shouldStaleRereport(
+      mkPrev({ sentAt: longAgo(), respondedBySupplement: true, lastRespondedAt: longAgo() }),
+      new Date(),
+    )).toBe(true);
+  });
+  it('supplement 刚响应 (lastRespondedAt 新) 即便 sentAt 很久前 → 不重报', () => {
+    expect(shouldStaleRereport(
+      mkPrev({ sentAt: longAgo(), respondedBySupplement: true, lastRespondedAt: new Date().toISOString() }),
+      new Date(),
+    )).toBe(false);
   });
   it('未超时 (刚上报) → 不重报', () => {
     expect(shouldStaleRereport(mkPrev({ sentAt: new Date().toISOString() }), new Date())).toBe(false);
@@ -354,6 +381,36 @@ describe('runObserverTick', () => {
     expect(listCommands(t.taskId).filter(c => c.commandType === 'report_help')).toHaveLength(2); // 补发了第二条
   });
 
+  // ── parentResponded 接线 (bug 修复 2026-05-31): 存在**真** supplement 命令 → respondedBySupplement=true，
+  //    observing 路径不再因"纯新证据"重复上报；只有诉求实质变化才再 enqueue。 ──
+  it('父群真 supplement 回应后 + 同 blocker + 仅新证据 m3 → 静默 (修复 supplement 后刷屏)', async () => {
+    const t = await mkObserving();
+    const exec1 = mkExec({ messages: [{ id: 'm1', rendered: '卡在 X' }, { id: 'm2', rendered: '需拍板' }], judged: { signal: 'need_help', summary: '卡在 X' } });
+    await runObserverTick(new Date(), exec1);
+    expect(listCommands(t.taskId).filter(c => c.commandType === 'report_help')).toHaveLength(1);
+    // 真 supplement 命令 (parent→child)，createdAt 晚于 help#1 → latestHelpReport.respondedBySupplement=true
+    await enqueueCommand({ taskId: t.taskId, direction: 'parent_to_child', targetChatId: 'oc_parent', commandType: 'supplement', payload: { content: '这样做' }, idempotencyKey: 'supp-1' });
+    expect(latestHelpReport(t.taskId)!.respondedBySupplement).toBe(true);
+    await transitionStatus(t.taskId, 'observing');
+    // 新证据 m3 但诉求未变 → 旧逻辑会刷屏；parentResponded 下应静默
+    const exec2 = mkExec({ messages: [{ id: 'm3', rendered: '我在按 supplement 推进' }], judged: { signal: 'need_help', summary: '卡在 X' } });
+    await runObserverTick(new Date(Date.now() + 2 * MIN_OBSERVE_INTERVAL_MS), exec2);
+    expect(getSubTask(t.taskId)!.status).toBe('observing');                                     // 没再转 reported_help
+    expect(listCommands(t.taskId).filter(c => c.commandType === 'report_help')).toHaveLength(1); // 没多发 help
+  });
+
+  it('父群真 supplement 回应后 + 诉求实质变化 (新 blocker) → 仍 enqueue (新问题该唤父群)', async () => {
+    const t = await mkObserving();
+    const exec1 = mkExec({ messages: [{ id: 'm1', rendered: '卡在 X' }, { id: 'm2', rendered: '需拍板' }], judged: { signal: 'need_help', summary: '卡在 X' } });
+    await runObserverTick(new Date(), exec1);
+    await enqueueCommand({ taskId: t.taskId, direction: 'parent_to_child', targetChatId: 'oc_parent', commandType: 'supplement', payload: { content: '这样做' }, idempotencyKey: 'supp-1' });
+    await transitionStatus(t.taskId, 'observing');
+    const exec2 = mkExec({ messages: [{ id: 'm3', rendered: '又冒新问题' }], judged: { signal: 'need_help', summary: '现在卡在 Y 了' } });
+    await runObserverTick(new Date(Date.now() + 2 * MIN_OBSERVE_INTERVAL_MS), exec2);
+    expect(getSubTask(t.taskId)!.status).toBe('reported_help');
+    expect(listCommands(t.taskId).filter(c => c.commandType === 'report_help')).toHaveLength(2);
+  });
+
   // ── 超时兜底重报集成 (松松追加): 无新进展但隔很久没人响应 → 兜底再报一次 ──
   /** 跑 ①help → supplement 切回 observing，并把 help 标成"已投出 sentAt=base"。返 {t, base, helpCmdId}。 */
   async function setupStaleHelp() {
@@ -386,11 +443,24 @@ describe('runObserverTick', () => {
     expect(getSubTask(t.taskId)!.status).toBe('reported_help');
   });
 
-  it('兜底③：无新进展 + 超 2h 但已被响应 (acked) → 即使超时也不重报', async () => {
+  // bug 修复 (2026-05-31 蔻黛克斯 review): 响应 = 重新起算 2h，而非永久关闭兜底。
+  it('兜底③：响应(acked)也已超 2h 同 blocker 仍卡 → 兜底重报 (响应没解决, 不永久埋掉)', async () => {
     const { t, base, helpCmdId } = await setupStaleHelp();
+    // ack 发生在很早 (base+60s)；重检在 base+2h+5min → 距 ack 也已超 2h
     await updateCommand(helpCmdId, { deliveryStatus: 'acked', ackedAt: new Date(base + 60_000).toISOString() });
     const exec2 = mkExec({ messages: [{ id: 'm2', rendered: '需拍板' }], judged: { signal: 'need_help', summary: '卡在 X，需要拍板' } });
     await runObserverTick(new Date(base + STALE_REREPORT_MS + 5 * 60_000), exec2);
+    expect(listCommands(t.taskId).filter(c => c.commandType === 'report_help')).toHaveLength(2); // 兜底补发
+    expect(getSubTask(t.taskId)!.status).toBe('reported_help');
+  });
+
+  it('兜底④：父群**刚**响应过 (ack 在重检前 5min) → 不重报 (给执行者推进时间, 不刚回应就刷屏)', async () => {
+    const { t, base, helpCmdId } = await setupStaleHelp();
+    const checkAt = base + STALE_REREPORT_MS + 5 * 60_000;
+    // ack 发生在重检前 5min → 距响应 < 2h，应抑制
+    await updateCommand(helpCmdId, { deliveryStatus: 'acked', ackedAt: new Date(checkAt - 5 * 60_000).toISOString() });
+    const exec2 = mkExec({ messages: [{ id: 'm2', rendered: '需拍板' }], judged: { signal: 'need_help', summary: '卡在 X，需要拍板' } });
+    await runObserverTick(new Date(checkAt), exec2);
     expect(listCommands(t.taskId).filter(c => c.commandType === 'report_help')).toHaveLength(1); // 没重报
     expect(getSubTask(t.taskId)!.status).toBe('observing');
   });

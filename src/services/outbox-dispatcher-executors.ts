@@ -12,12 +12,12 @@
  * parent_to_child (主bot finish/supplement → 子群)：急急如律令唤**子群执行 bot**，带内容。
  *
  * 可靠性 (保留 Phase 3 底座，蔻黛克斯 review)：deliver 失败**返 {ok:false} 不抛** → dispatcher 走
- *   claim/退避/重试。base relay 是异步的，sendAsOwner 阻塞轮询「已发送」(≤35s < lease 60s) 才返回
+ *   claim/退避/重试。base relay 是异步的，sendAsOwner 可先短等新群 group-id 字段生效，再阻塞轮询「已发送」
  *   (待定1 决策)；超时/取消 → 失败重试。重复 summon 幂等安全 —— summon 只是「去看 store」的唤醒信号，
  *   bot 醒来读到同一状态、不会重复执行 (内存共享式通信天然容忍重复唤醒)。
  */
 import { logger } from '../utils/logger.js';
-import { sendAsOwner } from './base-relay.js';
+import { DEFAULT_GROUP_NOT_FOUND_RETRY_TIMEOUT_MS, sendAsOwner } from './base-relay.js';
 import type { DispatchExecutors } from './outbox-dispatcher.js';
 import type { OutboxCommand, SubTask } from './subtask-store.js';
 
@@ -82,7 +82,11 @@ export function makeDispatchExecutors(): DispatchExecutors {
         ? childToParentSummon(cmd, task)
         : parentToChildSummon(cmd, task);
       // 以 owner 身份发急急如律令 base relay，阻塞轮询「已发送」(待定1)。失败返 {ok:false} 不抛。
-      const res = await sendAsOwner({ targetChatId: cmd.targetChatId, text });
+      const res = await sendAsOwner({
+        targetChatId: cmd.targetChatId,
+        text,
+        groupNotFoundRetryTimeoutMs: cmd.commandType === 'kickoff' ? DEFAULT_GROUP_NOT_FOUND_RETRY_TIMEOUT_MS : 0,
+      });
       if (res.ok) {
         logger.info(`[outbox-dispatcher-exec] summon sent cmd ${cmd.cmdId} (${cmd.commandType}) → ${cmd.targetChatId.slice(0, 12)} record=${res.recordId?.slice(0, 12) ?? '?'}`);
         return { ok: true, messageId: res.recordId };  // base relay 无真 messageId，用 recordId 追溯 (v3 锚点是 commandId)

@@ -6,7 +6,10 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 const mockSendAsOwner = vi.fn();
-vi.mock('../src/services/base-relay.js', () => ({ sendAsOwner: (...a: any[]) => mockSendAsOwner(...a) }));
+vi.mock('../src/services/base-relay.js', () => ({
+  DEFAULT_GROUP_NOT_FOUND_RETRY_TIMEOUT_MS: 10_000,
+  sendAsOwner: (...a: any[]) => mockSendAsOwner(...a),
+}));
 vi.mock('../src/utils/logger.js', () => ({
   logger: { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn(), isDebug: () => false },
 }));
@@ -90,6 +93,7 @@ describe('deliver parent_to_child (急急如律令唤执行bot)', () => {
     await exec.deliver(cmd, mkTask({ goal: '修登录bug', acceptance: '单测过' }));
     const arg = mockSendAsOwner.mock.calls[0][0];
     expect(arg.targetChatId).toBe('oc_sub');
+    expect(arg.groupNotFoundRetryTimeoutMs).toBeGreaterThan(0);
     expect(arg.text).toContain('急急如律令：【克劳德】');   // 执行 bot
     expect(arg.text).toContain('子任务启动');
     expect(arg.text).toContain('修登录bug');               // goal
@@ -116,6 +120,7 @@ describe('注入防护', () => {
     const cmd = mkCmd({ direction: 'parent_to_child', targetChatId: 'oc_sub', commandType: 'supplement', payload: { content: '第一行\n第二行' } });
     await exec.deliver(cmd, mkTask());
     const text = mockSendAsOwner.mock.calls[0][0].text;
+    expect(mockSendAsOwner.mock.calls[0][0].groupNotFoundRetryTimeoutMs).toBe(0);
     expect(text).not.toContain('\n');               // 整条 summon 单行
     expect(text).toContain('第一行 第二行');
   });

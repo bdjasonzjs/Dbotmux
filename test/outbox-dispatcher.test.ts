@@ -72,6 +72,11 @@ describe('planDispatch', () => {
     expect(planDispatch(cmd, { status: 'finished' } as any).action).toBe('skip');
     expect(planDispatch(cmd, { status: 'stopped' } as any).action).toBe('skip');
   });
+  it('child→parent report_help + task 已终态 → skip (陈旧求助不再刷父群)', () => {
+    const cmd = { deliveryStatus: 'pending', supersededBy: null, direction: 'child_to_parent', commandType: 'report_help' } as any;
+    expect(planDispatch(cmd, { status: 'finished' } as any).action).toBe('skip');
+    expect(planDispatch(cmd, { status: 'stopped' } as any).action).toBe('skip');
+  });
   it('E2E 修复: parent→child finish + task 已 finished → send (finish 豁免终态 skip, 必须通知子群)', () => {
     const cmd = { deliveryStatus: 'pending', supersededBy: null, direction: 'parent_to_child', commandType: 'finish' } as any;
     expect(planDispatch(cmd, { status: 'finished' } as any).action).toBe('send');
@@ -195,12 +200,14 @@ describe('runDispatcherTick', () => {
     expect(getCommand(cmdId)!.retryCount).toBe(c.retryCount); // 没变
   });
 
-  it('child→parent 上报: task 即便已 stopped 仍投递 (求助/完成要送达, 不因终态丢)', async () => {
-    const { taskId } = await mkTaskWithCommand();
-    await transitionStatus(taskId, 'stopped');
+  it('child→parent 上报: task 已 finished → skip + supersede (陈旧 need_help 不再投父群)', async () => {
+    const { cmdId, taskId } = await mkTaskWithCommand();
+    await transitionStatus(taskId, 'finished');
     const exec = mkDeliver();
     const stats = await runDispatcherTick(new Date(), exec);
-    expect(stats.sent).toBe(1); // child→parent 不因 task 终态 skip
+    expect(stats.skipped).toBe(1);
+    expect(exec.deliver).not.toHaveBeenCalled();
+    expect(getCommand(cmdId)!.supersededBy).not.toBeNull();
   });
 
   it('parent→child supplement + task 终态 → skip + supersede (补充无意义)', async () => {

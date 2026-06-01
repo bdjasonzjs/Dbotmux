@@ -9,8 +9,8 @@
  *   - buildGroupName: 群名 fallback
  *   - getOrCompute(idempotencyKey, () => createGroupWithBots(...)) 唯一
  *     入口，保证同 (sessionRootMessageId + purpose-slug) 24h 只建一次群
- *   - 不传 userOpenIds / transferOwnerTo / notifyOwnerOpenId — 松松**不**
- *     进子群；求助走 root inbox (P2)
+ *   - 把 session owner 加进子群，但不转让群主、不额外 @ 通知。
+ *     base relay 以 owner 身份写「接收群组」字段，owner 必须是目标群成员。
  *
  * 测试：test/main-bot-playbook-spawn-subtask.test.ts (P-S1~11)
  */
@@ -68,6 +68,7 @@ interface InternalSpawnContext {
   callerChatId: string;
   callerBotAppId: string;
   rootMessageId: string;
+  ownerOpenId?: string;
 }
 
 /** HTTP-style error so the IPC route can map to 4xx (caller error) vs
@@ -231,6 +232,7 @@ export async function authzCheck(sessionId: string): Promise<InternalSpawnContex
     callerChatId: session.chatId,
     callerBotAppId: session.larkAppId,
     rootMessageId: session.rootMessageId,
+    ownerOpenId: session.ownerOpenId,
   };
 }
 
@@ -258,8 +260,11 @@ export async function spawnSubTask(
       sourceChatId: ctx.callerChatId,   // 真凭证作 parentChatId
       purpose: request.purpose,
       chatContext,
-      // 显式不传：userOpenIds / transferOwnerTo / notifyOwnerOpenId
-      //   松松不进子群；求助走 root inbox (P2)
+      // base relay 以 owner 身份写多维表「接收群组」字段；Feishu Base 要求 owner
+      // 是目标群成员，否则 record-upsert 对新子群稳定返回 800030410/not_found。
+      userOpenIds: ctx.ownerOpenId ? [ctx.ownerOpenId] : undefined,
+      // 显式不传：transferOwnerTo / notifyOwnerOpenId。owner 入群只是 relay 前置条件，
+      // 不改变子群 owner，也不发额外通知。
     });
     return {
       key: idempotencyKey,
