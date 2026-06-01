@@ -246,6 +246,24 @@ export function buildMainBotPromptBlock(chatId: string | undefined, larkAppId: s
 }
 
 /**
+ * 输出纪律注入（每轮，所有会话 / 所有 bot 通用，无 gate）。
+ *
+ * 把「对外说话」和「执行命令(工具调用)」分成两个独立回合，降低工具调用在底层被
+ * 损坏（malformed）的概率：同一回合里既写正文又紧跟工具调用，会把工具调用结构
+ * 搅乱，导致解析失败 + 残片泄漏到群里。2026-06-01 邹劲松要求每轮、每群都注入。
+ * adopt/bridge 模式（botmux-unaware）走 buildBridgeInputContent，不经过此函数。
+ */
+export function buildOutputDisciplineBlock(): string {
+  return `<output_discipline>
+【输出纪律 · 每轮必读】把"对外说话"和"执行命令(工具调用)"严格分成两个独立回合：
+- 一个回合里，要么只对外说话（只调用一次 botmux send，不带任何其他工具调用），要么只执行（正文留空、直接发工具调用）。
+- 不要在同一回合里先写一段正文、再紧跟工具调用 —— 二者混在一起会在底层把工具调用结构搅乱、导致 malformed，既执行失败、残片又泄漏到群里。
+- 需要既汇报又执行时：先用一个回合 botmux send 把话说完，再用下一个回合（正文留空）执行。
+- 发长消息优先"先写进临时文件，再 botmux send 读取该文件"，让工具调用本身保持最短。
+</output_discipline>`;
+}
+
+/**
  * 子任务子群成员注入 (v3 #84，见 task-context「🔴 v3 设计纠偏」)：检测 chatId 是某个 **active**
  * 子任务的子群 → 注入 `<subtask_member_routing>`（4 部分：子任务目标/验收、你的角色职责、群里其他
  * bot 职责、求助机制）。**每轮注入**（首轮 buildNewTopicPrompt + 后续 buildFollowUpContent）——
@@ -433,6 +451,9 @@ export function buildNewTopicPrompt(
   const subtaskMemberBlock = buildSubtaskMemberBlock(chatId, larkAppId);
   if (subtaskMemberBlock) parts.push(subtaskMemberBlock);
 
+  // 输出纪律（每轮，所有会话 / 所有 bot，无 gate）—— 2026-06-01 邹劲松要求每群都塞。
+  parts.push(buildOutputDisciplineBlock());
+
   const senderBlock = renderSenderTag(sender);
   if (senderBlock) parts.push(senderBlock);
 
@@ -504,6 +525,9 @@ export function buildFollowUpContent(
   // v3 #84: 子任务子群成员注入（每轮）—— 多轮对话会丢这些信息，每条后续消息也补一次。
   const subtaskMemberBlock = buildSubtaskMemberBlock(opts?.chatId, opts?.larkAppId);
   if (subtaskMemberBlock) parts.push(subtaskMemberBlock);
+
+  // 输出纪律（每轮，所有会话 / 所有 bot，无 gate）—— 2026-06-01 邹劲松要求每群都塞。
+  parts.push(buildOutputDisciplineBlock());
 
   parts.push(`<botmux_reminder>${t('ai.followup.reminder', undefined, opts?.locale)}</botmux_reminder>`);
 
