@@ -464,4 +464,20 @@ describe('runObserverTick', () => {
     expect(listCommands(t.taskId).filter(c => c.commandType === 'report_help')).toHaveLength(1); // 没重报
     expect(getSubTask(t.taskId)!.status).toBe('observing');
   });
+
+  // 优化 #3 蔻黛克斯 code-review blocker1：纯 owner 回声不进 judge/不驱动状态
+  it('owner-only nudge 回声 → 推进 cursor，但 judge 不调用、不上报、不转态', async () => {
+    const t = await mkObserving(); // requester = ou_jason
+    const exec = {
+      // senderId === task.requester(ou_jason) → owner 回声，无执行者活动
+      fetchSince: vi.fn(async () => ({ messages: [{ id: 'm1', rendered: '[ou_jason] 任务搞定没有？', senderId: 'ou_jason' }], complete: true })),
+      judge: vi.fn(async () => ({ signal: 'need_help', summary: '（即便误判 need_help 也不该触发）' })),
+    } as any;
+    await runObserverTick(new Date(), exec);
+    const after = getSubTask(t.taskId)!;
+    expect(after.committedCursor).toBe('m1');                 // cursor 推进 (防重读循环)
+    expect(after.status).toBe('observing');                   // 未转 reported_help
+    expect(listCommands(t.taskId).filter(c => c.commandType === 'report_help')).toHaveLength(0); // 不上报
+    expect(exec.judge).not.toHaveBeenCalled();                // 纯回声不进 judge
+  });
 });

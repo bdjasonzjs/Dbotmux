@@ -21,6 +21,7 @@ import { createGroupWithBots, type CreateGroupOpts } from '../services/group-cre
 import { getOrCompute, type IdempotencyEntry } from '../services/spawn-idempotency-store.js';
 import { getMainTopicChatId } from '../services/main-topic-config.js';
 import * as sessionStore from '../services/session-store.js';
+import { SUBTASK_COLLAB_NORMS } from '../services/subtask-norms.js';
 import { logger } from '../utils/logger.js';
 
 // ─── Public API ────────────────────────────────────────────────────────────
@@ -170,21 +171,24 @@ export function buildChatContext(
     taskType: request.taskType,
     participants,
   };
+  // 优化 #2：协作 norms append 到每个 taskType 的 rules 末尾，**不覆盖**原 PRD/bug 指南 (蔻黛克斯 #2-major3)。
   switch (request.taskType) {
     case 'prd':
       return { ...base, rules: [
         '先读 PRD 全文再讨论，不要凭群名臆测',
         '模糊点列清单，不猜',
         '产出物：技术方案 → 主话题 progress-report',
+        ...SUBTASK_COLLAB_NORMS,
       ] };
     case 'bug':
       return { ...base, rules: [
         '先复现 bug，写出复现步骤',
         '判 owner（前端/后端/native/已修流转中）再开干',
         '能自己修的拉 git 分支；不能修的回主话题 request_decision',
+        ...SUBTASK_COLLAB_NORMS,
       ] };
     case 'misc':
-      return { ...base, rules: [] };
+      return { ...base, rules: [...SUBTASK_COLLAB_NORMS] };
   }
 }
 

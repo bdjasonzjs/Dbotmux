@@ -33,7 +33,11 @@ export type SubTaskStatus =
 export type DeliveryStatus = 'pending' | 'sent' | 'acked' | 'failed';
 export type Signal = 'normal' | 'need_help' | 'done';
 export type OutboxDirection = 'child_to_parent' | 'parent_to_child';
-export type CommandType = 'report_help' | 'report_done' | 'finish' | 'supplement' | 'kickoff';
+export type CommandType = 'report_help' | 'report_done' | 'finish' | 'supplement' | 'kickoff'
+  // 优化 #1 (时序门控)：执行者产出后显式唤 reviewer。优化 #3：停滞自动唤醒执行者。
+  | 'request_review' | 'nudge';
+/** 命令定向角色 (优化 #1/#3)。缺省 (老命令/未写) 由 dispatcher 解释为 legacy=all，保持旧行为。 */
+export type CommandTargetRole = 'main' | 'collab' | 'all';
 
 export interface SubTaskBot { openId: string; name: string; role: 'main' | 'observer' | 'collab'; }
 
@@ -58,6 +62,14 @@ export interface SubTask {
   staleAfter: number | null;
   compactSummary: string | null;
   lastError: string | null;
+  // 优化 #3 (停滞自动唤醒)：均为加法、可选；老任务缺省 (undefined) = 无 nudge 行为。
+  /** 最近一次自动唤醒(nudge)的时间。仅用于 nudge cooldown，**不参与** activity baseline。 */
+  lastNudgeAt?: string | null;
+  /** 本停滞窗口已自动唤醒次数；≥ MAX_NUDGES 后转 escalate。观测到执行者实质活动时清零。 */
+  nudgeCount?: number;
+  /** 最近一次观测到**执行者侧实质活动**的时间 (排除 owner/base-relay 的 nudge 回声)。
+   *  停滞门控的 activity baseline 取此字段，不取所有 observation。 */
+  lastExecutorActivityAt?: string | null;
 }
 
 /** Outbox 投递信封：双向命令统一建模。 */
@@ -67,7 +79,9 @@ export interface OutboxCommand {
   direction: OutboxDirection;
   targetChatId: string;            // 投到哪个群 (parent 或 child)
   commandType: CommandType;
-  payload: { summary?: string; content?: string; sourceMessageIds?: string[] };
+  payload: { summary?: string; content?: string; sourceMessageIds?: string[];
+    /** 优化 #1/#3：命令定向角色。缺省 → dispatcher 解释为 legacy=all (旧行为)。 */
+    targetRole?: CommandTargetRole };
   idempotencyKey: string;          // 防重发
   expectedTaskVersion: number | null;
   deliveryStatus: DeliveryStatus;
@@ -94,6 +108,9 @@ export interface Observation {
   evidenceLinks: string[];
   summary: string;
   signal: Signal;
+  /** 优化 #3：本轮增量是否含**执行者侧实质活动** (排除 owner/base-relay 的 nudge 回声)。
+   *  持久化此标记，停滞门控的 activity baseline 只认 true 的观测；缺省 (老数据) 视为 undefined。 */
+  hasExecutorActivity?: boolean;
 }
 
 interface StoreFile {
@@ -319,6 +336,10 @@ export async function commitObservationTransaction(opts: {
   /** done 误判后 recheck 回退时，把旧命令标 superseded。 */
   supersedeCommandIds?: string[];
   expectedVersion?: number;
+  /** 优化 #3：本轮是否含执行者侧实质活动 (由 observer 据消息 sender 元数据算)。
+   *  true → 记进 observation + 更新 lastExecutorActivityAt + 清 nudge 态 (执行者还活着)。
+   *  false/缺省 → 仅推进 cursor (owner nudge 回声不当 activity，不动 nudge 态)。 */
+  hasExecutorActivity?: boolean;
 }): Promise<{ observation: Observation; command: OutboxCommand | null } | null> {
   return mutate(s => {
     const idx = s.subtasks.findIndex(t => t.taskId === opts.taskId);
@@ -352,6 +373,7 @@ export async function commitObservationTransaction(opts: {
       readFromCursor: opts.readFromCursor, readToCursor: opts.readToCursor,
       analyzedMessageIds: opts.analyzedMessageIds, evidenceLinks: opts.evidenceLinks ?? [],
       summary: opts.summary, signal: opts.signal,
+      hasExecutorActivity: opts.hasExecutorActivity ?? false,
     };
     s.observations.push(observation);
 
@@ -375,11 +397,17 @@ export async function commitObservationTransaction(opts: {
       }
     }
 
+    // 优化 #3：观测到执行者实质活动 → 更新 activity baseline + 清 nudge 态 (执行者还活着，重新 arm)。
+    //   owner nudge 回声 (hasExecutorActivity=false) 只推进 cursor，不动 baseline / nudge 态。
+    const activityPatch = opts.hasExecutorActivity
+      ? { lastExecutorActivityAt: now, lastNudgeAt: null, nudgeCount: 0 }
+      : {};
     s.subtasks[idx] = {
       ...cur, committedCursor: opts.readToCursor, readCursor: opts.readToCursor,
       status: opts.statusTo ?? cur.status, version: cur.version + 1, updatedAt: now,
+      ...activityPatch,
     };
-    logger.info(`[subtask-store] commit tx ${opts.taskId}: obs=${observation.obsId}${command ? ` cmd=${command.cmdId}(${command.commandType})` : ''} cursor→${opts.readToCursor?.slice(0, 10) ?? 'null'}`);
+    logger.info(`[subtask-store] commit tx ${opts.taskId}: obs=${observation.obsId}${command ? ` cmd=${command.cmdId}(${command.commandType})` : ''} cursor→${opts.readToCursor?.slice(0, 10) ?? 'null'}${opts.hasExecutorActivity ? ' [exec-activity]' : ''}`);
     return { result: { observation, command }, dirty: true };
   });
 }
@@ -475,6 +503,92 @@ export async function transitionAndEnqueueCommand(opts: {
       version: cur.version + 1, updatedAt: now,
     };
     logger.info(`[subtask-store] transitionAndEnqueue ${opts.taskId}: ${cur.status}${to && to !== cur.status ? `→${to}` : ''} cmd=${command.cmdId}(${opts.command.commandType})`);
+    return { result: { task: s.subtasks[idx], command }, dirty: true };
+  });
+}
+
+/**
+ * 优化 #3 (停滞自动唤醒) · 原子 helper（蔻黛克斯 #3-blocker1）：
+ * nudge 命令入队 + 计数/时间戳更新在**同一临界区**，杜绝"只更计数没发命令 / 只发命令没更计数 /
+ * 两 tick 都过门发重复 nudge"。
+ * - 幂等：同 idempotencyKey 已存在 → 返既有命令、**不再 bump 计数** (整体幂等)。
+ * - 门控：仅当 status==='observing' 才发 (re-read 锁内复核，executor 本应在干活的态)。
+ * - 返回 null = 门控不满足 (状态已变 / version 冲突由抛错处理)。
+ */
+export async function enqueueNudgeAndUpdateStats(opts: {
+  taskId: string; targetChatId: string; idempotencyKey: string; expectedVersion?: number;
+  /** 优化 #3 (蔻黛克斯 round2)：当前 episode anchor (ISO)。上次 nudge 早于它 = 新 episode → 计数重置为 1。 */
+  episodeAnchorAt?: string;
+}): Promise<{ task: SubTask; command: OutboxCommand } | null> {
+  return mutate(s => {
+    const idx = s.subtasks.findIndex(t => t.taskId === opts.taskId);
+    if (idx < 0) throw new TaskNotFoundError(opts.taskId);
+    const cur = s.subtasks[idx];
+    // 幂等优先 (在 version check 前)：dup 命中直接返回、不动计数
+    const dup = s.commands.find(c => c.taskId === opts.taskId && c.idempotencyKey === opts.idempotencyKey);
+    if (dup) return { result: { task: cur, command: dup }, dirty: false };
+    if (opts.expectedVersion != null && cur.version !== opts.expectedVersion) {
+      throw new VersionConflictError(opts.taskId, opts.expectedVersion, cur.version);
+    }
+    // 门控复核：只在 observing 唤 (executor 本应继续却断开)
+    if (cur.status !== 'observing') return { result: null, dirty: false };
+    const now = new Date().toISOString();
+    // 新 episode (上次 nudge 早于 episode anchor) → 计数从 1 重置；同 episode → 累加。
+    const anchorMs = opts.episodeAnchorAt ? new Date(opts.episodeAnchorAt).getTime() : NaN;
+    const lastNudgeMs = cur.lastNudgeAt ? new Date(cur.lastNudgeAt).getTime() : 0;
+    const sameEpisode = Number.isFinite(anchorMs) ? lastNudgeMs >= anchorMs : true;
+    const newCount = sameEpisode ? (cur.nudgeCount ?? 0) + 1 : 1;
+    const command: OutboxCommand = {
+      cmdId: genId('cmd'), taskId: opts.taskId, direction: 'parent_to_child', targetChatId: opts.targetChatId,
+      commandType: 'nudge', payload: { targetRole: 'main' }, idempotencyKey: opts.idempotencyKey,
+      expectedTaskVersion: cur.version + 1, deliveryStatus: 'pending', deliveredMessageId: null,
+      retryCount: 0, nextRetryAt: null, sentAt: null, ackedAt: null, supersededBy: null,
+      lastError: null, createdAt: now, dispatchingUntil: null, dispatchAttemptId: null,
+    };
+    s.commands.push(command);
+    s.subtasks[idx] = {
+      ...cur, lastNudgeAt: now, nudgeCount: newCount,
+      version: cur.version + 1, updatedAt: now,
+    };
+    logger.info(`[subtask-store] nudge enqueued ${opts.taskId}: episode count→${newCount} cmd=${command.cmdId}`);
+    return { result: { task: s.subtasks[idx], command }, dirty: true };
+  });
+}
+
+/**
+ * 优化 #3 · 原子 helper（蔻黛克斯 #3-blocker2）：超过 MAX_NUDGES 仍无响应 → escalate 给父群。
+ * observing → reported_help + 入队一条 child_to_parent report_help（合成 summary）一把原子。
+ * **不复用 commitObservationTransaction**（停滞分支无 readToCursor/analyzedIds，避免空 observation 滥用）。
+ * - 幂等：同 idempotencyKey 已存在 → 返既有、不重复转/不重复入队。
+ * - 门控：仅 status==='observing' 才 escalate；转 reported_help 后停滞门控自然不再触发 (防重复)。
+ */
+export async function escalateStalledTask(opts: {
+  taskId: string; idempotencyKey: string; summary: string; expectedVersion?: number;
+}): Promise<{ task: SubTask; command: OutboxCommand } | null> {
+  return mutate(s => {
+    const idx = s.subtasks.findIndex(t => t.taskId === opts.taskId);
+    if (idx < 0) throw new TaskNotFoundError(opts.taskId);
+    const cur = s.subtasks[idx];
+    const dup = s.commands.find(c => c.taskId === opts.taskId && c.idempotencyKey === opts.idempotencyKey);
+    if (dup) return { result: { task: cur, command: dup }, dirty: false };
+    if (opts.expectedVersion != null && cur.version !== opts.expectedVersion) {
+      throw new VersionConflictError(opts.taskId, opts.expectedVersion, cur.version);
+    }
+    if (cur.status !== 'observing') return { result: null, dirty: false };
+    if (!isTransitionAllowed('observing', 'reported_help')) return { result: null, dirty: false };
+    const now = new Date().toISOString();
+    const command: OutboxCommand = {
+      cmdId: genId('cmd'), taskId: opts.taskId, direction: 'child_to_parent', targetChatId: cur.parentChatId,
+      commandType: 'report_help', payload: { summary: opts.summary }, idempotencyKey: opts.idempotencyKey,
+      expectedTaskVersion: cur.version + 1, deliveryStatus: 'pending', deliveredMessageId: null,
+      retryCount: 0, nextRetryAt: null, sentAt: null, ackedAt: null, supersededBy: null,
+      lastError: null, createdAt: now, dispatchingUntil: null, dispatchAttemptId: null,
+    };
+    s.commands.push(command);
+    s.subtasks[idx] = {
+      ...cur, status: 'reported_help', version: cur.version + 1, updatedAt: now,
+    };
+    logger.info(`[subtask-store] stall escalate ${opts.taskId}: observing→reported_help cmd=${command.cmdId}`);
     return { result: { task: s.subtasks[idx], command }, dirty: true };
   });
 }

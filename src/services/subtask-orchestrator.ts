@@ -28,7 +28,9 @@ import {
   helpReportDelivery,
   VersionConflictError, CommandRetryMismatchError,
   type SubTask, type SubTaskBot, type SubTaskStatus, type OutboxCommand, type Observation,
+  type CommandTargetRole,
 } from './subtask-store.js';
+import { SUBTASK_COLLAB_NORMS } from './subtask-norms.js';
 
 /** v2 编排链路标记 —— 进 chatContext.relatedRefs，dashboard/welcome card 可见，
  *  跟旧 watcher 链路区分 (边界3)。 */
@@ -120,6 +122,7 @@ export async function createSubtask(req: CreateSubtaskReq): Promise<{ taskId: st
         relatedRefs: [V2_MARKER, ...(req.relatedRefs ?? [])], // 边界3: v2 marker
         participants: resolved.map(r => ({ openId: r.ident.openId, role: r.meta.role })),
         parentDigest: req.parentDigest,
+        rules: [...SUBTASK_COLLAB_NORMS], // 优化 #2: 固化协作 norms 进群规则 (欢迎卡 + <rules> 注入)
       },
     });
     return { key: idempotencyKey, chatId: result.chatId, createdAt: new Date().toISOString() };
@@ -224,6 +227,62 @@ export async function askForHelp(req: AskForHelpReq): Promise<{ cmdId: string; t
   return reportProgress({ sessionId: req.sessionId, taskId: req.taskId, type: 'need_help', summary: req.summary, sourceMessageIds: req.sourceMessageIds, idempotencyKey: req.idempotencyKey });
 }
 
+// ─── request_review (优化 #1 时序门控) ──────────────────────────────────────────
+export interface RequestReviewReq {
+  sessionId: string;
+  taskId: string;
+  summary: string;          // 必须含可打开的飞书链接或本机绝对路径 (N2)
+  sourceMessageIds?: string[];
+  idempotencyKey?: string;
+}
+
+/** N2：summary 必须含可打开的飞书/http 链接，或本机绝对路径 (以 / 开头的路径 token)。 */
+function hasOpenableRef(s: string): boolean {
+  return /https?:\/\//i.test(s) || /(^|\s)\/[^\s]+/.test(s);
+}
+
+/**
+ * 优化 #1：执行者产出第一份可 review 物后，**显式**唤起 reviewer。kickoff 只唤执行者、reviewer
+ * 此前不被唤起 → 物理上杜绝 reviewer 抢活。鉴权复用子群形状 (非 authzParentBot，蔻黛克斯 #1-major4)：
+ * 必须从该子群、由本任务 **main(执行者)** 调用。幂等不按 summary hash (蔻黛克斯 #1-blocker2)。
+ */
+export async function requestReview(req: RequestReviewReq): Promise<{ cmdId: string; taskId: string }> {
+  const session = getSession(req.sessionId);
+  if (!session) throw new HttpError(403, `unknown session: ${req.sessionId}`);
+  const task = getSubTask(req.taskId);
+  if (!task) throw new HttpError(404, `subtask not found: ${req.taskId}`);
+  // 鉴权：只能从该子群调
+  if (session.chatId !== task.chatId) {
+    throw new HttpError(403, `request_review must come from the subtask chat (session.chatId=${session.chatId}, task.chatId=${task.chatId})`);
+  }
+  // 发起方必须是本任务的 main(执行者)
+  const botOpenId = sessionBotOpenId(session.larkAppId);
+  const me = botOpenId ? task.bots.find(b => b.openId === botOpenId) : undefined;
+  if (!me) throw new HttpError(403, `requesting bot (larkAppId=${session.larkAppId}) is not a participant of this subtask`);
+  if (me.role !== 'main') throw new HttpError(403, `only the executor(main) bot can request review (caller role=${me.role})`);
+  // 必须有 reviewer 可唤 (蔻黛克斯 #1-blocker3：空集合不发空名单)
+  if (!task.bots.some(b => b.role === 'collab')) {
+    throw new HttpError(409, 'no reviewer (collab) in this subtask — nothing to wake');
+  }
+  if (!req.summary?.trim()) throw new HttpError(400, 'missing summary');
+  if (!hasOpenableRef(req.summary)) {
+    throw new HttpError(400, 'request_review summary 必须含可打开的飞书链接或本机绝对路径 (N2)，别只发聊天摘要');
+  }
+  if (task.status === 'finished' || task.status === 'stopped') {
+    throw new HttpError(409, `subtask already ${task.status}; request_review suppressed`);
+  }
+  // 幂等：显式 key > sourceMessageIds > randomUUID。**不按 summary hash** (同一路径多轮复用会误 dedup)。
+  const idempotencyKey = req.idempotencyKey
+    ?? (req.sourceMessageIds?.length ? `review-${req.sourceMessageIds.join(',')}` : `review-${randomUUID()}`);
+  const cmd = await enqueueCommand({
+    taskId: task.taskId, direction: 'parent_to_child', targetChatId: task.chatId,
+    commandType: 'request_review', payload: { summary: req.summary, sourceMessageIds: req.sourceMessageIds, targetRole: 'collab' },
+    idempotencyKey, expectedTaskVersion: task.version,
+  });
+  logger.info(`[subtask-orch] request_review ${task.taskId} cmd=${cmd.cmdId}`);
+  return { cmdId: cmd.cmdId, taskId: task.taskId };
+}
+
 // ─── query_subtask ────────────────────────────────────────────────────────────
 export interface QuerySubtaskReq { sessionId: string; taskId?: string; commandId?: string; }
 export interface QuerySubtaskResult {
@@ -314,7 +373,11 @@ export async function finishSubtask(req: FinishSubtaskReq): Promise<{ taskId: st
 }
 
 // ─── supplement_subtask ───────────────────────────────────────────────────────
-export interface SupplementSubtaskReq { sessionId: string; taskId: string; content: string; expectedVersion?: number; force?: boolean; }
+export interface SupplementSubtaskReq {
+  sessionId: string; taskId: string; content: string; expectedVersion?: number; force?: boolean;
+  /** 优化 #1：补充输入定向。缺省 'main' (普通补充给执行者)；'reviewer'/'all' 用于"请 reviewer review"等。 */
+  targetRole?: CommandTargetRole | 'reviewer';
+}
 
 export async function supplementSubtask(req: SupplementSubtaskReq): Promise<{ taskId: string; cmdId: string; status: string }> {
   const { task } = authzParentBot(req.sessionId, req.taskId);
@@ -323,8 +386,15 @@ export async function supplementSubtask(req: SupplementSubtaskReq): Promise<{ ta
   if (!req.force && req.expectedVersion == null) {
     throw new HttpError(400, 'supplement_subtask requires expectedVersion (or force=true to override)');
   }
+  // 优化 #1：新建 supplement **显式**写 targetRole (默认 main)，dispatcher 缺省才当 legacy=all。
+  //   'reviewer' 是用户友好别名 → 内部 'collab'。
+  const rawRole = req.targetRole ?? 'main';
+  const targetRole: CommandTargetRole = rawRole === 'reviewer' ? 'collab' : rawRole;
+  if (!['main', 'collab', 'all'].includes(targetRole)) {
+    throw new HttpError(400, `invalid target-role: ${req.targetRole} (use main|reviewer|all)`);
+  }
   // review Blocker1: (reported_help→observing 条件转移) + supplement 命令入队**一把原子事务**。
-  // idempotencyKey 用内容 hash (同内容 dedup，不含 version 防转移后重试漏)。
+  // idempotencyKey 用内容 hash (同内容 dedup，不含 version 防转移后重试漏)；带 role 防同内容不同定向误 dedup。
   let result: Awaited<ReturnType<typeof transitionAndEnqueueCommand>>;
   try {
     result = await transitionAndEnqueueCommand({
@@ -332,8 +402,8 @@ export async function supplementSubtask(req: SupplementSubtaskReq): Promise<{ ta
       resolveTo: cur => (cur === 'reported_help' ? 'observing' : null), // help 被回应 → observing；其它状态不动
       command: {
         direction: 'parent_to_child', targetChatId: task.chatId,
-        commandType: 'supplement', payload: { content: req.content },
-        idempotencyKey: `supp-${req.taskId}-${djb2(req.content)}`,
+        commandType: 'supplement', payload: { content: req.content, targetRole },
+        idempotencyKey: `supp-${req.taskId}-${targetRole}-${djb2(req.content)}`,
       },
     });
   } catch (err) {

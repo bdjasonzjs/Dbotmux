@@ -16,6 +16,7 @@ import { logger } from '../utils/logger.js';
 import {
   listSubTasks, listObservations, listCommands, commitObservationTransaction,
   helpReportDelivery, staleHelpCommandIds, latestHelpReport,
+  enqueueNudgeAndUpdateStats, escalateStalledTask,
   CursorConflictError, InvalidCursorCommitError, VersionConflictError, ACTIVE_STATUSES,
   type SubTask, type SubTaskStatus, type Signal, type HelpDelivery,
 } from './subtask-store.js';
@@ -31,8 +32,10 @@ export interface JudgeResult { signal: Signal; summary: string; evidenceLinks?: 
 
 export interface FetchResult {
   /** 从 afterMessageId 之后**紧接着、连续、老→新**的增量 (最多 limit 条)。
-   *  关键 (review Blocker 1)：必须是连续的，cursor 才能安全推到本批最后一条不漏。 */
-  messages: Array<{ id: string; rendered: string }>;
+   *  关键 (review Blocker 1)：必须是连续的，cursor 才能安全推到本批最后一条不漏。
+   *  优化 #3：带 senderId (消息发送者 open_id/app_id)，用于判"执行者侧实质活动"——
+   *  owner(base relay nudge 回声) 的 senderId === task.requester，不算 activity。 */
+  messages: Array<{ id: string; rendered: string; senderId?: string }>;
   /** 是否已读到群尾。false = 还有更多 (忙群积压)，本轮只推进到本批末尾，下轮接着读。 */
   complete: boolean;
 }
@@ -54,6 +57,49 @@ export const HELP_ACK_TIMEOUT_MS = 10 * 60_000;
  *  求助已超过此阈值、且**仍没人响应**(未 ack 且主 bot 没补充)、blocker 仍在 → 兜底再报一次。
  *  默认 2h，可调。 */
 export const STALE_REREPORT_MS = 2 * 60 * 60 * 1000;
+
+/** 优化 #3 (停滞自动唤醒)：observing 子群距上次执行者实质活动超过此阈值且无新消息 → 自动唤醒。
+ *  >> MIN_OBSERVE_INTERVAL_MS，给长思考/长工具调用留余地；可调。 */
+export const STALL_AFTER_MS = 10 * 60_000;
+/** 同一停滞窗口最多自动唤醒几次；超过仍无响应 → escalate 给父群 (转 reported_help)。 */
+export const MAX_NUDGES = 3;
+
+/** 停滞自动唤醒决策 (纯函数，可单测)：observing + 距 activity baseline 超阈 → nudge；
+ *  已唤醒用 lastNudgeAt 做 cooldown；nudgeCount≥MAX → escalate；其余 → none。
+ *  @param lastInitiatingCmdAt 最近一条**非 nudge** 发起类 parent→child 命令(kickoff/supplement/
+ *    request_review) 的时间——蔻黛克斯 code-review blocker2：fresh supplement 后要给执行者完整窗口、
+ *    不能因 createdAt 老就立刻 nudge。**排除 nudge 自身**(否则窗口被自己的唤醒无限推后)。 */
+export type StallAction = { kind: 'none' } | { kind: 'nudge' } | { kind: 'escalate' };
+
+/** episode anchor = max{执行者实质活动, 最近非 nudge 发起命令, 建群时间} 的毫秒数。
+ *  fresh supplement/request_review/kickoff 会推高它 → 开启**新 episode**。NaN 表示全脏。 */
+export function episodeAnchorMs(t: SubTask, lastInitiatingCmdAt: string | null): number {
+  const ms = [t.lastExecutorActivityAt, lastInitiatingCmdAt, t.createdAt]
+    .filter((s): s is string => !!s)
+    .map(s => new Date(s).getTime())
+    .filter(Number.isFinite);
+  return ms.length ? Math.max(...ms) : NaN;
+}
+/** 当前 episode 的有效 nudge 次数：上次 nudge 早于 episode anchor (= 新 episode 已开启) → 视作 0。 */
+export function effectiveNudgeCount(t: SubTask, anchorMs: number): number {
+  const lastNudgeMs = t.lastNudgeAt ? new Date(t.lastNudgeAt).getTime() : 0;
+  const sameEpisode = Number.isFinite(lastNudgeMs) && lastNudgeMs >= anchorMs;
+  return sameEpisode ? (t.nudgeCount ?? 0) : 0;
+}
+
+export function planStallNudge(t: SubTask, now: Date, lastInitiatingCmdAt: string | null = null): StallAction {
+  if (t.status !== 'observing') return { kind: 'none' };       // 只在执行者本应继续的态唤
+  const anchorMs = episodeAnchorMs(t, lastInitiatingCmdAt);
+  if (!Number.isFinite(anchorMs)) return { kind: 'none' };     // 全脏 → 保守不唤
+  // since = max(episode anchor, lastNudgeAt cooldown)：新 episode(anchor 更新) → 从 anchor 重开窗口；
+  // 同 episode 内已 nudge → 按 lastNudgeAt cooldown。
+  const lastNudgeMs = t.lastNudgeAt ? new Date(t.lastNudgeAt).getTime() : 0;
+  const sinceMs = Math.max(anchorMs, Number.isFinite(lastNudgeMs) ? lastNudgeMs : 0);
+  if (now.getTime() - sinceMs <= STALL_AFTER_MS) return { kind: 'none' };
+  // 蔻黛克斯 round2 blocker：用 episode 有效次数 (新 episode 重置为 0)，不被旧窗口的 MAX 卡成立即 escalate。
+  if (effectiveNudgeCount(t, anchorMs) >= MAX_NUDGES) return { kind: 'escalate' };
+  return { kind: 'nudge' };
+}
 
 export async function runObserverTick(now: Date, exec: ObserverExecutors): Promise<{ checked: number; committed: number; errors: number }> {
   const stats = { checked: 0, committed: 0, errors: 0 };
@@ -77,7 +123,8 @@ async function tickOne(t: SubTask, now: Date, exec: ObserverExecutors): Promise<
 
   // 读 committedCursor 之后的【连续】增量 (老→新)。fetchSince IO 失败会抛 → 上层 catch skip。
   const fetched = await exec.fetchSince(t.chatId, t.committedCursor, FETCH_LIMIT);
-  if (fetched.messages.length === 0) return false;
+  // 优化 #3：无新消息 = 停滞信号。判是否本应继续却断开 → 自动唤醒 / escalate (原来直接 return false 丢弃)。
+  if (fetched.messages.length === 0) return handleStall(t, now);
 
   // review Blocker 1: 只分析这批连续增量、cursor 只推到本批最后一条。!complete 时积压留给下轮，
   // 绝不把 cursor 跳到"没读到的最新"。
@@ -86,6 +133,33 @@ async function tickOne(t: SubTask, now: Date, exec: ObserverExecutors): Promise<
   const readToCursor = analyzedMessageIds[analyzedMessageIds.length - 1];
   const renderedNew = ordered.map(m => m.rendered).join('\n');
   if (!fetched.complete) logger.info(`[subtask-observer] ${t.taskId} 积压未读完, 本轮推进到 ${readToCursor?.slice(0, 10)}, 下轮继续`);
+
+  // 优化 #3：本批是否含**执行者侧实质活动**——只有**已知 == owner(task.requester)** 的消息才算"非活动"
+  // (base relay nudge 回声/owner 系统消息)。sender 未知(undefined) 保守当作执行者活动，绝不误抑真进展。
+  // 仅当**整批都是已知 owner 消息**时 hasExecutorActivity=false → 纯回声。
+  const hasExecutorActivity = ordered.some(m => m.senderId !== t.requester);
+
+  // 蔻黛克斯 code-review blocker1：纯 owner 系统消息/nudge 回声 (无执行者活动) **绝不进 judge/planCommit**
+  // ——否则「任务搞定没有？」可能被误判 need_help/done 触发上报或转态。只推进 cursor 防重读、中性观测、
+  // 不上报、不转态、不 reset (hasExecutorActivity=false 已保证不动 baseline/nudge 态)。
+  if (!hasExecutorActivity) {
+    try {
+      const res = await commitObservationTransaction({
+        taskId: t.taskId, readFromCursor: t.committedCursor, readToCursor, analyzedMessageIds,
+        summary: '(仅 owner 系统消息/nudge 回声，无执行者活动；推进 cursor 不驱动状态)', signal: 'normal',
+        expectedVersion: t.version, hasExecutorActivity: false,
+      });
+      if (res == null) { logger.info(`[subtask-observer] ${t.taskId} echo commit null skip`); return false; }
+      logger.info(`[subtask-observer] ${t.taskId} owner-only 回声 → 推进 cursor, 不 judge/不驱动状态`);
+      return true;
+    } catch (err) {
+      if (err instanceof CursorConflictError || err instanceof InvalidCursorCommitError || err instanceof VersionConflictError) {
+        logger.info(`[subtask-observer] ${t.taskId} echo conflict skip: ${(err as Error).message}`);
+        return false;
+      }
+      throw err;
+    }
+  }
 
   const recentObs = listObservations(t.taskId, 5).map(o => `[${o.signal}] ${o.summary}`);
   const judged = await exec.judge({
@@ -123,7 +197,7 @@ async function tickOne(t: SubTask, now: Date, exec: ObserverExecutors): Promise<
       taskId: t.taskId, readFromCursor: t.committedCursor, readToCursor, analyzedMessageIds,
       summary: judged.summary, signal: judged.signal, evidenceLinks: judged.evidenceLinks,
       report: plan.report, statusTo: plan.statusTo, supersedeCommandIds: plan.supersedeCommandIds,
-      expectedVersion: t.version,
+      expectedVersion: t.version, hasExecutorActivity,
     });
     if (res == null) { logger.info(`[subtask-observer] ${t.taskId} commit null (非法转移?) skip`); return false; }
     logger.info(`[subtask-observer] ${t.taskId} signal=${judged.signal} → ${plan.statusTo ?? t.status}${plan.report ? ` report=${plan.report.commandType}` : ''}`);
@@ -132,6 +206,57 @@ async function tickOne(t: SubTask, now: Date, exec: ObserverExecutors): Promise<
     if (err instanceof CursorConflictError || err instanceof InvalidCursorCommitError || err instanceof VersionConflictError) {
       // cursor/版本 被别的进程改了 → 本轮放弃、不推进，下轮按新状态重来
       logger.info(`[subtask-observer] ${t.taskId} conflict, skip this tick: ${err.message}`);
+      return false;
+    }
+    throw err;
+  }
+}
+
+/**
+ * 优化 #3：停滞处理 (无新消息时调用)。planStallNudge 决策 → 调原子 store helper：
+ * - nudge：enqueueNudgeAndUpdateStats (计数+命令同锁原子，幂等 key 防重复 nudge)。
+ * - escalate：escalateStalledTask (observing→reported_help + 一条 report_help，转态后停滞门控自然不再触发)。
+ * idempotencyKey 用 activity baseline 作 episode 区分 (执行者恢复→baseline 变→新窗口可再唤)；
+ * nudgeCount 入 key 让同窗口每次 attempt 唯一、两 tick 并发同 attempt 自然 dedup。
+ */
+async function handleStall(t: SubTask, now: Date): Promise<boolean> {
+  // blocker2 fix: 最近一条非 nudge 发起命令时间 (kickoff/supplement/request_review)——
+  // sentAt 优先 (已投出)，否则 createdAt (pending)。排除 nudge 自身。
+  const initiating = listCommands(t.taskId).filter(c =>
+    c.direction === 'parent_to_child' && c.commandType !== 'nudge' && c.supersededBy == null);
+  const lastInitiatingCmdAt = initiating.length
+    ? initiating.map(c => c.sentAt ?? c.createdAt).sort().at(-1)!
+    : null;
+  const action = planStallNudge(t, now, lastInitiatingCmdAt);
+  if (action.kind === 'none') return false;
+  // round2 blocker fix: 用 episode anchor (而非旧 baseline) 作 idempotency episode，
+  // 让 fresh supplement/request_review 开新 episode → 新 key、不撞旧 escalation 命令；
+  // effectiveCount 让新 episode 从 0 起算 nudge 次数。
+  const anchorMs = episodeAnchorMs(t, lastInitiatingCmdAt);
+  const episodeAnchorAt = new Date(anchorMs).toISOString();
+  const effCount = effectiveNudgeCount(t, anchorMs);
+  try {
+    if (action.kind === 'nudge') {
+      const r = await enqueueNudgeAndUpdateStats({
+        taskId: t.taskId, targetChatId: t.chatId,
+        idempotencyKey: `nudge-${t.taskId}-${episodeAnchorAt}-${effCount}`,
+        episodeAnchorAt,
+        expectedVersion: t.version,
+      });
+      if (r) logger.info(`[subtask-observer] ${t.taskId} 停滞→自动唤醒执行者 (episode count=${effCount + 1})`);
+      return r != null;
+    }
+    const r = await escalateStalledTask({
+      taskId: t.taskId,
+      idempotencyKey: `stall-escalate-${t.taskId}-${episodeAnchorAt}`,
+      summary: '子任务长时间无新消息且多次自动唤醒无响应，疑似执行者断开',
+      expectedVersion: t.version,
+    });
+    if (r) logger.info(`[subtask-observer] ${t.taskId} 多次唤醒无响应→escalate 父群 (转 reported_help)`);
+    return r != null;
+  } catch (err) {
+    if (err instanceof VersionConflictError) {
+      logger.info(`[subtask-observer] ${t.taskId} stall action version conflict, skip this tick`);
       return false;
     }
     throw err;

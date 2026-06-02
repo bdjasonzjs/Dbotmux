@@ -1395,6 +1395,7 @@ const SUBTASK_ORCH_ROUTES: Array<[string, string]> = [
   ['/api/subtask-orch-finish', 'finishSubtask'],
   ['/api/subtask-orch-supplement', 'supplementSubtask'],
   ['/api/subtask-orch-askforhelp', 'askForHelp'],
+  ['/api/subtask-orch-request-review', 'requestReview'],   // 优化 #1: 执行者唤起 reviewer
 ];
 for (const [path, fnName] of SUBTASK_ORCH_ROUTES) {
   ipcRoute('POST', path, async (req, res) => {

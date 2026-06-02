@@ -18,8 +18,9 @@
  */
 import { logger } from '../utils/logger.js';
 import { DEFAULT_GROUP_NOT_FOUND_RETRY_TIMEOUT_MS, sendAsOwner } from './base-relay.js';
+import { SUBTASK_COLLAB_NORMS_ONELINE } from './subtask-norms.js';
 import type { DispatchExecutors } from './outbox-dispatcher.js';
-import type { OutboxCommand, SubTask } from './subtask-store.js';
+import type { CommandTargetRole, OutboxCommand, SubTask } from './subtask-store.js';
 
 /** 急急如律令口令前缀 —— **必须**与 event-dispatcher.parseUrgentSummon 的解析前缀一致。
  *  内联而非 import event-dispatcher，避免投递层拖入 IM 路由的重依赖 (也便于单测隔离)。 */
@@ -35,13 +36,31 @@ export function safeText(s: unknown, n: number): string {
   return str.replace(/[\x00-\x1F\x7F]/g, ' ').slice(0, n);
 }
 
-/** 急急如律令名单 = 子群执行 bot (非 observer)。observer(缇蕾) 不唤 —— 它是触发者不是执行者。 */
+/** 急急如律令名单 = 子群执行 bot (非 observer)。observer(缇蕾) 不唤 —— 它是触发者不是执行者。
+ *  = legacy/'all' 的目标 (finish / 缺省 targetRole 的旧 supplement)。 */
 function executorNames(task: SubTask): string[] {
   return task.bots.filter(b => b.role !== 'observer').map(b => b.name);
 }
 /** 主 bot 名 (child→parent 唤它)。取 role==='main'，缺省回退「克劳德」。 */
 function mainBotName(task: SubTask): string {
   return task.bots.find(b => b.role === 'main')?.name ?? '克劳德';
+}
+
+/** 优化 #1/#3 (蔻黛克斯 #1-blocker3)：按角色解析急急如律令名单，**绝不返回空名单**。
+ *  - 'main'：role==='main'，空 → 回退非 observer (自定义 bots/无 main 的任务仍能被唤)。
+ *  - 'collab'：role==='collab'，空 → 回退非 observer (防御；requestReview service 已先 409 守无 reviewer)。
+ *  - 'all'/缺省：非 observer 全体 (legacy 兼容)。 */
+function resolveTargets(task: SubTask, role: CommandTargetRole | undefined): string[] {
+  const nonObserver = executorNames(task);
+  if (role === 'main') {
+    const m = task.bots.filter(b => b.role === 'main').map(b => b.name);
+    return m.length ? m : nonObserver;
+  }
+  if (role === 'collab') {
+    const r = task.bots.filter(b => b.role === 'collab').map(b => b.name);
+    return r.length ? r : nonObserver;
+  }
+  return nonObserver; // 'all' | undefined → legacy
 }
 
 /** 拼 `急急如律令：【名单】正文` (名单 / 分隔)。正文已 safeText。 */
@@ -61,18 +80,31 @@ export function childToParentSummon(cmd: OutboxCommand, task: SubTask): string {
   return urgentSummon([mainBotName(task)], body);
 }
 
-/** 主bot finish/supplement → 子群文案 (急急如律令唤执行 bot)。payload.content 走 safeText。 */
+/** parent→child / 子群内唤醒文案 (急急如律令)。按 commandType + targetRole 选**名单**和**文案**
+ *  (优化 #1 角色分工 + #3 停滞唤醒)。payload 内容走 safeText、整体保持单行 (= base relay 记录标题)。 */
 export function parentToChildSummon(cmd: OutboxCommand, task: SubTask): string {
-  const names = executorNames(task);
   if (cmd.commandType === 'kickoff') {
+    // B1: kickoff 只唤执行者(main)，reviewer 不在此被唤起 (等执行者产出后 request_review 再唤)。
     const acc = task.acceptance ? ` 验收：${safeText(task.acceptance, 200)}` : '';
-    return urgentSummon(names, `📋 子任务启动：${safeText(task.goal, 240)}。${acc} 请开始干活；卡住/缺信息用 \`botmux subtask-askforhelp --task-id ${task.taskId} --summary "卡在哪"\` 向主 bot 求助，别硬扛别编。`);
+    return urgentSummon(resolveTargets(task, 'main'),
+      `📋 子任务启动：${safeText(task.goal, 240)}。${acc} 你是主推进者，方案/代码/文档由你产出、你驱动任务；产出第一份可 review 物后用 \`botmux subtask-request-review --task-id ${task.taskId} --summary "<可打开的链接/绝对路径>"\` 唤起 reviewer。卡住用 \`botmux subtask-askforhelp --task-id ${task.taskId} --summary "卡在哪"\`，别硬扛别编。${SUBTASK_COLLAB_NORMS_ONELINE}`);
+  }
+  if (cmd.commandType === 'request_review') {
+    // 优化 #1：只唤 reviewer，明确只 review/challenge、不抢执行。
+    return urgentSummon(resolveTargets(task, 'collab'),
+      `🔍 执行者已产出可 review 的交付物，请 review/challenge：${safeText(cmd.payload.summary ?? cmd.payload.content ?? '', CONTENT_MAX)}。你只 review/challenge，**不产主交付物、不直接实现**；发现问题挑出来交执行者改。`);
+  }
+  if (cmd.commandType === 'nudge') {
+    // 优化 #3：停滞自动唤醒——只唤执行者(main)，内容就一句 (松松指定)。
+    return urgentSummon(resolveTargets(task, 'main'), '任务搞定没有？');
   }
   if (cmd.commandType === 'finish') {
     const note = cmd.payload.content ? ` 说明：${safeText(cmd.payload.content, CONTENT_MAX)}` : '';
-    return urgentSummon(names, `✅ 主bot 已结束本子任务（taskId=${task.taskId}）。${note}`);
+    return urgentSummon(resolveTargets(task, 'all'), `✅ 主bot 已结束本子任务（taskId=${task.taskId}）。${note}`);
   }
-  return urgentSummon(names, `📨 主bot 补充输入（taskId=${task.taskId}）：${safeText(cmd.payload.content ?? '', CONTENT_MAX)}`);
+  // supplement：targetRole 缺省 → 'all' (legacy 兼容，旧 pending 仍唤 main+collab)；新命令显式带 'main'。
+  const role = cmd.payload.targetRole ?? 'all';
+  return urgentSummon(resolveTargets(task, role), `📨 主bot 补充输入（taskId=${task.taskId}）：${safeText(cmd.payload.content ?? '', CONTENT_MAX)}`);
 }
 
 export function makeDispatchExecutors(): DispatchExecutors {

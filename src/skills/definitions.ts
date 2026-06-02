@@ -858,9 +858,17 @@ botmux subtask-supplement --task-id <taskId> --expected-version <task.version> -
 - \`--force\`：极少数人工强制场景（不带 expected-version 直接结束/补充）。默认别用，老实走 version。
 - 幂等：同一条 finish/supplement 重试安全（按命令去重，不会重复执行）。
 
-## 作为子群分身：手动上报
+## 作为子群成员：角色 + 手动上报
 
-你是子群里的执行分身，想立刻把"卡住了 / 做完了"喊给主话题（不等脚本下一轮观测）：
+你是子群成员，**角色以注入的 \`<subtask_member_routing>\` 为准**（执行者 / reviewer / 观测者），不要凭群名臆测：
+- **执行者(main)**：你驱动任务、方案/代码/文档都由你产出。产出第一份可 review 物后，用 \`subtask-request-review\` 唤起 reviewer：
+  \`\`\`bash
+  botmux subtask-request-review --task-id <taskId> --summary "<可打开的飞书链接 或 本机绝对路径>"
+  \`\`\`
+  （summary 必须含可打开的链接/绝对路径，别只发聊天摘要——否则 reviewer 打不开你的产出。）
+- **reviewer**：只 review/challenge，**不驱动任务、不产主交付物、不直接实现**；等执行者产出后再上，发现问题挑出来交执行者改。
+
+想立刻把"卡住了 / 做完了"喊给主话题（不等脚本下一轮观测）：
 
 \`\`\`bash
 botmux subtask-report --task-id <taskId> --type need_help|done --summary "一句话" [--source-message-ids m1,m2]
@@ -868,6 +876,11 @@ botmux subtask-report --task-id <taskId> --type need_help|done --summary "一句
 
 - 只能从**该子任务的子群**里、且你是该任务参与 bot 时调用。
 - 这是观测脚本的**补充**显式信号；常规进展不用手动报，脚本会自动判。
+
+## 协作 norms（子群成员务必遵守）
+
+- 同群所有 bot 用**同一个工作副本**：先在群里对齐唯一 worktree / clone 路径，所有人都在那一个上工作，别各自 clone 或开不同 worktree（否则 reviewer 看不到 executor 的改动、没法 review）。
+- 文档 / 主交付物**不要塞聊天正文**：写成飞书 docx 发链接，或写到本机物理路径后发**绝对路径**，这样协作 bot 才能打开内容去 review。
 
 ## 输出与排错
 

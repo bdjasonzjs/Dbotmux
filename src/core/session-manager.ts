@@ -30,6 +30,7 @@ import { t, localeForBot, type Locale } from '../i18n/index.js';
 import { parseWorkingDirList } from '../utils/working-dir.js';
 import * as chatContextStore from '../services/chat-context-store.js';
 import * as subtaskStore from '../services/subtask-store.js';
+import { renderCollabNorms } from '../services/subtask-norms.js';
 
 function sessionCreatedAtMs(session: { createdAt?: string }): number {
   return session.createdAt ? (Date.parse(session.createdAt) || Date.now()) : Date.now();
@@ -279,9 +280,10 @@ export function buildSubtaskMemberBlock(chatId: string | undefined, larkAppId: s
   if (task.status === 'finished' || task.status === 'stopped') return ''; // 终态不再注入
 
   // 角色定义 (v3：claude=执行者 / codex=Reviewer / coco=超级Subagent)
+  // 优化 #1：把角色说硬——executor 驱动+产出主交付物、产出后唤 reviewer；reviewer 三句负约束、不抢执行。
   const ROLE_BY_CLI: Record<string, string> = {
-    'claude-code': '执行者 —— 负责方案的制定 + 方案的落地',
-    codex: 'Reviewer —— 审方案的合理性、审代码是否正确 / 有没有逻辑硬伤',
+    'claude-code': '执行者(主推进者) —— 你驱动任务、方案/代码/文档都由你产出。产出第一份可 review 物后，用 `botmux subtask-request-review --task-id <id> --summary "<可打开的链接/绝对路径>"` 唤起 reviewer；别闷头到底。',
+    codex: 'Reviewer —— 只 review/challenge：**不驱动任务、不产主交付物、不直接实现**。只在执行者已有方案/代码/明确请求 review 时再 review，发现问题挑出来交执行者改，别自己上手抢执行。',
     coco: '超级 Subagent —— Token 不限量，承接 token 消耗大但相对简单的活',
   };
   const ROLE_BY_NAME: Record<string, string> = {
@@ -305,6 +307,8 @@ export function buildSubtaskMemberBlock(chatId: string | undefined, larkAppId: s
 
 【群里其他成员】
 ${others.length ? others.join('\n') : '  (只有你和观测者)'}
+
+${renderCollabNorms('【协作 norms（每轮提醒，务必遵守）】')}
 
 【卡住 / 缺信息怎么办】
 - 用 \`botmux subtask-askforhelp --task-id ${task.taskId} --summary "卡在哪/需要什么"\` 向主 bot 求助。

@@ -19,6 +19,7 @@ import { sendMessage } from '../im/lark/client.js';
 import { getMainTopicChatId } from './main-topic-config.js';
 import { createGroupWithBots } from './group-creator.js';
 import { resolveBotIdent } from '../core/main-bot-playbook.js';
+import { SUBTASK_COLLAB_NORMS } from './subtask-norms.js';
 import { getOrCompute } from './spawn-idempotency-store.js';
 import type { ScoutTillyHighItem } from './main-bot-digest-store.js';
 import type { RouterExecutors } from './scout-inbox-router.js';
@@ -95,6 +96,7 @@ export function makeProductionExecutors(opts: { larkAppId: string }): RouterExec
                 { openId: resolveBotIdent('codex').openId, role: 'reviewer/sister' },
                 { openId: resolveBotIdent('tilly').openId, role: 'scout' },
               ],
+              rules: [...SUBTASK_COLLAB_NORMS], // 优化 #2 (蔻黛克斯 P3c): scout 自动 spawn 链路也固化协作 norms
             },
           });
           return { key: idempotencyKey, chatId: result.chatId, createdAt: new Date().toISOString() };

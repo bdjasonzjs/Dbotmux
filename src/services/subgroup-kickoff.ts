@@ -20,6 +20,7 @@
 import { sendMessage } from '../im/lark/client.js';
 import { resolveBotIdent } from '../core/main-bot-playbook.js';
 import { logger } from '../utils/logger.js';
+import { SUBTASK_COLLAB_NORMS } from './subtask-norms.js';
 
 export type SubgroupUrgency = 'urgent' | 'normal' | 'low';
 
@@ -78,6 +79,8 @@ export function buildKickoffText(spec: KickoffSpec, opts: {
     `- 你俩在这群里**没有主话题上下文**, 所有背景以上面 + 背景资料为准, 不要凭群名臆测。`,
     `- 阶段性进展直接在群里说, 我会定时扫。`,
     `- 真卡到需要松松拍板的, 说清楚卡在哪 + 需要什么, 我升级。`,
+    // 优化 #2：协作 norms (旧 v1 watcher 链路也固化)
+    ...SUBTASK_COLLAB_NORMS.map(n => `- ${n}`),
   ].join('\n');
 }
 

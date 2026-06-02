@@ -42,7 +42,7 @@ vi.mock('../src/services/spawn-idempotency-store.js', () => ({
 vi.mock('../src/services/session-store.js', () => ({ getSession: (id: string) => mockSessions.get(id) }));
 
 import {
-  createSubtask, reportProgress, querySubtask, finishSubtask, supplementSubtask, V2_MARKER,
+  createSubtask, reportProgress, querySubtask, finishSubtask, supplementSubtask, requestReview, V2_MARKER,
 } from '../src/services/subtask-orchestrator.js';
 import {
   createSubTask, getSubTask, getByChatId, transitionStatus, enqueueCommand, listCommands,
@@ -51,6 +51,12 @@ import {
 
 const BOTS: SubTaskBot[] = [
   { openId: 'ou_claude', name: '克劳德', role: 'main' },
+  { openId: 'ou_coco', name: '缇蕾', role: 'observer' },
+];
+/** 含 reviewer(collab) 的 bots —— request_review 需要有 reviewer 可唤。 */
+const BOTS_WITH_REVIEWER: SubTaskBot[] = [
+  { openId: 'ou_claude', name: '克劳德', role: 'main' },
+  { openId: 'ou_codex', name: '蔻黛克斯', role: 'collab' },
   { openId: 'ou_coco', name: '缇蕾', role: 'observer' },
 ];
 
@@ -385,5 +391,75 @@ describe('supplementSubtask', () => {
     mainSession();
     await expect(supplementSubtask({ sessionId: 'sess_main', taskId: t.taskId, content: ' ' }))
       .rejects.toMatchObject({ status: 400 });
+  });
+
+  it('优化 #1：缺省 targetRole → 命令 payload.targetRole=main', async () => {
+    const t = await mkTask();
+    await transitionStatus(t.taskId, 'reported_help');
+    mainSession();
+    const v = getSubTask(t.taskId)!.version;
+    const res = await supplementSubtask({ sessionId: 'sess_main', taskId: t.taskId, content: 'x', expectedVersion: v });
+    expect(getCommand(res.cmdId)!.payload.targetRole).toBe('main');
+  });
+
+  it('优化 #1：targetRole=reviewer → 内部映射 collab', async () => {
+    const t = await mkTask();
+    await transitionStatus(t.taskId, 'reported_help');
+    mainSession();
+    const v = getSubTask(t.taskId)!.version;
+    const res = await supplementSubtask({ sessionId: 'sess_main', taskId: t.taskId, content: 'y', expectedVersion: v, targetRole: 'reviewer' });
+    expect(getCommand(res.cmdId)!.payload.targetRole).toBe('collab');
+  });
+});
+
+// ─── request_review (优化 #1 时序门控) ──────────────────────────────────────────
+describe('requestReview', () => {
+  /** 造一个含 reviewer 的 observing 子任务。 */
+  async function mkTaskR(key = 'kr') {
+    const t = await createSubTask({
+      chatId: 'oc_sub', parentChatId: 'oc_main', parentMessageId: 'om_root',
+      goal: '修 bug', acceptance: null, bots: BOTS_WITH_REVIEWER, requester: 'ou_jason', createdBy: 'claude', idempotencyKey: key,
+    });
+    await transitionStatus(t.taskId, 'observing');
+    return getSubTask(t.taskId)!;
+  }
+
+  it('执行者(main) 从子群调 + summary 带绝对路径 → 入队 request_review (parent→child, targetRole=collab)', async () => {
+    const t = await mkTaskR();
+    subSession('sess_sub', 'oc_sub', 'app_claude'); // app_claude = ou_claude = main
+    const res = await requestReview({ sessionId: 'sess_sub', taskId: t.taskId, summary: '产出在 /tmp/plan.md' });
+    const cmd = getCommand(res.cmdId)!;
+    expect(cmd.commandType).toBe('request_review');
+    expect(cmd.direction).toBe('parent_to_child');
+    expect(cmd.targetChatId).toBe('oc_sub');
+    expect(cmd.payload.targetRole).toBe('collab');
+  });
+
+  it('summary 无可打开链接/绝对路径 → 400', async () => {
+    const t = await mkTaskR();
+    subSession('sess_sub', 'oc_sub', 'app_claude');
+    await expect(requestReview({ sessionId: 'sess_sub', taskId: t.taskId, summary: '我写完了快来看' }))
+      .rejects.toMatchObject({ status: 400 });
+  });
+
+  it('非 main(reviewer 自己) 调用 → 403', async () => {
+    const t = await mkTaskR();
+    subSession('sess_k', 'oc_sub', 'app_codex'); // codex = collab
+    await expect(requestReview({ sessionId: 'sess_k', taskId: t.taskId, summary: 'https://x/doc' }))
+      .rejects.toMatchObject({ status: 403 });
+  });
+
+  it('任务无 reviewer(collab) → 409', async () => {
+    const t = await mkTask(); // BOTS = main+observer，无 collab
+    subSession('sess_sub', 'oc_sub', 'app_claude');
+    await expect(requestReview({ sessionId: 'sess_sub', taskId: t.taskId, summary: 'https://x/doc' }))
+      .rejects.toMatchObject({ status: 409 });
+  });
+
+  it('从父群(非子群)调 → 403', async () => {
+    const t = await mkTaskR();
+    mainSession('sess_main', 'oc_main');
+    await expect(requestReview({ sessionId: 'sess_main', taskId: t.taskId, summary: 'https://x/doc' }))
+      .rejects.toMatchObject({ status: 403 });
   });
 });
