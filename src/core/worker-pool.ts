@@ -587,7 +587,101 @@ export async function closeSession(
 
 // ─── Fork worker ────────────────────────────────────────────────────────────
 
+// ─── Worker boot concurrency limiter ────────────────────────────────────────
+// Cold-starting a CLI worker briefly costs ~1GB RSS (CLI proc + bytedcli mcp
+// node child + node --max-old-space child). When many sessions get messages at
+// once (scout dispatch storm, broadcast, post-restart traffic burst), forking
+// them all simultaneously can spike memory past the 0-swap ceiling → OOM /
+// host freeze. Cap how many workers may be *booting* (forked but not yet
+// `ready`) at once; queue the rest and drain as boots finish.
+//
+// Scope: PER-DAEMON (each daemon process owns exactly one bot via
+// BOTMUX_BOT_INDEX), so the machine-wide ceiling is MAX_BOOTING × <daemon
+// count>. With the default 3 and 3 daemons that is ≤9 concurrent cold-starts
+// (~9GB transient) — well under the box's RAM, while still serialising the
+// pathological "dozens at once" case. Tune via BOTMUX_MAX_BOOTING.
+//
+// The slot is tracked ON THE WORKER instance (not the DaemonSession) so a
+// re-fork of the same session (the double-fork guard below kills the old
+// worker) can't make the old worker's late exit decrement the new worker's
+// slot. Release is idempotent per worker and happens at whichever comes first:
+// `ready`, process `exit`, a `fork()` throw, or a watchdog timeout (so a worker
+// that neither readies nor exits can't wedge the queue forever).
+// `__bootFollowups`: messages that arrived for this session while its fork was
+// still queued (ds.worker not yet set). Replayed to the worker after `ready`
+// so the boot-queue window can't drop user messages (review finding F1).
+type BootSlot = {
+  __bootSlotHeld?: boolean;
+  __bootTimer?: ReturnType<typeof setTimeout>;
+  __bootFollowups?: string[];
+};
+
+/** Parse a positive-int env var; warn + fall back to default on missing/invalid. */
+function envPosInt(name: string, def: number, min = 1): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return def;
+  const n = Math.floor(Number(raw));
+  if (!Number.isFinite(n) || n < min) {
+    logger.warn(`[worker-pool] invalid ${name}=${JSON.stringify(raw)} (need integer >= ${min}); using default ${def}`);
+    return def;
+  }
+  return n;
+}
+
+const MAX_BOOTING = envPosInt('BOTMUX_MAX_BOOTING', 3, 1);
+const BOOT_WATCHDOG_MS = envPosInt('BOTMUX_BOOT_WATCHDOG_MS', 120_000, 30_000);
+let bootingCount = 0;
+const pendingForks: Array<{
+  sessionId: string; ds: DaemonSession; prompt: string; resume: boolean; followups: string[];
+}> = [];
+
+function releaseBootSlot(worker: ChildProcess & BootSlot): void {
+  if (!worker.__bootSlotHeld) return;          // release at most once per worker
+  worker.__bootSlotHeld = false;
+  if (worker.__bootTimer) { clearTimeout(worker.__bootTimer); worker.__bootTimer = undefined; }
+  bootingCount = Math.max(0, bootingCount - 1);
+  drainPendingForks();
+}
+
+function drainPendingForks(): void {
+  while (bootingCount < MAX_BOOTING && pendingForks.length > 0) {
+    const next = pendingForks.shift()!;
+    // Drop forks whose session was closed while queued (avoid reviving a
+    // session the user/daemon already tore down).
+    if (!findActiveBySessionId(next.sessionId)) {
+      logger.info(`[worker-pool] Dropping queued fork for closed session ${next.sessionId.substring(0, 8)}`);
+      continue;
+    }
+    doForkWorker(next.ds, next.prompt, next.resume, next.followups);
+  }
+}
+
+/**
+ * Public spawn entrypoint. Gates on boot concurrency, then delegates to
+ * doForkWorker. When at capacity the request is queued. A session that already
+ * has a queued fork does NOT overwrite its prompt — additional messages are
+ * appended to `followups` and replayed to the worker after it becomes ready, so
+ * no user message is lost during the boot-queue window (review finding F1).
+ */
 export function forkWorker(ds: DaemonSession, prompt: string, resume = false): void {
+  if (bootingCount >= MAX_BOOTING) {
+    const existing = pendingForks.find(p => p.sessionId === ds.session.sessionId);
+    if (existing) {
+      existing.ds = ds;
+      existing.followups.push(prompt);   // keep the original init prompt; queue this one for replay
+    } else {
+      pendingForks.push({ sessionId: ds.session.sessionId, ds, prompt, resume, followups: [] });
+    }
+    logger.warn(`[${tag(ds)}] Spawn deferred (booting=${bootingCount}/${MAX_BOOTING}, queued=${pendingForks.length})`);
+    if (pendingForks.length >= MAX_BOOTING * 4) {
+      logger.warn(`[worker-pool] Boot queue backlog high: ${pendingForks.length} pending forks — workers are slow to become ready`);
+    }
+    return;
+  }
+  doForkWorker(ds, prompt, resume);
+}
+
+function doForkWorker(ds: DaemonSession, prompt: string, resume = false, followups: string[] = []): void {
   const cb = requireCallbacks();
   const bot = getBot(ds.larkAppId);
   const botCfg = bot.config;
@@ -616,7 +710,9 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
   const botmuxBinDir = join(homedir(), '.botmux', 'bin');
   const pathWithBotmux = `${botmuxBinDir}:${process.env.PATH ?? ''}`;
 
-  const worker = fork(workerPath, [], {
+  let worker: ChildProcess & BootSlot;
+  try {
+    worker = fork(workerPath, [], {
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     cwd,
     env: {
@@ -633,6 +729,29 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
       BOTMUX_SESSION_ID: ds.session.sessionId,
     },
   });
+  } catch (err: any) {
+    logger.error(`[${t}] fork() threw, spawn aborted: ${err?.message ?? err}`);
+    drainPendingForks();   // no slot was taken; let any queued work proceed
+    return;
+  }
+  // Reserve a boot slot for THIS worker (tracked on the worker instance, not
+  // the session, to survive re-forks) and arm a watchdog so a worker that
+  // never reaches `ready` and never exits can't pin the slot forever.
+  worker.__bootSlotHeld = true;
+  bootingCount++;
+  worker.__bootTimer = setTimeout(() => {
+    if (worker.__bootSlotHeld) {
+      logger.warn(`[${t}] Boot-slot watchdog fired after ${BOOT_WATCHDOG_MS}ms (pid=${worker.pid}) — force-releasing slot`);
+      releaseBootSlot(worker);
+    }
+  }, BOOT_WATCHDOG_MS);
+  worker.__bootTimer.unref?.();
+  // Carry messages that queued during the boot window so the `ready` handler
+  // can replay them to this worker (F1). Stored on the worker instance so a
+  // re-fork can't cross-deliver. These are already fully-wrapped prompts
+  // (buildReforkPrompt / buildNewTopicPrompt at the call sites), so mentions /
+  // attachments / sender / routing / botmux_reminder context is preserved.
+  worker.__bootFollowups = followups.length ? [...followups] : undefined;
 
   // Pipe worker stdout/stderr to daemon logger.
   // Both go through logger.info → daemon.log (not error.log). Worker stderr
@@ -673,30 +792,43 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     botOpenId: bot.botOpenId,
     locale: botLocale(botCfg),
   };
-  worker.send(initMsg);
-  ds.initConfig = initMsg;
-
-  // Stamp cliId on the persisted session so the dashboard can show a CLI badge
-  // even after the session is closed. Do this before installing worker handlers:
-  // a fast worker can emit `ready` immediately after init, and card rendering
-  // must see the session-level CLI identity rather than the bot default.
+  // Install handlers and mark this worker current BEFORE send, so a fast
+  // exit/error/ready can't slip through unhandled (which would leak the boot
+  // slot until the 120s watchdog). Handler callbacks only run on a later
+  // event-loop tick, so the synchronous post-send bookkeeping below still runs
+  // first. (review finding F3 — spawn lifecycle race)
+  //
+  // Stamp cliId first so a fast `ready` renders the right CLI badge rather than
+  // the bot default.
   if (ds.session.cliId !== botCfg.cliId) {
     ds.session.cliId = botCfg.cliId;
     sessionStore.updateSession(ds.session);
   }
-
-  // Use shared handler for IPC messages and exit
+  // Reset the exit-emit flag for the freshly spawned worker so a subsequent
+  // exit publishes again (the previous lifecycle's flag would otherwise mask it).
+  ds.exitEventEmitted = false;
   setupWorkerHandlers(ds, worker);
-
   ds.worker = worker;
+
+  try {
+    worker.send(initMsg);
+  } catch (err: any) {
+    // IPC channel already gone (worker died at birth). Release the slot now
+    // rather than waiting on the 120s watchdog, kill the husk, and unwind the
+    // ds.worker pointer we just set. (review findings F2 + F3)
+    logger.error(`[${t}] worker.send(init) failed, aborting spawn: ${err?.message ?? err}`);
+    releaseBootSlot(worker);
+    try { worker.kill(); } catch { /* ignore */ }
+    if (ds.worker === worker) { ds.worker = null; ds.workerPort = null; ds.workerToken = null; }
+    return;
+  }
+
+  // Send succeeded → record state and publish the externally-visible spawn.
+  ds.initConfig = initMsg;
   ds.spawnedAt = Date.now();
   ds.cliVersion = currentCliVersion;
   sessionStore.updateSessionPid(ds.session.sessionId, worker.pid ?? null);
   logger.info(`[${t}] Worker forked (pid: ${worker.pid}, active: ${cb.getActiveCount()})`);
-
-  // Reset the exit-emit flag for the freshly spawned worker so a subsequent
-  // exit publishes again (the previous lifecycle's flag would otherwise mask it).
-  ds.exitEventEmitted = false;
   // Notify dashboard SSE subscribers a new session is live.
   dashboardEventBus.publish({
     type: 'session.spawned',
@@ -722,6 +854,25 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
     const effectiveCliId = sessionCliId(ds, botCfg);
     switch (msg.type) {
       case 'ready': {
+        const rw = worker as ChildProcess & BootSlot;
+        releaseBootSlot(rw);  // boot finished → free the slot, drain queue
+        // Replay messages that queued while this session's fork was waiting in
+        // the boot queue (F1). Guard on `ds.worker === worker` so a late `ready`
+        // from an already-replaced (re-forked) worker doesn't deliver to the
+        // wrong CLI. `ready` means init completed, so it is safe to send now.
+        if (rw.__bootFollowups?.length) {
+          const fus = rw.__bootFollowups;
+          rw.__bootFollowups = undefined;
+          if (ds.worker === worker) {
+            logger.info(`[${t}] Replaying ${fus.length} queued follow-up message(s) after ready`);
+            for (const content of fus) {
+              try { worker.send({ type: 'message', content } as DaemonToWorker); }
+              catch (err: any) { logger.error(`[${t}] Failed to replay queued message: ${err?.message ?? err}`); }
+            }
+          } else {
+            logger.warn(`[${t}] Dropping ${fus.length} queued follow-up(s): worker no longer current at ready`);
+          }
+        }
         ds.workerPort = msg.port;
         ds.workerToken = msg.token;
         // Persist port so it can be reused after daemon restart
@@ -1204,6 +1355,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
   });
 
   worker.on('exit', (code) => {
+    releaseBootSlot(worker as ChildProcess & BootSlot);  // covers crash-before-ready; no-op if already freed
     logger.info(`[${t}] Worker process exited (code: ${code})`);
     // Only clear ds.worker if it's still THIS worker — during takeover,
     // the old worker's exit fires AFTER the new worker has been assigned.
