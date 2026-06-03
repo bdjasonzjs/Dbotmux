@@ -206,8 +206,14 @@ function checkR4Stub(_nodes: ChatNode[]): Escalation[] {
   return [];
 }
 
-/** R5: stuck keywords in summary or recent flag. */
-function checkR5(node: ChatNode): Escalation | null {
+/** R5: stuck keywords in summary or recent flag.
+ *  DISABLED 2026-06-04 (松松指令)：纯字符串关键词匹配（error/blocked/stuck/卡住…）
+ *  误报严重、无实际意义——任何群只要 summary 里出现这些字就被反复探一遍。全局关闭，
+ *  R5 永不触发；其余 R1-R4 不受影响。要恢复删掉下面这行 early-return 即可。 */
+function checkR5(_node: ChatNode): Escalation | null {
+  return null;
+  // eslint-disable-next-line no-unreachable
+  const node = _node;
   const text = (node.summary ?? '').toLowerCase();
   const hit = STUCK_KEYWORDS.find(kw => text.includes(kw.toLowerCase()));
   if (!hit) return null;
