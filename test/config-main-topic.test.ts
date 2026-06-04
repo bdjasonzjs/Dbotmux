@@ -136,20 +136,23 @@ describe('main-topic-config (P1 commit #2)', () => {
   });
 
   describe('CFG-5 — isTillyMainTopicConversationDenied', () => {
-    it('returns true only for coco in configured mainTopic', async () => {
+    it('默认取消限制 (2026-06-04 邹劲松)：无 opt-in env 时一律返 false', async () => {
       const { cfg } = await freshImport();
       cfg.setMainTopicChatId('oc_main');
-      expect(cfg.isTillyMainTopicConversationDenied('coco', 'oc_main')).toBe(true);
+      delete process.env.BOTMUX_TILLY_DENY_MAIN_TOPIC_CHAT;
+      expect(cfg.isTillyMainTopicConversationDenied('coco', 'oc_main')).toBe(false);
       expect(cfg.isTillyMainTopicConversationDenied('claude-code', 'oc_main')).toBe(false);
       expect(cfg.isTillyMainTopicConversationDenied('coco', 'oc_other')).toBe(false);
     });
 
-    it('escape hatch env disables the denial', async () => {
+    it('opt-in env 恢复保护：返 true 仅对 coco 且在 mainTopic', async () => {
       const { cfg } = await freshImport();
       cfg.setMainTopicChatId('oc_main');
-      process.env.BOTMUX_TILLY_ALLOW_MAIN_TOPIC_CHAT = '1';
-      expect(cfg.isTillyMainTopicConversationDenied('coco', 'oc_main')).toBe(false);
-      delete process.env.BOTMUX_TILLY_ALLOW_MAIN_TOPIC_CHAT;
+      process.env.BOTMUX_TILLY_DENY_MAIN_TOPIC_CHAT = '1';
+      expect(cfg.isTillyMainTopicConversationDenied('coco', 'oc_main')).toBe(true);
+      expect(cfg.isTillyMainTopicConversationDenied('claude-code', 'oc_main')).toBe(false);
+      expect(cfg.isTillyMainTopicConversationDenied('coco', 'oc_other')).toBe(false);
+      delete process.env.BOTMUX_TILLY_DENY_MAIN_TOPIC_CHAT;
     });
   });
 });

@@ -133,10 +133,13 @@ export function isTillyMainTopicConversationDenied(
   cliId: string | undefined,
   chatId: string | undefined,
 ): boolean {
+  // 2026-06-04 邹劲松取消该限制：默认**允许**缇蕾(coco)在主话题被 @ 回话。
+  // 机制保留、默认关：仅当显式 opt-in env `BOTMUX_TILLY_DENY_MAIN_TOPIC_CHAT=1`
+  // 时才恢复当初的主话题降噪保护。
+  if (process.env.BOTMUX_TILLY_DENY_MAIN_TOPIC_CHAT !== '1') return false;
   if (cliId !== 'coco') return false;
   if (!chatId) return false;
   const mainTopic = getMainTopicChatId();
   if (!mainTopic || chatId !== mainTopic) return false;
-  if (process.env.BOTMUX_TILLY_ALLOW_MAIN_TOPIC_CHAT === '1') return false;
   return true;
 }
