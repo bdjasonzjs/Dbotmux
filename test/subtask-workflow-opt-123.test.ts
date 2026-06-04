@@ -19,7 +19,7 @@ vi.mock('../src/services/base-relay.js', () => ({
   sendAsOwner: vi.fn(),
 }));
 
-import { parentToChildSummon } from '../src/services/outbox-dispatcher-executors.js';
+import { parentToChildSummon, childToParentSummon } from '../src/services/outbox-dispatcher-executors.js';
 import { planStallNudge, STALL_AFTER_MS, MAX_NUDGES } from '../src/services/subtask-observer.js';
 import {
   createSubTask, getSubTask, transitionStatus, updateSubTask, listCommands, commitObservationTransaction,
@@ -102,6 +102,24 @@ describe('#1 role-aware parentToChildSummon', () => {
     const t = parentToChildSummon(mkCmd({ commandType: 'kickoff' }), noMain);
     expect(t).not.toContain('【】');
     expect(t).toContain('蔻黛克斯');   // 回退到非 observer
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+describe('下发指令统一附加「交还主群文档必须写为飞书文档」(2026-06-04 邹劲松)', () => {
+  const task = mkTaskLit();
+  const RULE = '交还主群审查的文档，都必须写为飞书文档';
+
+  it.each(['kickoff', 'request_review', 'nudge', 'finish', 'supplement'] as const)(
+    '%s 下发指令末尾含飞书文档规则', (commandType) => {
+      const t = parentToChildSummon(mkCmd({ commandType, payload: { summary: 's', content: 'c' } }), task);
+      expect(t).toContain(RULE);
+      expect(t.includes('\n')).toBe(false); // 仍保持单行 (base 记录标题)
+    });
+
+  it('child→parent 上报不加该规则 (它是上报、不是下发指令)', () => {
+    const t = childToParentSummon(mkCmd({ direction: 'child_to_parent', commandType: 'report_help' }), task);
+    expect(t).not.toContain(RULE);
   });
 });
 

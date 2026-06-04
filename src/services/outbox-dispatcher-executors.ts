@@ -27,6 +27,12 @@ import type { CommandTargetRole, OutboxCommand, SubTask } from './subtask-store.
 const URGENT_SUMMON_TAG = '急急如律令';
 const CONTENT_MAX = 400;
 
+/** 所有**下发到子群的指令**（parent→child：kickoff / request_review / nudge / finish / supplement）
+ *  末尾统一附加的硬规则（2026-06-04 邹劲松）：交还主群审查的文档必须写为飞书文档。
+ *  急急如律令是单行纯文本（= base 记录标题），故用单行后缀拼接、不引入换行。
+ *  child→parent（子群→父群上报）是上报、不是下发指令，不加。 */
+const HANDBACK_DOC_RULE_SUFFIX = ' 另：所有交还主群审查的文档，都必须写为飞书文档（写成飞书 docx 发链接，不要塞聊天正文）。';
+
 /** 清洗**不可信内容** (payload 来自子群消息/LLM/主bot 下发)：控制字符(含换行)→空格，
  *  让 summon 标题保持单行 (base 记录标题更稳)，并截断。急急如律令是纯文本、无富文本注入面，
  *  不必再中和 `<at>`；但正文里的换行/控制字符仍要清掉。 */
@@ -83,6 +89,11 @@ export function childToParentSummon(cmd: OutboxCommand, task: SubTask): string {
 /** parent→child / 子群内唤醒文案 (急急如律令)。按 commandType + targetRole 选**名单**和**文案**
  *  (优化 #1 角色分工 + #3 停滞唤醒)。payload 内容走 safeText、整体保持单行 (= base relay 记录标题)。 */
 export function parentToChildSummon(cmd: OutboxCommand, task: SubTask): string {
+  // 所有下发到子群的指令末尾统一附加「交还主群的文档必须写为飞书文档」(2026-06-04 邹劲松)。
+  return parentToChildSummonBody(cmd, task) + HANDBACK_DOC_RULE_SUFFIX;
+}
+
+function parentToChildSummonBody(cmd: OutboxCommand, task: SubTask): string {
   if (cmd.commandType === 'kickoff') {
     // B1: kickoff 只唤执行者(main)，reviewer 不在此被唤起 (等执行者产出后 request_review 再唤)。
     const acc = task.acceptance ? ` 验收：${safeText(task.acceptance, 200)}` : '';
