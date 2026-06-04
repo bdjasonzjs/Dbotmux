@@ -814,11 +814,13 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           ds.chatId,
           ds.larkAppId,
           ambientBlock,
+          ds.pendingSelfMentionedThisTurn,
         );
         rememberLastCliInput(ds, pendingPrompt, prompt);
         ds.pendingPrompt = undefined;
         ds.pendingAttachments = undefined;
         ds.pendingMentions = undefined;
+        ds.pendingSelfMentionedThisTurn = undefined;
         ds.pendingSender = undefined;
         ds.pendingFollowUps = undefined;
         ds.pendingTriggerMessageId = undefined;
@@ -949,11 +951,13 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       targetDs.chatId,
       targetDs.larkAppId,
       ambientBlock,
+      targetDs.pendingSelfMentionedThisTurn,
     );
     rememberLastCliInput(targetDs, pendingPrompt, prompt);
     targetDs.pendingPrompt = undefined;
     targetDs.pendingAttachments = undefined;
     targetDs.pendingMentions = undefined;
+    targetDs.pendingSelfMentionedThisTurn = undefined;
     targetDs.pendingSender = undefined;
     targetDs.pendingFollowUps = undefined;
     targetDs.pendingTriggerMessageId = undefined;

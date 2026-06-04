@@ -53,6 +53,10 @@ export interface DaemonSession {
   pendingPrompt?: string;        // original user message to send after repo is selected
   pendingAttachments?: LarkAttachment[];
   pendingMentions?: LarkMention[];    // @mentions from initial message, used when building prompt after repo selection
+  /** 被圈时间感知 (2026-06-04, 蔻黛克斯 review Finding 2): 延迟 repo 路径下，初始消息
+   *  的权威「本轮是否被圈」判定 (isBotMentioned，覆盖 post inline at)。pendingRepo 创建时
+   *  存，repo/skip(命令或卡片) spawn 时透传给 buildNewTopicPrompt，spawn 后随 pendingMentions 清掉。 */
+  pendingSelfMentionedThisTurn?: boolean;
   /** Sender (open_id + type + resolved name) of the initial message — stashed
    *  so the deferred spawn after repo-selection still injects a <sender> tag
    *  matching the original caller, not the user who clicked the card. */

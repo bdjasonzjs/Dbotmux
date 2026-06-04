@@ -1857,6 +1857,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     pendingPrompt: promptContent,
     pendingAttachments: attachments.length > 0 ? attachments : undefined,
     pendingMentions: parsed.mentions,
+    pendingSelfMentionedThisTurn: isBotMentioned(larkAppId, data?.message ?? {}, data?.sender?.sender_id?.open_id),
     pendingSender: newTopicSender,
     // 2026-05-26 commit 3 follow-up (妹妹 P1-1/-2): 存触发消息 id/createTime
     // 让延迟 repo 路径 (card-handler / command-handler) spawn 时拿来传 helper
@@ -1878,7 +1879,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     const selfBot = getBot(larkAppId);
     // 2026-05-26 群聊模式 commit 3: ambient timeline 注入 (gate p2p / chatMode 关 内部判)
     const ambientBlock = await buildAmbientForSpawn(larkAppId, chatId, chatType, messageId, data?.message?.create_time);
-    const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, chatId, larkAppId, ambientBlock);
+    const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, chatId, larkAppId, ambientBlock, isBotMentioned(larkAppId, data?.message ?? {}, data?.sender?.sender_id?.open_id));
     rememberLastCliInput(ds, promptContent, prompt);
     forkWorker(ds, prompt);
     const reason = oncallEntry
@@ -1909,7 +1910,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     const selfBot = getBot(larkAppId);
     // 2026-05-26 群聊模式 commit 3: ambient timeline 注入 (gate p2p / chatMode 关 内部判)
     const ambientBlock = await buildAmbientForSpawn(larkAppId, chatId, chatType, messageId, data?.message?.create_time);
-    const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, chatId, larkAppId, ambientBlock);
+    const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, chatId, larkAppId, ambientBlock, isBotMentioned(larkAppId, data?.message ?? {}, data?.sender?.sender_id?.open_id));
     rememberLastCliInput(ds, promptContent, prompt);
     forkWorker(ds, prompt);
     logger.info(`Session ${session.sessionId} ready (no projects to select), total active: ${getActiveCount()}`);
@@ -2253,6 +2254,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       pendingPrompt: promptContent,
       pendingAttachments: attachments.length > 0 ? attachments : undefined,
       pendingMentions: parsed.mentions,
+      pendingSelfMentionedThisTurn: isBotMentioned(larkAppId, data?.message ?? {}, data?.sender?.sender_id?.open_id),
       pendingSender: autoCreateSender,
       // commit 3 follow-up (autoCreate 路径)
       pendingTriggerMessageId: parsed.messageId,
@@ -2274,7 +2276,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       const selfBot = getBot(larkAppId);
       // 2026-05-26 群聊模式 commit 3: ambient timeline 注入 (autoCreate 路径)
       const ambientBlock = await buildAmbientForSpawn(larkAppId, autoCreateChatId, autoCreateChatType, parsed.messageId, data?.message?.create_time);
-      const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender, autoCreateChatId, larkAppId, ambientBlock);
+      const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender, autoCreateChatId, larkAppId, ambientBlock, isBotMentioned(larkAppId, data?.message ?? {}, data?.sender?.sender_id?.open_id));
       rememberLastCliInput(newDs, promptContent, prompt);
       forkWorker(newDs, prompt);
       const reason = oncallEntry
@@ -2305,7 +2307,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       const selfBot = getBot(larkAppId);
       // 2026-05-26 群聊模式 commit 3: ambient timeline 注入 (autoCreate 路径)
       const ambientBlock = await buildAmbientForSpawn(larkAppId, autoCreateChatId, autoCreateChatType, parsed.messageId, data?.message?.create_time);
-      const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender, autoCreateChatId, larkAppId, ambientBlock);
+      const prompt = buildNewTopicPrompt(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, autoCreateChatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), autoCreateSender, autoCreateChatId, larkAppId, ambientBlock, isBotMentioned(larkAppId, data?.message ?? {}, data?.sender?.sender_id?.open_id));
       rememberLastCliInput(newDs, promptContent, prompt);
       forkWorker(newDs, prompt);
     }
@@ -2341,6 +2343,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
           sender: await getThreadSender(),
           chatId: ds.session.chatId,
           larkAppId: ds.larkAppId,
+          selfMentionedThisTurn: isBotMentioned(ds.larkAppId, data?.message ?? {}, data?.sender?.sender_id?.open_id),
         });
     beginNewTurn(ds, parsed.content);
     rememberLastCliInput(ds, promptContent, msgContent);
@@ -2389,6 +2392,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       cliPathOverride: dsBotCfgForFork.cliPathOverride,
       selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
       sender: await getThreadSender(),
+      selfMentionedThisTurn: isBotMentioned(ds.larkAppId, data?.message ?? {}, data?.sender?.sender_id?.open_id),
     });
     rememberLastCliInput(ds, promptContent, wrappedPrompt);
     forkWorker(ds, wrappedPrompt, ds.hasHistory);

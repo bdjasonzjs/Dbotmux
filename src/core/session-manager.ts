@@ -31,6 +31,7 @@ import { parseWorkingDirList } from '../utils/working-dir.js';
 import * as chatContextStore from '../services/chat-context-store.js';
 import * as subtaskStore from '../services/subtask-store.js';
 import { renderCollabNorms } from '../services/subtask-norms.js';
+import { recordMention, getRecentMentions, MAX_RECENT_MENTIONS } from '../services/mention-history-store.js';
 
 function sessionCreatedAtMs(session: { createdAt?: string }): number {
   return session.createdAt ? (Date.parse(session.createdAt) || Date.now()) : Date.now();
@@ -254,6 +255,38 @@ export function buildMainBotPromptBlock(chatId: string | undefined, larkAppId: s
  * 搅乱，导致解析失败 + 残片泄漏到群里。2026-06-01 邹劲松要求每轮、每群都注入。
  * adopt/bridge 模式（botmux-unaware）走 buildBridgeInputContent，不经过此函数。
  */
+/**
+ * 「被圈时间感知」块（2026-06-04 邹劲松要求）。仅当本 bot 这一轮确实被 @（被圈）时
+ * 才记录 + 渲染：先把这次时间戳记进存储，再列出本群最近 MAX_RECENT_MENTIONS 次被圈的
+ * 东八区时间（最新在前）。非被圈轮次返 ''（不注入），贴合"被圈的时候才感知"。
+ * 时间戳取 build 时刻（≈ 收到消息时刻，误差秒级），东八区格式化与系统时区无关。
+ *
+ * 「是否被圈」的权威判定（蔻黛克斯 review Finding 1）：daemon 路由层用 isBotMentioned
+ * 判定，它除了 message.mentions 还覆盖 post content 里的 inline `at` 节点（bot 发的
+ * post 消息常不填 message.mentions）。所以这里**优先**用调用方传入的 selfMentionedThisTurn
+ * （由 isBotMentioned 算好），避免和路由判定分叉漏触发；没传时才回退到只看 text mentions。
+ */
+export function buildRecentMentionsBlock(
+  larkAppId: string | undefined,
+  chatId: string | undefined,
+  selfOpenId: string | undefined,
+  mentions: LarkMention[] | undefined,
+  nowMs: number,
+  selfMentionedThisTurn?: boolean,
+): string {
+  if (!larkAppId || !chatId || !selfOpenId) return '';
+  const mentioned = selfMentionedThisTurn ?? !!mentions?.some(m => m.openId === selfOpenId);
+  if (!mentioned) return '';
+  recordMention(larkAppId, chatId, nowMs);
+  const recent = getRecentMentions(larkAppId, chatId);
+  if (recent.length === 0) return '';
+  const lines = recent
+    .slice()
+    .sort((a, b) => b - a) // 最新在前
+    .map(ts => `- ${new Date(ts).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })}`);
+  return `<recent_mentions hint="你最近 ${MAX_RECENT_MENTIONS} 次在本群被 @（被圈）的时间，东八区，最新在前；最上面这条就是这一次">\n${lines.join('\n')}\n</recent_mentions>`;
+}
+
 export function buildOutputDisciplineBlock(): string {
   return `<output_discipline>
 【输出纪律 · 每轮必读】把"对外说话"和"执行命令(工具调用)"严格分成两个独立回合：
@@ -383,6 +416,9 @@ export function buildNewTopicPrompt(
    *  传入; 空字符串 / undefined → 不注入。p2p 不应该传 (caller 自己
    *  gate)，buildNewTopicPrompt 只负责拼。 */
   ambientContextBlock?: string,
+  /** 被圈时间感知（2026-06-04）：本轮本 bot 是否被 @（被圈）的权威判定，由 daemon
+   *  用 isBotMentioned 算好传入（覆盖 post inline at）。不传则回退到只看 text mentions。 */
+  selfMentionedThisTurn?: boolean,
 ): string {
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
   // Non-Claude CLIs receive the botmux routing hints inline via the prompt
@@ -459,6 +495,11 @@ export function buildNewTopicPrompt(
   // 输出纪律（每轮，所有会话 / 所有 bot，无 gate）—— 2026-06-01 邹劲松要求每群都塞。
   parts.push(buildOutputDisciplineBlock());
 
+  // 被圈时间感知（2026-06-04 邹劲松要求）：仅当本 bot 这轮被 @ 时注入最近 N 次被圈时间。
+  const selfOpenIdForMentions = botIdentity?.openId ?? (larkAppId ? getBot(larkAppId)?.botOpenId ?? undefined : undefined);
+  const recentMentionsBlock = buildRecentMentionsBlock(larkAppId, chatId, selfOpenIdForMentions, mentions, Date.now(), selfMentionedThisTurn);
+  if (recentMentionsBlock) parts.push(recentMentionsBlock);
+
   const senderBlock = renderSenderTag(sender);
   if (senderBlock) parts.push(senderBlock);
 
@@ -492,7 +533,7 @@ export function buildNewTopicPrompt(
 export function buildFollowUpContent(
   content: string,
   sessionId: string,
-  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; chatId?: string; larkAppId?: string },
+  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; chatId?: string; larkAppId?: string; selfMentionedThisTurn?: boolean },
 ): string {
   const parts: string[] = [`<user_message>\n${content}\n</user_message>`];
 
@@ -533,6 +574,11 @@ export function buildFollowUpContent(
 
   // 输出纪律（每轮，所有会话 / 所有 bot，无 gate）—— 2026-06-01 邹劲松要求每群都塞。
   parts.push(buildOutputDisciplineBlock());
+
+  // 被圈时间感知（2026-06-04 邹劲松要求）：仅当本 bot 这轮被 @ 时注入最近 N 次被圈时间。
+  const selfOpenIdForMentions = opts?.larkAppId ? getBot(opts.larkAppId)?.botOpenId ?? undefined : undefined;
+  const recentMentionsBlock = buildRecentMentionsBlock(opts?.larkAppId, opts?.chatId, selfOpenIdForMentions, opts?.mentions, Date.now(), opts?.selfMentionedThisTurn);
+  if (recentMentionsBlock) parts.push(recentMentionsBlock);
 
   parts.push(`<botmux_reminder>${t('ai.followup.reminder', undefined, opts?.locale)}</botmux_reminder>`);
 
@@ -651,6 +697,8 @@ export function buildReforkPrompt(
     selfMention?: { name?: string | null; openId?: string | null };
     locale?: Locale;
     sender?: ResolvedSender;
+    /** 被圈时间感知（2026-06-04）：本轮本 bot 是否被 @ 的权威判定，透传给 buildFollowUpContent。 */
+    selfMentionedThisTurn?: boolean;
   },
 ): string {
   const locale = opts?.locale ?? localeForBot(ds.larkAppId);
@@ -672,6 +720,7 @@ export function buildReforkPrompt(
     sender: opts?.sender,
     chatId: ds.session.chatId,
     larkAppId: ds.larkAppId,
+    selfMentionedThisTurn: opts?.selfMentionedThisTurn,
   });
 }
 

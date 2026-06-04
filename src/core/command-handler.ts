@@ -443,11 +443,13 @@ export async function handleCommand(
               ds.chatId,
               ds.larkAppId,
               ambientBlock,
+              ds.pendingSelfMentionedThisTurn,
             );
             rememberLastCliInput(ds, pendingPrompt, prompt);
             ds.pendingPrompt = undefined;
             ds.pendingAttachments = undefined;
             ds.pendingMentions = undefined;
+            ds.pendingSelfMentionedThisTurn = undefined;
             ds.pendingSender = undefined;
             ds.pendingTriggerMessageId = undefined;
             ds.pendingTriggerCreateTime = undefined;
@@ -533,11 +535,13 @@ export async function handleCommand(
             ds.chatId,
             ds.larkAppId,
             ambientBlock,
+            ds.pendingSelfMentionedThisTurn,
           );
           rememberLastCliInput(ds, pendingPrompt, prompt);
           ds.pendingPrompt = undefined;
           ds.pendingAttachments = undefined;
           ds.pendingMentions = undefined;
+          ds.pendingSelfMentionedThisTurn = undefined;
           ds.pendingSender = undefined;
           ds.pendingTriggerMessageId = undefined;
           ds.pendingTriggerCreateTime = undefined;
