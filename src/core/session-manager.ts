@@ -316,7 +316,7 @@ export function buildSubtaskMemberBlock(chatId: string | undefined, larkAppId: s
   // 角色定义 (v3：claude=执行者 / codex=Reviewer / coco=超级Subagent)
   // 优化 #1：把角色说硬——executor 驱动+产出主交付物、产出后唤 reviewer；reviewer 三句负约束、不抢执行。
   const ROLE_BY_CLI: Record<string, string> = {
-    'claude-code': '执行者(主推进者) —— 你驱动任务、方案/代码/文档都由你产出。产出第一份可 review 物后，用 `botmux subtask-request-review --task-id <id> --summary "<可打开的链接/绝对路径>"` 唤起 reviewer；别闷头到底。',
+    'claude-code': '执行者(主推进者) —— 你驱动任务、方案/代码/文档都由你产出。产出第一份可 review 物后，用 `botmux subtask-request-review --task-id <id> --summary "<可打开的链接/绝对路径>"` 唤起 reviewer；别闷头到底。对 reviewer 的意见要独立思考、别轻易全盘接受——reviewer 经常给过于保守、不一定合理的建议；逐条判断是不是真正值得改的，值得才改、不值得就简述理由驳回，不被它带着无谓地反复返工。想清楚、改完就直接推进并 push。',
     codex: 'Reviewer —— 只 review/challenge：**不驱动任务、不产主交付物、不直接实现**。只在执行者已有方案/代码/明确请求 review 时再 review，发现问题挑出来交执行者改，别自己上手抢执行。',
     coco: '超级 Subagent —— Token 不限量，承接 token 消耗大但相对简单的活',
   };
