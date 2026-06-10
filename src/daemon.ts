@@ -95,6 +95,7 @@ import { createDaemonSpawnFn } from './workflows/spawn-bot.js';
 import { attachColdWorkflowRunsForDaemon } from './workflows/cold-attach.js';
 import { getRunsDir } from './workflows/runs-dir.js';
 import { loadEffectInputSidecar } from './workflows/effect-input.js';
+import { resolveDomainsDir } from './services/context/domain-injection.js';
 import { isValidWorkflowId } from './workflows/catalog.js';
 import { triggerWorkflowRun } from './workflows/trigger-run.js';
 import type { RawParamInput } from './workflows/params.js';
@@ -979,6 +980,7 @@ async function attachColdWorkflowRuns(ownerLarkAppId: string): Promise<void> {
         reconcilers: createDefaultProviderReconcilers(),
         loadEffectInput: (activityId, attemptId) =>
           loadEffectInputSidecar(log, activityId, attemptId),
+        domainsDir: resolveDomainsDir(),
       }),
       attachWatcher: (runId, ctx) => attachWorkflowEventWatcher(runId, ctx),
       driveRun: (runId) => driveWorkflowRun(runId),
@@ -1521,6 +1523,7 @@ ipcRoute('POST', '/api/workflows/definitions/:id/run', async (req, res, params) 
         reconcilers: createDefaultProviderReconcilers(),
         loadEffectInput: (activityId, attemptId) =>
           loadEffectInputSidecar(log, activityId, attemptId),
+        domainsDir: resolveDomainsDir(),
       }),
       attachRuntime: (runId, ctx) => attachWorkflowEventWatcher(runId, ctx),
       driveRun: (runId) => {

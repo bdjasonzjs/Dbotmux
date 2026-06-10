@@ -15,6 +15,7 @@
 
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
+import { DOMAIN_TOPIC_PATTERN } from '../services/context/domains.js';
 
 // ─── Field schemas ─────────────────────────────────────────────────────────
 
@@ -134,6 +135,13 @@ export const SubagentNodeSchema = z.object({
    * plumbing.  `dispatchWork` prepends it via the shared prompt renderer.
    */
   rolePersona: z.string().min(1).optional(),
+  /**
+   * Horizontal-knowledge topics this node consumes (T5 segment 3). At dispatch
+   * the runtime reads these from the domains library and injects the top-k as
+   * the "Domain knowledge" prompt segment. Optional + additive — a node without
+   * `domains` (or a runtime without a domains dir) injects nothing, unchanged.
+   */
+  domains: z.array(z.string().regex(DOMAIN_TOPIC_PATTERN)).optional(),
   prompt: BoundStringSchema,
   workingDir: z.string().optional(),
   modelOverrides: z
@@ -256,6 +264,7 @@ export const AuthoringSubagentNodeSchema = z.object({
   bot: z.string().min(1).optional(),
   role: z.string().min(1).optional(),
   roleId: z.string().min(1).optional(),
+  domains: z.array(z.string().regex(DOMAIN_TOPIC_PATTERN)).optional(),
   prompt: BoundStringSchema,
   workingDir: z.string().optional(),
   modelOverrides: z

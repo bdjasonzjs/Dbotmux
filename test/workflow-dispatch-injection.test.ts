@@ -27,6 +27,8 @@ import {
 } from '../src/workflows/runtime.js';
 import { decideNextActions } from '../src/workflows/orchestrator.js';
 import { createRun } from '../src/workflows/run-init.js';
+import { upsertDomain } from '../src/services/context/domains.js';
+import { resolveDomainsDir } from '../src/services/context/domain-injection.js';
 
 const RUN_ID = 'run-inject-test';
 
@@ -117,5 +119,91 @@ describe('dispatchWork four-segment injection (Major Finding 1)', () => {
 
     // no goal, no deps, no role → single-segment fast path: verbatim, no headers
     expect(captured).toBe('just do the thing');
+  });
+});
+
+describe('dispatchWork — domain injection (segment 3, Phase 2 第三闭环)', () => {
+  it('injects node-declared domains from the configured domains dir', async () => {
+    const domainsDir = join(baseDir, 'domains');
+    await upsertDomain(domainsDir, { topic: 'auth-jwt', scope: 'repo', body: 'JWT expires in 1h.' }, { now: '2026-06-10T00:00:00Z' });
+
+    const def = parseWorkflowDefinition({
+      workflowId: 'wf-dom', version: 1,
+      nodes: { only: { type: 'subagent', bot: 'b', domains: ['auth-jwt'], prompt: 'do the step' } },
+    });
+    const log = new EventLog(RUN_ID, baseDir);
+    await createRun(log, { def, params: {}, initiator: 't', botResolver: () => ({}) });
+
+    let captured = '';
+    const spawn: WorkerSpawnFn = async (input) => {
+      captured = input.prompt;
+      return { kind: 'success', output: {}, session: { sessionId: 's', botName: input.botName, startedAt: 0 } };
+    };
+    const ctx: WorkflowRuntimeContext = { log, def, spawnSubagent: spawn, domainsDir };
+
+    const actions = decideNextActions(replay(await log.readAll()), def);
+    const action = actions.find((a) => a.kind === 'dispatchWork' && a.nodeId === 'only');
+    if (!action || action.kind !== 'dispatchWork') throw new Error('no action');
+    await dispatchWork(ctx, action);
+
+    expect(captured).toContain('## Domain knowledge');
+    expect(captured).toContain('auth-jwt');
+    expect(captured).toContain('JWT expires in 1h.');
+    expect(captured).toContain('## Step');
+  });
+
+  it('injects nothing when no domains dir is configured (back-compat)', async () => {
+    const def = parseWorkflowDefinition({
+      workflowId: 'wf-dom2', version: 1,
+      nodes: { only: { type: 'subagent', bot: 'b', domains: ['auth-jwt'], prompt: 'do the step' } },
+    });
+    const log = new EventLog(RUN_ID, baseDir);
+    await createRun(log, { def, params: {}, initiator: 't', botResolver: () => ({}) });
+
+    let captured = '';
+    const spawn: WorkerSpawnFn = async (input) => {
+      captured = input.prompt;
+      return { kind: 'success', output: {}, session: { sessionId: 's', botName: input.botName, startedAt: 0 } };
+    };
+    const ctx: WorkflowRuntimeContext = { log, def, spawnSubagent: spawn }; // no domainsDir
+
+    const actions = decideNextActions(replay(await log.readAll()), def);
+    const action = actions.find((a) => a.kind === 'dispatchWork' && a.nodeId === 'only');
+    if (!action || action.kind !== 'dispatchWork') throw new Error('no action');
+    await dispatchWork(ctx, action);
+
+    // domains declared but no dir configured → no injection → verbatim fragment
+    expect(captured).toBe('do the step');
+  });
+
+  it('injects via resolveDomainsDir default path (entry-point wiring shape)', async () => {
+    // entry points set `domainsDir: resolveDomainsDir()`; here we exercise that
+    // exact shape — default <root>/.agents/domains — end to end through dispatch.
+    const repoRoot = join(baseDir, 'repo');
+    const domainsDir = join(repoRoot, '.agents', 'domains');
+    await upsertDomain(domainsDir, { topic: 'auth-jwt', scope: 'repo', body: 'JWT expires in 1h.' }, { now: '2026-06-10T00:00:00Z' });
+    const resolvedDir = resolveDomainsDir({ cwd: repoRoot, env: {} as NodeJS.ProcessEnv });
+
+    const def = parseWorkflowDefinition({
+      workflowId: 'wf-dom3', version: 1,
+      nodes: { only: { type: 'subagent', bot: 'b', domains: ['auth-jwt'], prompt: 'do the step' } },
+    });
+    const log = new EventLog(RUN_ID, baseDir);
+    await createRun(log, { def, params: {}, initiator: 't', botResolver: () => ({}) });
+
+    let captured = '';
+    const spawn: WorkerSpawnFn = async (input) => {
+      captured = input.prompt;
+      return { kind: 'success', output: {}, session: { sessionId: 's', botName: input.botName, startedAt: 0 } };
+    };
+    const ctx: WorkflowRuntimeContext = { log, def, spawnSubagent: spawn, domainsDir: resolvedDir };
+
+    const actions = decideNextActions(replay(await log.readAll()), def);
+    const action = actions.find((a) => a.kind === 'dispatchWork' && a.nodeId === 'only');
+    if (!action || action.kind !== 'dispatchWork') throw new Error('no action');
+    await dispatchWork(ctx, action);
+
+    expect(captured).toContain('## Domain knowledge');
+    expect(captured).toContain('JWT expires in 1h.');
   });
 });

@@ -11,6 +11,7 @@ import {
   createDefaultProviderReconcilers,
 } from '../../workflows/hostExecutors/registry.js';
 import { loadEffectInputSidecar } from '../../workflows/effect-input.js';
+import { resolveDomainsDir } from '../../services/context/domain-injection.js';
 import type { WorkflowDefinition } from '../../workflows/definition.js';
 import { coerceWorkflowParamsFromStrings as coerceWorkflowParams } from '../../workflows/params.js';
 // Re-export from the shared params module so existing IM tests + callers keep
@@ -194,6 +195,7 @@ export async function executeWorkflowCommand(
       reconcilers: createDefaultProviderReconcilers(),
       loadEffectInput: (activityId, attemptId) =>
         loadEffectInputSidecar(log, activityId, attemptId),
+      domainsDir: resolveDomainsDir(),
     };
 
     await create(log, {
