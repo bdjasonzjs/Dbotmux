@@ -18,6 +18,7 @@
  * Phase 3 的 Hub 范围，不在本地库这一层解决。
  */
 
+import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import { join } from 'node:path';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
@@ -199,4 +200,37 @@ export async function upsertDomain(
 export function widestScope(a: DomainScope, b: DomainScope): DomainScope {
   const rank: Record<DomainScope, number> = { repo: 0, org: 1, global: 2 };
   return rank[a] >= rank[b] ? a : b;
+}
+
+/**
+ * Content fingerprint of a domain — over topic + scope + body only (NOT version
+ * / updated_at), so two copies with the same knowledge hash equal regardless of
+ * freshness metadata. Used by pack manifests + the install lock to detect
+ * "already have this exact content" vs "an update arrived".
+ */
+export function domainContentHash(doc: Pick<DomainDoc, 'topic' | 'scope' | 'body'>): string {
+  const core = JSON.stringify({ topic: doc.topic, scope: doc.scope, body: doc.body.trim() });
+  return 'sha256:' + createHash('sha256').update(core).digest('hex');
+}
+
+/**
+ * Directly write a domain to its file, OVERWRITING any existing content (no
+ * merge). This is the materialization primitive for pack install: an incoming
+ * upstream version REPLACES what's there, and versioning is governed by the
+ * install lock rather than the merge path. Contrast `upsertDomain` (merge +
+ * library-owned version bump), which is the authoring/promotion path.
+ */
+export async function writeDomain(
+  domainsDir: string,
+  doc: DomainDoc,
+  opts: { now?: string } = {},
+): Promise<DomainDoc> {
+  assertValidTopic(doc.topic);
+  const stamped: DomainDoc = {
+    ...doc,
+    updated_at: doc.updated_at ?? opts.now ?? new Date().toISOString(),
+  };
+  await fs.mkdir(domainsDir, { recursive: true });
+  await fs.writeFile(domainPath(domainsDir, doc.topic), serializeDomain(stamped), 'utf-8');
+  return stamped;
 }

@@ -13,6 +13,8 @@
 
 > **修订记录 · v4（Phase 2 第一闭环开工）**：新增 §13——domains 横向知识本地库（唯一主题键 + upsert/merge）+ 晋升 promote-gate（scope/隐私/证据/唯一性，等价 comet archive）。落点 `src/services/context/{domains,promote}.ts`，service 层 + 单测，未接 CLI/IM。详见 §13。
 
+> **修订记录 · v5（Phase 2 第二闭环：跨仓装回）**：新增 §13.5——Context Pack（流通单位，manifest+内容+hash 校验）+ 物化安装 + `context.lock`（upstream/local 区分，local 不覆盖报 conflict）。落点 `src/services/context/{pack,install}.ts`。挂载默认物化（A 方案）。网络 pull/Hub 留 Phase 3。详见 §13.5–§13.7。
+
 ---
 
 ## 0. 关键前提：引擎底座已存在，我们是「扩展」不是「从零造」
@@ -294,3 +296,26 @@ Phase 2（占位）：domains 唯一性 / harness 打包 / Context Pack / Hub cl
 - 唯一性：同 topic 二次 upsert → 单文件 + version=2 + 两段正文都在。
 - 晋升：clean candidate 进库；缺证据 / 含 secret 的 candidate 被 gate 拦且不落库（e2e 经 manifest 验证）。
 - **路径安全**：`../outside` / 绝对路径 / in-context symlink 指向外部 的 payload_ref 全部被拒、不落库（review Blocker 修复 + 回归测试）。
+
+### 13.5 跨仓装回：Context Pack + 物化安装 + lock（已实现）
+
+> 目标：让横向知识能**跨仓库共享**——一个仓打包、另一个仓装回。挂载默认走**物化**（A 方案，松松定，运行环境=云开发机）。落点 `src/services/context/{pack,install}.ts` + `domains.ts` 加 `writeDomain`/`domainContentHash`。
+
+**Context Pack（`pack.ts`）= 流通单位**
+- manifest（`pack.json`）：`packId / packVersion / entries[{topic, scope, version, hash}]`；内容 = `domains/*.md`（与库同格式）。
+- `packDomains(domainsDir, {packId, packVersion, topics?})` 选 topics 打包、每条带 `domainContentHash`；`writePack`/`readPack` 落盘/读取，**readPack 逐条校验 content hash**（防篡改/漂移）。
+- 磁盘形态即"离线的 Hub 单位"；网络 publish/pull 留 Phase 3。
+
+**物化安装 + lock（`install.ts`）**
+- `installPack(pack, targetDomainsDir, lockPath)` 把每个 domain **物化成真实 .md**，并写 `context.lock` 记 upstream 来源(packId/version/hash/scope)。
+- **upstream vs local**（§6.5/§7.2，含 dirty 检测）：安装前先比对目标文件**当前内容 hash** 与 lock 记录——只有「干净 upstream」(existing hash == lock.hash) 才允许 skip/update；不在 lock（本仓自产）**或** 装后被本地手改(hash ≠ lock) 都算 local，一律 `conflict` 绝不覆盖。四态：全新→`installed`、干净同内容→`skipped`、干净新版本→`updated`、local/dirty→`conflict`。（只看 lock hash 不看磁盘当前内容会漏判"装后被手改"→ Phase 2 第二闭环 review Blocker。）
+
+### 13.6 边界（非本期）
+- 网络 pull（从 Hub 取 pack）属 Phase 3；本期 pack 是离线磁盘单位。
+- 冲突（local vs upstream 同 topic）本期**报告不自动 merge**，留人工/后续策略。
+- 引用闭包 pull（拉 harness 连带其 domains 依赖闭包，§7.6）、SDK、Hub server 仍后续。
+
+### 13.7 验收（跨仓装回）
+- `tsc --noEmit` exit 0；`context-pack.test.ts`(7) + `context-install.test.ts`(6) 全过；context 模块合计 54 tests passed。
+- 打包往返：writePack→readPack 内容/manifest 一致；篡改 body → hash mismatch、篡改 entry.version → version mismatch、重复 topic → 抛错。
+- 安装四态：全新 installed、干净重装 skipped、干净新版本 updated、local 自产 / **装后被本地手改(dirty)** 同 topic → conflict 且**不覆盖**（review Blocker 修复 + 回归）。
