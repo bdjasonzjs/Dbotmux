@@ -15,6 +15,8 @@
 
 > **修订记录 · v5（Phase 2 第二闭环：跨仓装回）**：新增 §13.5——Context Pack（流通单位，manifest+内容+hash 校验）+ 物化安装 + `context.lock`（upstream/local 区分，local 不覆盖报 conflict）。落点 `src/services/context/{pack,install}.ts`。挂载默认物化（A 方案）。网络 pull/Hub 留 Phase 3。详见 §13.5–§13.7。
 
+> **修订记录 · v6（Phase 2 第三闭环：domains 注入消费）**：新增 §13.8——node 声明 `domains: [topic]` + `domain-injection.ts` + `runtime.dispatchWork` 把库里 top-k 横向知识注入 prompt 的 segment 3。闭合「沉淀→晋升→装回→**被用上**」消费回路（接 Phase 1 T5 留空的 domains 段）。向后兼容（未配 domainsDir/未声明则不注入）。详见 §13.8–§13.9。
+
 ---
 
 ## 0. 关键前提：引擎底座已存在，我们是「扩展」不是「从零造」
@@ -187,7 +189,7 @@ hash: <content-hash>
 
 ### 6.5 注入：拆两个落点，共用底层渲染（Finding 4 修正）
 - **workflow prompt 渲染器**（`prompt-render.ts`，落 `runtime.dispatchWork` 前 / compile 后）：按固定顺序 `role persona → task 目标 → workflow 必需片段 → scoped domains top-k → run state 增量` 渲染 node prompt。这是 workflow engine 的真实注入路径。
-  - **Phase 1 真实注入现状（v3 闭合）**：`dispatchWork` 实注 `role persona`（compile 期嵌入）+ `task goal`（`def.goal`）+ `workflow fragment`（含 `$ref` 解析后的上游值）+ `run delta`（已完成依赖节点 output，`readNodeOutputIfPresent` 读 + `renderRunDelta` 渲染，缺失则降级跳过、不阻断 dispatch）。**domains 段留空**——本地库属 Phase 2 无数据源，rationale 记 `(domains: pending Phase 2)`。单段（纯 fragment）时仍走 verbatim 快路径，存量 workflow 字节不变。
+  - **Phase 1 真实注入现状（v3 闭合）**：`dispatchWork` 实注 `role persona`（compile 期嵌入）+ `task goal`（`def.goal`）+ `workflow fragment`（含 `$ref` 解析后的上游值）+ `run delta`（已完成依赖节点 output，`readNodeOutputIfPresent` 读 + `renderRunDelta` 渲染，缺失则降级跳过、不阻断 dispatch）。domains 段在 Phase 1 留空（本地库当时无数据源）；**Phase 2 第三闭环（§13.8）已接入**——node 声明 `domains` + 库 top-k 注入。单段（纯 fragment）时仍走 verbatim 快路径，存量 workflow 字节不变。
 - **subgroup kickoff**（`subgroup-kickoff.ts`）：保留 Lark 子群唤醒语义（跨 bot mention / 分工 / 协作 norms），**只把其中"上下文正文片段"委托给共享 renderer**。
 - 两者**共用底层模板能力，但不互相替代**（一个文件替换两个不同链路是错的）。
 - 记录注入理由（query/scope/filter/top-k/reason）到 run log，供二级排错。
@@ -319,3 +321,18 @@ Phase 2（占位）：domains 唯一性 / harness 打包 / Context Pack / Hub cl
 - `tsc --noEmit` exit 0；`context-pack.test.ts`(7) + `context-install.test.ts`(6) 全过；context 模块合计 54 tests passed。
 - 打包往返：writePack→readPack 内容/manifest 一致；篡改 body → hash mismatch、篡改 entry.version → version mismatch、重复 topic → 抛错。
 - 安装四态：全新 installed、干净重装 skipped、干净新版本 updated、local 自产 / **装后被本地手改(dirty)** 同 topic → conflict 且**不覆盖**（review Blocker 修复 + 回归）。
+
+### 13.8 横向知识消费：domains 注入 workflow prompt（已实现）
+
+> 闭合消费回路：沉淀 → 晋升 → 装回 → **运行时被用上**。这是 Phase 1 T5 留空的 segment 3 的真正接入。落点：node `domains` 字段 + `domain-injection.ts` + `runtime.dispatchWork`。
+
+- subagent 节点可声明 `domains: [topic...]`（authoring + runtime schema，可选、向后兼容）——**显式引用**它消费的横向知识，不做语义检索/embedding（可控、可审计、不臆造，符合 §5.4 显式依赖模型）。**schema 层用 `DOMAIN_TOPIC_PATTERN` 校验**：非法 topic（如 `../bad`）在 parse/compile 期就硬拒，不会拖到 dispatch 才抛基础设施异常（review Major）。
+- `resolveNodeDomains(domainsDir, topics, {k, maxChars})`（`domain-injection.ts`）：按声明顺序读库、取 top-k（默认 5）、单条 body 超 `maxChars`（默认 2000）截断；缺失 / 非法 topic（catch `DomainError` 双保险，绝不读越界路径）**收集进 missing 不抛**。
+- `runtime.dispatchWork`：当 `ctx.domainsDir` 配置且 node 声明 domains 时，注入为 §6.5 segment 3「Domain knowledge」；未配 dir 或未声明 → 不注入（向后兼容，单段 verbatim 快路径仍成立）。**missing topic 写 run log，独立于是否多段**（全 missing 的单段节点也记，review Minor）。
+- `WorkflowRuntimeContext` 加可选 `domainsDir` / `domainTopK`（默认 5）。
+- **生产入口 wiring（review Blocker）**：`resolveDomainsDir()` 是单一解析源（`BOTMUX_DOMAINS_DIR` 覆盖，默认 `<cwd>/.agents/domains`）；CLI run/resume/helper、IM slash、daemon cold-attach、dashboard trigger 共 6 处 runtime context factory 统一调它设 `domainsDir`，避免各端行为分叉——否则注入只在测试手造 ctx 时生效、产品路径不消费。
+
+### 13.9 验收（domains 注入）
+- `tsc --noEmit` exit 0（含 cli/im/daemon wiring 编译）；`context-domain-injection.test.ts`(9) + `workflow-dispatch-injection.test.ts`(5，含 domain e2e + 无 dir back-compat + resolveDomainsDir 默认路径 e2e) 全过。
+- 节点声明 domains + 配 `domainsDir` → prompt 含「Domain knowledge」段 + 内容；未配 dir → verbatim 不注入（向后兼容）；top-k + 单条 maxChars 截断；缺失 / 非法 topic 容错进 missing。
+- `resolveDomainsDir`：env 覆盖 / 默认 `<cwd>/.agents/domains` / 空白覆盖回退。

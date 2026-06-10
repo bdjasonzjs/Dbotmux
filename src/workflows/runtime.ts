@@ -21,7 +21,8 @@ import { join } from 'node:path';
 
 import { writeEffectInputSidecar } from './effect-input.js';
 import { writeBlob, writeJsonBlob } from './blob.js';
-import { renderNodePrompt, renderRunDelta, type RunDeltaEntry } from './prompt-render.js';
+import { renderNodePrompt, renderRunDelta, type RunDeltaEntry, type DomainSnippet } from './prompt-render.js';
+import { resolveNodeDomains } from '../services/context/domain-injection.js';
 import { logger } from '../utils/logger.js';
 import type { WorkflowDefinition } from './definition.js';
 import type { EventLog } from './events/append.js';
@@ -172,6 +173,15 @@ export type WorkflowRuntimeContext = {
    * `cancelRequested` event.  Pass `undefined` on tick exit to clear.
    */
   registerAborters?: (aborters: Map<string, AbortController> | undefined) => void;
+  /**
+   * Horizontal-knowledge library dir for prompt injection (T5 segment 3). When
+   * set, a subagent node's declared `domains` topics are read from here and the
+   * top-k injected as the "Domain knowledge" segment. Omitted → no domain
+   * injection (back-compat; the segment stays empty).
+   */
+  domainsDir?: string;
+  /** Cap on injected domains per node (default `DEFAULT_DOMAIN_TOP_K` = 5). */
+  domainTopK?: number;
 };
 
 function nowMs(ctx: WorkflowRuntimeContext): number {
@@ -710,20 +720,31 @@ export async function dispatchWork(
       if (out !== undefined) deltaEntries.push({ nodeId: depId, output: out });
     }
     const runDelta = renderRunDelta(deltaEntries);
-    // domains (segment 3): the local domains store is Phase 2 — there is no
-    // source to select top-k from yet, so it stays empty here. The rationale
-    // log records the gap so the missing segment is intentional, not silent.
+    // segment 3: inject the node's DECLARED domains (top-k) from the library,
+    // when a domains dir is configured and the node declares topics. Missing
+    // topics are collected for the rationale log, not fatal.
+    let domainSnippets: DomainSnippet[] = [];
+    let domainsMissing: string[] = [];
+    if (ctx.domainsDir && node.domains && node.domains.length > 0) {
+      const resolved = await resolveNodeDomains(ctx.domainsDir, node.domains, { k: ctx.domainTopK });
+      domainSnippets = resolved.snippets;
+      domainsMissing = resolved.missing;
+    }
     const rendered = renderNodePrompt({
       rolePersona,
       taskGoal,
       workflowFragment: resolvedPrompt,
-      domains: [],
+      domains: domainSnippets,
       runDelta,
     });
-    if (rendered.rationale.segments.length > 1) {
+    // Log when we injected multiple segments OR when declared domains were
+    // missing — the latter must surface even on a single-segment verbatim node
+    // (else a node that declared only non-existent domains logs nothing).
+    if (rendered.rationale.segments.length > 1 || domainsMissing.length > 0) {
+      const missNote = domainsMissing.length > 0 ? ` (domains missing: ${domainsMissing.join(',')})` : '';
       logger.info(
         `[workflow:prompt-render] run=${ctx.log.runId} node=${action.nodeId} ` +
-        `role=${node.roleId ?? '-'} ${rendered.rationale.reason} (domains: pending Phase 2)`,
+        `role=${node.roleId ?? '-'} ${rendered.rationale.reason}${missNote}`,
       );
     }
     resolvedPrompt = rendered.prompt;

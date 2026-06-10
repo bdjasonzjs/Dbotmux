@@ -32,6 +32,7 @@ import {
   createDefaultProviderReconcilers,
 } from '../workflows/hostExecutors/registry.js';
 import { loadEffectInputSidecar } from '../workflows/effect-input.js';
+import { resolveDomainsDir } from '../services/context/domain-injection.js';
 import {
   cancelWorkflowRun,
   isTerminalRunStatus,
@@ -216,6 +217,7 @@ async function cmdWorkflowRun(rest: string[]): Promise<void> {
     reconcilers: createDefaultProviderReconcilers(),
     loadEffectInput: (activityId, attemptId) =>
       loadEffectInputSidecar(log, activityId, attemptId),
+    domainsDir: resolveDomainsDir(),
   };
   const result = await runLoop(ctx, { maxTicks: 200 });
 
@@ -350,6 +352,7 @@ async function cmdWorkflowResume(rest: string[]): Promise<void> {
     reconcilers: createDefaultProviderReconcilers(),
     loadEffectInput: (activityId, attemptId) =>
       loadEffectInputSidecar(log, activityId, attemptId),
+    domainsDir: resolveDomainsDir(),
   };
 
   const result = await runLoop(ctx, { maxTicks: 200 });
@@ -466,6 +469,7 @@ function workflowCliRuntimeContext(
     reconcilers: createDefaultProviderReconcilers(),
     loadEffectInput: (activityId, attemptId) =>
       loadEffectInputSidecar(log, activityId, attemptId),
+    domainsDir: resolveDomainsDir(),
   };
 }
 
