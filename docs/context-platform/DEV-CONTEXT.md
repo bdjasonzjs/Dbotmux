@@ -11,6 +11,10 @@
 > **修订记录 · v3（按代码级 review 修正实现，全部采纳）**，code review 文档：https://bytedance.larkoffice.com/docx/HHYrdCg6DooHqjx9sbzcZUrKnTf
 > 两处修正：⑤【Major】四段注入此前只在 `dispatchWork` 真实路径注入了 role persona + workflow fragment 两段；现已接入 **task goal（新增 workflow 级 `goal` 字段）** 与 **run delta（从已完成依赖节点的 output 渲染，见 `output-binding.ts:readNodeOutputIfPresent` + `prompt-render.ts:renderRunDelta`）**；domains 段因本地库属 Phase 2 暂无数据源，留空并在 run log 记 `(domains: pending Phase 2)`。补 `dispatchWork` 级测试（`test/workflow-dispatch-injection.test.ts`）断言 worker 实收 prompt 含四段中的可用段，不再只测纯 renderer。⑥【Minor】role workflow 的 catalog list/detail `revisionId` 此前用不同 shape（authoring vs compiled）算，会出两个 hash；现统一为 **source(authoring) revision**——detail 返回编译后的 def 但 `revisionId` 基于 authoring shape，与 list 一致且不随 capability registry 状态漂移。
 
+> **修订记录 · v4（Phase 2 第一闭环开工）**：新增 §13——domains 横向知识本地库（唯一主题键 + upsert/merge）+ 晋升 promote-gate（scope/隐私/证据/唯一性，等价 comet archive）。落点 `src/services/context/{domains,promote}.ts`，service 层 + 单测，未接 CLI/IM。详见 §13。
+
+> **修订记录 · v5（Phase 2 第二闭环：跨仓装回）**：新增 §13.5——Context Pack（流通单位，manifest+内容+hash 校验）+ 物化安装 + `context.lock`（upstream/local 区分，local 不覆盖报 conflict）。落点 `src/services/context/{pack,install}.ts`。挂载默认物化（A 方案）。网络 pull/Hub 留 Phase 3。详见 §13.5–§13.7。
+
 ---
 
 ## 0. 关键前提：引擎底座已存在，我们是「扩展」不是「从零造」
@@ -261,3 +265,57 @@ Phase 2（占位）：domains 唯一性 / harness 打包 / Context Pack / Hub cl
 
 ## 12. Review 闭环
 蔻黛克斯 review v1（2 Blocker + 2 Major + 1 Minor）已全部采纳并落进本文 v2（见顶部修订记录与各节 Finding 标注）。下一步：本文定稿后进入 Phase 1 T1–T6 实现（派优化站 / 独立子群执行）。
+
+---
+
+## 13. Phase 2 第一闭环：domains 本地库 + 晋升（已实现）
+
+> 目标：让**横向知识真正能沉淀 + 晋升**——纵向 task-context 沉淀出的 candidate，经 gate 校验后并进全局唯一的 domains 库。等价 comet 的 archive(delta→main)。落点 `src/services/context/{domains,promote}.ts` + 单测。
+
+### 13.1 domains 本地库（`domains.ts`）
+- 物理：`<domainsDir>/<topic>.md`，**文件名即唯一主题键**——文件系统天然保证「一个 topic 一份」，不存在并存。
+- 格式：`---` YAML frontmatter（`topic/scope/version/source/owner/updated_at`）+ markdown 正文。
+- scope 三档：`repo < org < global`；merge 时取更宽（`widestScope`）。
+- 写入 = **upsert + merge**（DEV-CONTEXT §5.2「同 topic 走 merge 不并存」）：topic 不存在→新建 version 1；已存在→旧正文保留 + 新增量带 provenance 注释并入，`version`+1。Phase 2 用**无损 append + 版本号**（语义去重留后续——丢知识比冗余更糟）。`version` 由库own（caller 不能 fork）。
+- 接口：`readDomain / listDomains / upsertDomain / domainPath / widestScope`。
+
+### 13.2 晋升 + promote-gate（`promote.ts`）
+- **payload_ref trust boundary（前置门，安全契约）**：`payload_ref` 来自 state.yaml（可能是不可信的 authored 内容），**只能引用 contextDir 内的文件**。`resolvePayloadWithinContext` 拒绝绝对路径、url/scheme-like ref、以及任何逃出 contextDir 的相对路径——既做 lexical 校验（`resolved===root || startsWith(root+sep)`），又对 realpath 二次校验（in-context symlink 不得指向外部）。**没有这道门，redaction 兜不住任意本机文件的外溢**（Phase 2 review Blocker）。
+- `promote-gate` 内容四道门（§6.2「scope/隐私/证据/唯一性」）：① topic 合法（安全唯一键）② scope 合法（repo/org/global）③ 证据（payload 非空内容）④ 隐私（`redactScan` 扫 private-key/aws/github/slack/openai key、Authorization Bearer、lark token、secret/token 赋值，命中 HARD STOP）。**唯一性不在 gate 拦**——由 domains upsert(merge) 天然处理。
+- `resolvePayloadWithinContext` / `evaluatePromoteGate(candidate, payloadContent)` 均为可单测的导出函数（gate 纯函数，path boundary 含 realpath IO），可复用未来 CLI/IM 入口。
+- 编排：`promoteCandidate(candidate, {contextDir, domainsDir})` **先 path confinement → 读内容 → gate → (通过)upsert domains**；任一步失败返回 `promoted:false`+reasons **不抛**（批量可越过被拦项继续）；`promoteFromManifest(manifestPath, domainsDir)` 读 state.yaml 的 `promotion_candidates` 批量晋升。
+
+### 13.3 边界（诚实标注，非本期）
+- redaction 是**单文件**关键词/正则扫描（已含常见 secret + Authorization Bearer / openai / lark / token 赋值），**不是完备脱敏**；§8「引用闭包整体 redaction + policy scan」属 push-to-Hub（Phase 3），后续仍应持续补 pattern。
+- payload_ref trust boundary（§13.2）已落地——这是 promotion 落地的**前提**，不是可选项。
+- 晋升入口本期只到 **service 层 + 单测**，未接 CLI/IM/close-gate（后续）。
+- domains top-k 注入进 workflow prompt（接 §6.5 segment 3）、实例级 task goal 映射，仍是后续增量。
+
+### 13.4 验收（Phase 2 第一闭环）
+- `tsc --noEmit` exit 0；`test/context-domains.test.ts`(8) + `test/context-promote.test.ts`(17) 全过。
+- 唯一性：同 topic 二次 upsert → 单文件 + version=2 + 两段正文都在。
+- 晋升：clean candidate 进库；缺证据 / 含 secret 的 candidate 被 gate 拦且不落库（e2e 经 manifest 验证）。
+- **路径安全**：`../outside` / 绝对路径 / in-context symlink 指向外部 的 payload_ref 全部被拒、不落库（review Blocker 修复 + 回归测试）。
+
+### 13.5 跨仓装回：Context Pack + 物化安装 + lock（已实现）
+
+> 目标：让横向知识能**跨仓库共享**——一个仓打包、另一个仓装回。挂载默认走**物化**（A 方案，松松定，运行环境=云开发机）。落点 `src/services/context/{pack,install}.ts` + `domains.ts` 加 `writeDomain`/`domainContentHash`。
+
+**Context Pack（`pack.ts`）= 流通单位**
+- manifest（`pack.json`）：`packId / packVersion / entries[{topic, scope, version, hash}]`；内容 = `domains/*.md`（与库同格式）。
+- `packDomains(domainsDir, {packId, packVersion, topics?})` 选 topics 打包、每条带 `domainContentHash`；`writePack`/`readPack` 落盘/读取，**readPack 逐条校验 content hash**（防篡改/漂移）。
+- 磁盘形态即"离线的 Hub 单位"；网络 publish/pull 留 Phase 3。
+
+**物化安装 + lock（`install.ts`）**
+- `installPack(pack, targetDomainsDir, lockPath)` 把每个 domain **物化成真实 .md**，并写 `context.lock` 记 upstream 来源(packId/version/hash/scope)。
+- **upstream vs local**（§6.5/§7.2，含 dirty 检测）：安装前先比对目标文件**当前内容 hash** 与 lock 记录——只有「干净 upstream」(existing hash == lock.hash) 才允许 skip/update；不在 lock（本仓自产）**或** 装后被本地手改(hash ≠ lock) 都算 local，一律 `conflict` 绝不覆盖。四态：全新→`installed`、干净同内容→`skipped`、干净新版本→`updated`、local/dirty→`conflict`。（只看 lock hash 不看磁盘当前内容会漏判"装后被手改"→ Phase 2 第二闭环 review Blocker。）
+
+### 13.6 边界（非本期）
+- 网络 pull（从 Hub 取 pack）属 Phase 3；本期 pack 是离线磁盘单位。
+- 冲突（local vs upstream 同 topic）本期**报告不自动 merge**，留人工/后续策略。
+- 引用闭包 pull（拉 harness 连带其 domains 依赖闭包，§7.6）、SDK、Hub server 仍后续。
+
+### 13.7 验收（跨仓装回）
+- `tsc --noEmit` exit 0；`context-pack.test.ts`(7) + `context-install.test.ts`(6) 全过；context 模块合计 54 tests passed。
+- 打包往返：writePack→readPack 内容/manifest 一致；篡改 body → hash mismatch、篡改 entry.version → version mismatch、重复 topic → 抛错。
+- 安装四态：全新 installed、干净重装 skipped、干净新版本 updated、local 自产 / **装后被本地手改(dirty)** 同 topic → conflict 且**不覆盖**（review Blocker 修复 + 回归）。
