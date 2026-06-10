@@ -2879,6 +2879,45 @@ async function cmdSend(rest: string[]): Promise<void> {
   }
 }
 
+// ─── Chat-mode subcommand (2026-06-10 邹劲松：闲聊群 vs 工作群) ──────────────────
+
+async function cmdChatMode(rest: string[]): Promise<void> {
+  process.env.SESSION_DATA_DIR ??= resolveDataDir();
+  const { getChatMode, setChatMode } = await import('./services/chat-mode-store.js');
+  // 抽 positional（chat|work）时必须跳过带值 flag —— --chat-id / --session-id 的值不是 positional。
+  const VALUE_FLAGS = new Set(['--chat-id', '--session-id']);
+  let positional: string | undefined;
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i];
+    if (a.startsWith('--')) { if (VALUE_FLAGS.has(a)) i++; continue; }
+    positional = a; break;
+  }
+  let chatId = argValue(rest, '--chat-id');
+  if (!chatId) {
+    const { session } = await resolveSessionAppId(argValue(rest, '--session-id'));
+    chatId = session.chatId;
+  }
+  if (!chatId) {
+    console.error('无法确定 chatId（在群内 CLI 会话运行，或传 --chat-id <oc>）');
+    process.exit(1);
+  }
+  if (!positional) {
+    // 无参 = 查询当前模式
+    console.log(getChatMode(chatId));
+    return;
+  }
+  if (positional !== 'chat' && positional !== 'work') {
+    console.error('用法: botmux chat-mode [chat|work] [--chat-id <oc>]（无参 = 查询当前模式）');
+    process.exit(1);
+  }
+  setChatMode(chatId, positional);
+  const desc = positional === 'chat'
+    ? '闲聊模式：不再注入 output_discipline 等工作上下文（下一轮起生效）'
+    : '工作模式：恢复全部工作上下文';
+  console.error(`✅ 群 ${chatId} 模式 = ${positional}（${desc}）`);
+  process.stdout.write(`${positional}\n`);
+}
+
 // ─── Create-group subcommand ─────────────────────────────────────────────────
 
 async function cmdCreateGroup(rest: string[]): Promise<void> {
@@ -3030,6 +3069,14 @@ botmux create-group — 用一组机器人新建飞书群
   // Always stdout chatId on createChat success — even if transfer/notify
   // partially failed, the chat exists and retrying would create duplicates.
   process.stdout.write(`${result.chatId}\n`);
+
+  // 2026-06-10 邹劲松：--mode chat 建群即标闲聊模式（不注入工作上下文）。缺省 work。
+  const createMode = argValue(rest, '--mode');
+  if (createMode === 'chat') {
+    const { setChatMode } = await import('./services/chat-mode-store.js');
+    setChatMode(result.chatId, 'chat');
+    console.error('🗨️  已标记为闲聊模式（chat）：不注入 output_discipline 等工作上下文。');
+  }
 
   // Human-readable summary + warnings → stderr.
   const link = `https://applink.feishu.cn/client/chat/open?openChatId=${encodeURIComponent(result.chatId)}`;
@@ -3273,6 +3320,7 @@ switch (command) {
   }
   case 'send':     await cmdSend(process.argv.slice(3)); break;
   case 'create-group': await cmdCreateGroup(process.argv.slice(3)); break;
+  case 'chat-mode': await cmdChatMode(process.argv.slice(3)); break;
   case 'subtask-create': {
     const { cmdSubtaskCreate } = await import('./cli/subtask-create.js');
     await cmdSubtaskCreate(process.argv.slice(3));

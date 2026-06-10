@@ -17,6 +17,7 @@ import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { getBot, getAllBots } from '../bot-registry.js';
 import { getMainTopicChatId, isTillyMainTopicConversationDenied } from '../services/main-topic-config.js';
+import { getChatMode } from '../services/chat-mode-store.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { validateAdoptTarget } from './session-discovery.js';
 import type { LarkAttachment, LarkMention, ScheduledTask } from '../types.js';
@@ -492,8 +493,9 @@ export function buildNewTopicPrompt(
   const subtaskMemberBlock = buildSubtaskMemberBlock(chatId, larkAppId);
   if (subtaskMemberBlock) parts.push(subtaskMemberBlock);
 
-  // 输出纪律（每轮，所有会话 / 所有 bot，无 gate）—— 2026-06-01 邹劲松要求每群都塞。
-  parts.push(buildOutputDisciplineBlock());
+  // 输出纪律（每轮）—— 2026-06-01 邹劲松要求每群都塞；2026-06-10 加 chat 模式 gate：
+  // 闲聊群（mode=chat）不注入工作纪律块，保持裸聊。缺省 work → 照旧注入。
+  if (getChatMode(chatId) !== 'chat') parts.push(buildOutputDisciplineBlock());
 
   // 被圈时间感知（2026-06-04 邹劲松要求）：仅当本 bot 这轮被 @ 时注入最近 N 次被圈时间。
   const selfOpenIdForMentions = botIdentity?.openId ?? (larkAppId ? getBot(larkAppId)?.botOpenId ?? undefined : undefined);
@@ -572,8 +574,9 @@ export function buildFollowUpContent(
   const subtaskMemberBlock = buildSubtaskMemberBlock(opts?.chatId, opts?.larkAppId);
   if (subtaskMemberBlock) parts.push(subtaskMemberBlock);
 
-  // 输出纪律（每轮，所有会话 / 所有 bot，无 gate）—— 2026-06-01 邹劲松要求每群都塞。
-  parts.push(buildOutputDisciplineBlock());
+  // 输出纪律（每轮）—— 2026-06-01 邹劲松要求每群都塞；2026-06-10 加 chat 模式 gate：
+  // 闲聊群（mode=chat）不注入工作纪律块。缺省 work → 照旧注入。
+  if (getChatMode(opts?.chatId ?? '') !== 'chat') parts.push(buildOutputDisciplineBlock());
 
   // 被圈时间感知（2026-06-04 邹劲松要求）：仅当本 bot 这轮被 @ 时注入最近 N 次被圈时间。
   const selfOpenIdForMentions = opts?.larkAppId ? getBot(opts.larkAppId)?.botOpenId ?? undefined : undefined;
