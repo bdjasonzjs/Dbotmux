@@ -24,7 +24,7 @@ export interface DispatchExecutors {
    *  失败返 {ok:false, error}（**别抛**，让 dispatcher 走重试退避）。
    *  IO 层须用 cmd 的稳定 id (cmdId/idempotencyKey) 作 lark 发送幂等键，
    *  防 sent 回写前崩溃导致重复投递刷群。 */
-  deliver(cmd: OutboxCommand, task: SubTask): Promise<{ ok: boolean; messageId?: string; error?: string }>;
+  deliver(cmd: OutboxCommand, task: SubTask): Promise<{ ok: boolean; messageId?: string; error?: string; relayRecordId?: string }>;
 }
 
 /** 投递失败最多重试几次 (含首发后)。超过 → failed。 */
@@ -93,7 +93,7 @@ export async function runDispatcherTick(now: Date, exec: DispatchExecutors): Pro
         continue;
       }
 
-      let res: { ok: boolean; messageId?: string; error?: string };
+      let res: { ok: boolean; messageId?: string; error?: string; relayRecordId?: string };
       try {
         res = await exec.deliver(claimed, freshTask!);
       } catch (err: any) {
@@ -101,10 +101,14 @@ export async function runDispatcherTick(now: Date, exec: DispatchExecutors): Pro
         res = { ok: false, error: `deliver threw: ${err?.message ?? err}` };
       }
 
+      // 幂等 (2026-06-10 修重复刷屏)：executor 首发写入的 base recordId 必须落库 (成功/失败都落)，
+      // 重试时复用它只重轮询、不再 upsert 新记录，避免自动化重复发同一条消息。
+      const relayRecordId = res.relayRecordId ?? claimed.relayRecordId ?? null;
+
       if (res.ok) {
         // CAS 回写 (lease 没被抢走才写)，一并清 lease
         const ok = await completeDispatch(cmd.cmdId, attemptId, {
-          deliveryStatus: 'sent', deliveredMessageId: res.messageId ?? null,
+          deliveryStatus: 'sent', deliveredMessageId: res.messageId ?? null, relayRecordId,
           sentAt: now.toISOString(), nextRetryAt: null, lastError: null,
         });
         if (ok) {
@@ -117,8 +121,8 @@ export async function runDispatcherTick(now: Date, exec: DispatchExecutors): Pro
         const attempt = claimed.retryCount + 1;
         // 退避: retryCount + nextRetryAt + 清 lease 全在同一次 completeDispatch (锁内) 写完
         const patch = attempt >= MAX_RETRY
-          ? { deliveryStatus: 'failed' as const, retryCount: attempt, lastError: res.error ?? 'deliver failed' }
-          : { retryCount: attempt, nextRetryAt: new Date(now.getTime() + planBackoff(attempt)).toISOString(), lastError: res.error ?? 'deliver failed' };
+          ? { deliveryStatus: 'failed' as const, retryCount: attempt, lastError: res.error ?? 'deliver failed', relayRecordId }
+          : { retryCount: attempt, nextRetryAt: new Date(now.getTime() + planBackoff(attempt)).toISOString(), lastError: res.error ?? 'deliver failed', relayRecordId };
         const ok = await completeDispatch(cmd.cmdId, attemptId, patch);
         if (!ok) { stats.skipped += 1; continue; } // lease 丢了，别覆盖
         if (attempt >= MAX_RETRY) {

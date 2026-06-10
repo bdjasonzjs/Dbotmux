@@ -43,7 +43,7 @@ describe('deliver child_to_parent (急急如律令唤主bot)', () => {
   it('急急如律令：【克劳德】 + taskId + commandId + query 指引, 投父群, 返回 recordId', async () => {
     const exec = makeDispatchExecutors();
     const res = await exec.deliver(mkCmd(), mkTask());
-    expect(res).toEqual({ ok: true, messageId: 'rec_1' });
+    expect(res).toEqual({ ok: true, messageId: 'rec_1', relayRecordId: 'rec_1' });  // relayRecordId 落库供重试幂等复用
     const arg = mockSendAsOwner.mock.calls[0][0];
     expect(arg.targetChatId).toBe('oc_parent');              // 投父群
     expect(arg.text).toContain('急急如律令：【克劳德】');     // 急急如律令唤主bot (非缇蕾直发)
@@ -141,5 +141,28 @@ describe('deliver 失败', () => {
     const res = await exec.deliver(mkCmd(), mkTask());
     expect(res.ok).toBe(false);
     expect(res.error).toContain('not configured');
+  });
+});
+
+// 2026-06-10 修重复刷屏：幂等复用 base 记录，重试不再 upsert 新记录
+describe('deliver 幂等复用 base 记录 (防重复刷屏)', () => {
+  it('命令已带 relayRecordId → sendAsOwner 用 existingRecordId 复用, 不写新记录', async () => {
+    const exec = makeDispatchExecutors();
+    await exec.deliver(mkCmd({ relayRecordId: 'rec_existing' }), mkTask());
+    expect(mockSendAsOwner.mock.calls[0][0].existingRecordId).toBe('rec_existing');
+  });
+
+  it('首次投递 (无 relayRecordId) → existingRecordId 为 undefined (走 upsert 新建)', async () => {
+    const exec = makeDispatchExecutors();
+    await exec.deliver(mkCmd(), mkTask());
+    expect(mockSendAsOwner.mock.calls[0][0].existingRecordId).toBeUndefined();
+  });
+
+  it('poll 超时失败但已建记录 → deliver 仍带回 relayRecordId 供下轮复用', async () => {
+    mockSendAsOwner.mockResolvedValue({ ok: false, recordId: 'rec_1', error: 'relay poll timeout (record=rec_1 not 已发送)' });
+    const exec = makeDispatchExecutors();
+    const res = await exec.deliver(mkCmd(), mkTask());
+    expect(res.ok).toBe(false);
+    expect(res.relayRecordId).toBe('rec_1');  // 关键：失败也带回 recordId, dispatcher 落库, 重试复用不重发
   });
 });

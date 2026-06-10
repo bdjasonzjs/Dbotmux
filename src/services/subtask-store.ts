@@ -86,6 +86,9 @@ export interface OutboxCommand {
   expectedTaskVersion: number | null;
   deliveryStatus: DeliveryStatus;
   deliveredMessageId: string | null;  // 投递成功后的消息 id (= 主bot 查询 ID 锚点)
+  // 幂等关键 (2026-06-10 修重复刷屏)：首次 deliver 写入 base 记录后落库的 recordId。重试时复用它
+  // 只重轮询、不再 upsert 新记录，避免自动化把同一条消息重复发出去。
+  relayRecordId: string | null;
   retryCount: number;
   nextRetryAt: string | null;
   sentAt: string | null;
@@ -384,7 +387,7 @@ export async function commitObservationTransaction(opts: {
         targetChatId: cur.parentChatId, commandType: opts.report.commandType,
         payload: { summary: opts.summary, sourceMessageIds: opts.analyzedMessageIds },
         idempotencyKey: opts.report.idempotencyKey, expectedTaskVersion: cur.version + 1,
-        deliveryStatus: 'pending', deliveredMessageId: null, retryCount: 0, nextRetryAt: null,
+        deliveryStatus: 'pending', deliveredMessageId: null, relayRecordId: null, retryCount: 0, nextRetryAt: null,
         sentAt: null, ackedAt: null, supersededBy: null, lastError: null, createdAt: now,
         dispatchingUntil: null, dispatchAttemptId: null,
       };
@@ -432,7 +435,7 @@ export async function enqueueCommand(opts: {
       cmdId: genId('cmd'), taskId: opts.taskId, direction: opts.direction, targetChatId: opts.targetChatId,
       commandType: opts.commandType, payload: opts.payload, idempotencyKey: opts.idempotencyKey,
       expectedTaskVersion: opts.expectedTaskVersion ?? null, deliveryStatus: 'pending',
-      deliveredMessageId: null, retryCount: 0, nextRetryAt: null, sentAt: null, ackedAt: null,
+      deliveredMessageId: null, relayRecordId: null, retryCount: 0, nextRetryAt: null, sentAt: null, ackedAt: null,
       supersededBy: null, lastError: null, createdAt: new Date().toISOString(),
       dispatchingUntil: null, dispatchAttemptId: null,
     };
@@ -494,7 +497,7 @@ export async function transitionAndEnqueueCommand(opts: {
       cmdId: genId('cmd'), taskId: opts.taskId, direction: opts.command.direction, targetChatId: opts.command.targetChatId,
       commandType: opts.command.commandType, payload: opts.command.payload, idempotencyKey: opts.command.idempotencyKey,
       expectedTaskVersion: cur.version + 1, deliveryStatus: 'pending',
-      deliveredMessageId: null, retryCount: 0, nextRetryAt: null, sentAt: null, ackedAt: null,
+      deliveredMessageId: null, relayRecordId: null, retryCount: 0, nextRetryAt: null, sentAt: null, ackedAt: null,
       supersededBy: null, lastError: null, createdAt: now, dispatchingUntil: null, dispatchAttemptId: null,
     };
     s.commands.push(command);
@@ -541,7 +544,7 @@ export async function enqueueNudgeAndUpdateStats(opts: {
     const command: OutboxCommand = {
       cmdId: genId('cmd'), taskId: opts.taskId, direction: 'parent_to_child', targetChatId: opts.targetChatId,
       commandType: 'nudge', payload: { targetRole: 'main' }, idempotencyKey: opts.idempotencyKey,
-      expectedTaskVersion: cur.version + 1, deliveryStatus: 'pending', deliveredMessageId: null,
+      expectedTaskVersion: cur.version + 1, deliveryStatus: 'pending', deliveredMessageId: null, relayRecordId: null,
       retryCount: 0, nextRetryAt: null, sentAt: null, ackedAt: null, supersededBy: null,
       lastError: null, createdAt: now, dispatchingUntil: null, dispatchAttemptId: null,
     };
@@ -580,7 +583,7 @@ export async function escalateStalledTask(opts: {
     const command: OutboxCommand = {
       cmdId: genId('cmd'), taskId: opts.taskId, direction: 'child_to_parent', targetChatId: cur.parentChatId,
       commandType: 'report_help', payload: { summary: opts.summary }, idempotencyKey: opts.idempotencyKey,
-      expectedTaskVersion: cur.version + 1, deliveryStatus: 'pending', deliveredMessageId: null,
+      expectedTaskVersion: cur.version + 1, deliveryStatus: 'pending', deliveredMessageId: null, relayRecordId: null,
       retryCount: 0, nextRetryAt: null, sentAt: null, ackedAt: null, supersededBy: null,
       lastError: null, createdAt: now, dispatchingUntil: null, dispatchAttemptId: null,
     };

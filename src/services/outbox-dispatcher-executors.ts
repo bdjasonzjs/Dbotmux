@@ -125,17 +125,20 @@ export function makeDispatchExecutors(): DispatchExecutors {
         ? childToParentSummon(cmd, task)
         : parentToChildSummon(cmd, task);
       // 以 owner 身份发急急如律令 base relay，阻塞轮询「已发送」(待定1)。失败返 {ok:false} 不抛。
+      // 幂等 (2026-06-10 修重复刷屏)：若本命令上次已写过 base 记录 (relayRecordId)，复用它**只重轮询**、
+      // 不再 upsert；首发拿到的 recordId 即使 poll 超时也带回 (relayRecordId)，由 dispatcher 落库供重试复用。
       const res = await sendAsOwner({
         targetChatId: cmd.targetChatId,
         text,
         groupNotFoundRetryTimeoutMs: cmd.commandType === 'kickoff' ? DEFAULT_GROUP_NOT_FOUND_RETRY_TIMEOUT_MS : 0,
+        existingRecordId: cmd.relayRecordId ?? undefined,
       });
       if (res.ok) {
         logger.info(`[outbox-dispatcher-exec] summon sent cmd ${cmd.cmdId} (${cmd.commandType}) → ${cmd.targetChatId.slice(0, 12)} record=${res.recordId?.slice(0, 12) ?? '?'}`);
-        return { ok: true, messageId: res.recordId };  // base relay 无真 messageId，用 recordId 追溯 (v3 锚点是 commandId)
+        return { ok: true, messageId: res.recordId, relayRecordId: res.recordId };  // base relay 无真 messageId，用 recordId 追溯 (v3 锚点是 commandId)
       }
       logger.warn(`[outbox-dispatcher-exec] summon failed cmd ${cmd.cmdId}: ${res.error}`);
-      return { ok: false, error: res.error };
+      return { ok: false, error: res.error, relayRecordId: res.recordId };  // 带回 recordId：首发已建记录、poll 超时，下轮复用别重发
     },
   };
 }

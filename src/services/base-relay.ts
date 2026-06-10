@@ -160,13 +160,21 @@ export interface SendAsOwnerResult { ok: boolean; recordId?: string; error?: str
  * 写记录 → 阻塞轮询确认「已发送」(待定1 决策：复用 dispatcher 退避/重试模型，可靠性不变)。
  * 失败/超时返 {ok:false}，**不抛** —— 让 dispatcher 走 claim/退避/重试。
  */
-export async function sendAsOwner(opts: { targetChatId: string; text: string; pollTimeoutMs?: number; groupNotFoundRetryTimeoutMs?: number }): Promise<SendAsOwnerResult> {
+export async function sendAsOwner(opts: { targetChatId: string; text: string; pollTimeoutMs?: number; groupNotFoundRetryTimeoutMs?: number; existingRecordId?: string }): Promise<SendAsOwnerResult> {
   const cfg = relayConfig();
   if (!cfg) return { ok: false, error: 'base relay not configured (set SUBTASK_RELAY_BASE_TOKEN / SUBTASK_RELAY_TABLE_ID)' };
   try {
-    const upsert = await upsertRecord(cfg, opts.text, opts.targetChatId, opts.groupNotFoundRetryTimeoutMs ?? 0);
-    if (!upsert.ok || !upsert.recordId) return { ok: false, error: upsert.error ?? 'upsert returned no record_id' };
-    const recordId = upsert.recordId;
+    // 幂等关键 (2026-06-10 修重复刷屏)：重试时**复用上次已写入的记录、只重新轮询状态**，绝不再 upsert
+    // 新记录。自动化对每条命令只触发一次发送；poll 超时仅代表「自动化还没回写已发送」(积压延迟)，不代表
+    // 没发出去 —— 再 upsert 会让自动化把同一条消息发第二遍 = 刷屏。
+    let recordId: string;
+    if (opts.existingRecordId) {
+      recordId = opts.existingRecordId;
+    } else {
+      const upsert = await upsertRecord(cfg, opts.text, opts.targetChatId, opts.groupNotFoundRetryTimeoutMs ?? 0);
+      if (!upsert.ok || !upsert.recordId) return { ok: false, error: upsert.error ?? 'upsert returned no record_id' };
+      recordId = upsert.recordId;
+    }
     const status = await pollStatus(cfg, recordId, opts.pollTimeoutMs ?? DEFAULT_POLL_TIMEOUT_MS);
     if (status === 'sent') return { ok: true, recordId };
     if (status === 'cancelled') return { ok: false, recordId, error: 'relay record cancelled (not sent)' };
