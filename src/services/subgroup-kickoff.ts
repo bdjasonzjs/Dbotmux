@@ -21,6 +21,7 @@ import { sendMessage } from '../im/lark/client.js';
 import { resolveBotIdent } from '../core/main-bot-playbook.js';
 import { logger } from '../utils/logger.js';
 import { SUBTASK_COLLAB_NORMS } from './subtask-norms.js';
+import { composeSections } from '../workflows/prompt-render.js';
 
 export type SubgroupUrgency = 'urgent' | 'normal' | 'low';
 
@@ -59,16 +60,22 @@ export function buildKickoffText(spec: KickoffSpec, opts: {
     ? clean(spec.acceptance, 300)
     : '(未明确, 执行中如不清晰找缇蕾确认)';
 
+  // 上下文正文片段委托给共享 renderer 的 composeSections 原语 (Finding 4):
+  // kickoff 仍保留下面的唤醒/@mention/分工/协作 norms 语义, 只把"任务正文"这段
+  // 用 workflow prompt 渲染器的同一套拼装能力产出。
+  const contextBody = composeSections([
+    { header: '【任务】', body: clean(spec.purpose, 300) },
+    { header: '【类型】', body: spec.taskType },
+    { header: '【背景资料】', body: refsBlock },
+    { header: '【验收标准】', body: acceptanceBlock },
+  ]);
+
   return [
     `<at user_id="${opts.claudeOpenId}">克劳德</at> <at user_id="${opts.sisterOpenId}">寇黛克斯</at>`,
     ``,
     `📦 子群任务 kickoff · ${URGENCY_LABEL[spec.urgency]}`,
     ``,
-    `【任务】${clean(spec.purpose, 300)}`,
-    `【类型】${spec.taskType}`,
-    `【背景资料】`,
-    refsBlock,
-    `【验收标准】${acceptanceBlock}`,
+    contextBody,
     ``,
     `【分工】(松松定的标准)`,
     `- 克劳德(你): 技术方案 + 工程实现。先出方案、对齐再动手, 不闷头写。`,

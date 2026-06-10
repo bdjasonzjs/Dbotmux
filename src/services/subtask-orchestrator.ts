@@ -24,13 +24,14 @@ import { logger } from '../utils/logger.js';
 import type { Session } from '../types.js';
 import {
   createSubTask, getSubTask, getCommand, transitionStatus, enqueueCommand, ackCommand,
-  transitionAndEnqueueCommand, listObservations, listCommands,
+  transitionAndEnqueueCommand, listObservations, listCommands, commitObservationTransaction,
   helpReportDelivery,
   VersionConflictError, CommandRetryMismatchError,
   type SubTask, type SubTaskBot, type SubTaskStatus, type OutboxCommand, type Observation,
   type CommandTargetRole,
 } from './subtask-store.js';
 import { SUBTASK_COLLAB_NORMS } from './subtask-norms.js';
+import { evaluateRequireEvidence, isEvidenceLink } from './context/guard.js';
 
 /** v2 编排链路标记 —— 进 chatContext.relatedRefs，dashboard/welcome card 可见，
  *  跟旧 watcher 链路区分 (边界3)。 */
@@ -234,6 +235,13 @@ export interface RequestReviewReq {
   summary: string;          // 必须含可打开的飞书链接或本机绝对路径 (N2)
   sourceMessageIds?: string[];
   idempotencyKey?: string;
+  /**
+   * T4 require-evidence: verification artifact links the executor attaches
+   * (test output / report doc / abs path). Recorded into the subtask-store as
+   * an Observation.evidenceLinks so the service-layer guard has a reachable
+   * data source. Phase 1's reachable path; observer auto-extraction is Phase 2.
+   */
+  evidenceLinks?: string[];
 }
 
 /** N2：summary 必须含可打开的飞书/http 链接，或本机绝对路径 (以 / 开头的路径 token)。 */
@@ -270,6 +278,42 @@ export async function requestReview(req: RequestReviewReq): Promise<{ cmdId: str
   }
   if (task.status === 'finished' || task.status === 'stopped') {
     throw new HttpError(409, `subtask already ${task.status}; request_review suppressed`);
+  }
+  // require-evidence guard (T4, DEV-CONTEXT §6.2): the real enforcement point is
+  // here in the service layer — the CLI only pre-checks. "Has verification
+  // evidence" is derived from subtask-store Observation.evidenceLinks (single
+  // source of truth), not a second `verified` flag.
+  //
+  // Reachable data path (Phase 1): the executor attaches verification artifact
+  // links via `evidenceLinks` (CLI `--evidence-links`). We record them as a
+  // non-advancing Observation (cursor untouched, so the observer's high-water
+  // mark is unaffected) before evaluating the guard. Observer auto-extraction
+  // of evidenceLinks from analyzed messages is Phase 2.
+  const freshEvidence = (req.evidenceLinks ?? []).map((l) => (l ?? '').trim()).filter(Boolean);
+  if (freshEvidence.length > 0) {
+    // Shape check at the service boundary: evidence must be openable (URL or
+    // abs path), so `--evidence-links foo` can't satisfy require-evidence.
+    const bad = freshEvidence.filter((l) => !isEvidenceLink(l));
+    if (bad.length > 0) {
+      throw new HttpError(
+        400,
+        `evidenceLinks 必须是可打开的链接(http/https)或本机绝对路径(/...)；非法项: ${bad.join(', ')}`,
+      );
+    }
+    await commitObservationTransaction({
+      taskId: task.taskId,
+      readFromCursor: task.committedCursor,
+      readToCursor: task.committedCursor, // non-advancing: evidence only
+      analyzedMessageIds: [],
+      summary: `evidence attached for review: ${freshEvidence.length} link(s)`,
+      signal: 'normal',
+      evidenceLinks: freshEvidence,
+      expectedVersion: task.version,
+    });
+  }
+  const evidence = evaluateRequireEvidence(listObservations(task.taskId));
+  if (!evidence.ok) {
+    throw new HttpError(422, `require-evidence: ${evidence.reason}`);
   }
   // 幂等：显式 key > sourceMessageIds > randomUUID。**不按 summary hash** (同一路径多轮复用会误 dedup)。
   const idempotencyKey = req.idempotencyKey

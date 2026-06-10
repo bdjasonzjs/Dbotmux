@@ -46,7 +46,8 @@ import {
 } from '../src/services/subtask-orchestrator.js';
 import {
   createSubTask, getSubTask, getByChatId, transitionStatus, enqueueCommand, listCommands,
-  getCommand, listObservations, __resetForTesting, ackCommand, type SubTaskBot,
+  getCommand, listObservations, commitObservationTransaction, __resetForTesting, ackCommand,
+  type SubTaskBot,
 } from '../src/services/subtask-store.js';
 
 const BOTS: SubTaskBot[] = [
@@ -424,8 +425,17 @@ describe('requestReview', () => {
     return getSubTask(t.taskId)!;
   }
 
-  it('执行者(main) 从子群调 + summary 带绝对路径 → 入队 request_review (parent→child, targetRole=collab)', async () => {
+  /** 落一条带 evidenceLinks 的 Observation —— require-evidence guard 的真相来源。 */
+  async function addEvidence(taskId: string, link = '/tmp/verification/report-1.md') {
+    await commitObservationTransaction({
+      taskId, readFromCursor: null, readToCursor: null, analyzedMessageIds: [],
+      summary: 'verified', signal: 'normal', evidenceLinks: [link],
+    });
+  }
+
+  it('执行者(main) 从子群调 + summary 带绝对路径 + 有证据 → 入队 request_review (parent→child, targetRole=collab)', async () => {
     const t = await mkTaskR();
+    await addEvidence(t.taskId);
     subSession('sess_sub', 'oc_sub', 'app_claude'); // app_claude = ou_claude = main
     const res = await requestReview({ sessionId: 'sess_sub', taskId: t.taskId, summary: '产出在 /tmp/plan.md' });
     const cmd = getCommand(res.cmdId)!;
@@ -433,6 +443,38 @@ describe('requestReview', () => {
     expect(cmd.direction).toBe('parent_to_child');
     expect(cmd.targetChatId).toBe('oc_sub');
     expect(cmd.payload.targetRole).toBe('collab');
+  });
+
+  it('require-evidence: 无 Observation.evidenceLinks → service 层 HARD STOP (422)', async () => {
+    const t = await mkTaskR();
+    subSession('sess_sub', 'oc_sub', 'app_claude');
+    // summary 合法 + 是 main + 有 reviewer，唯独没有证据 —— 仍被 service 层拦下
+    await expect(requestReview({ sessionId: 'sess_sub', taskId: t.taskId, summary: '产出在 /tmp/plan.md' }))
+      .rejects.toMatchObject({ status: 422 });
+  });
+
+  it('require-evidence: 显式 evidenceLinks 入参 → 写入 store 并通过 (真 API 可达路径)', async () => {
+    const t = await mkTaskR();
+    subSession('sess_sub', 'oc_sub', 'app_claude');
+    const res = await requestReview({
+      sessionId: 'sess_sub', taskId: t.taskId,
+      summary: '产出在 /tmp/plan.md',
+      evidenceLinks: ['/tmp/verification/report-1.md'],
+    });
+    // 证据被记进 store
+    expect(listObservations(t.taskId).some(o => o.evidenceLinks.includes('/tmp/verification/report-1.md'))).toBe(true);
+    // 命令入队
+    expect(getCommand(res.cmdId)!.commandType).toBe('request_review');
+  });
+
+  it('require-evidence: 形状非法的 evidenceLinks (foo) → 400，且不写入 store', async () => {
+    const t = await mkTaskR();
+    subSession('sess_sub', 'oc_sub', 'app_claude');
+    await expect(requestReview({
+      sessionId: 'sess_sub', taskId: t.taskId, summary: '产出在 /tmp/plan.md', evidenceLinks: ['foo'],
+    })).rejects.toMatchObject({ status: 400 });
+    // 脏证据不入库
+    expect(listObservations(t.taskId).some(o => o.evidenceLinks.includes('foo'))).toBe(false);
   });
 
   it('summary 无可打开链接/绝对路径 → 400', async () => {

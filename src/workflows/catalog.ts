@@ -19,10 +19,21 @@ import { join, dirname } from 'node:path';
 
 import {
   computeRevisionId,
-  parseWorkflowDefinition,
+  parseAuthoringWorkflowDefinition,
+  type AuthoringWorkflowDefinition,
   type WorkflowDefinition,
 } from './definition.js';
-import { workflowDefinitionSearchPaths } from './loader.js';
+import { compileWorkflowFromRaw, workflowDefinitionSearchPaths } from './loader.js';
+import {
+  loadCapabilityRegistries,
+  loadRoleResolver,
+  resolveRoleToBot,
+} from './capability.js';
+
+// Re-exported for callers that discover capability config via the catalog
+// (DEV-CONTEXT §4.2: "catalog 暴露 resolveRoleToBot"). Implementations live in
+// capability.ts so the loader can depend on them without a catalog cycle.
+export { resolveRoleToBot, loadCapabilityRegistries, loadRoleResolver };
 
 const WORKFLOW_ID_PATTERN = /^[A-Za-z0-9_.-]+$/;
 
@@ -67,7 +78,7 @@ async function readEntriesFromDir(dir: string): Promise<string[]> {
   }
 }
 
-function summarize(def: WorkflowDefinition, path: string): CatalogEntry {
+function summarize(def: WorkflowDefinition | AuthoringWorkflowDefinition, path: string): CatalogEntry {
   const params = def.params ?? {};
   const paramCount = Object.keys(params).length;
   const requiredParamCount = Object.values(params).filter((p) => p.required).length;
@@ -75,7 +86,7 @@ function summarize(def: WorkflowDefinition, path: string): CatalogEntry {
     workflowId: def.workflowId,
     version: def.version,
     path,
-    revisionId: computeRevisionId(def),
+    revisionId: computeRevisionId(def as WorkflowDefinition),
     paramCount,
     requiredParamCount,
     nodeCount: Object.keys(def.nodes).length,
@@ -107,7 +118,10 @@ export async function listWorkflowDefinitions(opts: {
       const path = join(dir, name);
       try {
         const raw = await fs.readFile(path, 'utf-8');
-        const def = parseWorkflowDefinition(JSON.parse(raw));
+        // Authoring parse (shape only): role workflows must appear in the
+        // catalog list. Listing needs no concrete bots — the summary fields
+        // (id/version/params/nodeCount) are present pre-compilation.
+        const def = parseAuthoringWorkflowDefinition(JSON.parse(raw));
         // First occurrence wins (cwd before HOME by search-path order).
         if (!seen.has(def.workflowId)) {
           seen.set(def.workflowId, summarize(def, path));
@@ -134,14 +148,24 @@ export async function loadCatalogDefinition(
 ): Promise<CatalogDefinition | undefined> {
   const paths = opts.searchPaths ?? workflowDefinitionSearchPaths(workflowId);
   for (const path of paths) {
+    let raw: string;
     try {
-      const raw = await fs.readFile(path, 'utf-8');
-      const def = parseWorkflowDefinition(JSON.parse(raw));
-      return { definition: def, revisionId: computeRevisionId(def), path };
+      raw = await fs.readFile(path, 'utf-8');
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue;
       throw err;
     }
+    // revisionId is the SOURCE revision — computed from the authoring shape so
+    // it matches `listWorkflowDefinitions` (which only authoring-parses) and
+    // stays stable regardless of capability-registry state at compile time
+    // (Finding 2: list/detail must not show two different revision hashes for
+    // the same role workflow). The returned `definition` is still the compiled
+    // runtime def so the dashboard detail view shows resolved bots, not roles.
+    const rawObj: unknown = JSON.parse(raw);
+    const authoring = parseAuthoringWorkflowDefinition(rawObj);
+    const revisionId = computeRevisionId(authoring as unknown as WorkflowDefinition);
+    const def = await compileWorkflowFromRaw(rawObj);
+    return { definition: def, revisionId, path };
   }
   return undefined;
 }
