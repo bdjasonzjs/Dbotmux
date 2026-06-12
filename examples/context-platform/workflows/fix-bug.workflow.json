@@ -1,0 +1,42 @@
+{
+  "workflowId": "fix-bug",
+  "version": 1,
+  "goal": "Reproduce, fix, and re-verify the reported bug with the smallest correct change.",
+  "nodes": {
+    "verify": {
+      "type": "subagent",
+      "role": "verifier",
+      "prompt": "Reproduce the reported bug and run the relevant tests. Report whether it currently fails.",
+      "outputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": ["passed"],
+        "properties": { "passed": { "type": "boolean" }, "evidence": { "type": "string" } }
+      }
+    },
+    "fix": {
+      "type": "subagent",
+      "role": "fixer",
+      "depends": ["verify"],
+      "prompt": "Apply the smallest correct fix for the verified bug.",
+      "outputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": ["summary"],
+        "properties": { "changedFiles": { "type": "array", "items": { "type": "string" } }, "summary": { "type": "string" } }
+      }
+    },
+    "reverify": {
+      "type": "subagent",
+      "role": "verifier",
+      "depends": ["fix"],
+      "prompt": "Re-run verification after the fix. Report pass/fail.",
+      "outputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": ["passed"],
+        "properties": { "passed": { "type": "boolean" }, "evidence": { "type": "string" } }
+      }
+    }
+  }
+}

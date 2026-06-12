@@ -21,12 +21,15 @@ import { join } from 'node:path';
 
 import { writeEffectInputSidecar } from './effect-input.js';
 import { writeBlob, writeJsonBlob } from './blob.js';
+import { renderNodePrompt, renderRunDelta, type RunDeltaEntry } from './prompt-render.js';
+import { logger } from '../utils/logger.js';
 import type { WorkflowDefinition } from './definition.js';
 import type { EventLog } from './events/append.js';
 import {
   BindingError,
   resolveBindings,
   resolveBoundString,
+  readNodeOutputIfPresent,
   type BindingContext,
 } from './output-binding.js';
 import type { BotSnapshot, ErrorClass, ErrorCode, OutputRef } from './events/payloads.js';
@@ -687,6 +690,43 @@ export async function dispatchWork(
       };
     }
     throw err;
+  }
+
+  // T5 prompt injection: route the resolved node prompt through the shared
+  // renderer. With only the workflow fragment present the renderer returns it
+  // verbatim (back-compat); a role-compiled node carries `rolePersona` (embedded
+  // at compile time) and gets the fixed-order multi-segment prompt. Injection
+  // rationale → run log.
+  {
+    const rolePersona = node.rolePersona;
+    const taskGoal = ctx.def.goal;
+    // Run-state delta (segment 4): fold in the outputs of already-completed
+    // dependency nodes. Real data from the run snapshot; a missing or
+    // not-yet-finished upstream degrades to nothing (readNodeOutputIfPresent
+    // never throws), so this can't fail an otherwise-valid dispatch.
+    const deltaEntries: RunDeltaEntry[] = [];
+    for (const depId of node.depends ?? []) {
+      const out = await readNodeOutputIfPresent(depId, bindingCtx);
+      if (out !== undefined) deltaEntries.push({ nodeId: depId, output: out });
+    }
+    const runDelta = renderRunDelta(deltaEntries);
+    // domains (segment 3): the local domains store is Phase 2 — there is no
+    // source to select top-k from yet, so it stays empty here. The rationale
+    // log records the gap so the missing segment is intentional, not silent.
+    const rendered = renderNodePrompt({
+      rolePersona,
+      taskGoal,
+      workflowFragment: resolvedPrompt,
+      domains: [],
+      runDelta,
+    });
+    if (rendered.rationale.segments.length > 1) {
+      logger.info(
+        `[workflow:prompt-render] run=${ctx.log.runId} node=${action.nodeId} ` +
+        `role=${node.roleId ?? '-'} ${rendered.rationale.reason} (domains: pending Phase 2)`,
+      );
+    }
+    resolvedPrompt = rendered.prompt;
   }
 
   // NB: still skipping `leaseSigned` in v0 — that's tied to the lease-

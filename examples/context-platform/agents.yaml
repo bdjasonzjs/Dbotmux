@@ -1,0 +1,8 @@
+# Phase 1 sample agent registry (DEV-CONTEXT §4.1).
+# Each bot: its larkAppId (the runtime identity key) + the capabilities it fills.
+# A role binds to the FIRST bot whose capabilities are a superset of the role's.
+agents:
+  - botId: cli_reviewer
+    capabilities: [repo-read, run-tests]
+  - botId: cli_fixer
+    capabilities: [repo-read, repo-write, run-tests]

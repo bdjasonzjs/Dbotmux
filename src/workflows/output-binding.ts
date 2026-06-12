@@ -175,6 +175,34 @@ export async function resolveOutputRef(
   return walkPath(root, pathSegments, ref);
 }
 
+/**
+ * Read a node's FULL output payload if it has already produced one — used by
+ * the run-delta prompt segment (T5). Unlike `resolveOutputRef`, this NEVER
+ * throws: a not-yet-completed upstream, a missing blob, or unparsable JSON all
+ * resolve to `undefined`, so the delta renderer just drops that entry instead
+ * of failing the dispatch. Mirrors `resolveOutputRef`'s subagent/hostExecutor
+ * unwrap so the returned shape matches what `$ref` consumers see.
+ */
+export async function readNodeOutputIfPresent(
+  nodeId: string,
+  ctx: BindingContext,
+): Promise<unknown | undefined> {
+  const nodeDef = ctx.def.nodes[nodeId];
+  if (!nodeDef) return undefined;
+  const actId = workActivityId(ctx.snapshot.run.runId, nodeId);
+  const outputRef = ctx.snapshot.outputs.get(actId);
+  if (!outputRef?.outputPath) return undefined;
+  try {
+    const raw = await fs.readFile(outputRef.outputPath, 'utf-8');
+    const blob: unknown = JSON.parse(raw);
+    return nodeDef.type === 'hostExecutor'
+      ? (blob as { output?: unknown })?.output
+      : blob;
+  } catch {
+    return undefined;
+  }
+}
+
 async function loadRunParams(ref: string, ctx: BindingContext): Promise<Record<string, unknown>> {
   if (ctx.loadParams) return ctx.loadParams();
   const inputRef = ctx.snapshot.run.input;

@@ -119,6 +119,21 @@ export const SubagentNodeSchema = z.object({
   ...NodeBaseShape,
   type: z.literal('subagent'),
   bot: z.string().min(1),
+  /**
+   * Audit / injection metadata: the authoring `role` this node was compiled
+   * from (see `role-compile.ts`).  Optional and additive — bot-authored nodes
+   * (no role) simply omit it.  The runtime still keys scheduling/spawn off
+   * `bot`; `roleId` is carried only so the prompt renderer (T5) and run log
+   * can attribute the node back to its role.
+   */
+  roleId: z.string().min(1).optional(),
+  /**
+   * Resolved role.md persona body, embedded at compile time alongside `bot`
+   * (T5).  Travels with the compiled def — so it's frozen in the run snapshot
+   * and reaches `dispatchWork` through every entry point without per-call ctx
+   * plumbing.  `dispatchWork` prepends it via the shared prompt renderer.
+   */
+  rolePersona: z.string().min(1).optional(),
   prompt: BoundStringSchema,
   workingDir: z.string().optional(),
   modelOverrides: z
@@ -186,6 +201,14 @@ const NodeIdSchema = z.string().regex(
 export const WorkflowDefinitionSchema = z.object({
   workflowId: z.string().min(1),
   version: z.number().int().positive(),
+  /**
+   * Optional workflow-level task goal — the one-line "what this whole run is
+   * about". Surfaced as the FIRST prompt segment (T5, DEV-CONTEXT §6.5) so
+   * every node sees the big picture above its own step. Optional + additive:
+   * existing `workflow.json` without a goal parse unchanged and the renderer
+   * simply omits the segment.
+   */
+  goal: z.string().min(1).optional(),
   params: z.record(ParamDefSchema).optional(),
   defaults: z
     .object({
@@ -208,6 +231,58 @@ export const WorkflowDefinitionSchema = z.object({
   nodes: z.record(NodeIdSchema, WorkflowNodeSchema),
 });
 export type WorkflowDefinition = z.infer<typeof WorkflowDefinitionSchema>;
+
+// ─── Authoring layer (role ⊥ bot) ──────────────────────────────────────────
+
+/**
+ * Authoring schema — the shape a human/tool writes.  A subagent node may
+ * reference an abstract `role` *instead of* a concrete `bot`.  `role-compile.ts`
+ * resolves `role` → concrete `bot` BEFORE the definition reaches the runtime;
+ * the runtime schema (`SubagentNodeSchema`) still requires `bot`, so an
+ * unresolved role can never enter orchestrator / loop / dispatch.
+ *
+ * Backward compatibility: a node that writes `bot` directly (no `role`) is a
+ * valid authoring node too — existing `workflows/*.workflow.json` parse and
+ * compile to themselves unchanged.
+ *
+ * The "exactly one of bot|role" invariant is enforced as a cross-field check
+ * in `parseAuthoringWorkflowDefinition` (mirroring how graph invariants live
+ * outside the zod schema), so this stays a plain ZodObject usable inside a
+ * discriminated union.
+ */
+export const AuthoringSubagentNodeSchema = z.object({
+  ...NodeBaseShape,
+  type: z.literal('subagent'),
+  bot: z.string().min(1).optional(),
+  role: z.string().min(1).optional(),
+  roleId: z.string().min(1).optional(),
+  prompt: BoundStringSchema,
+  workingDir: z.string().optional(),
+  modelOverrides: z
+    .object({
+      model: z.string().optional(),
+      reasoningEffort: z.string().optional(),
+    })
+    .optional(),
+  toolPolicy: z
+    .object({
+      allow: z.array(z.string()).optional(),
+      deny: z.array(z.string()).optional(),
+    })
+    .optional(),
+});
+export type AuthoringSubagentNode = z.infer<typeof AuthoringSubagentNodeSchema>;
+
+export const AuthoringWorkflowNodeSchema = z.discriminatedUnion('type', [
+  AuthoringSubagentNodeSchema,
+  HostExecutorNodeSchema,
+]);
+export type AuthoringWorkflowNode = z.infer<typeof AuthoringWorkflowNodeSchema>;
+
+export const AuthoringWorkflowDefinitionSchema = WorkflowDefinitionSchema.extend({
+  nodes: z.record(NodeIdSchema, AuthoringWorkflowNodeSchema),
+});
+export type AuthoringWorkflowDefinition = z.infer<typeof AuthoringWorkflowDefinitionSchema>;
 
 // ─── Canonical JSON stringify ──────────────────────────────────────────────
 
@@ -263,7 +338,48 @@ export function parseWorkflowDefinition(raw: unknown): WorkflowDefinition {
   return def;
 }
 
-function validateGraph(def: WorkflowDefinition): void {
+/**
+ * Parse + validate an *authoring* definition (role ⊥ bot allowed).  Runs the
+ * same graph invariants as `parseWorkflowDefinition` plus the authoring-only
+ * "exactly one of bot|role per subagent node" check.  Does NOT resolve roles —
+ * that's `role-compile.ts`'s job, which then re-validates against the strict
+ * runtime schema so `bot` is guaranteed before runtime.
+ */
+export function parseAuthoringWorkflowDefinition(raw: unknown): AuthoringWorkflowDefinition {
+  const def = AuthoringWorkflowDefinitionSchema.parse(raw);
+  validateGraph(def);
+  for (const [nodeId, node] of Object.entries(def.nodes)) {
+    if (node.type !== 'subagent') continue;
+    const slots = (node.bot ? 1 : 0) + (node.role ? 1 : 0);
+    if (slots !== 1) {
+      throw new Error(
+        `Subagent node '${nodeId}' must declare exactly one of \`bot\` or \`role\` ` +
+        `(found ${slots === 0 ? 'neither' : 'both'}).`,
+      );
+    }
+  }
+  return def;
+}
+
+/**
+ * Structural view of a definition that the graph invariants need.  Both the
+ * runtime `WorkflowDefinition` and the `AuthoringWorkflowDefinition` satisfy
+ * it, so the DAG / side-effect-gate checks run identically on either.
+ */
+type GraphCheckableDef = {
+  nodes: Record<
+    string,
+    {
+      type: 'subagent' | 'hostExecutor';
+      depends?: string[];
+      executor?: string;
+      humanGate?: unknown;
+      unsafeAllowUngated?: boolean;
+    }
+  >;
+};
+
+function validateGraph(def: GraphCheckableDef): void {
   const ids = Object.keys(def.nodes);
   if (ids.length === 0) {
     throw new Error('Workflow must declare at least one node');
@@ -295,6 +411,7 @@ function validateGraph(def: WorkflowDefinition): void {
     // and friends at parse time instead of relying on author discipline.
     if (
       node.type === 'hostExecutor' &&
+      node.executor &&
       isSideEffectExecutor(node.executor) &&
       !node.humanGate &&
       !node.unsafeAllowUngated
@@ -313,7 +430,7 @@ function validateGraph(def: WorkflowDefinition): void {
   }
 }
 
-function detectCycle(def: WorkflowDefinition): void {
+function detectCycle(def: GraphCheckableDef): void {
   const WHITE = 0;
   const GRAY = 1;
   const BLACK = 2;
