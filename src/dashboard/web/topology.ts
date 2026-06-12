@@ -286,18 +286,27 @@ export function renderTopologyPage(root: HTMLElement): () => void {
     if (rootId) {
       placed.push({ n: byId.get(rootId)!, x: cx, y: cy, ring: 0 });
       const ring1 = childrenOf.get(rootId) ?? [];
-      const R1 = 190;
+      // 嵌套子任务(子群建孙群)实测适配 (2026-06-12)：原 R1=190 圆 + R2=340 圆在
+      // viewBox H=540 下，ring2 纵向必出画布 (cy±340 ∈ [-100,580])，且原 spread≤0.8
+      // 给 3 孙仅 ~61px 间距 (<120px 节点宽) 必重叠（仿真 + 几何推导，见任务文档 §八）。
+      // 改两环椭圆：纵向 145/210 收进画布且环间垂直间隙 65px > 节点高 44；横向 190/420。
+      // fan 间距 0.30rad（横向 420×0.30=126px>宽120，纵向 210×0.30=63px>高44），并按
+      // 相邻兄弟角距 85% 钳制防跨家入侵（ring1 历史堆积场景退化为轻度重叠，与存量一致）。
+      // depth>2 节点仍不入图——与 G2 深度上限(默认2)联动；调大 BOTMUX_MAX_SUBTASK_DEPTH
+      // 需同步扩展此处布局。
+      const R1x = 190, R1y = 145;
+      const R2x = 420, R2y = 210;
+      const siblingGap = (2 * Math.PI) / Math.max(ring1.length, 1);
       ring1.forEach((c, i) => {
         const a = (i / Math.max(ring1.length, 1)) * 2 * Math.PI - Math.PI / 2;
-        placed.push({ n: c, x: cx + R1 * Math.cos(a), y: cy + R1 * Math.sin(a), ring: 1 });
+        placed.push({ n: c, x: cx + R1x * Math.cos(a), y: cy + R1y * Math.sin(a), ring: 1 });
         const ring2 = childrenOf.get(c.chatId) ?? [];
-        const R2 = 340;
-        const ring2Angle = (i / Math.max(ring1.length, 1)) * 2 * Math.PI - Math.PI / 2;
-        const spread = Math.min(ring2.length * 0.12, 0.8);
+        const ring2Angle = a;
+        const spread = Math.min(Math.max(ring2.length - 1, 0) * 0.30, 1.2, siblingGap * 0.85);
         ring2.forEach((gc, j) => {
           const offset = ring2.length === 1 ? 0 : ((j / (ring2.length - 1)) - 0.5) * spread;
           const a2 = ring2Angle + offset;
-          placed.push({ n: gc, x: cx + R2 * Math.cos(a2), y: cy + R2 * Math.sin(a2), ring: 2 });
+          placed.push({ n: gc, x: cx + R2x * Math.cos(a2), y: cy + R2y * Math.sin(a2), ring: 2 });
         });
       });
     }
