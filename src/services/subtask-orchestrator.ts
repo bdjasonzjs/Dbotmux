@@ -228,6 +228,11 @@ export async function createSubtask(req: CreateSubtaskReq): Promise<{ taskId: st
   //     计数=锁外读快照，极端并发瞬时超限 1 可接受，确定性硬闸是 G1/G2/G7）。
   //     触发 422/429 + 明确文案，执行者按 routing 转 askforhelp 不自旋。
   const newDepth = ctx.depth + 1;
+  // 输入校验（非 fork-bomb 闸，主话题分支也适用）：depth 触顶的新任务授 spawnable 无意义——
+  // 它再 spawn 必被 G2 拦，注入段还会出现「还能开 0 层」的误导文案。create 一锤定音，直接拒。
+  if (req.spawnable === true && newDepth >= maxSubtaskDepth()) {
+    throw new HttpError(400, `spawnable 无意义：新任务 depth=${newDepth} 已达上限 ${maxSubtaskDepth()}，其子群不可能再 spawn（去掉 --spawnable 重试）`);
+  }
   if (ctx.parentTask) {
     if (newDepth > maxSubtaskDepth()) {
       throw new HttpError(422, `subtask depth limit exceeded (depth=${newDepth} > max=${maxSubtaskDepth()}); 把这一步并入当前任务或上报父群拆解`);

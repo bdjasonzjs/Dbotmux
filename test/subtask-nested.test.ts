@@ -159,6 +159,18 @@ describe('嵌套 spawn：authzSpawn + depth/rootChatId 落库', () => {
     await expect(createSubtask({ sessionId: 'sess_b', goal: 'x' })).rejects.toMatchObject({ status: 403 });
   });
 
+  it('depth 触顶 + --spawnable → 400（授权无意义，create 一锤定音直接拒）', async () => {
+    vi.stubEnv('BOTMUX_SPAWN_MIN_INTERVAL_MS', '1');
+    await mkTask();                      // depth=1 父，新任务 depth=2 = 默认上限
+    await sleep(10);
+    botSession('sess_b', 'oc_b');
+    await expect(createSubtask({ sessionId: 'sess_b', goal: 'x', spawnable: true }))
+      .rejects.toMatchObject({ status: 400, message: expect.stringContaining('spawnable 无意义') });
+    // 不带 spawnable 仍可正常创建（只拒授权、不拒建群）
+    const r = await createSubtask({ sessionId: 'sess_b', goal: 'x' });
+    expect(getSubTask(r.taskId)!.spawnable).toBe(false);
+  });
+
   it('G7: BOTMUX_NESTED_SUBTASK=0 → 403（一键回现状）', async () => {
     vi.stubEnv('BOTMUX_NESTED_SUBTASK', '0');
     await mkTask();
