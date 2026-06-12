@@ -25,7 +25,7 @@ const VERB_ROUTE: Record<string, string> = {
 };
 const NUM_FLAGS = new Set(['expectedVersion']);
 const LIST_FLAGS = new Set(['bots', 'sourceMessageIds', 'relatedRefs']);
-const BOOL_FLAGS = new Set(['force']);
+const BOOL_FLAGS = new Set(['force', 'spawnable', 'cascade']);
 /** bot 简写 → service 认的完整 key (review P2: help 写 c/k/t 但 service 只认 claude|codex|tilly)。 */
 const BOT_SHORT: Record<string, 'claude' | 'codex' | 'tilly'> = {
   c: 'claude', claude: 'claude', k: 'codex', codex: 'codex', t: 'tilly', tilly: 'tilly',
@@ -85,9 +85,11 @@ const HELP = `botmux subtask-{start|report|query|finish|supplement} — 子任�
 
   subtask-start      --goal "<任务>" [--acceptance "<验收>"] [--bots c,k,t]
                      [--task-type prd|bug|misc] [--name "<群名>"] [--related-refs a,b]
+                     [--spawnable]  (授权新子群可再派孙群；默认关，create 一锤定音)
   subtask-report     --task-id <id> --type need_help|done --summary "<一句话>" [--source-message-ids m1,m2]
   subtask-query      (--task-id <id> | --command-id <id>)
   subtask-finish     --task-id <id> --expected-version <n> [--note "<说明>"] [--force]
+                     [--cascade]  (存在 ACTIVE 子任务时级联自底向上收尾；不带则 409 列清单)
   subtask-supplement --task-id <id> --content "<补充>" --expected-version <n> [--force]
                      [--target-role main|reviewer|all]  (缺省 main：普通补充给执行者)
                      (expected-version 默认必传守 stale；人工强制结束/补充才加 --force)

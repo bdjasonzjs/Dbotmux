@@ -70,6 +70,13 @@ export interface SubTask {
   /** 最近一次观测到**执行者侧实质活动**的时间 (排除 owner/base-relay 的 nudge 回声)。
    *  停滞门控的 activity baseline 取此字段，不取所有 observation。 */
   lastExecutorActivityAt?: string | null;
+  // 嵌套子任务 (子群建孙群)：均为加法、可选；老数据缺省语义见各注释，零迁移。
+  /** 树深度：1 = 主话题直属（老数据缺省按 1）。上限见 BOTMUX_MAX_SUBTASK_DEPTH。 */
+  depth?: number;
+  /** 树根 chatId（G4 树级预算聚合键）；老数据缺省按 parentChatId 推定（见 rootOf）。 */
+  rootChatId?: string;
+  /** G1 可裂变开关：create 一锤定音，true 才允许本任务子群再 subtask-start（缺省 false）。 */
+  spawnable?: boolean;
 }
 
 /** Outbox 投递信封：双向命令统一建模。 */
@@ -235,6 +242,7 @@ export async function createSubTask(opts: {
   goal: string; acceptance?: string | null; bots: SubTaskBot[];
   requester: string; createdBy: string; idempotencyKey: string;
   staleAfter?: number | null; deadline?: string | null;
+  depth?: number; rootChatId?: string; spawnable?: boolean;
 }): Promise<SubTask> {
   return mutate(s => {
     const existing = s.subtasks.find(t => t.idempotencyKey === opts.idempotencyKey);
@@ -250,6 +258,7 @@ export async function createSubTask(opts: {
       idempotencyKey: opts.idempotencyKey, status: 'creating', version: 1, createdAt: now, updatedAt: now,
       readCursor: null, committedCursor: null, deadline: opts.deadline ?? null,
       staleAfter: opts.staleAfter ?? null, compactSummary: null, lastError: null,
+      depth: opts.depth, rootChatId: opts.rootChatId, spawnable: opts.spawnable,
     };
     s.subtasks.push(t);
     logger.info(`[subtask-store] created subtask ${t.taskId} chat=${opts.chatId.slice(0, 12)}`);

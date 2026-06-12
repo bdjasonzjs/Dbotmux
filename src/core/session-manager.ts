@@ -333,12 +333,28 @@ export function buildSubtaskMemberBlock(chatId: string | undefined, larkAppId: s
     .map(b => `  - ${b.name}：${ROLE_BY_NAME[b.name] ?? (b.role === 'observer' ? '观测/盯群、触发唤醒（不参与执行）' : '协作')}`);
   const accLine = task.acceptance ? `\n【验收标准】${task.acceptance}` : '';
 
+  // 嵌套裂变授权（双帽角色重述）：仅 task.spawnable===true 且本 bot 是执行者(main) 时注入；
+  // 其余场景（含全部存量任务）输出与此前**逐字一致**（快照测试钉死）。
+  let spawnableBlock = '';
+  const mainBot = task.bots.find(b => b.role === 'main');
+  if (task.spawnable === true && selfOpenId && selfOpenId === mainBot?.openId) {
+    const rawMaxDepth = Number.parseInt(process.env.BOTMUX_MAX_SUBTASK_DEPTH ?? '', 10);
+    const maxDepth = Number.isFinite(rawMaxDepth) && rawMaxDepth >= 1 ? rawMaxDepth : 2;
+    const depth = task.depth ?? 1;
+    spawnableBlock = `
+
+【裂变授权（spawnable）】本任务已被授权在本群再派子任务（孙群）。你戴两顶帽子，边界=「上报永远只报直接父群；决策 scope 内自治、scope 外上报」：
+- 对上（不变）：你仍是父群派下任务的执行者，卡住/超出本任务边界就 subtask-askforhelp 报父群。
+- 对下（新增）：可用 \`botmux subtask-start --goal "..."\` 在本群派子任务（当前深度 ${depth}/${maxDepth}，再往下还能开 ${Math.max(0, maxDepth - depth)} 层；数量预算与限速由命令自动把守，422/429 时按提示收尾或上报，别自旋重试）。你派的子群上报会流到**本群**：收到 🛰️ 子任务状态卡片 → \`botmux subtask-query --command-id <id>\` 查详情并 ack；属于本任务范围内的执行细节自己 supplement/finish 拍掉，超出边界的（花钱/部署/方案级岔路）打包成**你自己的** askforhelp 上报父群——不许把子群问题原样转发当传话筒，不许拿到任务转手即裂。
+- 收尾纪律：finish 本任务前先收尾你派的全部子任务（系统硬拦，--cascade 才级联）；孙群必须复用本群同一 worktree / 工作副本，禁止新 clone。`;
+  }
+
   return `<subtask_member_routing>
 你现在在一个**子任务子群**里干活（不是主话题，零主话题上下文，背景以这里为准）。
 
 【子任务目标】${task.goal}${accLine}
 
-【你的角色】${selfRole}
+【你的角色】${selfRole}${spawnableBlock}
 
 【群里其他成员】
 ${others.length ? others.join('\n') : '  (只有你和观测者)'}

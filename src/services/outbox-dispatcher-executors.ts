@@ -20,7 +20,7 @@ import { logger } from '../utils/logger.js';
 import { DEFAULT_GROUP_NOT_FOUND_RETRY_TIMEOUT_MS, sendAsOwner } from './base-relay.js';
 import { SUBTASK_COLLAB_NORMS_ONELINE } from './subtask-norms.js';
 import type { DispatchExecutors } from './outbox-dispatcher.js';
-import type { CommandTargetRole, OutboxCommand, SubTask } from './subtask-store.js';
+import { getByChatId, type CommandTargetRole, type OutboxCommand, type SubTask } from './subtask-store.js';
 
 /** 急急如律令口令前缀 —— **必须**与 event-dispatcher.parseUrgentSummon 的解析前缀一致。
  *  内联而非 import event-dispatcher，避免投递层拖入 IM 路由的重依赖 (也便于单测隔离)。 */
@@ -47,9 +47,20 @@ export function safeText(s: unknown, n: number): string {
 function executorNames(task: SubTask): string[] {
   return task.bots.filter(b => b.role !== 'observer').map(b => b.name);
 }
-/** 主 bot 名 (child→parent 唤它)。取 role==='main'，缺省回退「克劳德」。 */
+/** 主 bot 名 (parent→child 'main' 路径回退用)。取 role==='main'，缺省回退「克劳德」。 */
 function mainBotName(task: SubTask): string {
   return task.bots.find(b => b.role === 'main')?.name ?? '克劳德';
+}
+
+/** 父群 orchestrator 名 (child→parent 唤它)。嵌套后父群可能也是任务群 → 唤它登记的 main bot；
+ *  父=主话题 → getByChatId 不命中 → 回退「克劳德」(恰好正确)。最小地址簿 (方案 §1.4 规则 1+3)。 */
+function parentOrchestratorName(task: SubTask): string {
+  try {
+    const parent = getByChatId(task.parentChatId);
+    return parent?.bots.find(b => b.role === 'main')?.name ?? '克劳德';
+  } catch {
+    return '克劳德';   // store corrupt 等异常不阻塞投递，按单层语义回退
+  }
 }
 
 /** 优化 #1/#3 (蔻黛克斯 #1-blocker3)：按角色解析急急如律令名单，**绝不返回空名单**。
@@ -83,7 +94,7 @@ export function childToParentSummon(cmd: OutboxCommand, task: SubTask): string {
     `请执行 \`botmux subtask-query --command-id ${cmd.cmdId}\` 查详情+证据并 ack，`,
     `读到 task.version 后据此 subtask-finish 或 subtask-supplement --expected-version <v>。`,
   ].join(' ');
-  return urgentSummon([mainBotName(task)], body);
+  return urgentSummon([parentOrchestratorName(task)], body);
 }
 
 /** parent→child / 子群内唤醒文案 (急急如律令)。按 commandType + targetRole 选**名单**和**文案**
@@ -97,8 +108,12 @@ function parentToChildSummonBody(cmd: OutboxCommand, task: SubTask): string {
   if (cmd.commandType === 'kickoff') {
     // B1: kickoff 只唤执行者(main)，reviewer 不在此被唤起 (等执行者产出后 request_review 再唤)。
     const acc = task.acceptance ? ` 验收：${safeText(task.acceptance, 200)}` : '';
+    // 嵌套 (v1.1 §7)：spawnable 任务在 kickoff 即提示可裂变，细则靠每轮注入的【裂变授权】段。
+    const spawnHint = task.spawnable === true
+      ? ' 本任务已授权可裂变：可用 `botmux subtask-start` 在本群再派子任务（深度/预算闸自动把守，细则见注入的【裂变授权】段）。'
+      : '';
     return urgentSummon(resolveTargets(task, 'main'),
-      `📋 子任务启动：${safeText(task.goal, 240)}。${acc} 你是主推进者，方案/代码/文档由你产出、你驱动任务；产出第一份可 review 物后用 \`botmux subtask-request-review --task-id ${task.taskId} --summary "<可打开的链接/绝对路径>"\` 唤起 reviewer。卡住用 \`botmux subtask-askforhelp --task-id ${task.taskId} --summary "卡在哪"\`，别硬扛别编。${SUBTASK_COLLAB_NORMS_ONELINE}`);
+      `📋 子任务启动：${safeText(task.goal, 240)}。${acc} 你是主推进者，方案/代码/文档由你产出、你驱动任务；产出第一份可 review 物后用 \`botmux subtask-request-review --task-id ${task.taskId} --summary "<可打开的链接/绝对路径>"\` 唤起 reviewer。卡住用 \`botmux subtask-askforhelp --task-id ${task.taskId} --summary "卡在哪"\`，别硬扛别编。${spawnHint}${SUBTASK_COLLAB_NORMS_ONELINE}`);
   }
   if (cmd.commandType === 'request_review') {
     // 优化 #1：只唤 reviewer，明确只 review/challenge、不抢执行。

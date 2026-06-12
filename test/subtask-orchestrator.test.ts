@@ -40,6 +40,8 @@ vi.mock('../src/services/spawn-idempotency-store.js', () => ({
   },
 }));
 vi.mock('../src/services/session-store.js', () => ({ getSession: (id: string) => mockSessions.get(id) }));
+// 嵌套改造后 createSubtask 走内部 authzSpawn（authzCheck 不再被 v2 调用）：主话题判定靠 main-topic-config。
+vi.mock('../src/services/main-topic-config.js', () => ({ getMainTopicChatId: () => 'oc_main' }));
 
 import {
   createSubtask, reportProgress, querySubtask, finishSubtask, supplementSubtask, requestReview, V2_MARKER,
@@ -163,10 +165,11 @@ describe('createSubtask', () => {
       .rejects.toMatchObject({ status: 400 });
   });
 
-  it('鉴权: authzCheck 抛 (非 mainTopic/非主bot) → 透传', async () => {
-    mainSession();
-    mockAuthzCheck.mockRejectedValue(Object.assign(new Error('not main topic'), { name: 'HttpError', status: 403 }));
-    await expect(createSubtask({ sessionId: 'sess_main', goal: 'x' })).rejects.toThrow('not main topic');
+  it('鉴权 (authzSpawn): 非主话题且非登记任务群 → 403；主话题非主bot → 403', async () => {
+    mockSessions.set('sess_x', { sessionId: 'sess_x', chatId: 'oc_unknown', rootMessageId: 'om_x', larkAppId: 'app_claude', ownerOpenId: 'ou_jason' });
+    await expect(createSubtask({ sessionId: 'sess_x', goal: 'x' })).rejects.toMatchObject({ status: 403 });
+    mockSessions.set('sess_y', { sessionId: 'sess_y', chatId: 'oc_main', rootMessageId: 'om_y', larkAppId: 'app_codex', ownerOpenId: 'ou_jason' });
+    await expect(createSubtask({ sessionId: 'sess_y', goal: 'x' })).rejects.toMatchObject({ status: 403 });
   });
 
   it('缺 goal → 400', async () => {

@@ -16,16 +16,17 @@
  *   report_progress=session.chatId===task.chatId（只能从该子群上报）。
  */
 import { randomUUID } from 'node:crypto';
-import { authzCheck, HttpError, resolveBotIdent } from '../core/main-bot-playbook.js';
+import { HttpError, resolveBotIdent } from '../core/main-bot-playbook.js';
+import { getMainTopicChatId } from './main-topic-config.js';
 import { getOrCompute, type IdempotencyEntry } from './spawn-idempotency-store.js';
 import { createGroupWithBots } from './group-creator.js';
 import { getSession } from './session-store.js';
 import { logger } from '../utils/logger.js';
 import type { Session } from '../types.js';
 import {
-  createSubTask, getSubTask, getCommand, transitionStatus, enqueueCommand, ackCommand,
-  transitionAndEnqueueCommand, listObservations, listCommands,
-  helpReportDelivery,
+  createSubTask, getSubTask, getByChatId, getCommand, transitionStatus, enqueueCommand, ackCommand,
+  transitionAndEnqueueCommand, listObservations, listCommands, listSubTasks,
+  helpReportDelivery, ACTIVE_STATUSES,
   VersionConflictError, CommandRetryMismatchError,
   type SubTask, type SubTaskBot, type SubTaskStatus, type OutboxCommand, type Observation,
   type CommandTargetRole,
@@ -62,14 +63,142 @@ function sessionBotOpenId(larkAppId?: string): string | null {
   return null;
 }
 
-/** 父群主 bot 鉴权：session 合法 + 是主 bot(claude) + 只能操作自己父群的 task。 */
+/** session.larkAppId 反查 bot key（createdBy 记真实创建者用）。 */
+function sessionBotKey(larkAppId?: string): 'claude' | 'codex' | 'tilly' | null {
+  if (!larkAppId) return null;
+  for (const k of ['claude', 'codex', 'tilly'] as const) {
+    if (resolveBotIdent(k).larkAppId === larkAppId) return k;
+  }
+  return null;
+}
+
+// ─── 嵌套子任务：G 闸阈值（全部 env 可调；惰性读取便于测试与调参；**只对嵌套分支生效**，
+//     主话题建子任务行为与存量 100% 一致）────────────────────────────────────────
+function envPosInt(name: string, def: number, min = 1): number {
+  const raw = process.env[name];
+  if (!raw) return def;
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) && n >= min ? n : def;
+}
+const maxSubtaskDepth = () => envPosInt('BOTMUX_MAX_SUBTASK_DEPTH', 2);              // G2
+const maxActiveChildren = () => envPosInt('BOTMUX_MAX_ACTIVE_CHILDREN', 3);          // G3
+const maxActivePerTree = () => envPosInt('BOTMUX_MAX_ACTIVE_PER_TREE', 4);           // G4 (保守首发 4，方案上限 8)
+const maxActiveGlobal = () => envPosInt('BOTMUX_MAX_ACTIVE_GLOBAL', 15);             // G5
+const spawnMinIntervalMs = () => envPosInt('BOTMUX_SPAWN_MIN_INTERVAL_MS', 60_000);  // G6
+/** 防环 walk 步数上限（深度上限远小于它，越界=数据脏/成环）。 */
+const PARENT_WALK_MAX = 16;
+
+/** 老数据归一化：rootChatId 缺省时按 parentChatId 推定（G4 聚合 / 级联 DFS 共用，只读不回写）。 */
+function rootOf(t: SubTask, mainTopic: string | null | undefined): string {
+  if (t.rootChatId) return t.rootChatId;
+  return t.parentChatId === mainTopic ? (mainTopic ?? t.parentChatId) : t.parentChatId;
+}
+
+/** 嵌套 spawn 鉴权上下文：InternalSpawnContext 超集（主话题路径字段同名同值）。 */
+interface SpawnCtx {
+  callerChatId: string;
+  callerBotAppId: string;
+  rootMessageId: string;
+  ownerOpenId?: string;
+  depth: number;            // 调用方所在层（0=主话题）；新任务 depth = 此值 + 1
+  rootChatId: string;
+  parentTask: SubTask | null;
+}
+
+/**
+ * 嵌套建群鉴权（替代 v2 链路对 authzCheck 的复用；v1 playbook 仍走 authzCheck，主话题 only 不动）。
+ * 主话题分支与原 authzCheck 语义逐字等价；嵌套分支以 subtask-store + sessionStore 为权威（D1），
+ * 闸序：G7 总开关 → 登记任务群 → ACTIVE → G1 spawnable → 执行者(main) bot。
+ */
+async function authzSpawn(sessionId: string): Promise<SpawnCtx> {
+  if (!sessionId) throw new HttpError(400, 'missing sessionId');
+  const mainTopic = getMainTopicChatId();
+  if (!mainTopic) throw new HttpError(500, 'mainTopicChatId not configured — run `botmux config set-main-topic <chatId>`');
+  const session = getSession(sessionId);
+  if (!session) throw new HttpError(403, `unknown session: ${sessionId}`);
+
+  if (session.chatId === mainTopic) {
+    // —— 主话题分支：与 authzCheck (main-bot-playbook.ts) 行为 100% 一致 ——
+    const claudeApp = resolveBotIdent('claude').larkAppId;
+    if (session.larkAppId !== claudeApp) {
+      throw new HttpError(403, `only main bot can spawn subtasks (session.larkAppId=${session.larkAppId}, expected=${claudeApp})`);
+    }
+    return {
+      callerChatId: session.chatId, callerBotAppId: session.larkAppId,
+      rootMessageId: session.rootMessageId, ownerOpenId: session.ownerOpenId,
+      depth: 0, rootChatId: mainTopic, parentTask: null,
+    };
+  }
+
+  // —— 嵌套分支：子群建孙群 ——
+  if (process.env.BOTMUX_NESTED_SUBTASK === '0') {
+    throw new HttpError(403, 'nested subtask globally disabled (BOTMUX_NESTED_SUBTASK=0)');
+  }
+  if (!session.larkAppId) {
+    throw new HttpError(403, `session has no larkAppId; cannot identify caller bot`);
+  }
+  const task = getByChatId(session.chatId);
+  if (!task) {
+    throw new HttpError(403, `spawn only allowed from main topic or a registered task chat (session.chatId=${session.chatId})`);
+  }
+  if (!ACTIVE_STATUSES.includes(task.status)) {
+    throw new HttpError(403, `task ${task.taskId} is not active (status=${task.status}); cannot spawn from it`);
+  }
+  if (task.spawnable !== true) {
+    throw new HttpError(403, `task ${task.taskId} is not spawnable (create 时未授权 --spawnable)`);
+  }
+  const botOpenId = sessionBotOpenId(session.larkAppId);
+  const mainBot = task.bots.find(b => b.role === 'main');
+  if (!botOpenId || botOpenId !== mainBot?.openId) {
+    throw new HttpError(403, `only this chat's registered executor (main bot) can spawn (caller larkAppId=${session.larkAppId})`);
+  }
+  // owner 链 + 跨 app scope 防护 (蔻黛克斯 review blocker)：open_id 是 app-scoped，而 createSubtask
+  // 固定以 Claude app 建群 (group-creator 合同: userOpenIds 必须 creator scope)。非 Claude 执行者
+  // 会话里的 ownerOpenId 是它自己 app 视角的 id，直接用会让 owner 邀请失败 → base relay 投不进新群。
+  // 所以只有 Claude 会话的 ownerOpenId 可直接用；其余回退父任务 requester —— 整条建树链的 requester
+  // 都由 Claude 链路写入，恒为 Claude scope。'owner' 是历史占位符，视为无效。
+  const claudeApp = resolveBotIdent('claude').larkAppId;
+  const inheritedRequester = task.requester && task.requester !== 'owner' ? task.requester : undefined;
+  const ownerOpenId = (session.larkAppId === claudeApp ? session.ownerOpenId : undefined) ?? inheritedRequester;
+  return {
+    callerChatId: session.chatId, callerBotAppId: session.larkAppId,
+    rootMessageId: session.rootMessageId,
+    ownerOpenId,
+    depth: task.depth ?? 1, rootChatId: rootOf(task, mainTopic), parentTask: task,
+  };
+}
+
+/** 防环 walk：create 前沿 parentChatId 上溯，成环/超步数拒绝（防脏数据放大成无限树）。 */
+function assertNoCycle(startChatId: string, mainTopic: string): void {
+  const visited = new Set<string>([startChatId]);
+  let cur = getByChatId(startChatId);
+  let steps = 0;
+  while (cur && cur.parentChatId !== mainTopic) {
+    if (visited.has(cur.parentChatId) || ++steps > PARENT_WALK_MAX) {
+      throw new HttpError(422, `subtask parent chain corrupt (cycle or >${PARENT_WALK_MAX} hops) at ${cur.taskId}`);
+    }
+    visited.add(cur.parentChatId);
+    cur = getByChatId(cur.parentChatId);
+  }
+}
+
+/** 父群 orchestrator bot 解析：父群是任务群 → 它登记的 main bot；父=主话题 → 克劳德。 */
+function parentOrchestratorOpenId(task: SubTask): string {
+  const parentTask = getByChatId(task.parentChatId);
+  return parentTask?.bots.find(b => b.role === 'main')?.openId ?? resolveBotIdent('claude').openId;
+}
+
+/** 父群主 bot 鉴权：session 合法 + 是该 task 父群的 orchestrator bot（父=主话题→克劳德）+
+ *  只能从该 task 的父群操作。嵌套后逐级各自成立。 */
 function authzParentBot(sessionId: string, taskId: string): { session: Session; task: SubTask } {
   const session = getSession(sessionId);
   if (!session) throw new HttpError(403, `unknown session: ${sessionId}`);
   const task = getSubTask(taskId);
   if (!task) throw new HttpError(404, `subtask not found: ${taskId}`);
-  const claudeApp = resolveBotIdent('claude').larkAppId;
-  if (session.larkAppId !== claudeApp) throw new HttpError(403, 'only main bot can operate subtask');
+  const botOpenId = sessionBotOpenId(session.larkAppId);
+  if (!botOpenId || botOpenId !== parentOrchestratorOpenId(task)) {
+    throw new HttpError(403, 'only the parent-chat orchestrator bot can operate this subtask');
+  }
   if (task.parentChatId !== session.chatId) {
     throw new HttpError(403, `subtask parent chat mismatch (task.parentChatId=${task.parentChatId}, session.chatId=${session.chatId})`);
   }
@@ -86,12 +215,43 @@ export interface CreateSubtaskReq {
   name?: string;
   relatedRefs?: string[];
   parentDigest?: string;
+  /** G1: 新任务是否允许其子群再 spawn（create 一锤定音，默认 false）。 */
+  spawnable?: boolean;
 }
 
 export async function createSubtask(req: CreateSubtaskReq): Promise<{ taskId: string; chatId: string; isNew: boolean }> {
   if (!req.goal?.trim()) throw new HttpError(400, 'missing goal');
-  const ctx = await authzCheck(req.sessionId);              // mainTopic + 主bot (复用)
+  const ctx = await authzSpawn(req.sessionId);              // 主话题=原 authzCheck 语义；子群=嵌套闸
   const session = getSession(req.sessionId);                // for ownerOpenId
+
+  // ─── G2-G6：fork-bomb 闸（**只对嵌套分支**——主话题建子任务行为与存量逐字一致；
+  //     计数=锁外读快照，极端并发瞬时超限 1 可接受，确定性硬闸是 G1/G2/G7）。
+  //     触发 422/429 + 明确文案，执行者按 routing 转 askforhelp 不自旋。
+  const newDepth = ctx.depth + 1;
+  if (ctx.parentTask) {
+    if (newDepth > maxSubtaskDepth()) {
+      throw new HttpError(422, `subtask depth limit exceeded (depth=${newDepth} > max=${maxSubtaskDepth()}); 把这一步并入当前任务或上报父群拆解`);
+    }
+    assertNoCycle(ctx.callerChatId, getMainTopicChatId()!);
+    const active = listSubTasks({ statuses: ACTIVE_STATUSES });
+    const mainTopicForRoot = getMainTopicChatId();
+    const siblings = active.filter(t => t.parentChatId === ctx.callerChatId);
+    if (siblings.length >= maxActiveChildren()) {
+      throw new HttpError(429, `active children limit reached for this chat (${siblings.length}/${maxActiveChildren()}); 先收尾再派新的`);
+    }
+    const treePeers = active.filter(t => rootOf(t, mainTopicForRoot) === ctx.rootChatId);
+    if (treePeers.length >= maxActivePerTree()) {
+      throw new HttpError(429, `active subtask budget for this tree reached (${treePeers.length}/${maxActivePerTree()}, root=${ctx.rootChatId.slice(0, 12)})`);
+    }
+    if (active.length >= maxActiveGlobal()) {
+      throw new HttpError(429, `global active subtask limit reached (${active.length}/${maxActiveGlobal()})`);
+    }
+    const newestInTree = treePeers.map(t => t.createdAt).sort().at(-1);
+    if (newestInTree && Date.now() - Date.parse(newestInTree) < spawnMinIntervalMs()) {
+      throw new HttpError(429, `spawning too fast in this tree (min interval ${spawnMinIntervalMs()}ms); 稍后重试`);
+    }
+  }
+
   const botKeys = req.bots ?? ['claude', 'codex', 'tilly'];
   // review P2: service 层也校验 bot key（IPC 可绕过 CLI 直传未知 key → 否则 resolveBotIdent 走 undefined/500）
   for (const k of botKeys) {
@@ -105,7 +265,9 @@ export async function createSubtask(req: CreateSubtaskReq): Promise<{ taskId: st
   // 边界4: 建群 + 登记串同一 idempotencyKey。crash window 安全靠两步同 key。
   // review Blocker: slug(goal) 对中文全压成 'task' → 同 root 下不同中文 goal 会碰撞 dedup。
   // 必须带 full goal 的稳定 hash，让"同 root 不同 goal"不 dedup、"同 root 同 goal 重试"才 dedup。
-  const idempotencyKey = `${ctx.rootMessageId}-${slug(req.goal)}-${djb2(req.goal)}`;
+  // 嵌套：前缀 callerChatId —— chat-scope session 的 rootMessageId 只是起始消息 id，跨树有撞键面；
+  // 加前缀后跨树同 goal 永不互踩、同群重试仍 dedup。
+  const idempotencyKey = `${ctx.callerChatId}-${ctx.rootMessageId}-${slug(req.goal)}-${djb2(req.goal)}`;
 
   const { entry, cacheHit } = await getOrCompute(idempotencyKey, async (): Promise<IdempotencyEntry> => {
     const result = await createGroupWithBots({
@@ -113,7 +275,8 @@ export async function createSubtask(req: CreateSubtaskReq): Promise<{ taskId: st
       larkAppIds,
       // base relay 以 owner 身份写「接收群组」字段；owner 不在目标群时，
       // Base 会把该 oc_id 判为 800030410/not_found，kickoff/supplement 永远投不出。
-      userOpenIds: session?.ownerOpenId ? [session.ownerOpenId] : undefined,
+      // 嵌套分支 session.ownerOpenId 可能缺 → 回退父任务 requester（authzSpawn 已并入 ctx.ownerOpenId）。
+      userOpenIds: ctx.ownerOpenId ? [ctx.ownerOpenId] : undefined,
       name: req.name ?? `子任务·${req.goal.slice(0, 20)}`,
       sourceChatId: ctx.callerChatId,
       purpose: req.goal,
@@ -133,7 +296,10 @@ export async function createSubtask(req: CreateSubtaskReq): Promise<{ taskId: st
   const task = await createSubTask({
     chatId: entry.chatId, parentChatId: ctx.callerChatId, parentMessageId: ctx.rootMessageId,
     goal: req.goal, acceptance: req.acceptance ?? null, bots: subtaskBots,
-    requester: session?.ownerOpenId ?? 'owner', createdBy: 'claude', idempotencyKey,
+    requester: ctx.ownerOpenId ?? 'owner',
+    createdBy: sessionBotKey(session?.larkAppId) ?? 'claude',   // 记真实创建 bot（嵌套后不再恒为 claude）
+    idempotencyKey,
+    depth: newDepth, rootChatId: ctx.rootChatId, spawnable: req.spawnable === true,
   });
   // 群已建好 = 激活成功 → creating 转 observing 让 observer 接管。已 observing 不重复转。
   if (task.status === 'creating') await transitionStatus(task.taskId, 'observing');
@@ -307,9 +473,11 @@ export async function querySubtask(req: QuerySubtaskReq): Promise<QuerySubtaskRe
     throw new HttpError(400, 'need taskId or commandId');
   }
   if (!task) throw new HttpError(404, 'subtask not found');
-  // 鉴权: 主 bot 且操作自己父群的 task
-  const claudeApp = resolveBotIdent('claude').larkAppId;
-  if (session.larkAppId !== claudeApp) throw new HttpError(403, 'only main bot can query subtask');
+  // 鉴权: 父群 orchestrator bot 且只能从该 task 的父群查（嵌套后逐级各自成立，同 authzParentBot 闸）
+  const botOpenId = sessionBotOpenId(session.larkAppId);
+  if (!botOpenId || botOpenId !== parentOrchestratorOpenId(task)) {
+    throw new HttpError(403, 'only the parent-chat orchestrator bot can query this subtask');
+  }
   if (task.parentChatId !== session.chatId) {
     throw new HttpError(403, `subtask parent chat mismatch (task.parentChatId=${task.parentChatId}, session.chatId=${session.chatId})`);
   }
@@ -333,7 +501,34 @@ export async function querySubtask(req: QuerySubtaskReq): Promise<QuerySubtaskRe
 }
 
 // ─── finish_subtask ───────────────────────────────────────────────────────────
-export interface FinishSubtaskReq { sessionId: string; taskId: string; expectedVersion?: number; note?: string; force?: boolean; }
+export interface FinishSubtaskReq {
+  sessionId: string; taskId: string; expectedVersion?: number; note?: string; force?: boolean;
+  /** 级联收尾：存在 ACTIVE 子任务时默认 409；显式 --cascade 才 DFS 自底向上逐个 finish。 */
+  cascade?: boolean;
+}
+
+/** 收集 chatId 的全部 ACTIVE 后代任务，深度优先、返回序=自底向上（叶子在前）。 */
+function collectActiveDescendantsBottomUp(rootChatId: string): SubTask[] {
+  const active = listSubTasks({ statuses: ACTIVE_STATUSES });
+  const byParent = new Map<string, SubTask[]>();
+  for (const t of active) {
+    const arr = byParent.get(t.parentChatId) ?? [];
+    arr.push(t);
+    byParent.set(t.parentChatId, arr);
+  }
+  const out: SubTask[] = [];
+  const seen = new Set<string>();
+  const walk = (chatId: string): void => {
+    for (const child of byParent.get(chatId) ?? []) {
+      if (seen.has(child.taskId)) continue;   // 防脏数据成环
+      seen.add(child.taskId);
+      walk(child.chatId);                      // 先孙后子 = 自底向上
+      out.push(child);
+    }
+  };
+  walk(rootChatId);
+  return out;
+}
 
 export async function finishSubtask(req: FinishSubtaskReq): Promise<{ taskId: string; status: string; cmdId: string; alreadyFinished?: boolean }> {
   const { task } = authzParentBot(req.sessionId, req.taskId);
@@ -352,6 +547,32 @@ export async function finishSubtask(req: FinishSubtaskReq): Promise<{ taskId: st
   // review P1: expectedVersion 默认必传守 stale；人工强制走显式 force (才跳过 version check)
   if (!req.force && req.expectedVersion == null) {
     throw new HttpError(400, 'finish_subtask requires expectedVersion (or force=true to override)');
+  }
+  // 级联守护（嵌套）：本任务还有 ACTIVE 子任务 → 默认 409 列清单；显式 --cascade 才自底向上逐个收尾。
+  const activeDescendants = collectActiveDescendantsBottomUp(task.chatId);
+  if (activeDescendants.length && !req.cascade) {
+    const listing = activeDescendants.map(t => `${t.taskId}(${t.goal.slice(0, 20)})`).join(', ');
+    throw new HttpError(409, `task has ${activeDescendants.length} active descendant subtask(s): ${listing} — finish them first, or pass --cascade`);
+  }
+  if (req.cascade && activeDescendants.length) {
+    // 复用 finish-<taskId> 幂等键 + 原子事务：单个失败即中断报错，重放安全（已收尾的下轮幂等跳过）。
+    for (const child of activeDescendants) {
+      try {
+        const r = await transitionAndEnqueueCommand({
+          taskId: child.taskId, expectedVersion: undefined, resolveTo: () => 'finished',
+          command: {
+            direction: 'parent_to_child', targetChatId: child.chatId,
+            commandType: 'finish', payload: { content: `级联收尾：祖先任务 ${task.taskId} finish --cascade` },
+            idempotencyKey: `finish-${child.taskId}`,
+          },
+        });
+        if (!r) throw new HttpError(409, `cascade finish failed for ${child.taskId} (illegal transition from ${child.status})`);
+        logger.info(`[subtask-orch] cascade finish ${child.taskId} (ancestor=${task.taskId})`);
+      } catch (err) {
+        if (err instanceof HttpError) throw err;
+        throw new HttpError(409, `cascade finish aborted at ${child.taskId}: ${err instanceof Error ? err.message : err}; 已收尾部分幂等、可安全重试`);
+      }
+    }
   }
   // review Blocker1: 状态转移 + finish 命令入队**一把原子事务**。
   let result: Awaited<ReturnType<typeof transitionAndEnqueueCommand>>;
