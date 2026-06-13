@@ -15,6 +15,8 @@
 
 > **修订记录 · v5（Phase 2 第二闭环：跨仓装回）**：新增 §13.5——Context Pack（流通单位，manifest+内容+hash 校验）+ 物化安装 + `context.lock`（upstream/local 区分，local 不覆盖报 conflict）。落点 `src/services/context/{pack,install}.ts`。挂载默认物化（A 方案）。网络 pull/Hub 留 Phase 3。详见 §13.5–§13.7。
 
+> **修订记录 · v7（Phase 2 第四闭环：harness Bundle）**：新增 §14——`harness.ts` 把 workflow + roles + domains 闭包 + capability 槽需求打成可分发 Bundle（packHarness 扫闭包 / write·readHarness 落盘+hash 校验 / installHarness preflight 能力+物化，domains 复用 installPack）。第三类可流通内容（运行骨架）落地——知识 + 骨架都能跨仓流通。详见 §14。
+
 > **修订记录 · v6（Phase 2 第三闭环：domains 注入消费）**：新增 §13.8——node 声明 `domains: [topic]` + `domain-injection.ts` + `runtime.dispatchWork` 把库里 top-k 横向知识注入 prompt 的 segment 3。闭合「沉淀→晋升→装回→**被用上**」消费回路（接 Phase 1 T5 留空的 domains 段）。向后兼容（未配 domainsDir/未声明则不注入）。详见 §13.8–§13.9。
 
 ---
@@ -336,3 +338,38 @@ Phase 2（占位）：domains 唯一性 / harness 打包 / Context Pack / Hub cl
 - `tsc --noEmit` exit 0（含 cli/im/daemon wiring 编译）；`context-domain-injection.test.ts`(9) + `workflow-dispatch-injection.test.ts`(5，含 domain e2e + 无 dir back-compat + resolveDomainsDir 默认路径 e2e) 全过。
 - 节点声明 domains + 配 `domainsDir` → prompt 含「Domain knowledge」段 + 内容；未配 dir → verbatim 不注入（向后兼容）；top-k + 单条 maxChars 截断；缺失 / 非法 topic 容错进 missing。
 - `resolveDomainsDir`：env 覆盖 / 默认 `<cwd>/.agents/domains` / 空白覆盖回退。
+
+---
+
+## 14. harness Bundle：运行骨架打包（已实现）
+
+> 第三类可流通内容（§5.3「harness = 运行骨架 = Bundle」）。把一个 workflow 的完整「干活方式」打成可分发包，让"怎么干"也能跨仓流通——不只知识。落点 `src/services/context/harness.ts` + `pack.ts` 的 `buildPack`。
+
+### 14.1 packHarness（扫引用闭包）
+- harness = workflow def + 它引用的 roles（`node.role`）+ 依赖的 domains（`node.domains` 闭包）+ capability 槽需求。
+- `collectRefs` 扫节点收 role/domain 引用（§5.4：domains 不反向依赖，闭包 = workflow 直接引用）；缺 role/domain **硬报错** `HarnessError`（闭包不完整，不产半个 Bundle）。
+- `HarnessManifest`：`bundleId/bundleVersion`、`workflowId/workflowVersion`、`roles[]`、`domains[]`、`requiredCapabilities[]`（role capabilities 并集）、`hash`。
+- workflow 取 **authoring 版**（保留 role/domains 引用，不编译）——Bundle 是可重分发的源骨架。
+- **路径安全（review Blocker）**：workflowId / roleId / bundleId 都会拼进文件路径，必须过 `assertSafeName`（`[A-Za-z0-9_.-]+` 且非 `.`/`..`/不含 `..`）——pack 产出、read 读入、write/install 写盘**每个点都校验**，防 `roleId:../escape` / `workflowId:../pwn` 写出 roles//workflows/ 目录。
+
+### 14.2 write / read
+- 磁盘：`harness.json` + `workflow.json` + `roles/*.md` + `domains/*.md`。
+- `readHarness` 重算 hash（workflow canonical + roles + domain content hashes + requiredCapabilities）比对 manifest，**篡改/漂移检测**；闭包文件缺失报错；`parseRoleFile` 还校验 role.md frontmatter `roleId` 与 manifest 一致（防 roleId 漂移，review Minor）。
+- **manifest/payload 一致性校验（review follow-up）**：readHarness 还校验 manifest 的派生字段（workflowId/version/roles/domains/requiredCapabilities）与 payload 推导一致；其中 `requiredCapabilities` **从 payload roles 重新推导**、不信 manifest 自身——否则只改 manifest 的字段能自洽地通过 hash（hash 重算若用 manifest 值会自指）。
+
+### 14.3 installHarness（preflight + 物化）
+- **preflight**：`requiredCapabilities` 对照目标仓 `agents.yaml`——缺的槽进 `preflightMissingCapabilities` **报告不阻断**（§7.6：缺能力是部署提示"去 agents.yaml 补 capable bot"，知识/骨架仍物化让人就地修）。
+- 物化：workflow → `targetRoot/workflows/`，roles → `targetRoot/roles/`，domains → `targetRoot/.agents/domains/`（**复用 `installPack`**，带 lock + upstream/local/dirty 保护）。
+- **无 domains 闭环**：`bundle.domains` 为空时跳过 `installPack`、返回空 `domainOutcomes`（不写无意义 lock）；`install.ts:writeLock` 也补 mkdir 父目录兜底（review Major：无 domains 安装曾因 `.agents/context.lock` 父目录不存在 ENOENT）。
+
+### 14.4 边界（非本期）
+- preflight 缺能力非阻断（仅报告）；workflow/roles 物化为覆盖写（domains 走 installPack 的冲突保护）；网络分发（Hub publish/pull harness）属 Phase 3。
+- **预留扩展点：orchestration policy（主群 2026-06-13 多级子群优化）**。未来若 workflow 支持 fan-out 建子群（manager/worker 预算分流、汇报模式 reportingMode、逐级 rollup、digest 策略），这批 **orchestration policy** 需作为运行骨架参数纳入 HarnessManifest 一起跨仓带走。当前不在 workflow engine scope（多级子群是 subtask 层的事），标 follow-up。
+- **与"多分身多角色"相容**（主群定调"角色不变、变职责"）：本设计三层本就分离——workflow role（能力位，编译期解析）/ bot identity（larkAppId，agents.yaml）/ subtask task role（main/collab/observer，协作位）。clone 出的分身 = agents.yaml 多一个 botId entry，`resolveRoleToBot` 天然容纳；harness Bundle 带"能力位需求"不绑死 bot 入口（install preflight 对照目标 agents.yaml），正是"身份/职责两层分开"。无需返工。
+
+### 14.5 验收（harness Bundle）
+- `tsc --noEmit` exit 0；`context-harness.test.ts`(13) 全过；复用 pack/install/domains 测试不破。
+- 闭包：收齐 roles+domains+requiredCapabilities；缺引用（role/domain）→ HarnessError。
+- 往返：write→read hash 一致；篡改 domain / workflow → hash mismatch；role frontmatter roleId 漂移 → 报错。
+- 安装：preflight 满足/缺失两态；workflow+roles+domains 物化 + lock 记账；**无 domains 也能装成**（空 domainOutcomes）。
+- 路径安全：`roleId:../escape` / `workflowId:../pwn` 在 pack/read/install 被拒、不写出目录（review Blocker 回归）。

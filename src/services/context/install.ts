@@ -14,6 +14,7 @@
  */
 
 import { promises as fs } from 'node:fs';
+import { dirname } from 'node:path';
 import { z } from 'zod';
 
 import { readDomain, writeDomain, domainContentHash } from './domains.js';
@@ -49,6 +50,7 @@ export async function readLock(lockPath: string): Promise<ContextLock> {
 }
 
 export async function writeLock(lockPath: string, lock: ContextLock): Promise<void> {
+  await fs.mkdir(dirname(lockPath), { recursive: true });
   await fs.writeFile(lockPath, JSON.stringify(lock, null, 2) + '\n', 'utf-8');
 }
 

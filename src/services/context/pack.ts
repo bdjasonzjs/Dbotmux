@@ -92,6 +92,18 @@ export async function packDomains(domainsDir: string, opts: PackOptions): Promis
     throw new PackError(`cannot pack: no domains found in ${domainsDir}`);
   }
 
+  return buildPack(domains, opts);
+}
+
+/**
+ * Build a ContextPack from in-memory domain docs (no fs read). Shared by
+ * `packDomains` (after it reads from a dir) and other producers — e.g. harness
+ * bundling, which already holds the domain docs and just needs the pack shape.
+ */
+export function buildPack(
+  domains: DomainDoc[],
+  opts: { packId: string; packVersion: string; now?: string },
+): ContextPack {
   const entries: PackEntry[] = domains.map((d) => ({
     topic: d.topic,
     scope: d.scope,
