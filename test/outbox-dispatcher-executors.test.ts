@@ -8,13 +8,14 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 const mockSendAsOwner = vi.fn();
 vi.mock('../src/services/base-relay.js', () => ({
   DEFAULT_GROUP_NOT_FOUND_RETRY_TIMEOUT_MS: 10_000,
+  resolvePollTimeoutMs: () => 75_000,
   sendAsOwner: (...a: any[]) => mockSendAsOwner(...a),
 }));
 vi.mock('../src/utils/logger.js', () => ({
   logger: { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn(), isDebug: () => false },
 }));
 
-import { makeDispatchExecutors, safeText } from '../src/services/outbox-dispatcher-executors.js';
+import { makeDispatchExecutors, safeText, parentToChildSummon, MAX_SUMMON_BUDGET } from '../src/services/outbox-dispatcher-executors.js';
 import type { OutboxCommand, SubTask } from '../src/services/subtask-store.js';
 
 function mkTask(over?: Partial<SubTask>): SubTask {
@@ -164,5 +165,52 @@ describe('deliver 幂等复用 base 记录 (防重复刷屏)', () => {
     const res = await exec.deliver(mkCmd(), mkTask());
     expect(res.ok).toBe(false);
     expect(res.relayRecordId).toBe('rec_1');  // 关键：失败也带回 recordId, dispatcher 落库, 重试复用不重发
+  });
+});
+
+// 2026-06-14 信箱瘦身：长正文落信箱 (哨兵)、短正文内联不变、最终 summon ≤ 预算
+describe('parentToChildSummon 预算化瘦身 (信箱)', () => {
+  const stub = vi.fn();
+  beforeEach(() => { stub.mockReset(); stub.mockImplementation((_p: string) => ({ letterId: 'lt_stub01' })); });
+
+  function supplementCmd(content: string): OutboxCommand {
+    return mkCmd({ direction: 'parent_to_child', targetChatId: 'oc_sub', commandType: 'supplement',
+      payload: { content, targetRole: 'main' }, idempotencyKey: 'supp-st_1-main-abc' });
+  }
+
+  it('短 supplement → 内联、不写信、无哨兵、内容原样可见', () => {
+    const out = parentToChildSummon(supplementCmd('短补充'), mkTask(), stub as any);
+    expect(stub).not.toHaveBeenCalled();
+    expect(out).not.toContain('⟪letter:');
+    expect(out).toContain('短补充');
+  });
+
+  it('长 supplement (>1KB) → 落信箱、正文出现哨兵、写信拿到全文、最终 summon ≤ 预算', () => {
+    const long = '验收细节'.repeat(400); // ~1600 字
+    const out = parentToChildSummon(supplementCmd(long), mkTask(), stub as any);
+    expect(stub).toHaveBeenCalledTimes(1);
+    expect(stub.mock.calls[0][0]).toBe(long);                 // 写信拿到的是全文、未截断
+    expect(stub.mock.calls[0][1]).toMatchObject({ idempotencyKey: 'supp-st_1-main-abc' }); // 复用 cmd 幂等键
+    expect(out).toContain('⟪letter:lt_stub01⟫');             // 正文只留哨兵
+    expect(out).not.toContain(long);                          // 全文不进 relay 正文
+    expect(out.length).toBeLessThanOrEqual(MAX_SUMMON_BUDGET); // P1-4：最终 summon ≤ 预算
+  });
+
+  it('长 kickoff 目标 → 目标落信箱哨兵、最终 summon ≤ 预算', () => {
+    const longGoal = '目标描述'.repeat(300);
+    const cmd = mkCmd({ direction: 'parent_to_child', targetChatId: 'oc_sub', commandType: 'kickoff', payload: {} });
+    const out = parentToChildSummon(cmd, mkTask({ goal: longGoal, acceptance: '验收标准'.repeat(80) }), stub as any);
+    expect(stub).toHaveBeenCalledTimes(1);
+    expect(stub.mock.calls[0][0]).toContain(longGoal);        // 全文目标进信
+    expect(out).toContain('⟪letter:lt_stub01⟫');
+    expect(out.length).toBeLessThanOrEqual(MAX_SUMMON_BUDGET);
+  });
+
+  it('落信失败 → 降级内联截断、不抛、投递不中断', () => {
+    stub.mockImplementation(() => { throw new Error('disk full'); });
+    const long = 'X'.repeat(2000);
+    const out = parentToChildSummon(supplementCmd(long), mkTask(), stub as any);
+    expect(out).not.toContain('⟪letter:');                   // 没有裸哨兵
+    expect(out).toContain('X');                               // 有内容（截断后的）
   });
 });

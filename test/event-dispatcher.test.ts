@@ -59,6 +59,12 @@ vi.mock('../src/services/observed-bots-store.js', () => ({
   listObservedBots: (...args: any[]) => mockListObservedBots(...args),
 }));
 
+// 信箱 auto-expand：默认透传 (无哨兵原样)；新增 summon 集成测试里改成「把哨兵替换为全文」。
+let mockExpandLetters: (t: string) => string = (t: string) => t;
+vi.mock('../src/services/mailbox.js', () => ({
+  expandLetters: (t: string) => mockExpandLetters(t),
+}));
+
 let mockMainTopicChatId: string | undefined;
 vi.mock('../src/services/main-topic-config.js', () => ({
   getMainTopicChatId: () => mockMainTopicChatId,
@@ -1785,6 +1791,7 @@ describe('im.message.receive_v1 — 急急如律令 summon routing', () => {
     mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
     mockGetChatMode.mockResolvedValue('group');
     mockReadFileSync.mockReturnValue('[]');
+    mockExpandLetters = (t: string) => t; // 默认透传
     startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
   });
 
@@ -1818,5 +1825,36 @@ describe('im.message.receive_v1 — 急急如律令 summon routing', () => {
     await capturedHandlers['im.message.receive_v1'](event);
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  // 信箱 auto-expand 集成回归 (蔻黛克斯 code review P1)：B1 核心系统保证 —— 入口必须把哨兵
+  // 展开成全文后再喂 CLI，且 routed message 里不能残留裸哨兵。锁住这条链路别被无意打断。
+  it('auto-expands a letter sentinel in the summon body before routing (new topic)', async () => {
+    mockExpandLetters = (t: string) => t.replace('⟪letter:lt_abc⟫', '这是信箱里的长全文');
+    const event = makeUserSummon('急急如律令：【克劳德】📨 补充：⟪letter:lt_abc⟫ 末尾');
+    await capturedHandlers['im.message.receive_v1'](event);
+    expect(handlers.handleNewTopic).toHaveBeenCalled();
+    const routed = JSON.parse(event.message.content).text;
+    expect(routed).toBe('📨 补充：这是信箱里的长全文 末尾'); // 哨兵已被全文替换
+    expect(routed).not.toContain('⟪letter:');                  // 无裸哨兵
+  });
+
+  it('auto-expands the sentinel on the already-owned thread branch too', async () => {
+    handlers.isSessionOwner.mockReturnValue(true);
+    mockExpandLetters = (t: string) => t.replace('⟪letter:lt_xyz⟫', '全文XYZ');
+    const event = makeUserSummon('急急如律令：【克劳德】⟪letter:lt_xyz⟫');
+    await capturedHandlers['im.message.receive_v1'](event);
+    expect(handlers.handleThreadReply).toHaveBeenCalled();
+    expect(JSON.parse(event.message.content).text).toBe('全文XYZ');
+  });
+
+  it('miss-path: unreadable letter leaves manual-read hint, never a bare sentinel', async () => {
+    // 真实 expandLetters 的降级语义由 mailbox 单测覆盖；此处验证入口把降级结果原样下发、不裸露哨兵
+    mockExpandLetters = (t: string) => t.replace(/⟪letter:lt_gone⟫/, '（信箱取信失败 lt_gone，请手动运行 botmux mailbox read lt_gone 取全文）');
+    const event = makeUserSummon('急急如律令：【克劳德】⟪letter:lt_gone⟫');
+    await capturedHandlers['im.message.receive_v1'](event);
+    const routed = JSON.parse(event.message.content).text;
+    expect(routed).not.toContain('⟪letter:');
+    expect(routed).toContain('botmux mailbox read lt_gone');
   });
 });

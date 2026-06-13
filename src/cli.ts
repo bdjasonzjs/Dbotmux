@@ -2067,6 +2067,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
                                        拉取当前会话的消息历史 (JSON)。默认按 session scope：话题/话题群 → 话题内，普通群 → 整群；
                                        thread 会话里可用 --scope ambient 读取 thread 外的群聊上下文
   quoted <message_id>                  拉取被引用的单条消息 (JSON)，message_id 取自 daemon 注入的引用提示行
+  mailbox read <letterId> [--json]     读急急如律令信箱里的长文 (收端 auto-expand 的人工兜底)；mailbox gc 清过期
 
 新建飞书群:
   create-group --bot <name> [--bot ...] [--name "群名"]
@@ -3364,6 +3365,13 @@ switch (command) {
     process.env.SESSION_DATA_DIR ??= resolveDataDir();
     const { cmdMonitorReportConsume } = await import('./cli/group-monitor.js');
     await cmdMonitorReportConsume(process.argv.slice(3));
+    break;
+  }
+  case 'mailbox': {
+    // 先固定 dataDir 再 import，否则 mailbox 读默认 <repo>/data 而非 daemon 的 ~/.botmux/data
+    process.env.SESSION_DATA_DIR ??= resolveDataDir();
+    const { cmdMailbox } = await import('./cli/mailbox.js');
+    await cmdMailbox(process.argv[3] ?? '', process.argv.slice(4));
     break;
   }
   case 'bots':     await cmdBots(process.argv[3] ?? 'list', process.argv.slice(4)); break;
