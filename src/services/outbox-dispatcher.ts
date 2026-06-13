@@ -32,8 +32,10 @@ export const MAX_RETRY = 5;
 const BASE_BACKOFF_MS = 30_000;
 const MAX_BACKOFF_MS = 600_000;
 /** 单条投递 lease 时长，须 ≥ 一次 deliver IO 的最坏耗时，过期后别的进程可重 claim。
- *  kickoff 可能在 base relay 内等待新群 group-id 字段 ready，再轮询「已发送」，因此要大于 60s。 */
-export const DISPATCH_LEASE_MS = 120_000;
+ *  kickoff 可能在 base relay 内等待新群 group-id 字段 ready，再轮询「已发送」，因此要大于 60s。
+ *  2026-06-14 (蔻黛克斯 review P1-5)：poll 超时调大到 75s，worst-case = overhead(50s)+poll(75s)=125s，
+ *  lease 须 > 该值；上调到 180s 留 55s 余量。base-relay.resolvePollTimeoutMs(lease) 据此 clamp poll。 */
+export const DISPATCH_LEASE_MS = 180_000;
 
 /** 第 attempt 次重试 (1-based) 的退避间隔：30s,60s,120s,240s,480s → cap 10min。 */
 export function planBackoff(attempt: number): number {

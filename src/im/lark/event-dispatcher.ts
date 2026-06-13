@@ -23,6 +23,7 @@ import { handleChatMemberBotAdded } from './chat-created-handler.js';
 import { bumpMessage as topologyBumpMessage } from '../../services/chat-topology-store.js';
 import { markStale as digestMarkStale } from '../../services/main-bot-digest-store.js';
 import { isArchived as ctxIsArchived, unarchive as ctxUnarchive } from '../../services/chat-context-store.js';
+import { expandLetters } from '../../services/mailbox.js';
 
 // ─── Bot identity ─────────────────────────────────────────────────────────
 
@@ -981,6 +982,10 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
               logger.debug(`[${larkAppId}] 急急如律令 from non-allowed sender ${senderOpenId} — ignored`);
               return;
             }
+            // 信箱 auto-expand (2026-06-14)：正文里的 ⟪letter:lt_xxx⟫ 哨兵就地换成信件全文，
+            // 让长 supplement/kickoff 完整进 CLI 上下文 = 系统保证，而非靠 agent 自觉读信。
+            // 同机共享 ~/.botmux/data/mailbox；读不到则保留人工 read 提示 (见 expandLetters)。
+            summonBody = expandLetters(summonBody);
             // 剥前缀 + 把卡片规整成 text，让 CLI 拿到干净指令。
             normalizeToTextMessage(message, summonBody);
             const summonRouting = await decideRouting(larkAppId, message);
