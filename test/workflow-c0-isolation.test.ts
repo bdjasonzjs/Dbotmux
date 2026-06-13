@@ -53,6 +53,21 @@ describe('Slice C0 — chat side-effect isolation', () => {
     expect(out.stderr).toMatch(/refused inside workflow/);
   });
 
+  it('botmux bot clone refuses when BOTMUX_WORKFLOW=1 (privileged: scan + bots.json write)', () => {
+    const out = runCli(['bot', 'clone', 'claude'], {
+      BOTMUX_WORKFLOW: '1',
+      BOTMUX_WORKFLOW_RUN_ID: 'run-clone',
+      BOTMUX_WORKFLOW_NODE_ID: 'node-clone',
+    });
+    expect(out.status).toBe(2);
+    expect(out.stderr).toContain('refused inside workflow');
+    expect(out.stderr).toContain('run-clone');
+    // Must be refused at the gate BEFORE any scan / config write happens —
+    // i.e. it never reached the clone command's own output.
+    expect(out.stderr).not.toMatch(/扫码|二维码|已克隆/);
+    expect(out.stdout).toBe('');
+  });
+
   it('botmux schedule add refuses when BOTMUX_WORKFLOW=1', () => {
     const out = runCli(['schedule', 'add', '@every', '1h', 'task'], {
       BOTMUX_WORKFLOW: '1',

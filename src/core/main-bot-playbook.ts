@@ -86,13 +86,9 @@ export class HttpError extends Error {
 interface BotIdent {
   larkAppId: string;
   openId: string;
+  /** Resolved display name (botName from bots-info, or the ref as given). */
+  name: string;
 }
-
-const BOT_KEY_TO_CLI_ID: Record<'claude' | 'codex' | 'tilly', string> = {
-  claude: 'claude-code',
-  codex: 'codex',
-  tilly: 'coco',
-};
 
 const BOT_KEY_TO_ROLE: Record<'claude' | 'codex' | 'tilly', string> = {
   claude: 'main bot',
@@ -100,17 +96,37 @@ const BOT_KEY_TO_ROLE: Record<'claude' | 'codex' | 'tilly', string> = {
   tilly: 'scout',
 };
 
-/** Resolve 'claude' | 'codex' | 'tilly' → BotIdent.
+/** Built-in aliases → canonical cliId: legacy short codes (c/k/t) + full names.
+ *  Any OTHER ref is resolved as a botName or larkAppId against bots-info.json
+ *  (lets `--bots` reference clones / any registered bot). Kept exhaustive so the
+ *  original 3-bot refs stay byte-equivalent. */
+const BOT_ALIAS_TO_CLI_ID: Record<string, string> = {
+  claude: 'claude-code', c: 'claude-code',
+  codex: 'codex', k: 'codex',
+  tilly: 'coco', t: 'coco',
+};
+
+type BotsInfoEntry = { larkAppId: string; botName: string; cliId: string; botOpenId: string; isClone?: boolean };
+
+/** Pick the canonical (non-clone) "本体" bot of a cliId via the intrinsic
+ *  `isClone` marker — NOT array position. Falls back to first match when
+ *  nothing is marked (no clones → byte-equivalent to the original behaviour). */
+function pickCanonicalByCliId(bots: BotsInfoEntry[], cliId: string): BotsInfoEntry | undefined {
+  const sameCli = bots.filter(b => b.cliId === cliId);
+  return sameCli.find(b => b.isClone !== true) ?? sameCli[0];
+}
+
+/** Resolve a bot ref → BotIdent.
  *
- *  Reads `~/.botmux/data/bots-info.json` for cliId → larkAppId + botName
- *  (cross-app aware — covers ALL bot daemons, not just this process's own).
- *  Then reads `bot-openids-<thisAppId>.json` cross-ref for botName → openId
- *  in **this daemon's app scope** (so participants written to ChatContext
- *  read correctly from the main-bot Claude perspective).
+ *  `ref` may be a built-in alias (claude/c, codex/k, tilly/t → the canonical
+ *  non-clone bot of that cliId), or any registered bot's larkAppId / botName
+ *  (so `--bots` can reference clones). Legacy 'claude'|'codex'|'tilly' callers
+ *  are unchanged (alias path).
  *
- *  Falls back to bot-registry getAllBots() for own bot if file missing. */
-export function resolveBotIdent(key: 'claude' | 'codex' | 'tilly'): BotIdent {
-  const targetCliId = BOT_KEY_TO_CLI_ID[key];
+ *  Reads `~/.botmux/data/bots-info.json` (cross-app catalog), then
+ *  `bot-openids-<thisAppId>.json` cross-ref for botName → openId in this
+ *  daemon's app scope. */
+export function resolveBotIdent(ref: string): BotIdent {
   // 2026-05-29: 用 config.session.dataDir 不硬编码 homedir()/.botmux/data。
   // 生产 daemon 设 SESSION_DATA_DIR=~/.botmux/data, 两者相等 (无差异); 但这
   // 样 resolveBotIdent 才尊重 SESSION_DATA_DIR override + 让单测能隔离到
@@ -121,15 +137,21 @@ export function resolveBotIdent(key: 'claude' | 'codex' | 'tilly'): BotIdent {
   if (!existsSync(botsInfoPath)) {
     throw new HttpError(500, `bots-info.json not found at ${botsInfoPath}`);
   }
-  let bots: Array<{ larkAppId: string; botName: string; cliId: string; botOpenId: string }>;
+  let bots: BotsInfoEntry[];
   try {
     bots = JSON.parse(readFileSync(botsInfoPath, 'utf-8'));
   } catch (err) {
     throw new HttpError(500, `failed to parse bots-info.json: ${err}`);
   }
-  const bot = bots.find(b => b.cliId === targetCliId);
+  // Built-in alias → canonical (non-clone) bot of that cliId; otherwise match
+  // by larkAppId (exact) or botName (case-insensitive).
+  const aliasCliId = BOT_ALIAS_TO_CLI_ID[ref.toLowerCase()];
+  const bot = aliasCliId
+    ? pickCanonicalByCliId(bots, aliasCliId)
+    : (bots.find(b => b.larkAppId === ref)
+       ?? bots.find(b => b.botName && b.botName.toLowerCase() === ref.toLowerCase()));
   if (!bot) {
-    throw new HttpError(500, `bot key "${key}" (cliId=${targetCliId}) not in bots-info.json`);
+    throw new HttpError(500, `bot ref "${ref}" not found in bots-info.json (by alias/appId/name)`);
   }
   // 2. Resolve open_id in **this daemon's app scope** via cross-ref file.
   //    This daemon's app id = process.env.LARK_APP_ID (set by daemon main)
@@ -143,12 +165,12 @@ export function resolveBotIdent(key: 'claude' | 'codex' | 'tilly'): BotIdent {
       openId = xref[bot.botName];
     } catch { /* fall through to own openId */ }
   }
-  // Fallback: bot's own openId (only correct when key === own bot's key)
+  // Fallback: bot's own openId (only correct when ref === own bot).
   if (!openId) openId = bot.botOpenId;
   if (!openId) {
-    throw new HttpError(500, `bot "${key}" has no openId (xref missing + no botOpenId in bots-info)`);
+    throw new HttpError(500, `bot ref "${ref}" has no openId (xref missing + no botOpenId in bots-info)`);
   }
-  return { larkAppId: bot.larkAppId, openId };
+  return { larkAppId: bot.larkAppId, openId, name: bot.botName || ref };
 }
 
 // ─── Templates ─────────────────────────────────────────────────────────────

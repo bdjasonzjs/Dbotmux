@@ -39,7 +39,7 @@ export function writeBotInfoFile(dataDir: string): void {
   if (!existsSync(dataDir)) mkdirSync(dataDir, { recursive: true });
 
   // Read existing entries from other daemon processes
-  type BotInfoEntry = { larkAppId: string; botOpenId: string | null; botName: string | null; cliId: string };
+  type BotInfoEntry = { larkAppId: string; botOpenId: string | null; botName: string | null; cliId: string; isClone?: boolean };
   let existing: BotInfoEntry[] = [];
   try {
     if (existsSync(filePath)) {
@@ -60,6 +60,9 @@ export function writeBotInfoFile(dataDir: string): void {
       botOpenId: b.botOpenId ?? null,
       botName: b.botName ?? null,
       cliId: b.config.cliId,
+      // Intrinsic "is this a clone" marker (clones get an isolated claudeConfigDir).
+      // Lets resolveBotIdent pick the canonical 本体 without relying on array order.
+      isClone: !!b.config.claudeConfigDir,
     });
   }
 
@@ -505,11 +508,15 @@ export function parseUrgentSummon(
   return { names, body: m[2].trim() };
 }
 
-/** 触发名单里的某个名字是否指向 botName（含别名表，大小写不敏感）。 */
-function summonNameMatchesBot(name: string, botName: string): boolean {
+/** 触发名单里的某个名字是否指向本 bot（大小写不敏感）。匹配候选：
+ *  - Lark botName 精确匹配 + SUMMON_ALIASES（原行为，保持不动）；
+ *  - clone 的 botmux displayName『本体名（N号机）』精确匹配（块7 第二轮 #4 动态认分身——
+ *    无需硬编码克隆名，且不依赖手填 Lark 名）。 */
+function summonNameMatchesBot(name: string, botName?: string, displayName?: string): boolean {
   const n = name.toLowerCase();
-  if (n === botName.toLowerCase()) return true;
-  const aliases = SUMMON_ALIASES[botName];
+  if (botName && n === botName.toLowerCase()) return true;
+  if (displayName && n === displayName.toLowerCase()) return true;
+  const aliases = botName ? SUMMON_ALIASES[botName] : undefined;
   return !!aliases && aliases.includes(n);
 }
 
@@ -535,11 +542,13 @@ function extractSummonText(message: any): string | null {
  *  REST 解析——interactive 场景由调用方先 resolveNonsupportMessage 再调本函数）。
  *  命中返 body（剥前缀后的正文），否则 null。 */
 export function urgentSummonBodyForBot(larkAppId: string, message: any): string | null {
-  const botName = getBot(larkAppId).botName;
-  if (!botName) return null;
+  const bot = getBot(larkAppId);
+  const botName = bot.botName;
+  const displayName = bot.config.displayName; // clone『本体名（N号机）』(undefined on 本体)
+  if (!botName && !displayName) return null;
   const parsed = parseUrgentSummon(extractSummonText(message));
   if (!parsed) return null;
-  if (!parsed.names.some(n => summonNameMatchesBot(n, botName))) return null;
+  if (!parsed.names.some(n => summonNameMatchesBot(n, botName, displayName))) return null;
   return parsed.body;
 }
 

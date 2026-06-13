@@ -1414,6 +1414,23 @@ for (const [path, fnName] of SUBTASK_ORCH_ROUTES) {
   });
 }
 
+// CEO 端到端建群编排入口 (方案 块7)。CLI `botmux bot ceo-spawn` 薄壳打到这里 →
+// ceoSpawn 组装真实 deps (registry/lark/pm2/subtask) 调 ensureClonesAndSpawn。
+// owner 门控 + activation 部署门控都在 service 侧 (session 反查，CLI 不能伪造)。
+ipcRoute('POST', '/api/bot-ceo-spawn', async (req, res) => {
+  let body: any;
+  try { body = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  try {
+    const { ceoSpawn } = await import('./services/ceo-spawn-service.js');
+    const result = await ceoSpawn(body);
+    return jsonRes(res, 200, { ok: true, ...result });
+  } catch (err: any) {
+    const status = err && err.name === 'HttpError' ? err.status : 500;
+    return jsonRes(res, status, { ok: false, error: String(err?.message ?? err) });
+  }
+});
+
 ipcRoute(
   'POST',
   '/api/workflows/runs/:runId/attempts/:activityId/:attemptId/resume',

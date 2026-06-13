@@ -47,6 +47,7 @@ import {
 } from './utils/render-dimensions.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
 import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionIds } from './adapters/cli/claude-code.js';
+import { resolveClaudeHome, defaultClaudeHome } from './core/claude-home.js';
 import type { CliAdapter, PtyHandle } from './adapters/cli/types.js';
 import { PtyBackend } from './adapters/backend/pty-backend.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
@@ -175,6 +176,9 @@ let bridgeJsonlDir: string | undefined;
  *  follow the new jsonl. */
 let bridgeCliPid: number | undefined;
 let bridgeCliCwd: string | undefined;
+/** This worker's Claude home (CLAUDE_CONFIG_DIR). Set on init from the bot's
+ *  claudeConfigDir; defaults to ~/.claude (existing bots → unchanged paths). */
+let workerClaudeHome: string = defaultClaudeHome();
 /** Last sessionId we observed via the pid resolver — used to detect
  *  rotations cheaply (string compare instead of stat()ing every jsonl). */
 let bridgeObservedCliSessionId: string | undefined;
@@ -433,7 +437,7 @@ function bridgeAbsorbBaseline(): void {
  *  agrees. */
 function bridgeMarkStalePidStateForAcceptedSid(acceptedSid: string): void {
   if (bridgeCliPid === undefined || bridgeCliCwd === undefined) return;
-  const pidResolved = resolveJsonlFromPid(bridgeCliPid, bridgeCliCwd);
+  const pidResolved = resolveJsonlFromPid(bridgeCliPid, bridgeCliCwd, workerClaudeHome);
   if (pidResolved && pidResolved.cliSessionId !== acceptedSid) {
     bridgeStalePidStateSessionId = pidResolved.cliSessionId;
   }
@@ -873,7 +877,7 @@ function maybeFollowQuietRotation(): void {
 
 function maybeFollowSessionRotationViaPid(): PidFollowResult {
   if (!bridgeCliPid || !bridgeCliCwd) return 'unavailable';
-  const resolved = resolveJsonlFromPid(bridgeCliPid, bridgeCliCwd);
+  const resolved = resolveJsonlFromPid(bridgeCliPid, bridgeCliCwd, workerClaudeHome);
   if (!resolved) return 'unavailable';
   if (bridgeObservedCliSessionId !== resolved.cliSessionId) {
     bridgeObservedCliSessionId = resolved.cliSessionId;
@@ -1039,7 +1043,7 @@ function startBridgeWatcher(jsonlPath: string, opts?: { cliPid?: number; cliCwd?
   // and we swap to it before baseline so we don't waste a baseline on
   // a frozen file.
   if (bridgeCliPid && bridgeCliCwd) {
-    const resolved = resolveJsonlFromPid(bridgeCliPid, bridgeCliCwd);
+    const resolved = resolveJsonlFromPid(bridgeCliPid, bridgeCliCwd, workerClaudeHome);
     if (resolved) {
       bridgeObservedCliSessionId = resolved.cliSessionId;
       bridgeRememberSessionIdForPath(resolved.path);
@@ -1064,10 +1068,10 @@ function startBridgeWatcher(jsonlPath: string, opts?: { cliPid?: number; cliCwd?
   // continuously for the active session, so this catches the rotation
   // even between writes). `findOpenClaudeSessionIds` unions both.
   if (bridgeCliPid !== undefined && bridgeJsonlDir && bridgeCliCwd) {
-    const sids = findOpenClaudeSessionIds(bridgeCliPid);
+    const sids = findOpenClaudeSessionIds(bridgeCliPid, workerClaudeHome);
     const candidates: string[] = [];
     for (const sid of sids) {
-      const path = claudeJsonlPathForSession(sid, bridgeCliCwd);
+      const path = claudeJsonlPathForSession(sid, bridgeCliCwd, workerClaudeHome);
       bridgeRememberSessionIdForPath(path);
       if (existsSyncSafe(path)) candidates.push(path);
     }
@@ -2609,7 +2613,11 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // so it needs no per-session wiring here.
   if (cfg.cliId === 'claude-code') {
     (backend as TmuxBackend | PtyBackend).claudeJsonlPath =
-      claudeJsonlPathForSession(cfg.cliSessionId ?? adapterSessionId, cfg.workingDir);
+      claudeJsonlPathForSession(cfg.cliSessionId ?? adapterSessionId, cfg.workingDir, workerClaudeHome);
+    // Expose this worker's Claude home to the adapter's writeInput() pid-state
+    // re-resolution (submit-confirm / resume-rotation / recheck) so a cloned
+    // bot follows its own home, not the default ~/.claude.
+    (backend as TmuxBackend | PtyBackend).claudeHome = workerClaudeHome;
   }
 
   const args = cliAdapter.buildArgs({
@@ -2658,6 +2666,10 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
       ...process.env,
       CLAUDECODE: undefined,
       ...(injectClaudeSandbox ? { IS_SANDBOX: '1' } : {}),
+      // Cloned bots run with an isolated Claude home. Only inject when the bot
+      // actually has one configured — unconfigured bots keep the inherited env
+      // (no CLAUDE_CONFIG_DIR), identical to before.
+      ...(cfg.claudeConfigDir ? { CLAUDE_CONFIG_DIR: cfg.claudeConfigDir } : {}),
     } as unknown as Record<string, string>,
   });
 
@@ -2703,7 +2715,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // don't want to re-emit yesterday's conversation as fresh turns).
   if (cfg.cliId === 'claude-code' && adapterSessionId) {
     const claudeBridgeSessionId = cfg.cliSessionId ?? adapterSessionId;
-    const claudeJsonl = claudeJsonlPathForSession(claudeBridgeSessionId, cfg.workingDir);
+    const claudeJsonl = claudeJsonlPathForSession(claudeBridgeSessionId, cfg.workingDir, workerClaudeHome);
     startBridgeWatcher(claudeJsonl, {
       cliPid: cliPid ?? undefined,
       cliCwd: cfg.workingDir,
@@ -3189,6 +3201,9 @@ process.on('message', async (raw: unknown) => {
       if (lastInitConfig) return;  // already initialized
       lastInitConfig = msg;
       sessionId = msg.sessionId;
+      // Resolve this worker's Claude home once (cloned bots get an isolated
+      // CLAUDE_CONFIG_DIR; everyone else → ~/.claude, identical to before).
+      workerClaudeHome = resolveClaudeHome(msg.claudeConfigDir);
       if (msg.ownerOpenId) process.env.__OWNER_OPEN_ID = msg.ownerOpenId;
       // Pin this worker's i18n locale early so every t() call below resolves
       // against the bot's chosen language without each callsite needing to

@@ -20,7 +20,7 @@ import {
   updateCommand, claimCommandForDispatch, completeDispatch, transitionAndEnqueueCommand,
   helpReportDelivery, staleHelpCommandIds,
   listObservations, pruneFinished, VersionConflictError, TaskNotFoundError, CommandRetryMismatchError, ACTIVE_STATUSES,
-  StoreCorruptError, __resetForTesting, type SubTaskBot,
+  StoreCorruptError, __resetForTesting, addBotToSubTask, type SubTaskBot,
 } from '../src/services/subtask-store.js';
 
 const BOTS: SubTaskBot[] = [
@@ -78,6 +78,24 @@ describe('SubTask CRUD + 幂等', () => {
     const t = await mkObserving('k', 'oc_x');
     expect(getByChatId('oc_x')?.taskId).toBe(t.taskId);
     expect(listSubTasks({ statuses: ['observing'] }).map(x => x.taskId)).toEqual([t.taskId]);
+  });
+});
+
+describe('addBotToSubTask (块7 #5: late clone joins existing subtask)', () => {
+  it('appends a new bot + bumps version; idempotent by larkAppId', async () => {
+    const t = await mk('kadd');
+    const v0 = getSubTask(t.taskId)!.version;
+    const clone: SubTaskBot = { openId: 'ou_new', name: '克劳德（初号机）', role: 'collab', larkAppId: 'cli_new' };
+    const after = await addBotToSubTask(t.taskId, clone);
+    expect(after!.bots.map(b => b.larkAppId)).toContain('cli_new');
+    expect(after!.version).toBe(v0 + 1);
+    // idempotent: adding the same larkAppId again is a no-op (no dup, no version bump)
+    const again = await addBotToSubTask(t.taskId, clone);
+    expect(again!.bots.filter(b => b.larkAppId === 'cli_new')).toHaveLength(1);
+    expect(again!.version).toBe(v0 + 1);
+  });
+  it('unknown taskId → null', async () => {
+    expect(await addBotToSubTask('st_nope', { openId: 'o', name: 'n', role: 'collab', larkAppId: 'a' })).toBeNull();
   });
 });
 

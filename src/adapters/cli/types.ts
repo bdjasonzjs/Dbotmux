@@ -17,6 +17,11 @@ export interface PtyHandle {
   /** Working directory the CLI was spawned in; cross-checked against the pid file's
    *  cwd field to reject pid reuse / unrelated processes. */
   cliCwd?: string;
+  /** This session's Claude home (CLAUDE_CONFIG_DIR); set by worker for cloned
+   *  bots so writeInput's pid-state re-resolution reads the clone's
+   *  `<home>/sessions/<pid>.json`, not the default ~/.claude. Undefined → the
+   *  resolvers fall back to ~/.claude (existing bots, unchanged). */
+  claudeHome?: string;
 }
 
 export interface CliAdapter {

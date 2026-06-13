@@ -995,6 +995,7 @@ export async function startAdoptSession(
     cwd: target.cwd,
     paneCols: target.paneCols,
     paneRows: target.paneRows,
+    claudeConfigDir: target.claudeConfigDir,
   };
   ds.session.adoptedFrom = { ...ds.adoptedFrom };
   sessionStore.updateSession(ds.session);

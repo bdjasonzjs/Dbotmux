@@ -26,16 +26,11 @@ const VERB_ROUTE: Record<string, string> = {
 const NUM_FLAGS = new Set(['expectedVersion']);
 const LIST_FLAGS = new Set(['bots', 'sourceMessageIds', 'relatedRefs']);
 const BOOL_FLAGS = new Set(['force', 'spawnable', 'cascade']);
-/** bot 简写 → service 认的完整 key (review P2: help 写 c/k/t 但 service 只认 claude|codex|tilly)。 */
-const BOT_SHORT: Record<string, 'claude' | 'codex' | 'tilly'> = {
-  c: 'claude', claude: 'claude', k: 'codex', codex: 'codex', t: 'tilly', tilly: 'tilly',
-};
-
 function kebabToCamel(s: string): string {
   return s.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
 }
 
-function findClaudeDaemonPort(): number | null {
+export function findClaudeDaemonPort(): number | null {
   let files: string[];
   try { files = readdirSync(REGISTRY_DIR).filter(f => f.endsWith('.json')); }
   catch { return null; }
@@ -66,16 +61,10 @@ function parseBody(argv: string[]): { body: Record<string, unknown> } | { error:
     else body[key] = val;
     i += 2;
   }
-  // P2: bots 简写 c/k/t → 完整 key
-  if (Array.isArray(body.bots)) {
-    const mapped: string[] = [];
-    for (const b of body.bots as string[]) {
-      const full = BOT_SHORT[b.toLowerCase()];
-      if (!full) return { error: `unknown bot ref: ${b} (use c|k|t or claude|codex|tilly)` };
-      mapped.push(full);
-    }
-    body.bots = mapped;
-  }
+  // N-bot: pass --bots entries through verbatim. The orchestrator resolves each
+  // ref (alias c/k/t/claude/codex/tilly, or any registered bot name/appId) and
+  // parses an optional `ref:role` suffix; unknown ref / bad role → 400 there.
+  // So `--bots claude:main,克隆2:collab` flows straight through.
   if (!body.sessionId) body.sessionId = process.env.BOTMUX_SESSION_ID;
   if (!body.sessionId) return { error: 'missing --session-id <sid> or env BOTMUX_SESSION_ID' };
   return { body };
@@ -83,8 +72,10 @@ function parseBody(argv: string[]): { body: Record<string, unknown> } | { error:
 
 const HELP = `botmux subtask-{start|report|query|finish|supplement} — 子任务编排 v2
 
-  subtask-start      --goal "<任务>" [--acceptance "<验收>"] [--bots c,k,t]
+  subtask-start      --goal "<任务>" [--acceptance "<验收>"] [--bots <ref>[:role],...]
                      [--task-type prd|bug|misc] [--name "<群名>"] [--related-refs a,b]
+    --bots  逗号分隔；每项 <ref>[:role]。ref = c|k|t / claude|codex|tilly / 已注册 bot 的 name 或 appId（含分身）。
+            role ∈ main|collab|observer（省略走默认：内建 bot 保留原角色，其它默认 collab）。默认全拉三 bot。
                      [--spawnable]  (授权新子群可再派孙群；默认关，create 一锤定音)
   subtask-report     --task-id <id> --type need_help|done --summary "<一句话>" [--source-message-ids m1,m2]
   subtask-query      (--task-id <id> | --command-id <id>)

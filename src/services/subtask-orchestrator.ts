@@ -43,12 +43,27 @@ const BOT_META: Record<'claude' | 'codex' | 'tilly', { name: string; role: SubTa
   tilly: { name: '缇蕾', role: 'observer' },
 };
 
-function slug(s: string): string {
+/** Built-in alias (lower-cased) → BOT_META key. Covers short codes (c/k/t) and
+ *  full names so `bots:['c']` / `['CLAUDE']` keep the legacy name+role. Any ref
+ *  not here is an arbitrary bot (clone) → name from registry, role defaults to
+ *  'collab'. */
+const ALIAS_TO_META_KEY: Record<string, keyof typeof BOT_META> = {
+  claude: 'claude', c: 'claude',
+  codex: 'codex', k: 'codex',
+  tilly: 'tilly', t: 'tilly',
+};
+
+/** Roles a `--bots ref:role` suffix may set. */
+const VALID_ROLES = new Set<string>(['main', 'collab', 'observer']);
+
+/** Exported so the CEO-spawn key (ceo-spawn-store) mirrors createSubtask's
+ *  idempotencyKey exactly (块7 第二轮 #5: subgroup + CEO-spawn state share one key). */
+export function slug(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 32) || 'task';
 }
 
 /** djb2 短哈希 (supplement idempotencyKey 用内容算稳定 key)。 */
-function djb2(s: string): string {
+export function djb2(s: string): string {
   let h = 5381;
   for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
   return h.toString(36);
@@ -210,7 +225,9 @@ export interface CreateSubtaskReq {
   sessionId: string;
   goal: string;
   acceptance?: string | null;
-  bots?: Array<'claude' | 'codex' | 'tilly'>;
+  /** Bot refs: legacy aliases (claude/codex/tilly/c/k/t) OR any registered
+   *  bot's botName / larkAppId (clones). Default = the original 3 bots. */
+  bots?: string[];
   taskType?: 'prd' | 'bug' | 'misc';
   name?: string;
   relatedRefs?: string[];
@@ -258,14 +275,36 @@ export async function createSubtask(req: CreateSubtaskReq): Promise<{ taskId: st
   }
 
   const botKeys = req.bots ?? ['claude', 'codex', 'tilly'];
-  // review P2: service 层也校验 bot key（IPC 可绕过 CLI 直传未知 key → 否则 resolveBotIdent 走 undefined/500）
-  for (const k of botKeys) {
-    if (!(k in BOT_META)) throw new HttpError(400, `unknown bot key: ${k} (allowed: claude|codex|tilly)`);
-  }
-  const resolved = botKeys.map(k => ({ key: k, ident: resolveBotIdent(k), meta: BOT_META[k] }));
+  // N-bot: each ref is a built-in alias (claude/codex/tilly/c/k/t) OR any
+  // registered bot's name/appId (clones). Legacy aliases keep their exact
+  // BOT_META name/role (byte-equivalent); arbitrary refs derive name from the
+  // registry and default to 'collab' (explicit roles land in the CLI parser).
+  const resolved = botKeys.map(entry => {
+    // Each entry is `ref` or `ref:role` (role ∈ main|collab|observer). The role
+    // suffix is an explicit override; without it we fall back to the alias's
+    // legacy role, else 'collab'.
+    const ci = entry.indexOf(':');
+    const ref = ci >= 0 ? entry.slice(0, ci) : entry;
+    const explicitRole = ci >= 0 ? entry.slice(ci + 1).trim().toLowerCase() : '';
+    if (explicitRole && !VALID_ROLES.has(explicitRole)) {
+      throw new HttpError(400, `invalid role "${explicitRole}" for bot "${ref}" (allowed: main|collab|observer)`);
+    }
+    let ident: ReturnType<typeof resolveBotIdent>;
+    try {
+      ident = resolveBotIdent(ref);
+    } catch {
+      throw new HttpError(400, `unknown bot ref: ${ref} (use claude|codex|tilly|c|k|t or a registered bot name/appId)`);
+    }
+    // Canonicalize built-in aliases (incl. short codes + case) to a BOT_META key
+    // for the default name/role — `c`/`CLAUDE` keep the legacy 本体 main, not collab.
+    const metaKey = ALIAS_TO_META_KEY[ref.toLowerCase()];
+    const meta = metaKey ? BOT_META[metaKey] : undefined;
+    const role = (explicitRole || meta?.role || 'collab') as SubTaskBot['role'];
+    return { key: ref, ident, name: meta?.name ?? ident.name, role };
+  });
   const claudeApp = resolveBotIdent('claude').larkAppId;
   const larkAppIds = resolved.map(r => r.ident.larkAppId);
-  const subtaskBots: SubTaskBot[] = resolved.map(r => ({ openId: r.ident.openId, name: r.meta.name, role: r.meta.role }));
+  const subtaskBots: SubTaskBot[] = resolved.map(r => ({ openId: r.ident.openId, name: r.name, role: r.role, larkAppId: r.ident.larkAppId }));
 
   // 边界4: 建群 + 登记串同一 idempotencyKey。crash window 安全靠两步同 key。
   // review Blocker: slug(goal) 对中文全压成 'task' → 同 root 下不同中文 goal 会碰撞 dedup。
@@ -288,7 +327,7 @@ export async function createSubtask(req: CreateSubtaskReq): Promise<{ taskId: st
       chatContext: {
         taskType: req.taskType,
         relatedRefs: [V2_MARKER, ...(req.relatedRefs ?? [])], // 边界3: v2 marker
-        participants: resolved.map(r => ({ openId: r.ident.openId, role: r.meta.role })),
+        participants: resolved.map(r => ({ openId: r.ident.openId, role: r.role })),
         parentDigest: req.parentDigest,
         rules: [...SUBTASK_COLLAB_NORMS], // 优化 #2: 固化协作 norms 进群规则 (欢迎卡 + <rules> 注入)
       },

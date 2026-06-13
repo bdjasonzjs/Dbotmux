@@ -112,6 +112,7 @@ export interface DaemonSession {
     cwd: string;              // CLI working directory
     paneCols?: number;        // tmux pane width at adopt time
     paneRows?: number;        // tmux pane height at adopt time
+    claudeConfigDir?: string; // adopted process's own CLAUDE_CONFIG_DIR (undefined → ~/.claude)
   };
 }
 

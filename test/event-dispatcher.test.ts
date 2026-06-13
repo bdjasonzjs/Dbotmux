@@ -1729,6 +1729,28 @@ describe('urgentSummonBodyForBot', () => {
     const card = { content: JSON.stringify({ title: '急急如律令：【克劳德】标题正文', elements: [] }) };
     expect(urgentSummonBodyForBot(APP, card)).toBe('标题正文');
   });
+
+  // 块7 第二轮 #4 动态认分身: clone matched by botmux config.displayName『本体名（N号机）』
+  function setBotConfig(botName: string | null, displayName?: string) {
+    mockGetBot.mockReturnValue({ botName, config: { larkAppId: APP, displayName } });
+  }
+  it('clone matched by displayName『克劳德（初号机）』(even with no Lark botName)', () => {
+    setBotConfig(null, '克劳德（初号机）');
+    expect(urgentSummonBodyForBot(APP, msg('急急如律令：【克劳德（初号机）】干活'))).toBe('干活');
+  });
+  it('本体 (no displayName) is NOT matched by a clone name; still summonable by its own name', () => {
+    setBotName('克劳德'); // displayName undefined
+    expect(urgentSummonBodyForBot(APP, msg('急急如律令：【克劳德（初号机）】x'))).toBeNull();
+    expect(urgentSummonBodyForBot(APP, msg('急急如律令：【克劳德】x'))).toBe('x');
+  });
+  it('clone with displayName is NOT matched by a different clone name', () => {
+    setBotConfig(null, '克劳德（初号机）');
+    expect(urgentSummonBodyForBot(APP, msg('急急如律令：【克劳德（二号机）】x'))).toBeNull();
+  });
+  it('legacy clone (Lark botName set manually, no botmux displayName) still wakeable by botName', () => {
+    setBotConfig('克劳德（初号机）', undefined);
+    expect(urgentSummonBodyForBot(APP, msg('急急如律令：【克劳德（初号机）】x'))).toBe('x');
+  });
 });
 
 describe('normalizeToTextMessage', () => {

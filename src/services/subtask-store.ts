@@ -39,7 +39,7 @@ export type CommandType = 'report_help' | 'report_done' | 'finish' | 'supplement
 /** 命令定向角色 (优化 #1/#3)。缺省 (老命令/未写) 由 dispatcher 解释为 legacy=all，保持旧行为。 */
 export type CommandTargetRole = 'main' | 'collab' | 'all';
 
-export interface SubTaskBot { openId: string; name: string; role: 'main' | 'observer' | 'collab'; }
+export interface SubTaskBot { openId: string; name: string; role: 'main' | 'observer' | 'collab'; larkAppId?: string; }
 
 export interface SubTask {
   taskId: string;
@@ -88,7 +88,10 @@ export interface OutboxCommand {
   commandType: CommandType;
   payload: { summary?: string; content?: string; sourceMessageIds?: string[];
     /** 优化 #1/#3：命令定向角色。缺省 → dispatcher 解释为 legacy=all (旧行为)。 */
-    targetRole?: CommandTargetRole };
+    targetRole?: CommandTargetRole;
+    /** 块7 第二轮 #5 late-kickoff：定向唤起单个 bot（用其 summon 名，即 clone 的
+     *  displayName『本体名（N号机）』）。设置后 kickoff 只唤这一个，绝不唤 main。 */
+    targetSummonName?: string };
   idempotencyKey: string;          // 防重发
   expectedTaskVersion: number | null;
   deliveryStatus: DeliveryStatus;
@@ -263,6 +266,28 @@ export async function createSubTask(opts: {
     s.subtasks.push(t);
     logger.info(`[subtask-store] created subtask ${t.taskId} chat=${opts.chatId.slice(0, 12)}`);
     return { result: t, dirty: true };
+  });
+}
+
+/**
+ * Add a bot to an existing subtask (块7 第二轮 #5: a late-activated clone joins
+ * the already-created subgroup). Idempotent by larkAppId — re-entry after a
+ * partial failure won't duplicate the bot. Bumps version + updatedAt.
+ * Returns the updated task, or null if the task is gone.
+ */
+export async function addBotToSubTask(taskId: string, bot: SubTaskBot): Promise<SubTask | null> {
+  return mutate(s => {
+    const idx = s.subtasks.findIndex(t => t.taskId === taskId);
+    if (idx < 0) return { result: null, dirty: false };
+    const cur = s.subtasks[idx];
+    if (cur.bots.some(b => b.larkAppId && b.larkAppId === bot.larkAppId)) {
+      return { result: cur, dirty: false }; // idempotent: already a member
+    }
+    s.subtasks[idx] = {
+      ...cur, bots: [...cur.bots, bot],
+      version: cur.version + 1, updatedAt: new Date().toISOString(),
+    };
+    return { result: s.subtasks[idx], dirty: true };
   });
 }
 

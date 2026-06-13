@@ -1,0 +1,123 @@
+/**
+ * Pure helpers that the CEO-spawn daemon service composes into ensureClonesAndSpawn
+ * deps. Kept IO-free so the two review-critical rules (蔻黛 design points) are
+ * unit-tested in isolation:
+ *   1. readiness = pm2 app online AND probed open_id persisted (BOTH, not either).
+ *   2. activation-approval = explicit owner-scope check, not just a CLI flag.
+ */
+import { botProcessName } from '../setup/bot-config-editor.js';
+import type { SeatSpec } from './ceo-clone-orchestration.js';
+
+export interface BotInfoLite {
+  larkAppId: string;
+  botOpenId?: string | null;
+}
+
+export interface ReadySnapshot {
+  /** bots-info.json entries (per-daemon probed open_id, merged). */
+  botsInfo: BotInfoLite[];
+  /** pm2 appName → live pid (only ONLINE apps appear). */
+  pidsByApp: Record<string, number>;
+  /** bots.json entries in order (index == pm2 app index). */
+  bots: Array<{ larkAppId?: string; name?: string }>;
+  /** pm2 process-name prefix (e.g. 'botmux'). */
+  pm2Name: string;
+}
+
+/**
+ * A bot is a USABLE seat iff BOTH hold (蔻黛 design pt 1):
+ *   - its probed open_id is persisted in bots-info (proves it booted + probed), and
+ *   - its pm2 app is online right now (proves it's alive, not a stale file).
+ * pm2-online alone can't talk/observe yet; open_id alone may be a dead clone's
+ * leftover. Returns the open_id when ready, else undefined.
+ */
+export function resolveReady(appId: string, snap: ReadySnapshot): string | undefined {
+  const info = snap.botsInfo.find(b => b.larkAppId === appId);
+  if (!info?.botOpenId) return undefined;            // never probed an open_id
+  const idx = snap.bots.findIndex(b => b.larkAppId === appId);
+  if (idx < 0) return undefined;                     // not in bots.json
+  const appName = botProcessName(snap.bots[idx] ?? {}, idx, snap.pm2Name);
+  const pid = snap.pidsByApp[appName];
+  if (!pid || pid <= 0) return undefined;            // pm2 app not online
+  return info.botOpenId;
+}
+
+export interface ActivationApprovalCheck {
+  /** appId the CLI request asserts 松松 approved for activation. */
+  approvedAppId?: string;
+  /** open_id of whoever triggered this turn (session.lastCallerOpenId). */
+  senderOpenId?: string;
+  /** owner open_id for the CEO app (same-app scope → safe ===). */
+  ownerOpenId?: string;
+  /** session.larkAppId — the bot whose session drove this command. */
+  callerAppId?: string;
+  /** the canonical main/CEO (claude) appId. */
+  claudeAppId?: string;
+  /** the clone ensureClonesAndSpawn is currently gating on. */
+  pendingAppId?: string;
+  /** the pending bot has a claudeConfigDir (is a real clone). */
+  pendingIsClone: boolean;
+}
+
+/**
+ * Gate that decides whether activation (pm2 start = deploy) may proceed (蔻黛
+ * design pt 2). A CLI `--activation-approved <appId>` flag alone is too soft —
+ * the daemon must independently confirm ALL of:
+ *   - the trigger came from the owner,
+ *   - on the main/CEO bot's own session,
+ *   - the approved appId matches the actual pending clone, and
+ *   - that pending bot really is a clone.
+ * Any miss → false → ensureClonesAndSpawn stays at awaiting_activation (no pm2).
+ */
+export function activationApproved(c: ActivationApprovalCheck): boolean {
+  if (!c.approvedAppId) return false;
+  if (!c.senderOpenId || c.senderOpenId !== c.ownerOpenId) return false;
+  if (!c.callerAppId || c.callerAppId !== c.claudeAppId) return false;
+  if (!c.pendingAppId || c.approvedAppId !== c.pendingAppId) return false;
+  if (!c.pendingIsClone) return false;
+  return true;
+}
+
+/**
+ * Resolve the CEO bot's owner open_id. Prefer the bot-config allowedUsers owner
+ * (`getOwnerOpenId`); fall back to the session owner (the human who first
+ * messaged this bot, captured at session create) when allowedUsers is empty —
+ * otherwise deployments that don't populate per-bot allowedUsers would have
+ * getOwnerOpenId() === undefined and the owner gate would fail closed for
+ * everyone, breaking clone/activate entirely (真机部署 owner-fix #1).
+ *
+ * Security note (for review): the session-owner fallback means that in a
+ * deployment with NO configured allowedUsers, whoever first started the topic
+ * is treated as owner. Acceptable for single-owner deployments; tighten via
+ * allowedUsers when multi-tenant.
+ */
+export function resolveCeoOwner(configOwner: string | undefined, sessionOwner: string | undefined): string | undefined {
+  return configOwner ?? sessionOwner;
+}
+
+const VALID_ROLES = new Set(['main', 'collab', 'observer']);
+/** Reserved ref meaning "fill this seat with a claude seat (本体 or a clone)". */
+export const AUTO_SEAT_REF = 'auto';
+
+/**
+ * Parse `--seats` entries into SeatSpecs. Each entry is `<role>` shorthand,
+ * `auto:<role>` (a claude-auto seat → ref-less, ensureClonesAndSpawn fills it),
+ * or `<ref>:<role>` (a specific already-registered bot). A bare role with no
+ * ref is treated as a claude-auto seat. Throws on an invalid role.
+ */
+export function parseSeats(entries: string[]): SeatSpec[] {
+  return entries.map(raw => {
+    const entry = raw.trim();
+    const ci = entry.indexOf(':');
+    let ref = ci >= 0 ? entry.slice(0, ci).trim() : '';
+    let role = (ci >= 0 ? entry.slice(ci + 1) : entry).trim().toLowerCase();
+    if (!role) role = 'collab';
+    if (!VALID_ROLES.has(role)) {
+      throw new Error(`invalid role "${role}" in seat "${raw}" (allowed: main|collab|observer)`);
+    }
+    if (!ref || ref.toLowerCase() === AUTO_SEAT_REF) {
+      return { role: role as SeatSpec['role'] }; // claude-auto (ref-less)
+    }
+    return { ref, role: role as SeatSpec['role'] };
+  });
+}

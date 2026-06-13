@@ -107,12 +107,14 @@ export function parentToChildSummon(cmd: OutboxCommand, task: SubTask): string {
 function parentToChildSummonBody(cmd: OutboxCommand, task: SubTask): string {
   if (cmd.commandType === 'kickoff') {
     // B1: kickoff 只唤执行者(main)，reviewer 不在此被唤起 (等执行者产出后 request_review 再唤)。
+    // 块7 第二轮 #5 late-kickoff：payload.targetSummonName 设置时**只唤这一个 bot**
+    // (后期激活拉进群的 clone，用其 displayName)，绝不唤 main —— 满足 reviewer blocker3。
     const acc = task.acceptance ? ` 验收：${safeText(task.acceptance, 200)}` : '';
     // 嵌套 (v1.1 §7)：spawnable 任务在 kickoff 即提示可裂变，细则靠每轮注入的【裂变授权】段。
     const spawnHint = task.spawnable === true
       ? ' 本任务已授权可裂变：可用 `botmux subtask-start` 在本群再派子任务（深度/预算闸自动把守，细则见注入的【裂变授权】段）。'
       : '';
-    return urgentSummon(resolveTargets(task, 'main'),
+    return urgentSummon(cmd.payload.targetSummonName ? [cmd.payload.targetSummonName] : resolveTargets(task, 'main'),
       `📋 子任务启动：${safeText(task.goal, 240)}。${acc} 你是主推进者，方案/代码/文档由你产出、你驱动任务；产出第一份可 review 物后用 \`botmux subtask-request-review --task-id ${task.taskId} --summary "<可打开的链接/绝对路径>"\` 唤起 reviewer。卡住用 \`botmux subtask-askforhelp --task-id ${task.taskId} --summary "卡在哪"\`，别硬扛别编。${spawnHint}${SUBTASK_COLLAB_NORMS_ONELINE}`);
   }
   if (cmd.commandType === 'request_review') {

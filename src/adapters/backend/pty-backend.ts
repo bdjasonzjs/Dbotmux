@@ -26,6 +26,9 @@ export class PtyBackend implements SessionBackend {
   /** Working directory the CLI was spawned in — cross-checked against the pid
    *  file's cwd field so a recycled PID can't mislead the resolver. */
   cliCwd?: string;
+  /** This session's Claude home (CLAUDE_CONFIG_DIR) — set by worker for cloned
+   *  bots so the adapter's pid-state re-resolution reads the clone's home. */
+  claudeHome?: string;
 
   spawn(bin: string, args: string[], opts: SpawnOpts): void {
     logger.debug(

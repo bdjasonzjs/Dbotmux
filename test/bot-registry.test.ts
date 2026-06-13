@@ -270,6 +270,20 @@ describe('loadBotConfigs', () => {
     expect(configs[0].cliId).toBe('claude-code'); // default
   });
 
+  it('round-trips displayName/clonedFromName when present; undefined when absent (块7 #2)', () => {
+    process.env.BOTS_CONFIG = '/tmp/bots.json';
+    fsMock.existsSync.mockReturnValue(true);
+    fsMock.readFileSync.mockReturnValue(JSON.stringify([
+      { larkAppId: 'cli_clone', larkAppSecret: 's', cliId: 'claude-code', displayName: '克劳德（初号机）', clonedFromName: '克劳德' },
+      { larkAppId: 'cli_main', larkAppSecret: 's2', cliId: 'claude-code' }, // 本体: no fields
+    ]));
+    const configs = mod.loadBotConfigs();
+    expect(configs[0].displayName).toBe('克劳德（初号机）');
+    expect(configs[0].clonedFromName).toBe('克劳德');
+    expect(configs[1].displayName).toBeUndefined();
+    expect(configs[1].clonedFromName).toBeUndefined();
+  });
+
   it('should fall back to ~/.botmux/bots.json when BOTS_CONFIG is not set', () => {
     // No BOTS_CONFIG env var
     // existsSync: first call (for BOTS_CONFIG) won't happen since env isn't set,
