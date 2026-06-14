@@ -6,7 +6,7 @@
  *   2. activation-approval = explicit owner-scope check, not just a CLI flag.
  */
 import { botProcessName } from '../setup/bot-config-editor.js';
-import type { SeatSpec } from './ceo-clone-orchestration.js';
+import type { SeatSpec, AutoTarget } from './ceo-clone-orchestration.js';
 
 export interface BotInfoLite {
   larkAppId: string;
@@ -117,29 +117,89 @@ export function hotRegisterClone(appId: string, deps: HotRegisterDeps): { ok: bo
   catch (e: any) { return { ok: false, error: String(e?.message ?? e) }; }
 }
 
+export interface AutoTargetResolveDeps {
+  /** bots.json entries (clone marker = claudeConfigDir present). */
+  bots: Array<{ larkAppId: string; cliId: string; claudeConfigDir?: string }>;
+  /** bots-info name catalog for botName match — NO open_id needed (蔻黛 Batch1
+   *  Blocker2: resolution must not depend on open_id / cross-ref availability). */
+  names: Array<{ larkAppId: string; botName?: string }>;
+  /** Built-in alias → canonical cliId (claude/c, codex/k, tilly/t). */
+  aliasToCliId: Record<string, string>;
+  /** CEO's own cliId — the default target when autoTarget is undefined. */
+  ceoCliId: string;
+}
+
+/**
+ * Resolve an auto seat's target → {cliId, 本体 appId}, fully bot-agnostic and
+ * decoupled from open_id (蔻黛 Batch1 Blocker2). Priority: exact appId > built-in
+ * alias > botName (case-insensitive) > raw cliId. undefined/blank → the CEO's
+ * engine. 本体 = the non-clone (no claudeConfigDir) bot of the resolved cliId.
+ * Pure over injected registry snapshots so the priority is unit-testable without
+ * a live daemon / bots-info openId.
+ */
+export function resolveAutoTarget(autoTarget: string | undefined, d: AutoTargetResolveDeps): AutoTarget | { error: string } {
+  let cliId: string | undefined;
+  const t = (autoTarget ?? '').trim();
+  if (!t) {
+    cliId = d.ceoCliId;
+  } else {
+    const tl = t.toLowerCase();
+    const byApp = d.bots.find(b => b.larkAppId === t);               // 1. exact appId
+    if (byApp) cliId = byApp.cliId;
+    else if (d.aliasToCliId[tl]) cliId = d.aliasToCliId[tl];         // 2. built-in alias
+    else {
+      const named = d.names.find(n => n.botName && n.botName.trim().toLowerCase() === tl); // 3. botName
+      const namedBot = named && d.bots.find(b => b.larkAppId === named.larkAppId);
+      if (namedBot) cliId = namedBot.cliId;
+      else {
+        const byCli = d.bots.find(b => b.cliId.toLowerCase() === tl); // 4. raw cliId
+        if (byCli) cliId = byCli.cliId;
+      }
+    }
+    if (!cliId) return { error: `未知的 bot/引擎 "${autoTarget}"` };
+  }
+  const benti = d.bots.find(b => b.cliId === cliId && !b.claudeConfigDir);
+  if (!benti) return { error: `引擎 "${cliId}" 没有可用本体` };
+  return { cliId, bentiAppId: benti.larkAppId };
+}
+
 const VALID_ROLES = new Set(['main', 'collab', 'observer']);
-/** Reserved ref meaning "fill this seat with a claude seat (本体 or a clone)". */
+/** Reserved head meaning "auto seat" — fill from a ready bot of the target
+ *  engine or clone one. `auto` alone = the CEO's own engine; `auto@<ref>` = the
+ *  engine/bot named by ref (alias/name/appId/cliId). */
 export const AUTO_SEAT_REF = 'auto';
 
 /**
- * Parse `--seats` entries into SeatSpecs. Each entry is `<role>` shorthand,
- * `auto:<role>` (a claude-auto seat → ref-less, ensureClonesAndSpawn fills it),
- * or `<ref>:<role>` (a specific already-registered bot). A bare role with no
- * ref is treated as a claude-auto seat. Throws on an invalid role.
+ * Parse `--seats` entries into SeatSpecs. Pure syntax only — does NOT validate
+ * whether a ref exists or an engine is supported (that needs the runtime
+ * registry; it happens in ensureClonesAndSpawn). Forms:
+ *   - `<role>` / `auto:<role>`        → auto seat, default target (CEO engine)
+ *   - `auto@<ref>:<role>`             → auto seat, target = ref (any bot/engine id)
+ *   - `<ref>:<role>`                  → explicit already-registered bot, no clone
+ * Throws on an invalid role or an empty `auto@` target.
  */
 export function parseSeats(entries: string[]): SeatSpec[] {
   return entries.map(raw => {
     const entry = raw.trim();
     const ci = entry.indexOf(':');
-    let ref = ci >= 0 ? entry.slice(0, ci).trim() : '';
+    const head = (ci >= 0 ? entry.slice(0, ci) : '').trim();
     let role = (ci >= 0 ? entry.slice(ci + 1) : entry).trim().toLowerCase();
     if (!role) role = 'collab';
     if (!VALID_ROLES.has(role)) {
       throw new Error(`invalid role "${role}" in seat "${raw}" (allowed: main|collab|observer)`);
     }
-    if (!ref || ref.toLowerCase() === AUTO_SEAT_REF) {
-      return { role: role as SeatSpec['role'] }; // claude-auto (ref-less)
+    const r = role as SeatSpec['role'];
+    // bare role or `auto` → auto seat, default target.
+    if (!head || head.toLowerCase() === AUTO_SEAT_REF) {
+      return { auto: true, role: r };
     }
-    return { ref, role: role as SeatSpec['role'] };
+    // `auto@<ref>` → auto seat targeting a specific bot/engine.
+    if (head.toLowerCase().startsWith(`${AUTO_SEAT_REF}@`)) {
+      const target = head.slice(AUTO_SEAT_REF.length + 1).trim();
+      if (!target) throw new Error(`auto@ requires a target in seat "${raw}"`);
+      return { auto: true, autoTarget: target, role: r };
+    }
+    // `<ref>` → explicit already-registered bot.
+    return { ref: head, role: r };
   });
 }

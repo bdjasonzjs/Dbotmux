@@ -29,7 +29,11 @@ import { execSync } from 'node:child_process';
 import { homedir, platform } from 'node:os';
 import { join } from 'node:path';
 
-const CODEX_SESSIONS_ROOT = join(homedir(), '.codex', 'sessions');
+/** Codex sessions root, per home. `home` (Round-4 B4) = a clone's CODEX_HOME when
+ *  isolated; defaults to the global ~/.codex (本体, unchanged). */
+function codexSessionsRoot(home?: string): string {
+  return join(home && home.trim() ? home : join(homedir(), '.codex'), 'sessions');
+}
 const IS_LINUX = platform() === 'linux';
 
 /** Extract the cliSessionId encoded in a rollout filename. Codex's session
@@ -178,10 +182,11 @@ export interface CodexDrainResult {
  *  `rollout-<ts>-<sid>.jsonl`, so a suffix match is unambiguous. The
  *  directory tree is small (year/month/day) — a one-shot recursive scan
  *  is cheap enough that we don't bother caching. */
-export function findCodexRolloutBySessionId(cliSessionId: string): string | undefined {
-  if (!cliSessionId || !existsSync(CODEX_SESSIONS_ROOT)) return undefined;
+export function findCodexRolloutBySessionId(cliSessionId: string, home?: string): string | undefined {
+  const root = codexSessionsRoot(home);
+  if (!cliSessionId || !existsSync(root)) return undefined;
   const suffix = `-${cliSessionId}.jsonl`;
-  const stack: string[] = [CODEX_SESSIONS_ROOT];
+  const stack: string[] = [root];
   while (stack.length > 0) {
     const dir = stack.pop()!;
     let entries: string[];

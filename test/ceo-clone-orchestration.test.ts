@@ -1,28 +1,27 @@
 import { describe, it, expect } from 'vitest';
 import { ensureClonesAndSpawn, type EnsureSpawnDeps, type EnsureSpawnReq } from '../src/services/ceo-clone-orchestration.js';
-import type { BotInventoryEntry } from '../src/services/bot-inventory.js';
 import type { CeoSpawnState } from '../src/services/ceo-spawn-store.js';
 
 const OWNER = 'ou_owner';
 const baseReq = (over: Partial<EnsureSpawnReq> = {}): EnsureSpawnReq => ({
   goal: 'push X', chatId: 'oc_main', rootMessageId: 'om_root', senderOpenId: OWNER,
-  seats: [{ role: 'main' }, { role: 'collab' }], requestKey: 'k1',
+  seats: [{ auto: true, role: 'main' }, { auto: true, role: 'collab' }], requestKey: 'k1',
   ...over,
 });
 
-const main = (): BotInventoryEntry => ({ larkAppId: 'cli_main', cliId: 'claude-code', index: 0 });
-const clone = (id = 'cli_clone'): BotInventoryEntry => ({ larkAppId: id, cliId: 'claude-code', index: 1, claudeConfigDir: `/c/${id}` });
-
 function deps(over: Partial<EnsureSpawnDeps> = {}): { d: EnsureSpawnDeps; calls: any; store: Map<string, CeoSpawnState> } {
   const store = new Map<string, CeoSpawnState>();
-  const calls = { spawn: 0, cloneInChat: 0, activate: 0, registerActivatedBot: 0, isInChat: 0, addBotToChat: 0, addBotToSubTask: 0, lateKickoff: 0, replies: [] as string[], order: [] as string[], lateKickoffArgs: [] as any[] };
+  const calls = { spawn: 0, cloneInChat: 0, activate: 0, registerActivatedBot: 0, isInChat: 0, addBotToChat: 0, addBotToSubTask: 0, lateKickoff: 0, replies: [] as string[], order: [] as string[], lateKickoffArgs: [] as any[], cloneArgs: [] as any[] };
   const d: EnsureSpawnDeps = {
     getOwnerOpenId: () => OWNER,
-    listClaudeBots: () => [main()],
+    // default auto target = the claude 本体 (cli_main); pool has only the 本体 ready.
+    resolveAutoTarget: () => ({ cliId: 'claude-code', bentiAppId: 'cli_main' }),
+    usableAppsByCli: (cliId) => (cliId === 'claude-code' ? ['cli_main'] : []),
+    cloneTier: () => 'full',
     botOpenIdReady: (id) => (id === 'cli_main' ? 'ou_main' : undefined),
     displayNameForApp: (id) => (id === 'cli_new' ? '克劳德（初号机）' : undefined),
     spawnSubtask: async ({ bots }) => { calls.spawn++; return { taskId: 'st_1', chatId: 'oc_sub', bots }; },
-    cloneInChat: async () => { calls.cloneInChat++; return { ok: true, appId: 'cli_new' }; },
+    cloneInChat: async (a) => { calls.cloneInChat++; calls.cloneArgs.push(a); return { ok: true, appId: 'cli_new' }; },
     activationApproved: () => false,
     activate: async () => { calls.activate++; calls.order.push('activate'); return { ok: true }; },
     registerActivatedBot: async () => { calls.registerActivatedBot++; calls.order.push('register'); return { ok: true }; },
@@ -49,7 +48,7 @@ describe('ensureClonesAndSpawn (subgroup-first #5)', () => {
 
   it('enough ready seats → builds subgroup with all seats, no clone, spawned', async () => {
     const { d, calls } = deps({
-      listClaudeBots: () => [main(), clone()],
+      usableAppsByCli: (cliId) => (cliId === 'claude-code' ? ['cli_main', 'cli_clone'] : []),
       botOpenIdReady: (id) => (id === 'cli_main' || id === 'cli_clone' ? `ou_${id}` : undefined),
     });
     const out = await ensureClonesAndSpawn(baseReq(), d);
@@ -149,16 +148,18 @@ describe('ensureClonesAndSpawn (subgroup-first #5)', () => {
     expect(calls.lateKickoff).toBe(1);
   });
 
-  // blocker2: 本体(non-clone) must take auto:main even if a clone is earlier in bots.json.
-  it('clone at bots.json index 0, 本体 ready → auto:main = 本体, clone → collab', async () => {
+  // blocker2: orchestration fills seats in the pool's order; the 本体-first
+  // guarantee is the service's usableAppsByCli sort (本体 before clones), so the
+  // injected pool here is already 本体-first and auto:main lands on the 本体.
+  it('pool is 本体-first (cli_main before clone) → auto:main = 本体, clone → collab', async () => {
     const { d } = deps({
-      listClaudeBots: () => [clone('cli_c0'), main()], // clone listed FIRST
+      usableAppsByCli: (cliId) => (cliId === 'claude-code' ? ['cli_main', 'cli_c0'] : []),
       botOpenIdReady: (id) => (id === 'cli_main' || id === 'cli_c0' ? `ou_${id}` : undefined),
     });
     const out = await ensureClonesAndSpawn(baseReq(), d);
     expect(out.status).toBe('spawned');
     if (out.status !== 'spawned') return;
-    expect(out.bots).toEqual(['cli_main:main', 'cli_c0:collab']); // 本体 main, not the index-0 clone
+    expect(out.bots).toEqual(['cli_main:main', 'cli_c0:collab']); // 本体 main, then clone
   });
 
   // hardening: a clone with no displayName must NOT trigger a kickoff (would wake main).
@@ -212,5 +213,156 @@ describe('ensureClonesAndSpawn (subgroup-first #5)', () => {
     expect(out.status).toBe('error');
     expect(calls.addBotToChat).toBe(0);
     expect(calls.replies.some(m => /激活失败/.test(m))).toBe(true);
+  });
+});
+
+describe('ensureClonesAndSpawn (Round-4: bot-agnostic engine grouping)', () => {
+  // Per-engine pools fill independently: a codex auto seat draws from the codex
+  // pool, a claude auto seat from the claude pool — never cross.
+  it('mixed engines: each auto seat fills from ITS engine pool', async () => {
+    const { d, calls } = deps({
+      seats: undefined as any, // set via req below
+      resolveAutoTarget: (t) => t === 'codex'
+        ? { cliId: 'codex', bentiAppId: 'cli_kbenti' }
+        : { cliId: 'claude-code', bentiAppId: 'cli_main' },
+      usableAppsByCli: (cliId) => cliId === 'codex' ? ['cli_kbenti'] : cliId === 'claude-code' ? ['cli_main'] : [],
+      botOpenIdReady: (id) => (id === 'cli_main' || id === 'cli_kbenti' ? `ou_${id}` : undefined),
+    });
+    const out = await ensureClonesAndSpawn(baseReq({
+      seats: [{ auto: true, role: 'main' }, { auto: true, autoTarget: 'codex', role: 'collab' }],
+    }), d);
+    expect(out.status).toBe('spawned');
+    if (out.status !== 'spawned') return;
+    expect(out.bots).toEqual(['cli_main:main', 'cli_kbenti:collab']);
+    expect(calls.cloneInChat).toBe(0);
+  });
+
+  // codex pool exhausted → clone a codex; cloneInChat gets the codex 本体 as source.
+  it('codex auto seat, pool empty → clones codex 本体 (source = codex 本体, not CEO)', async () => {
+    const { d, calls } = deps({
+      resolveAutoTarget: () => ({ cliId: 'codex', bentiAppId: 'cli_kbenti' }),
+      usableAppsByCli: () => [], // no ready codex → must clone
+    });
+    const out = await ensureClonesAndSpawn(baseReq({
+      seats: [{ auto: true, autoTarget: 'codex', role: 'collab' }],
+    }), d);
+    expect(out.status).toBe('awaiting_activation');
+    expect(calls.cloneInChat).toBe(1);
+    expect(calls.cloneArgs[0]).toMatchObject({ sourceCliId: 'codex', sourceBentiAppId: 'cli_kbenti' });
+  });
+
+  // No cloneHome at all (tier undefined) needing a clone → refuse BEFORE building.
+  it('auto@<engine> needs clone but engine has no cloneHome → refused, no subgroup/clone/store', async () => {
+    const { d, calls, store } = deps({
+      resolveAutoTarget: () => ({ cliId: 'gemini', bentiAppId: 'cli_gembenti' }),
+      usableAppsByCli: () => [], // no ready → would need a clone
+      cloneTier: (cliId) => cliId === 'gemini' ? undefined : 'full',
+    });
+    const out = await ensureClonesAndSpawn(baseReq({
+      seats: [{ auto: true, autoTarget: 'gemini', role: 'collab' }],
+    }), d);
+    expect(out.status).toBe('refused');
+    expect(calls.spawn).toBe(0);
+    expect(calls.cloneInChat).toBe(0);
+    expect(store.get('k1')).toBeUndefined();
+  });
+
+  // 蔻黛 coco guardrail 2: DEFAULT auto (no explicit target) must NEVER select a
+  // state-only engine — refuse at plan time, even if a ready one exists.
+  it('default auto resolving to a state-only engine → refused, no subgroup', async () => {
+    const { d, calls } = deps({
+      // default target (autoTarget undefined) resolves to a state-only engine.
+      resolveAutoTarget: () => ({ cliId: 'coco', bentiAppId: 'cli_cocobenti' }),
+      usableAppsByCli: (cliId) => cliId === 'coco' ? ['cli_cocobenti'] : [], // even ready
+      cloneTier: (cliId) => cliId === 'coco' ? 'state-only' : 'full',
+      botOpenIdReady: (id) => (id === 'cli_cocobenti' ? 'ou_coco' : undefined),
+    });
+    const out = await ensureClonesAndSpawn(baseReq({ seats: [{ auto: true, role: 'collab' }] }), d);
+    expect(out.status).toBe('refused');
+    expect(calls.spawn).toBe(0);
+  });
+
+  // EXPLICIT auto@coco → state-only IS allowed (owner opt-in) → clones coco 本体.
+  it('explicit auto@coco (state-only) → allowed, clones coco 本体', async () => {
+    const { d, calls } = deps({
+      resolveAutoTarget: () => ({ cliId: 'coco', bentiAppId: 'cli_cocobenti' }),
+      usableAppsByCli: () => [], // no ready coco → clone
+      cloneTier: (cliId) => cliId === 'coco' ? 'state-only' : 'full',
+    });
+    const out = await ensureClonesAndSpawn(baseReq({
+      seats: [{ auto: true, autoTarget: 'coco', role: 'collab' }],
+    }), d);
+    expect(out.status).toBe('awaiting_activation');
+    expect(calls.cloneInChat).toBe(1);
+    expect(calls.cloneArgs[0]).toMatchObject({ sourceCliId: 'coco', sourceBentiAppId: 'cli_cocobenti' });
+    // state-only tier surfaced in the build notice
+    expect(calls.replies.some(m => /state-only/.test(m))).toBe(true);
+  });
+
+  // Explicit ref to a ready state-only bot (coco:collab) → fills seat, no clone.
+  it('explicit ref coco:collab (ready) → fills seat, no clone', async () => {
+    const { d, calls } = deps({ cloneTier: (cliId) => cliId === 'coco' ? 'state-only' : 'full' });
+    const out = await ensureClonesAndSpawn(baseReq({ seats: [{ ref: 'coco', role: 'collab' }] }), d);
+    expect(out.status).toBe('spawned');
+    if (out.status !== 'spawned') return;
+    expect(out.bots).toEqual(['coco:collab']);
+    expect(calls.cloneInChat).toBe(0);
+  });
+
+  // Unresolvable autoTarget → refuse before building anything.
+  it('unknown autoTarget → refused, no subgroup', async () => {
+    const { d, calls } = deps({
+      resolveAutoTarget: () => ({ error: '未知的 bot/引擎 "nope"' }),
+    });
+    const out = await ensureClonesAndSpawn(baseReq({
+      seats: [{ auto: true, autoTarget: 'nope', role: 'main' }],
+    }), d);
+    expect(out.status).toBe('refused');
+    expect(calls.spawn).toBe(0);
+  });
+
+  // Blocker3: a pending clone persisted before Round-4 (no cliId/bentiAppId) must
+  // migrate to the default target, not call cloneInChat with undefined source.
+  it('old pending state (no cliId/bentiAppId) → migrates to default target, then clones', async () => {
+    const { d, calls, store } = deps({ activationApproved: () => false });
+    store.set('k1', {
+      key: 'k1', taskId: 'st_old', subgroupChatId: 'oc_old',
+      pendingClones: [{ seatIndex: 0, role: 'collab', phase: 'pending' } as any], updatedAt: '',
+    });
+    const out = await ensureClonesAndSpawn(baseReq(), d);
+    expect(out.status).toBe('awaiting_activation');
+    expect(calls.cloneInChat).toBe(1);
+    expect(calls.cloneArgs[0]).toMatchObject({ sourceCliId: 'claude-code', sourceBentiAppId: 'cli_main' });
+    expect(store.get('k1')?.pendingClones[0].cliId).toBe('claude-code');
+  });
+
+  // Blocker3: if even the default target can't resolve → clear state + visible error (never clone undefined).
+  it('old pending state + unresolvable default → clears state, error, no clone', async () => {
+    const { d, calls, store } = deps({ resolveAutoTarget: () => ({ error: '没有可用本体' }) });
+    store.set('k1', {
+      key: 'k1', taskId: 'st_old', subgroupChatId: 'oc_old',
+      pendingClones: [{ seatIndex: 0, role: 'collab', phase: 'pending' } as any], updatedAt: '',
+    });
+    const out = await ensureClonesAndSpawn(baseReq(), d);
+    expect(out.status).toBe('error');
+    expect(calls.cloneInChat).toBe(0);
+    expect(store.get('k1')).toBeUndefined();
+  });
+
+  // Explicit ref seats pass through untouched (no resolution, no clone).
+  it('explicit ref seat → passthrough, no resolveAutoTarget/clone', async () => {
+    let resolveCalls = 0;
+    const { d, calls } = deps({
+      resolveAutoTarget: () => { resolveCalls++; return { cliId: 'claude-code', bentiAppId: 'cli_main' }; },
+      usableAppsByCli: () => [],
+    });
+    const out = await ensureClonesAndSpawn(baseReq({
+      seats: [{ ref: 'codex', role: 'main' }, { ref: '缇蕾', role: 'observer' }],
+    }), d);
+    expect(out.status).toBe('spawned');
+    if (out.status !== 'spawned') return;
+    expect(out.bots).toEqual(['codex:main', '缇蕾:observer']);
+    expect(resolveCalls).toBe(0);
+    expect(calls.cloneInChat).toBe(0);
   });
 });

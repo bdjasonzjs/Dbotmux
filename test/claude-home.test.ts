@@ -2,7 +2,7 @@ import { describe, expect, it, afterEach } from 'vitest';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
-import { resolveClaudeHome, defaultClaudeHome } from '../src/core/claude-home.js';
+import { resolveClaudeHome, defaultClaudeHome, cloneHomeEnv } from '../src/core/claude-home.js';
 import {
   claudeJsonlPathForSession,
   claudePidStatePath,
@@ -23,6 +23,27 @@ describe('resolveClaudeHome', () => {
   it('returns the configured dir when set (clone isolation)', () => {
     expect(resolveClaudeHome('/home/u/.botmux/clones/cli_x/.claude'))
       .toBe('/home/u/.botmux/clones/cli_x/.claude');
+  });
+});
+
+describe('cloneHomeEnv (Round-4 B4: engine-aware spawn-env home override)', () => {
+  it('claude clone → CLAUDE_CONFIG_DIR (byte-equivalent to the old injection)', () => {
+    expect(cloneHomeEnv('/c/cli_x/.claude', { envVar: 'CLAUDE_CONFIG_DIR' }))
+      .toEqual({ CLAUDE_CONFIG_DIR: '/c/cli_x/.claude' });
+  });
+  it('codex clone → CODEX_HOME', () => {
+    expect(cloneHomeEnv('/c/cli_y/.codex', { envVar: 'CODEX_HOME' }))
+      .toEqual({ CODEX_HOME: '/c/cli_y/.codex' });
+  });
+  it('coco state-only clone → XDG_CACHE_HOME (clone-scoped)', () => {
+    expect(cloneHomeEnv('/c/cli_z/coco-cache', { envVar: 'XDG_CACHE_HOME' }))
+      .toEqual({ XDG_CACHE_HOME: '/c/cli_z/coco-cache' });
+  });
+  it('non-clone bot (no clone home) → {} (inherited env, unchanged)', () => {
+    expect(cloneHomeEnv(undefined, { envVar: 'CLAUDE_CONFIG_DIR' })).toEqual({});
+  });
+  it('engine without cloneHome capability → {} (no injection)', () => {
+    expect(cloneHomeEnv('/c/cli_z/.home', undefined)).toEqual({});
   });
 });
 

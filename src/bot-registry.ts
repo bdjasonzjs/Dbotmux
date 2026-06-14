@@ -67,15 +67,14 @@ export interface BotConfig {
    */
   defaultWorkingDir?: string;
   /**
-   * Per-bot Claude config/home directory (passed to the CLI as CLAUDE_CONFIG_DIR
-   * and used by botmux's own transcript-follow path resolvers). Lets a cloned
-   * bot isolate its sessions/state/memory under a dedicated dir while sharing
-   * persona files via symlinks. When unset, defaults to `~/.claude` (the source
-   * bot / original behaviour — no migration).
-   *
-   * NOTE: the runtime resolver that consumes this (worker env + adapter path
-   * resolution) lands in a later block; this field is currently parsed and
-   * round-tripped through bots.json but not yet wired into spawn.
+   * Per-bot isolated home directory + the universal CLONE MARKER (Round-4: name
+   * kept for back-compat, but it is NOT claude-specific anymore). A clone gets a
+   * dedicated dir here (`<botmux>/clones/<appId>/.claude|.codex|…`) so its
+   * sessions/state/memory are isolated while persona is symlink-shared. The worker
+   * injects it into the spawn env via the ENGINE's home env var (claude-code →
+   * CLAUDE_CONFIG_DIR, codex → CODEX_HOME) from the adapter's cloneHome — so do NOT
+   * assume this maps to CLAUDE_CONFIG_DIR. Unset ⇒ a 本体 (uses the engine default
+   * home; original behaviour, no migration). Presence ⇒ this bot is a clone.
    */
   claudeConfigDir?: string;
   /** Per-bot default: auto-bind every new group chat to oncall on first new-topic. */

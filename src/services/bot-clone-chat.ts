@@ -13,7 +13,6 @@ import { join } from 'node:path';
 import QRCode from 'qrcode';
 import type { BotConfig } from '../bot-registry.js';
 import { cloneBot, type CloneBotResult } from './bot-clone.js';
-import { resolveClaudeHome } from '../core/claude-home.js';
 import { tryRegisterApp, type RegisterAppOptions, type RegisterAppResult } from '../setup/register-app.js';
 
 export interface CloneBotInChatArgs {
@@ -127,7 +126,7 @@ export async function cloneBotInChat(
       writeFileSync(p, png);
       const imageKey = await deps.uploadImage(args.ceoAppId, p);
       await deps.postToChat(args.ceoAppId, targetChatId, JSON.stringify({ image_key: imageKey }), 'image');
-      await reply('👆 请用飞书扫码创建克劳德分身（二维码有效期约 10 分钟）。');
+      await reply(`👆 请用飞书扫码创建${args.sourceDisplayName ? `${args.sourceDisplayName}分身` : '分身'}（二维码有效期约 10 分钟）。`);
     } finally {
       try { rmSync(dir, { recursive: true, force: true }); } catch { /* */ }
     }
@@ -146,7 +145,8 @@ export async function cloneBotInChat(
       sourceBot: args.sourceBot,
       configDir: args.configDir,
       botsJsonPath: args.botsJsonPath,
-      sourceClaudeHome: resolveClaudeHome(args.sourceBot.claudeConfigDir),
+      // sourceClaudeHome omitted → cloneBot derives it engine-aware (codex 本体 →
+      // ~/.codex, not ~/.claude). Round-4 B4.
       sourceDisplayName: args.sourceDisplayName,
       botNamesByAppId: args.botNamesByAppId,
     },

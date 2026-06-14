@@ -24,9 +24,67 @@ export interface PtyHandle {
   claudeHome?: string;
 }
 
+/**
+ * Per-engine clone-home capability (Round-4). Declaring this makes a CLI
+ * auto-cloneable: the clone gets an isolated home relocated via `envVar`. An
+ * adapter WITHOUT cloneHome cannot be auto-cloned (the orchestrator refuses
+ * before building anything — 蔻黛 v2 Blocker1). This is the single per-engine
+ * extension point: the clone/seat/orchestration path reads this capability and
+ * never hardcodes an engine list, so adding a new adapter makes it auto-clone-
+ * ready without touching that path.
+ *
+ * (Round-4 batch 1 carries the two facts the upper layer needs — the env var to
+ * relocate the home and the clone's home dir name. File classification + worker/
+ * transcript home threading land in batch 2 / B4.)
+ */
+export interface CloneHomeSpec {
+  /**
+   * Isolation tier (Round-4 coco). 'full' = home/state/memory all isolated
+   * (claude-code, codex — a single relocatable home holds everything). 'state-only'
+   * = ONLY session/cache state is isolated; persona/config/memory are SHARED
+   * because the CLI keeps them under non-relocatable $HOME paths (coco/trae:
+   * ~/.coco + ~/.trae). A 'state-only' engine is NEVER chosen by default auto
+   * seat-filling — it requires an explicit ref (蔻黛 guardrail 2).
+   *
+   * IMPORTANT (蔻黛 guardrail 1): for 'state-only', botmux does NOT enforce
+   * read-only on the shared $HOME persona/memory — it merely OBSERVED that the
+   * current CLI version doesn't write them during a session. Never describe this
+   * as "read-only protected"; if a future CLI version starts writing those dirs,
+   * two clones could race. State that must be written goes to the isolated cache.
+   */
+  readonly tier: 'full' | 'state-only';
+  /** Env var that relocates this CLI's home/cache for an isolated clone
+   *  (claude-code → CLAUDE_CONFIG_DIR, codex → CODEX_HOME, coco → XDG_CACHE_HOME). */
+  readonly envVar: string;
+  /** Dir name under `<botmux>/clones/<appId>/` for the clone's isolated home. */
+  readonly dirName: string;
+  /** The 本体's default home dir (claude → ~/.claude, codex → ~/.codex) — the source
+   *  tree symlink/copy/seed read from when the source bot has no per-bot home dir. */
+  defaultHome(): string;
+  /** Top-level entries symlink-shared with the source (read-mostly persona / creds
+   *  the clone should follow). */
+  readonly sharedEntries: readonly string[];
+  /** Top-level entries COPIED once at clone time then owned independently — for
+   *  mutable files that must not be symlink-shared (e.g. codex auth.json/config.toml,
+   *  which a CLI may rewrite/atomic-rename, clobbering a symlink or cross-polluting
+   *  the 本体). Skipped if already present (never overwrites a forked clone). */
+  readonly copyEntries: readonly string[];
+  /** Top-level dirs pre-created empty & independent (state). May be empty when the
+   *  CLI creates its own state on first run in a fresh home (e.g. codex). */
+  readonly independentDirs: readonly string[];
+  /** Memory-seed strategy. 'claude-projects' = copy each projects/<key>/memory
+   *  (plain files, safe); 'none' = no seed (clone starts with empty memory — used
+   *  where memory is live SQLite that must never be copied, e.g. codex). */
+  readonly memorySeed: 'claude-projects' | 'none';
+}
+
 export interface CliAdapter {
   /** Unique identifier */
   readonly id: string;
+
+  /** Clone-home capability (Round-4). Present ⇒ this CLI can be auto-cloned with
+   *  an isolated, relocated home. Absent ⇒ not auto-cloneable. */
+  readonly cloneHome?: CloneHomeSpec;
 
   /** Resolved absolute path to the CLI binary */
   readonly resolvedBin: string;
@@ -48,6 +106,11 @@ export interface CliAdapter {
     botOpenId?: string;
     /** UI / response language for prompts injected into the CLI (e.g. zh / en). */
     locale?: import('../../i18n/index.js').Locale;
+    /** This session's CLI home (Round-4 B4): for a cloned bot, the relocated home
+     *  (= cfg.claudeConfigDir). Adapters that read home-scoped files during
+     *  buildArgs (e.g. codex resume-fallback scanning history.jsonl) MUST use this,
+     *  not a hardcoded global ~/.codex — else a clone reads the 本体's home. */
+    cliHome?: string;
   }): string[];
 
   /** When true, the adapter passes the initial prompt via CLI args (e.g. -i).
@@ -72,6 +135,9 @@ export interface CliAdapter {
     sessionId: string;
     /** CLI-native session id from session.cliSessionId, when available. */
     cliSessionId?: string;
+    /** This session's CLI home (Round-4 B4) — same role as buildArgs.cliHome:
+     *  resume-fallback history lookups read this home, not the global default. */
+    cliHome?: string;
   }): string | null;
 
   /** Write user input to PTY. May fire writes asynchronously (e.g. Aiden delayed Enter).

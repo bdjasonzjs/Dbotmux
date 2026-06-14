@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
-  resolveReady, activationApproved, parseSeats, resolveCeoOwner, hotRegisterClone,
-  type ReadySnapshot, type ActivationApprovalCheck,
+  resolveReady, activationApproved, parseSeats, resolveCeoOwner, hotRegisterClone, resolveAutoTarget,
+  type ReadySnapshot, type ActivationApprovalCheck, type AutoTargetResolveDeps,
 } from '../src/services/ceo-spawn-wiring.js';
 import { parseCeoSpawnArgs } from '../src/cli/bot-clone.js';
 
@@ -129,24 +129,80 @@ describe('resolveCeoOwner (真机 owner-fix #1: allowedUsers ?? session owner)',
   });
 });
 
-describe('parseSeats', () => {
-  it('auto:role → claude-auto (ref-less)', () => {
-    expect(parseSeats(['auto:main', 'auto:collab'])).toEqual([{ role: 'main' }, { role: 'collab' }]);
+describe('resolveAutoTarget (Round-4 Blocker2: open_id-decoupled, priority appId>alias>name>cliId)', () => {
+  const rad = (over: Partial<AutoTargetResolveDeps> = {}): AutoTargetResolveDeps => ({
+    bots: [
+      { larkAppId: 'cli_claude', cliId: 'claude-code' },
+      { larkAppId: 'cli_codex', cliId: 'codex' },
+      { larkAppId: 'cli_gem', cliId: 'gemini' },
+      { larkAppId: 'cli_cxclone', cliId: 'codex', claudeConfigDir: '/c/cxclone' }, // a clone
+    ],
+    names: [{ larkAppId: 'cli_codex', botName: '寇黛克斯' }],
+    aliasToCliId: { claude: 'claude-code', c: 'claude-code', codex: 'codex', k: 'codex', tilly: 'coco', t: 'coco' },
+    ceoCliId: 'claude-code',
+    ...over,
   });
-  it('bare role → claude-auto (ref-less)', () => {
-    expect(parseSeats(['main', 'collab'])).toEqual([{ role: 'main' }, { role: 'collab' }]);
+
+  it('undefined → CEO engine 本体', () => {
+    expect(resolveAutoTarget(undefined, rad())).toEqual({ cliId: 'claude-code', bentiAppId: 'cli_claude' });
   });
-  it('ref:role → specific bot', () => {
-    expect(parseSeats(['codex:collab', '克隆2:observer'])).toEqual([
-      { ref: 'codex', role: 'collab' }, { ref: '克隆2', role: 'observer' },
+  it('exact appId resolves WITHOUT any open_id / names (Blocker2)', () => {
+    expect(resolveAutoTarget('cli_codex', rad({ names: [] }))).toEqual({ cliId: 'codex', bentiAppId: 'cli_codex' });
+  });
+  it('built-in alias (k → codex)', () => {
+    expect(resolveAutoTarget('k', rad())).toEqual({ cliId: 'codex', bentiAppId: 'cli_codex' });
+  });
+  it('botName match needs NO open_id (Blocker2)', () => {
+    expect(resolveAutoTarget('寇黛克斯', rad())).toEqual({ cliId: 'codex', bentiAppId: 'cli_codex' });
+  });
+  it('raw cliId only when not appId/alias/name (gemini has no alias)', () => {
+    expect(resolveAutoTarget('gemini', rad())).toEqual({ cliId: 'gemini', bentiAppId: 'cli_gem' });
+  });
+  it('case-insensitive + trim for alias/name/cliId', () => {
+    expect(resolveAutoTarget('  Gemini ', rad())).toEqual({ cliId: 'gemini', bentiAppId: 'cli_gem' });
+    expect(resolveAutoTarget('CODEX', rad())).toEqual({ cliId: 'codex', bentiAppId: 'cli_codex' });
+  });
+  it('本体 = non-clone of the cliId (skips the clone entry)', () => {
+    // codex 本体 is cli_codex, never the cli_cxclone clone.
+    expect(resolveAutoTarget('codex', rad()).bentiAppId).toBe('cli_codex');
+  });
+  it('unknown ref → error', () => {
+    expect(resolveAutoTarget('nope', rad())).toEqual({ error: '未知的 bot/引擎 "nope"' });
+  });
+  it('cliId exists but only as a clone (no 本体) → error', () => {
+    const r = resolveAutoTarget('codex', rad({ bots: [{ larkAppId: 'cli_cxclone', cliId: 'codex', claudeConfigDir: '/c/x' }] }));
+    expect(r).toHaveProperty('error');
+  });
+});
+
+describe('parseSeats (Round-4: bot-agnostic auto seats)', () => {
+  it('auto:role / bare role → auto seat, default target (no autoTarget)', () => {
+    expect(parseSeats(['auto:main', 'collab'])).toEqual([
+      { auto: true, role: 'main' }, { auto: true, role: 'collab' },
     ]);
   });
-  it('mixed auto + specific', () => {
-    expect(parseSeats(['auto:main', 'codex:collab'])).toEqual([
-      { role: 'main' }, { ref: 'codex', role: 'collab' },
+  it('auto@<ref>:role → auto seat targeting a bot/engine', () => {
+    expect(parseSeats(['auto@codex:collab', 'auto@缇蕾:observer'])).toEqual([
+      { auto: true, autoTarget: 'codex', role: 'collab' },
+      { auto: true, autoTarget: '缇蕾', role: 'observer' },
+    ]);
+  });
+  it('<ref>:role → explicit already-registered bot (no clone)', () => {
+    expect(parseSeats(['codex:main', '克隆2:observer'])).toEqual([
+      { ref: 'codex', role: 'main' }, { ref: '克隆2', role: 'observer' },
+    ]);
+  });
+  it('mixed auto + auto@ + explicit', () => {
+    expect(parseSeats(['auto:main', 'auto@codex:collab', 'tilly:observer'])).toEqual([
+      { auto: true, role: 'main' },
+      { auto: true, autoTarget: 'codex', role: 'collab' },
+      { ref: 'tilly', role: 'observer' },
     ]);
   });
   it('invalid role → throws', () => {
     expect(() => parseSeats(['auto:boss'])).toThrow(/invalid role/);
+  });
+  it('empty auto@ target → throws', () => {
+    expect(() => parseSeats(['auto@:collab'])).toThrow(/auto@ requires a target/);
   });
 });

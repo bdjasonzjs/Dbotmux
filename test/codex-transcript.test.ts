@@ -2,7 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, appendFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { drainCodexRollout, codexSessionIdFromRolloutPath, splitCodexEventsByCutoff, extractLastCodexTurn, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
+import { mkdirSync } from 'node:fs';
+import { drainCodexRollout, codexSessionIdFromRolloutPath, splitCodexEventsByCutoff, extractLastCodexTurn, findCodexRolloutBySessionId, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
 
 let dir: string;
 let path: string;
@@ -43,6 +44,21 @@ beforeEach(() => {
 
 afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
+});
+
+describe('findCodexRolloutBySessionId (Round-4 B4: per-home rollout discovery)', () => {
+  it('reads the GIVEN home (clone CODEX_HOME), not the global ~/.codex', () => {
+    const sid = '019e7d2c-2de6-7712-9f6c-3f439a0d70eb';
+    const sessDir = join(dir, 'sessions', '2026', '06', '14');
+    mkdirSync(sessDir, { recursive: true });
+    const rollout = join(sessDir, `rollout-2026-06-14T10-00-00-${sid}.jsonl`);
+    writeFileSync(rollout, '{}');
+    // `dir` here stands in for a clone's CODEX_HOME.
+    expect(findCodexRolloutBySessionId(sid, dir)).toBe(rollout);
+  });
+  it('returns undefined when the home has no such session (no global fallback leak)', () => {
+    expect(findCodexRolloutBySessionId('019e0000-0000-7000-8000-000000000000', dir)).toBeUndefined();
+  });
 });
 
 describe('codexSessionIdFromRolloutPath', () => {

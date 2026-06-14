@@ -10,10 +10,18 @@ import {
   cloneBot,
   cloneNameSlug,
   setupCloneHome,
-  CLONE_SHARED_ENTRIES,
-  CLONE_INDEPENDENT_DIRS,
 } from '../src/services/bot-clone.js';
 import type { RegisterAppResult } from '../src/setup/register-app.js';
+import { createClaudeCodeAdapter } from '../src/adapters/cli/claude-code.js';
+import { createCodexAdapter } from '../src/adapters/cli/codex.js';
+import { createCocoAdapter } from '../src/adapters/cli/coco.js';
+import type { CloneHomeSpec } from '../src/adapters/cli/types.js';
+
+// Round-4 B4: setupCloneHome is now spec-driven. Use the real adapter specs so the
+// tests track production classification (symlink / copy / independent / memory).
+const CLAUDE_SPEC: CloneHomeSpec = createClaudeCodeAdapter().cloneHome!;
+const CODEX_SPEC: CloneHomeSpec = createCodexAdapter().cloneHome!;
+const COCO_SPEC: CloneHomeSpec = createCocoAdapter().cloneHome!;
 
 const tmps: string[] = [];
 function tmp(prefix = 'clone-'): string {
@@ -139,7 +147,7 @@ describe('setupCloneHome', () => {
   it('symlinks shared persona/auth entries to the source', () => {
     const src = fakeSourceHome();
     const dst = join(tmp('clone-home-'), '.claude');
-    setupCloneHome(dst, src);
+    setupCloneHome(dst, src, CLAUDE_SPEC);
 
     for (const entry of ['CLAUDE.md', 'settings.json', '.credentials.json', 'skills', 'identity']) {
       const p = join(dst, entry);
@@ -153,7 +161,7 @@ describe('setupCloneHome', () => {
   it('skips shared entries that do not exist on the source (no throw)', () => {
     const src = fakeSourceHome(); // has no keybindings.json / plugins / hooks / settings.local.json
     const dst = join(tmp('clone-home-'), '.claude');
-    expect(() => setupCloneHome(dst, src)).not.toThrow();
+    expect(() => setupCloneHome(dst, src, CLAUDE_SPEC)).not.toThrow();
     expect(existsSync(join(dst, 'keybindings.json'))).toBe(false);
     expect(existsSync(join(dst, 'plugins'))).toBe(false);
   });
@@ -161,8 +169,8 @@ describe('setupCloneHome', () => {
   it('creates independent state dirs as REAL empty dirs (not symlinks)', () => {
     const src = fakeSourceHome();
     const dst = join(tmp('clone-home-'), '.claude');
-    setupCloneHome(dst, src);
-    for (const dir of CLONE_INDEPENDENT_DIRS) {
+    setupCloneHome(dst, src, CLAUDE_SPEC);
+    for (const dir of CLAUDE_SPEC.independentDirs) {
       const p = join(dst, dir);
       const st = lstatSync(p);
       expect(st.isDirectory(), `${dir} should be a real dir`).toBe(true);
@@ -173,7 +181,7 @@ describe('setupCloneHome', () => {
   it('seeds project-scoped memory by COPY (real file, not symlink) and leaves transcripts behind', () => {
     const src = fakeSourceHome();
     const dst = join(tmp('clone-home-'), '.claude');
-    setupCloneHome(dst, src);
+    setupCloneHome(dst, src, CLAUDE_SPEC);
 
     const seededMem = join(dst, 'projects', '-work', 'memory', 'MEMORY.md');
     expect(existsSync(seededMem)).toBe(true);
@@ -186,7 +194,7 @@ describe('setupCloneHome', () => {
   it('seeded memory diverges from source (editing clone copy does not touch source)', () => {
     const src = fakeSourceHome();
     const dst = join(tmp('clone-home-'), '.claude');
-    setupCloneHome(dst, src);
+    setupCloneHome(dst, src, CLAUDE_SPEC);
     writeFileSync(join(dst, 'projects', '-work', 'memory', 'MEMORY.md'), 'clone-edit');
     expect(readFileSync(join(src, 'projects', '-work', 'memory', 'MEMORY.md'), 'utf-8')).toBe('mem-index');
   });
@@ -194,20 +202,20 @@ describe('setupCloneHome', () => {
   it('is idempotent (second call does not throw on existing symlinks/dirs)', () => {
     const src = fakeSourceHome();
     const dst = join(tmp('clone-home-'), '.claude');
-    setupCloneHome(dst, src);
-    expect(() => setupCloneHome(dst, src)).not.toThrow();
+    setupCloneHome(dst, src, CLAUDE_SPEC);
+    expect(() => setupCloneHome(dst, src, CLAUDE_SPEC)).not.toThrow();
   });
 
   it('re-running setup does NOT overwrite memory the clone has diverged (first-init-only seed)', () => {
     const src = fakeSourceHome();
     const dst = join(tmp('clone-home-'), '.claude');
-    setupCloneHome(dst, src);
+    setupCloneHome(dst, src, CLAUDE_SPEC);
     const cloneMem = join(dst, 'projects', '-work', 'memory', 'MEMORY.md');
     writeFileSync(cloneMem, 'clone-diverged');
     // also change the source after the fact — must not leak into the clone
     writeFileSync(join(src, 'projects', '-work', 'memory', 'MEMORY.md'), 'source-v2');
 
-    setupCloneHome(dst, src); // re-run / retry
+    setupCloneHome(dst, src, CLAUDE_SPEC); // re-run / retry
 
     expect(readFileSync(cloneMem, 'utf-8')).toBe('clone-diverged');
   });
@@ -215,22 +223,95 @@ describe('setupCloneHome', () => {
   it('seeds a project whose clone memory does not yet exist, even on a later run', () => {
     const src = fakeSourceHome();
     const dst = join(tmp('clone-home-'), '.claude');
-    setupCloneHome(dst, src);
+    setupCloneHome(dst, src, CLAUDE_SPEC);
     // source gains a brand-new project with memory after the first setup
     const newProjMem = join(src, 'projects', '-other', 'memory');
     mkdirSync(newProjMem, { recursive: true });
     writeFileSync(join(newProjMem, 'MEMORY.md'), 'other-mem');
 
-    setupCloneHome(dst, src);
+    setupCloneHome(dst, src, CLAUDE_SPEC);
 
     expect(readFileSync(join(dst, 'projects', '-other', 'memory', 'MEMORY.md'), 'utf-8')).toBe('other-mem');
   });
 
-  it('exposes the documented shared/independent entry lists', () => {
-    expect(CLONE_SHARED_ENTRIES).toContain('CLAUDE.md');
-    expect(CLONE_SHARED_ENTRIES).toContain('.credentials.json');
-    expect(CLONE_INDEPENDENT_DIRS).toContain('sessions');
-    expect(CLONE_INDEPENDENT_DIRS).toContain('projects');
+  it('claude-code adapter cloneHome declares the documented shared/independent lists', () => {
+    expect(CLAUDE_SPEC.sharedEntries).toContain('CLAUDE.md');
+    expect(CLAUDE_SPEC.sharedEntries).toContain('.credentials.json');
+    expect(CLAUDE_SPEC.independentDirs).toContain('sessions');
+    expect(CLAUDE_SPEC.independentDirs).toContain('projects');
+    expect(CLAUDE_SPEC.memorySeed).toBe('claude-projects');
+    expect(CLAUDE_SPEC.envVar).toBe('CLAUDE_CONFIG_DIR');
+  });
+});
+
+describe('setupCloneHome — codex spec (Round-4 B4)', () => {
+  function fakeCodexHome(): string {
+    const home = tmp('codex-src-');
+    writeFileSync(join(home, 'AGENTS.md'), 'codex-persona');
+    writeFileSync(join(home, 'auth.json'), 'CREDS');
+    writeFileSync(join(home, 'config.toml'), 'cfg');
+    mkdirSync(join(home, 'identity'), { recursive: true });
+    // state that must NOT be copied/symlinked (codex creates it itself)
+    writeFileSync(join(home, 'history.jsonl'), 'BIG');
+    writeFileSync(join(home, 'logs_2.sqlite'), 'DB');
+    return home;
+  }
+
+  it('symlinks persona (AGENTS.md/identity), COPIES auth.json/config.toml, leaves state', () => {
+    const src = fakeCodexHome();
+    const dst = join(tmp('codex-clone-'), '.codex');
+    setupCloneHome(dst, src, CODEX_SPEC);
+
+    // persona symlinked
+    expect(lstatSync(join(dst, 'AGENTS.md')).isSymbolicLink()).toBe(true);
+    expect(lstatSync(join(dst, 'identity')).isSymbolicLink()).toBe(true);
+    // creds/config COPIED (real file, not symlink) — codex may atomic-rename them
+    expect(existsSync(join(dst, 'auth.json'))).toBe(true);
+    expect(lstatSync(join(dst, 'auth.json')).isSymbolicLink()).toBe(false);
+    expect(readFileSync(join(dst, 'auth.json'), 'utf-8')).toBe('CREDS');
+    expect(lstatSync(join(dst, 'config.toml')).isSymbolicLink()).toBe(false);
+    // mutable state is NEITHER symlinked nor copied (codex regenerates it)
+    expect(existsSync(join(dst, 'history.jsonl'))).toBe(false);
+    expect(existsSync(join(dst, 'logs_2.sqlite'))).toBe(false);
+  });
+
+  it('copy-on-create does not overwrite an already-forked clone auth.json', () => {
+    const src = fakeCodexHome();
+    const dst = join(tmp('codex-clone-'), '.codex');
+    setupCloneHome(dst, src, CODEX_SPEC);
+    writeFileSync(join(dst, 'auth.json'), 'CLONE_ROTATED');
+    setupCloneHome(dst, src, CODEX_SPEC); // re-run
+    expect(readFileSync(join(dst, 'auth.json'), 'utf-8')).toBe('CLONE_ROTATED');
+  });
+
+  it('codex spec seeds NO memory (no live-sqlite copy) + declares CODEX_HOME', () => {
+    expect(CODEX_SPEC.memorySeed).toBe('none');
+    expect(CODEX_SPEC.envVar).toBe('CODEX_HOME');
+    expect(CODEX_SPEC.copyEntries).toContain('auth.json');
+    expect(CODEX_SPEC.copyEntries).toContain('config.toml');
+    expect(CODEX_SPEC.sharedEntries).not.toContain('auth.json'); // creds NOT symlinked
+  });
+});
+
+describe('setupCloneHome — coco state-only spec (Round-4: no writable persona copy)', () => {
+  it('makes NO persona copy/symlink (read-only safety): clone home only gets the dir', () => {
+    const src = tmp('coco-src-');
+    // a fake coco home with persona + memory that must NOT be touched
+    writeFileSync(join(src, 'AGENTS.md'), 'persona');
+    mkdirSync(join(src, 'private_memories'), { recursive: true });
+    writeFileSync(join(src, 'private_memories', 'daily-notes.md'), 'memory');
+    const dst = join(tmp('coco-clone-'), 'coco-cache');
+    setupCloneHome(dst, src, COCO_SPEC);
+    // 蔻黛 guardrail 1: coco shares persona/memory via $HOME (read-only OBSERVED),
+    // NOT by copy/symlink — so the clone home holds no persona/memory at all.
+    expect(existsSync(join(dst, 'AGENTS.md'))).toBe(false);
+    expect(existsSync(join(dst, 'private_memories'))).toBe(false);
+  });
+
+  it('coco spec is state-only tier (claude/codex are full)', () => {
+    expect(COCO_SPEC.tier).toBe('state-only');
+    expect(CLAUDE_SPEC.tier).toBe('full');
+    expect(CODEX_SPEC.tier).toBe('full');
   });
 });
 
@@ -260,6 +341,34 @@ describe('cloneBot', () => {
     writeFileSync(botsJsonPath, JSON.stringify([source()]));
     return { configDir, srcHome, botsJsonPath };
   }
+
+  // Round-4 蔻黛 Batch1 复审 Blocker: the cloneHome capability gate lives in the
+  // clone PRIMITIVE so EVERY entry (CLI `bot clone`, chat clone, CEO orch) is
+  // covered — an engine without cloneHome is rejected before any side effect.
+  it('Round-4 gate: unsupported engine (no cloneHome) rejected BEFORE registerApp / write', async () => {
+    const { configDir, srcHome, botsJsonPath } = dirs();
+    let scanned = false;
+    const res = await cloneBot(
+      { sourceBot: { ...source(), cliId: 'codex' }, configDir, botsJsonPath, sourceClaudeHome: srcHome },
+      { registerApp: async () => { scanned = true; return okScan; }, supportsClone: (c) => c === 'claude-code' },
+    );
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+    expect(res.error).toBe('unsupported_engine');
+    expect(scanned).toBe(false); // no device-flow scan triggered
+    expect(JSON.parse(readFileSync(botsJsonPath, 'utf-8')).length).toBe(1); // nothing appended
+  });
+
+  it('Round-4 gate: supported engine (claude-code) proceeds to registerApp', async () => {
+    const { configDir, srcHome, botsJsonPath } = dirs();
+    let scanned = false;
+    const res = await cloneBot(
+      { sourceBot: source(), configDir, botsJsonPath, sourceClaudeHome: srcHome },
+      { registerApp: async () => { scanned = true; return okScan; }, supportsClone: (c) => c === 'claude-code' },
+    );
+    expect(res.ok).toBe(true);
+    expect(scanned).toBe(true);
+  });
 
   it('success: appends clone with scanner-scoped owner + isolated home, no secret in result', async () => {
     const { configDir, srcHome, botsJsonPath } = dirs();

@@ -47,7 +47,7 @@ import {
 } from './utils/render-dimensions.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
 import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionIds } from './adapters/cli/claude-code.js';
-import { resolveClaudeHome, defaultClaudeHome } from './core/claude-home.js';
+import { resolveClaudeHome, defaultClaudeHome, cloneHomeEnv } from './core/claude-home.js';
 import type { CliAdapter, PtyHandle } from './adapters/cli/types.js';
 import { PtyBackend } from './adapters/backend/pty-backend.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
@@ -179,6 +179,15 @@ let bridgeCliCwd: string | undefined;
 /** This worker's Claude home (CLAUDE_CONFIG_DIR). Set on init from the bot's
  *  claudeConfigDir; defaults to ~/.claude (existing bots → unchanged paths). */
 let workerClaudeHome: string = defaultClaudeHome();
+/** This worker's codex home (Round-4 B4). undefined ⇒ global ~/.codex (本体); a
+ *  codex clone sets it to its CODEX_HOME so rollout discovery reads the clone's
+ *  sessions, not the 本体's. Single-bot-per-worker, so a module var is safe. */
+let workerCodexHome: string | undefined;
+/** This worker's coco XDG cache base (Round-4 coco state-only). undefined ⇒
+ *  default ~/.cache (本体); a coco clone sets it to its clone-scoped
+ *  XDG_CACHE_HOME so the transcript bridge reads the clone's events, not the
+ *  本体's. Single-bot-per-worker, so a module var is safe. */
+let workerCocoHome: string | undefined;
 /** Last sessionId we observed via the pid resolver — used to detect
  *  rotations cheaply (string compare instead of stat()ing every jsonl). */
 let bridgeObservedCliSessionId: string | undefined;
@@ -1346,8 +1355,8 @@ function codexBridgeStartTimer(): void {
         let path: string | undefined;
         if (codexBridgePendingSessionId) {
           path = isCoco
-            ? cocoEventsPathForSession(codexBridgePendingSessionId)
-            : findCodexRolloutBySessionId(codexBridgePendingSessionId);
+            ? cocoEventsPathForSession(codexBridgePendingSessionId, workerCocoHome)
+            : findCodexRolloutBySessionId(codexBridgePendingSessionId, workerCodexHome);
           if (path && isCoco && !existsSync(path)) path = undefined;
         }
         if (!path && codexAdoptPendingPid) {
@@ -1453,7 +1462,7 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'fre
  *  remembers the sid so the 1s poller can keep retrying. */
 function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
   if (!codexBridgeFallbackActive() || codexBridgeRolloutPath) return;
-  const path = findCodexRolloutBySessionId(cliSessionId);
+  const path = findCodexRolloutBySessionId(cliSessionId, workerCodexHome);
   if (path) {
     codexBridgePendingSessionId = undefined;
     codexBridgeAttach(path, 'fresh-empty');
@@ -2477,7 +2486,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
       codexAdoptStartMs = adoptStartMs;
       codexBridgeQueue.setLocalTurns(true, adoptStartMs);
       let rolloutPath: string | undefined;
-      if (cfg.cliSessionId) rolloutPath = findCodexRolloutBySessionId(cfg.cliSessionId);
+      if (cfg.cliSessionId) rolloutPath = findCodexRolloutBySessionId(cfg.cliSessionId, cfg.claudeConfigDir);
       if (!rolloutPath && cfg.adoptCliPid) {
         const probed = findCodexRolloutByPid(cfg.adoptCliPid);
         if (probed) rolloutPath = probed.path;
@@ -2507,7 +2516,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
       codexAdoptStartMs = adoptStartMs;
       codexBridgeQueue.setLocalTurns(true, adoptStartMs);
       let eventsPath: string | undefined;
-      if (cfg.cliSessionId) eventsPath = cocoEventsPathForSession(cfg.cliSessionId);
+      if (cfg.cliSessionId) eventsPath = cocoEventsPathForSession(cfg.cliSessionId, cfg.claudeConfigDir);
       if (!eventsPath && cfg.adoptCliPid) {
         const probed = findCocoSessionByPid(cfg.adoptCliPid);
         if (probed) eventsPath = probed.eventsPath;
@@ -2611,6 +2620,12 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // actually committed (rather than trusting a fixed sleep), so wire it up now.
   // Codex's adapter uses ~/.codex/history.jsonl (a fixed global path) directly,
   // so it needs no per-session wiring here.
+  // Round-4 B4: this session's CLI home, engine-aware. For a clone = its relocated
+  // home (cfg.claudeConfigDir); for a 本体 = the engine's default home (claude →
+  // ~/.claude, codex → ~/.codex). Threaded to adapters that read home-scoped files
+  // (codex history.jsonl / rollout discovery) so a clone never reads the 本体's home.
+  const sessionCliHome = cfg.claudeConfigDir ?? cliAdapter.cloneHome?.defaultHome() ?? defaultClaudeHome();
+
   if (cfg.cliId === 'claude-code') {
     (backend as TmuxBackend | PtyBackend).claudeJsonlPath =
       claudeJsonlPathForSession(cfg.cliSessionId ?? adapterSessionId, cfg.workingDir, workerClaudeHome);
@@ -2618,6 +2633,19 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     // re-resolution (submit-confirm / resume-rotation / recheck) so a cloned
     // bot follows its own home, not the default ~/.claude.
     (backend as TmuxBackend | PtyBackend).claudeHome = workerClaudeHome;
+  } else if (cfg.cliId === 'codex') {
+    // Codex's writeInput reads history.jsonl from pty.claudeHome (= this session's
+    // home) — a codex clone must read its own CODEX_HOME, not the 本体's ~/.codex.
+    (backend as TmuxBackend | PtyBackend).claudeHome = sessionCliHome;
+    // Module var for rollout discovery in the bridge timer (module scope). Only set
+    // for a clone (has claudeConfigDir); undefined → global ~/.codex (本体).
+    workerCodexHome = cfg.claudeConfigDir ? sessionCliHome : undefined;
+  } else if (cfg.cliId === 'coco') {
+    // coco state-only clone (Round-4): writeInput reads history.jsonl from
+    // pty.claudeHome (= the clone's XDG_CACHE_HOME base); 本体 → default cache.
+    (backend as TmuxBackend | PtyBackend).claudeHome = cfg.claudeConfigDir ? sessionCliHome : undefined;
+    // Module var for the transcript bridge's cocoEventsPathForSession (module scope).
+    workerCocoHome = cfg.claudeConfigDir ? sessionCliHome : undefined;
   }
 
   const args = cliAdapter.buildArgs({
@@ -2629,6 +2657,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     botName: cfg.botName,
     botOpenId: cfg.botOpenId,
     locale: cfg.locale,
+    cliHome: sessionCliHome,
   });
 
   // Extra args from env (CLI_DISABLE_DEFAULT_ARGS is removed — adapters own their defaults)
@@ -2666,10 +2695,11 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
       ...process.env,
       CLAUDECODE: undefined,
       ...(injectClaudeSandbox ? { IS_SANDBOX: '1' } : {}),
-      // Cloned bots run with an isolated Claude home. Only inject when the bot
-      // actually has one configured — unconfigured bots keep the inherited env
-      // (no CLAUDE_CONFIG_DIR), identical to before.
-      ...(cfg.claudeConfigDir ? { CLAUDE_CONFIG_DIR: cfg.claudeConfigDir } : {}),
+      // Cloned bots run with an isolated home, relocated via the ENGINE's home env
+      // var (Round-4 B4: claude-code → CLAUDE_CONFIG_DIR, codex → CODEX_HOME, …).
+      // Pure helper (unit-tested) — unconfigured bots get {} (inherited env,
+      // byte-equivalent to before).
+      ...cloneHomeEnv(cfg.claudeConfigDir, cliAdapter.cloneHome),
     } as unknown as Record<string, string>,
   });
 
@@ -2730,7 +2760,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // from botmux sessionId.
   if (cfg.cliId === 'codex') {
     if (cfg.cliSessionId) {
-      const rolloutPath = findCodexRolloutBySessionId(cfg.cliSessionId);
+      const rolloutPath = findCodexRolloutBySessionId(cfg.cliSessionId, cfg.claudeConfigDir);
       if (rolloutPath) {
         codexBridgeAttach(rolloutPath, 'baseline-existing');
       } else {
@@ -2741,7 +2771,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
       codexBridgeStartTimer();
     }
   } else if (cfg.cliId === 'coco') {
-    const eventsPath = cocoEventsPathForSession(cfg.sessionId);
+    const eventsPath = cocoEventsPathForSession(cfg.sessionId, cfg.claudeConfigDir);
     codexBridgeAttach(eventsPath, cfg.resume ? 'baseline-existing' : 'fresh-empty');
     codexBridgeStartTimer();
   }

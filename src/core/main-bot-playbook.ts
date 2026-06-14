@@ -100,7 +100,7 @@ const BOT_KEY_TO_ROLE: Record<'claude' | 'codex' | 'tilly', string> = {
  *  Any OTHER ref is resolved as a botName or larkAppId against bots-info.json
  *  (lets `--bots` reference clones / any registered bot). Kept exhaustive so the
  *  original 3-bot refs stay byte-equivalent. */
-const BOT_ALIAS_TO_CLI_ID: Record<string, string> = {
+export const BOT_ALIAS_TO_CLI_ID: Record<string, string> = {
   claude: 'claude-code', c: 'claude-code',
   codex: 'codex', k: 'codex',
   tilly: 'coco', t: 'coco',

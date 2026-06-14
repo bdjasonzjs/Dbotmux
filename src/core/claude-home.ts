@@ -31,6 +31,21 @@ export function resolveClaudeHome(claudeConfigDir?: string): string {
 }
 
 /**
+ * Spawn-env home override for a cloned bot (Round-4 B4). A clone runs with its
+ * engine's home relocated via that engine's env var (claude-code →
+ * CLAUDE_CONFIG_DIR, codex → CODEX_HOME), taken from the adapter's cloneHome.
+ * Returns `{}` when the bot has no clone home OR its adapter declares no cloneHome
+ * — so unconfigured (non-clone) bots keep the inherited env, byte-equivalent to
+ * before. (claude clone stays byte-equivalent: envVar resolves to CLAUDE_CONFIG_DIR.)
+ */
+export function cloneHomeEnv(
+  claudeConfigDir: string | undefined,
+  cloneHome: { envVar: string } | undefined,
+): Record<string, string> {
+  return claudeConfigDir && cloneHome ? { [cloneHome.envVar]: claudeConfigDir } : {};
+}
+
+/**
  * Resolve the Claude home for an ADOPTED session. Precedence: the adopted
  * process's own CLAUDE_CONFIG_DIR (discovered from its env) wins, then the
  * adopting bot's configured dir, then ~/.claude. This keeps adopt following the

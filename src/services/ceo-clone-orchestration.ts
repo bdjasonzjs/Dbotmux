@@ -14,15 +14,27 @@
  * (蔻黛 blocker2). The deploy step (pm2 activate) is a GATE we advance up to and
  * report; never crossed without 松松's approval.
  */
-import { listBotsByCli, type BotInventoryEntry } from './bot-inventory.js';
 import type { CeoSpawnState, PendingCloneSeat } from './ceo-spawn-store.js';
-
-const CLAUDE_CLI = 'claude-code';
 
 export interface SeatSpec {
   role: 'main' | 'collab' | 'observer';
-  /** Explicit bot ref (alias / name / appId). Omit → needs a claude-code seat. */
+  /** Explicit already-registered bot ref (alias / name / appId). Used as-is, no
+   *  clone. Mutually exclusive with `auto`. */
   ref?: string;
+  /** Auto seat: fill from a ready bot of the target engine, or clone one. The
+   *  clone path is fully bot/engine-agnostic — `autoTarget` (alias/name/appId/
+   *  cliId, or undefined = the CEO's own engine) is resolved against the runtime
+   *  registry, NOT any hardcoded engine list. */
+  auto?: boolean;
+  /** The auto seat's @-target ref. Undefined → default target (CEO's cliId). */
+  autoTarget?: string;
+}
+
+/** Resolved target of an auto seat: which engine to fill/clone + its 本体. */
+export interface AutoTarget {
+  cliId: string;
+  /** appId of the canonical (non-clone) 本体 of `cliId` — the clone source. */
+  bentiAppId: string;
 }
 
 export interface EnsureSpawnReq {
@@ -47,7 +59,20 @@ export type EnsureSpawnOutcome =
 
 export interface EnsureSpawnDeps {
   getOwnerOpenId: () => string | undefined;
-  listClaudeBots?: () => BotInventoryEntry[];
+  /** Resolve an auto seat's target → {cliId, 本体 appId}. `autoTarget` undefined
+   *  ⇒ the CEO's own engine. Registry-driven (alias/name/appId/cliId), NEVER a
+   *  hardcoded engine list. Returns an error string for an unknown ref (bubbles
+   *  up to a refusal BEFORE the subgroup is built). */
+  resolveAutoTarget: (autoTarget: string | undefined) => AutoTarget | { error: string };
+  /** Ready (本体-first) addressable appIds of a given cliId — replaces the old
+   *  claude-only pool so seats fill from THEIR target engine. */
+  usableAppsByCli: (cliId: string) => string[];
+  /** Clone-isolation tier of `cliId` (Round-4 coco): 'full' (claude/codex),
+   *  'state-only' (coco), or undefined (no cloneHome → not cloneable at all).
+   *  Two derived rules (蔻黛 guardrails): auto-clone REQUIRES a tier (else only
+   *  already-registered bots usable); and a 'state-only' engine is NEVER chosen by
+   *  a DEFAULT auto seat — it requires an explicit ref/autoTarget. */
+  cloneTier: (cliId: string) => 'full' | 'state-only' | undefined;
   /** CEO-scope open_id if a bot is addressable now (本体 always; clone once live). */
   botOpenIdReady: (appId: string) => string | undefined;
   /** Computed『本体名（N号机）』for a freshly-written clone (from bots.json). */
@@ -55,8 +80,9 @@ export interface EnsureSpawnDeps {
   /** Build the subgroup with the given bot refs. Returns taskId + chatId. */
   spawnSubtask: (opts: { goal: string; bots: string[] }) => Promise<{ taskId: string; chatId: string; bots: string[] }>;
   /** Chat-native clone (block 5/#5): posts QR into targetChatId (= subgroup),
-   *  blocks through the scan. ok+appId, or error (qr_delivery_failed / expired…). */
-  cloneInChat: (args: { targetChatId: string; rootMessageId: string; senderOpenId: string }) => Promise<{ ok: boolean; appId?: string; error?: string }>;
+   *  blocks through the scan. Clones the given engine's 本体 (bot-agnostic source,
+   *  not the CEO). ok+appId, or error (qr_delivery_failed / expired…). */
+  cloneInChat: (args: { targetChatId: string; rootMessageId: string; senderOpenId: string; sourceCliId: string; sourceBentiAppId: string }) => Promise<{ ok: boolean; appId?: string; error?: string }>;
   /** Deploy gate: has 松松 approved starting this clone's daemon this round? */
   activationApproved?: (appId: string) => boolean;
   activate: (appId: string) => Promise<{ ok: boolean; error?: string }>;
@@ -81,24 +107,45 @@ export interface EnsureSpawnDeps {
   reply: (message: string) => Promise<void>;
 }
 
-function claudeSeatsNeeded(seats: SeatSpec[]): number {
-  return seats.filter(s => !s.ref).length;
-}
+/** A pending auto seat that needs a clone, tagged with its resolved engine. */
+interface PlannedPendingSeat { seatIndex: number; role: SeatSpec['role']; cliId: string; bentiAppId: string }
 
-/** Plan the subgroup's initial bots from READY seats; defer ref-less claude
- *  seats with no ready bot as pending clones (they join after activation). */
+/**
+ * Plan the subgroup's initial bots, fully engine-agnostic. Explicit `ref` seats
+ * pass through. Each auto seat resolves its target engine (deps.resolveAutoTarget)
+ * and is filled from THAT engine's ready pool (independent cursor per cliId); when
+ * the pool is exhausted it becomes a pending clone tagged with {cliId, bentiAppId}.
+ * An unresolvable autoTarget aborts planning with `error` (no subgroup is built).
+ */
 function planSeats(
-  seats: SeatSpec[], readyClaudeApps: string[],
-): { readyBotRefs: string[]; pendingSeats: Array<{ seatIndex: number; role: SeatSpec['role'] }> } {
+  seats: SeatSpec[], deps: EnsureSpawnDeps,
+): { readyBotRefs: string[]; pending: PlannedPendingSeat[]; error?: string } {
   const readyBotRefs: string[] = [];
-  const pendingSeats: Array<{ seatIndex: number; role: SeatSpec['role'] }> = [];
-  let ri = 0;
-  seats.forEach((s, i) => {
-    if (s.ref) { readyBotRefs.push(`${s.ref}:${s.role}`); return; }
-    if (ri < readyClaudeApps.length) { readyBotRefs.push(`${readyClaudeApps[ri++]}:${s.role}`); return; }
-    pendingSeats.push({ seatIndex: i, role: s.role });
-  });
-  return { readyBotRefs, pendingSeats };
+  const pending: PlannedPendingSeat[] = [];
+  const cursorByCli: Record<string, number> = {};
+  const poolByCli: Record<string, string[]> = {};
+  const pool = (cliId: string): string[] => (poolByCli[cliId] ??= deps.usableAppsByCli(cliId));
+
+  for (let i = 0; i < seats.length; i++) {
+    const s = seats[i]!;
+    if (s.ref) { readyBotRefs.push(`${s.ref}:${s.role}`); continue; }
+    const target = deps.resolveAutoTarget(s.autoTarget);
+    if ('error' in target) {
+      return { readyBotRefs, pending, error: `席位 ${i + 1}（${s.autoTarget ?? 'auto'}）：${target.error}` };
+    }
+    const { cliId, bentiAppId } = target;
+    // 蔻黛 guardrail 2: a DEFAULT auto seat (no explicit autoTarget) must NEVER
+    // select a 'state-only' engine — not even a ready one. state-only (coco) is
+    // opt-in only, via an explicit ref (`coco:role`) or `auto@coco`.
+    if (!s.autoTarget && deps.cloneTier(cliId) === 'state-only') {
+      return { readyBotRefs, pending, error: `席位 ${i + 1}：引擎「${cliId}」是 state-only 档，默认 auto 不可选取（需显式 ${cliId}:${s.role} 或 auto@${cliId}:${s.role}）` };
+    }
+    const p = pool(cliId);
+    const cur = cursorByCli[cliId] ?? 0;
+    if (cur < p.length) { readyBotRefs.push(`${p[cur]}:${s.role}`); cursorByCli[cliId] = cur + 1; continue; }
+    pending.push({ seatIndex: i, role: s.role, cliId, bentiAppId });
+  }
+  return { readyBotRefs, pending };
 }
 
 export async function ensureClonesAndSpawn(req: EnsureSpawnReq, deps: EnsureSpawnDeps): Promise<EnsureSpawnOutcome> {
@@ -108,22 +155,31 @@ export async function ensureClonesAndSpawn(req: EnsureSpawnReq, deps: EnsureSpaw
     return { status: 'refused', reason: 'sender is not the owner' };
   }
 
-  const listClaude = deps.listClaudeBots ?? (() => listBotsByCli(CLAUDE_CLI));
-  // 本体 (non-clone, no claudeConfigDir) FIRST so `auto:main` lands on the 本体
-  // even when a clone sits earlier in bots.json (守点: 本体 main 不靠 index 0).
-  const usableApps = (): string[] => listClaude()
-    .filter(b => deps.botOpenIdReady(b.larkAppId))
-    .sort((a, b) => (a.claudeConfigDir ? 1 : 0) - (b.claudeConfigDir ? 1 : 0))
-    .map(b => b.larkAppId);
-
   // ── PHASE A: ensure the subgroup exists (built FIRST, 松松 #5) ──
   let state = deps.getState(req.requestKey);
   if (!state) {
-    const { readyBotRefs, pendingSeats } = planSeats(req.seats, usableApps());
+    const { readyBotRefs, pending, error } = planSeats(req.seats, deps);
+    // Unresolvable autoTarget → refuse BEFORE building anything.
+    if (error) {
+      await deps.reply(`⚠️ 席位解析失败：${error}，已拒绝（未建子群）。`);
+      return { status: 'refused', reason: error };
+    }
+    // 蔻黛 v2 Blocker1 — unsupported-engine PREFLIGHT, before spawnSubtask: any
+    // pending clone whose engine can't be isolated (no cloneHome → no tier) is
+    // refused here, so we never leave a half-built subgroup / dangling state.
+    // (state-only via default auto is already errored in planSeats — guardrail 2.)
+    const unsupported = pending.filter(p => !deps.cloneTier(p.cliId));
+    if (unsupported.length > 0) {
+      const engines = [...new Set(unsupported.map(p => p.cliId))].join(', ');
+      await deps.reply(`⚠️ 引擎「${engines}」不支持自动克隆（无隔离 home 能力）——只能引用已注册的该引擎 bot，不能新建分身。已拒绝（未建子群）。`);
+      return { status: 'refused', reason: `unsupported auto-clone engine(s): ${engines}` };
+    }
     const spawn = await deps.spawnSubtask({ goal: req.goal, bots: readyBotRefs });
     state = {
       key: req.requestKey, taskId: spawn.taskId, subgroupChatId: spawn.chatId,
-      pendingClones: pendingSeats.map((p): PendingCloneSeat => ({ seatIndex: p.seatIndex, role: p.role, phase: 'pending' })),
+      pendingClones: pending.map((p): PendingCloneSeat => ({
+        seatIndex: p.seatIndex, role: p.role, cliId: p.cliId, bentiAppId: p.bentiAppId, phase: 'pending',
+      })),
       updatedAt: '',
     };
     deps.putState(state);
@@ -132,7 +188,16 @@ export async function ensureClonesAndSpawn(req: EnsureSpawnReq, deps: EnsureSpaw
       await deps.reply(`✅ 子群已建：${spawn.chatId}，席位 ${readyBotRefs.join(', ')}，已就绪。`);
       return { status: 'spawned', chatId: spawn.chatId, bots: spawn.bots };
     }
-    await deps.reply(`✅ 子群已建：${spawn.chatId}（worker 先就位）。还缺 ${state.pendingClones.length} 个 claude 分身，开始在子群里克隆…`);
+    // Surface state-only tier honestly (蔻黛 guardrail 1+4): clone of a state-only
+    // engine isolates session state only; persona/记忆 shared (botmux 不隔离),
+    // cache is clone-scoped process-tree cache.
+    const stateOnly = [...new Set(
+      state.pendingClones.filter(c => deps.cloneTier(c.cliId) === 'state-only').map(c => c.cliId),
+    )];
+    const tierNote = stateOnly.length > 0
+      ? `\n⚠️ 其中「${stateOnly.join(', ')}」是 state-only 档：仅会话状态隔离，人格/记忆共享（botmux 不隔离这些目录），cache 为 clone 专属进程缓存。`
+      : '';
+    await deps.reply(`✅ 子群已建：${spawn.chatId}（worker 先就位）。还缺 ${state.pendingClones.length} 个分身，开始在子群里克隆…${tierNote}`);
   }
 
   // ── PHASE B: fill the next pending clone (one transition per call) ──
@@ -143,7 +208,23 @@ export async function ensureClonesAndSpawn(req: EnsureSpawnReq, deps: EnsureSpaw
   }
 
   if (pc.phase === 'pending') {
-    const scan = await deps.cloneInChat({ targetChatId: state.subgroupChatId, rootMessageId: req.rootMessageId, senderOpenId: req.senderOpenId });
+    // Backward-compat (蔻黛 Batch1 Blocker3): a pending clone persisted BEFORE
+    // Round-4 has no cliId/bentiAppId. Every pre-Round-4 clone was the CEO's own
+    // engine, so default to it; fail-closed (clear + visible error) if even that
+    // can't resolve — never call cloneInChat with an undefined source.
+    if (!pc.cliId || !pc.bentiAppId) {
+      const t = deps.resolveAutoTarget(undefined);
+      if ('error' in t) {
+        deps.clearState(req.requestKey);
+        return { status: 'error', message: `旧版克隆状态无法迁移（${t.error}），已清理，请重发指令。` };
+      }
+      pc.cliId = t.cliId; pc.bentiAppId = t.bentiAppId;
+      deps.putState(state);
+    }
+    const scan = await deps.cloneInChat({
+      targetChatId: state.subgroupChatId, rootMessageId: req.rootMessageId, senderOpenId: req.senderOpenId,
+      sourceCliId: pc.cliId, sourceBentiAppId: pc.bentiAppId,
+    });
     if (scan.error === 'qr_delivery_failed') {
       return { status: 'error', message: '二维码发送到子群失败，已中止克隆（未写入配置）。请稍后重试。' };
     }
@@ -223,5 +304,5 @@ export async function ensureClonesAndSpawn(req: EnsureSpawnReq, deps: EnsureSpaw
     await deps.reply(`✅ 子群齐活：${state.subgroupChatId}，分身已拉进群并就位。`);
     return { status: 'spawned', chatId: state.subgroupChatId, bots: [] };
   }
-  return { status: 'awaiting_clone_join', taskId: state.taskId, chatId: state.subgroupChatId, message: `还有 ${remaining.length} 个 claude 席位待补，继续…` };
+  return { status: 'awaiting_clone_join', taskId: state.taskId, chatId: state.subgroupChatId, message: `还有 ${remaining.length} 个席位待补，继续…` };
 }

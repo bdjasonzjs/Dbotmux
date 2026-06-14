@@ -5,6 +5,9 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import { randomUUID } from 'node:crypto';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 // ---------------------------------------------------------------------------
 // Mock external dependencies BEFORE importing adapters
@@ -155,6 +158,34 @@ describe('coco buildArgs', () => {
   });
 });
 
+describe('coco state-only clone (Round-4)', () => {
+  const adapter = createCocoAdapter('/usr/bin/coco');
+
+  it('declares a state-only cloneHome via XDG_CACHE_HOME', () => {
+    expect(adapter.cloneHome?.tier).toBe('state-only');
+    expect(adapter.cloneHome?.envVar).toBe('XDG_CACHE_HOME');
+    // never symlink/copy/seed persona — no writable persona copy is made
+    expect(adapter.cloneHome?.sharedEntries).toEqual([]);
+    expect(adapter.cloneHome?.copyEntries).toEqual([]);
+    expect(adapter.cloneHome?.memorySeed).toBe('none');
+  });
+
+  it('buildResumeCommand: 本体 (no cliHome) → plain command', () => {
+    expect(adapter.buildResumeCommand?.({ sessionId: 'sid-1' })).toBe('coco --resume sid-1');
+  });
+
+  it('buildResumeCommand: clone → shell-safe XDG_CACHE_HOME prefix (蔻黛 guardrail 3)', () => {
+    const cmd = adapter.buildResumeCommand?.({ sessionId: 'sid-1', cliHome: '/tmp/botmux clone/coco-cache' });
+    // path with a space must be quoted so the command is copy-paste executable
+    expect(cmd).toBe(`XDG_CACHE_HOME='/tmp/botmux clone/coco-cache' coco --resume sid-1`);
+  });
+
+  it("buildResumeCommand: quotes a path containing a single quote safely", () => {
+    const cmd = adapter.buildResumeCommand?.({ sessionId: 's', cliHome: "/tmp/a'b/coco-cache" });
+    expect(cmd).toBe(`XDG_CACHE_HOME='/tmp/a'\\''b/coco-cache' coco --resume s`);
+  });
+});
+
 describe('codex buildArgs', () => {
   const adapter = createCodexAdapter('/usr/bin/codex');
 
@@ -179,6 +210,26 @@ describe('codex buildArgs', () => {
       '-C',
       '/repo/root',
     ]);
+  });
+
+  // Round-4 B4 (蔻黛 v2 Blocker2): resume-fallback reads history.jsonl from cliHome,
+  // so a codex clone resumes against its OWN CODEX_HOME, not the 本体's ~/.codex.
+  it('resume-fallback reads history.jsonl from cliHome (clone CODEX_HOME)', () => {
+    const home = mkdtempSync(join(tmpdir(), 'codex-home-'));
+    try {
+      writeFileSync(join(home, 'history.jsonl'),
+        JSON.stringify({ session_id: 'cdx-uuid-1', text: 'sess-4 hello' }) + '\n');
+      const args = adapter.buildArgs({ sessionId: 'sess-4', resume: true, cliHome: home });
+      expect(args).toEqual(['resume', '--dangerously-bypass-approvals-and-sandbox', '--no-alt-screen', 'cdx-uuid-1']);
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  it('resume-fallback with an empty cliHome → fresh args (no global ~/.codex leak)', () => {
+    const home = mkdtempSync(join(tmpdir(), 'codex-empty-'));
+    try {
+      const args = adapter.buildArgs({ sessionId: 'sess-unique-zzz', resume: true, cliHome: home });
+      expect(args).not.toContain('resume');
+    } finally { rmSync(home, { recursive: true, force: true }); }
   });
 });
 

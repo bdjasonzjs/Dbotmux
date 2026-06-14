@@ -29,36 +29,27 @@ import { botProcessName, normalizeBotProcessName, normalizeBotConfig } from '../
 import { readBotsJsonOrEmpty, writeBotsJsonAtomic } from '../setup/bots-store.js';
 import { tryRegisterApp, type RegisterAppOptions, type RegisterAppResult } from '../setup/register-app.js';
 import { fetchSourceBotAvatar, buildClonePreset } from './clone-app-preset.js';
+import { createCliAdapterSync } from '../adapters/cli/registry.js';
+import type { CliId, CloneHomeSpec } from '../adapters/cli/types.js';
 
 /**
- * Persona / auth / config entries shared with the source via symlink (when they
- * exist). Read-mostly; symlinking means the clone follows the source when the
- * user edits persona or rotates credentials.
+ * Default clone-capability gate (Round-4 蔻黛 Batch1 复审 Blocker): a source
+ * engine is cloneable ONLY if its adapter declares `cloneHome`. Until an
+ * engine's isolated home setup + worker read-path threading land (B4), only
+ * claude-code declares it, so codex/coco are fail-closed here — at the clone
+ * PRIMITIVE, covering every entry (CLI `bot clone`, chat clone, CEO orchestration).
  */
-export const CLONE_SHARED_ENTRIES = [
-  'CLAUDE.md',
-  'settings.json',
-  'settings.local.json',
-  'keybindings.json',
-  'skills',
-  'identity',
-  'plugins',
-  'hooks',
-  '.credentials.json',
-] as const;
+export function defaultSupportsClone(cliId: string): boolean {
+  return !!defaultCloneHomeFor(cliId);
+}
 
-/**
- * Per-clone independent state dirs (created empty as real dirs, never shared).
- * `projects` holds transcripts (independent) — memory living *under* it is
- * seeded separately by copy (see seedCloneMemory).
- */
-export const CLONE_INDEPENDENT_DIRS = [
-  'projects',
-  'sessions',
-  'todos',
-  'shell-snapshots',
-  'statsig',
-] as const;
+/** Resolve a cliId's clone-home spec from its adapter (Round-4 B4). The per-engine
+ *  file classification (symlink/copy/independent/memory) lives ON the adapter — the
+ *  clone primitive reads it, never hardcoding an engine list. undefined ⇒ the
+ *  engine can't be cloned. */
+export function defaultCloneHomeFor(cliId: string): CloneHomeSpec | undefined {
+  try { return createCliAdapterSync(cliId as CliId).cloneHome; } catch { return undefined; }
+}
 
 /** Map a cliId to a short ASCII base for clone process names (`claude-code` → `claude`). */
 function cliBaseSlug(cliId: string): string {
@@ -182,6 +173,9 @@ export interface BuildCloneConfigOpts {
   displayName?: string;
   /** Source 本体's base display name, stored for sibling counting. */
   clonedFromName?: string;
+  /** Clone home dir name (from the engine's CloneHomeSpec, e.g. '.claude' / '.codex').
+   *  Defaults to '.claude' for byte-equivalence with pre-Round-4 claude clones. */
+  homeDirName?: string;
 }
 
 /**
@@ -201,7 +195,10 @@ export function buildCloneConfig(
     larkAppSecret: creds.appSecret,
     name: opts.slug,
     cliId: sourceBot.cliId ?? 'claude-code',
-    claudeConfigDir: join(opts.configDir, 'clones', creds.appId, '.claude'),
+    // `claudeConfigDir` stays the universal clone-home marker (NOT claude-specific
+    // anymore); the dir name is engine-specific (.claude / .codex / …) and the
+    // worker injects the engine's home env var (CLAUDE_CONFIG_DIR / CODEX_HOME).
+    claudeConfigDir: join(opts.configDir, 'clones', creds.appId, opts.homeDirName ?? '.claude'),
   };
 
   // Clone display naming『本体名（N号机）』(块7 第二轮 #2/#4). Only set when computed
@@ -270,26 +267,38 @@ export function seedCloneMemory(claudeConfigDir: string, sourceClaudeHome: strin
 }
 
 /**
- * Build the clone's isolated CLAUDE_CONFIG_DIR: symlink shared persona/auth
- * entries, create independent state dirs, and seed memory by copy. Idempotent —
- * existing entries are left as-is.
+ * Build the clone's isolated home (Round-4 B4: engine-agnostic, spec-driven).
+ * Per the source engine's CloneHomeSpec: symlink shared persona/creds entries,
+ * COPY mutable copy-entries once (skip if present), create independent state dirs,
+ * and seed memory per strategy. Idempotent — existing entries are left as-is, so a
+ * re-run never overwrites a forked clone.
  */
-export function setupCloneHome(claudeConfigDir: string, sourceClaudeHome: string): void {
-  mkdirSync(claudeConfigDir, { recursive: true });
+export function setupCloneHome(cloneHomeDir: string, sourceHome: string, spec: CloneHomeSpec): void {
+  mkdirSync(cloneHomeDir, { recursive: true });
 
-  for (const entry of CLONE_SHARED_ENTRIES) {
-    const src = join(sourceClaudeHome, entry);
+  for (const entry of spec.sharedEntries) {
+    const src = join(sourceHome, entry);
     if (!existsSync(src)) continue;
-    const dst = join(claudeConfigDir, entry);
+    const dst = join(cloneHomeDir, entry);
     if (existsSync(dst)) continue;
     symlinkSync(src, dst);
   }
 
-  for (const dir of CLONE_INDEPENDENT_DIRS) {
-    mkdirSync(join(claudeConfigDir, dir), { recursive: true });
+  // copy-on-create: mutable creds/config — a real independent copy, NOT a symlink
+  // (so a CLI rewrite/atomic-rename can't clobber the link or pollute the 本体).
+  for (const entry of spec.copyEntries) {
+    const src = join(sourceHome, entry);
+    if (!existsSync(src)) continue;
+    const dst = join(cloneHomeDir, entry);
+    if (existsSync(dst)) continue;          // never overwrite a forked clone
+    cpSync(src, dst, { recursive: true });
   }
 
-  seedCloneMemory(claudeConfigDir, sourceClaudeHome);
+  for (const dir of spec.independentDirs) {
+    mkdirSync(join(cloneHomeDir, dir), { recursive: true });
+  }
+
+  if (spec.memorySeed === 'claude-projects') seedCloneMemory(cloneHomeDir, sourceHome);
 }
 
 export type CloneBotResult =
@@ -302,8 +311,11 @@ export interface CloneBotInput {
   configDir: string;
   /** bots.json path to append the clone to. */
   botsJsonPath: string;
-  /** Source bot's claude home, to symlink persona + seed memory from. */
-  sourceClaudeHome: string;
+  /** Source bot's home, to symlink/copy persona + seed memory from. OPTIONAL
+   *  (Round-4 B4): when omitted, derived engine-aware as sourceBot.claudeConfigDir
+   *  ?? the engine's defaultHome() — so a codex 本体 reads ~/.codex, not ~/.claude.
+   *  Explicit value still wins (tests inject a temp dir). */
+  sourceClaudeHome?: string;
   /** Source 本体's display name (e.g. probed Lark botName "克劳德"), used to
    *  compute the clone's『本体名（N号机）』displayName. Omit → no displayName. */
   sourceDisplayName?: string;
@@ -316,6 +328,13 @@ export interface CloneBotInput {
 export interface CloneBotDeps {
   /** Injectable scan (device-flow). Defaults to the real tryRegisterApp. */
   registerApp?: (opts?: RegisterAppOptions) => Promise<RegisterAppResult>;
+  /** Round-4 clone-capability gate (蔻黛 Batch1 复审 Blocker): is this source
+   *  engine cloneable (adapter declares cloneHome)? Defaults to the real adapter
+   *  check; injected for tests. Gating here covers ALL clone entry points. */
+  supportsClone?: (cliId: string) => boolean;
+  /** Round-4 B4: resolve the source engine's clone-home spec (symlink/copy/dir/
+   *  memory classification). Defaults to the adapter's cloneHome; injected for tests. */
+  cloneHomeFor?: (cliId: string) => CloneHomeSpec | undefined;
   /** Injectable source-bot avatar fetch (块7 #2). Defaults to fetchSourceBotAvatar
    *  (/bot/v3/info, fail-soft). Lets tests avoid the network. */
   fetchSourceAvatar?: (appId: string, appSecret: string) => Promise<string | undefined>;
@@ -337,6 +356,20 @@ export interface CloneBotDeps {
  * via bots-store); it is never returned, logged, or put in an error message.
  */
 export async function cloneBot(input: CloneBotInput, deps: CloneBotDeps = {}): Promise<CloneBotResult> {
+  // Round-4 capability gate (蔻黛 Batch1 复审 Blocker) — FIRST, before any side
+  // effect (no registerApp / no QR / no bots.json write). An engine whose adapter
+  // doesn't declare cloneHome cannot be cloned: its home/setup isn't isolated yet,
+  // so a "codex clone" built with the Claude-only setup below would be invalid.
+  const supportsClone = deps.supportsClone ?? defaultSupportsClone;
+  const sourceCliId = input.sourceBot.cliId ?? 'claude-code';
+  if (!supportsClone(sourceCliId)) {
+    return { ok: false, error: 'unsupported_engine', message: `引擎「${sourceCliId}」暂不支持克隆（adapter 未声明 cloneHome / 隔离 home 未实现）` };
+  }
+  // Resolve the engine's clone-home spec (drives dir name + symlink/copy/seed).
+  const cloneHomeSpec = (deps.cloneHomeFor ?? defaultCloneHomeFor)(sourceCliId);
+  if (!cloneHomeSpec) {
+    return { ok: false, error: 'unsupported_engine', message: `引擎「${sourceCliId}」无 cloneHome 规格` };
+  }
   const registerApp = deps.registerApp ?? tryRegisterApp;
   const fetchAvatar = deps.fetchSourceAvatar ?? fetchSourceBotAvatar;
   // Build clone-count entries from a bots.json snapshot, enriched with bots-info
@@ -383,13 +416,17 @@ export async function cloneBot(input: CloneBotInput, deps: CloneBotDeps = {}): P
   const clone = buildCloneConfig(
     input.sourceBot,
     { appId: scan.appId, appSecret: scan.appSecret, userOpenId: scan.userOpenId },
-    { slug, configDir: input.configDir, displayName: naming?.displayName, clonedFromName: naming?.clonedFromName },
+    { slug, configDir: input.configDir, displayName: naming?.displayName, clonedFromName: naming?.clonedFromName, homeDirName: cloneHomeSpec.dirName },
   );
   const claudeConfigDir = clone.claudeConfigDir!;
 
+  // Source home, engine-aware: explicit input wins (tests); else the source bot's
+  // own home dir; else the engine's default 本体 home (~/.claude / ~/.codex).
+  const sourceHome = input.sourceClaudeHome ?? input.sourceBot.claudeConfigDir ?? cloneHomeSpec.defaultHome();
+
   // Set up the isolated home BEFORE the bots.json write so a write failure can
   // roll the dir back, leaving no half-registered clone.
-  setupCloneHome(claudeConfigDir, input.sourceClaudeHome);
+  setupCloneHome(claudeConfigDir, sourceHome, cloneHomeSpec);
 
   try {
     writeBotsJsonAtomic(input.botsJsonPath, [...existing, normalizeBotConfig(clone as Record<string, any>)]);

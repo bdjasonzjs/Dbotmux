@@ -40,12 +40,12 @@ export async function cmdBot(sub: string, args: string[]): Promise<void> {
     process.exit(1);
   }
   const sourceBot = bots[idx] as BotConfig;
-  const sourceClaudeHome = sourceBot.claudeConfigDir ?? join(homedir(), '.claude');
 
   console.error(`正在克隆 bot「${(sourceBot as any).name ?? sourceBot.larkAppId}」(cli: ${sourceBot.cliId ?? 'claude-code'})…`);
   console.error('请用飞书 App 扫码创建分身（二维码见下方）。');
 
-  const result = await cloneBot({ sourceBot, configDir, botsJsonPath, sourceClaudeHome });
+  // sourceClaudeHome omitted → cloneBot derives it engine-aware (Round-4 B4).
+  const result = await cloneBot({ sourceBot, configDir, botsJsonPath });
   if (!result.ok) {
     console.error(`❌ clone 失败: ${result.error} — ${result.message}`);
     process.exit(1);

@@ -19,7 +19,11 @@ import { platform } from 'node:os';
 import { join } from 'node:path';
 import { cocoCacheRoot } from './coco-paths.js';
 
-const COCO_SESSIONS_ROOT = join(cocoCacheRoot(), 'sessions');
+/** CoCo sessions root, per home (Round-4 coco state-only). `home` = a clone's
+ *  XDG_CACHE_HOME value when isolated; omit → 本体's default cache. */
+function cocoSessionsRoot(home?: string): string {
+  return join(cocoCacheRoot(home), 'sessions');
+}
 const SESSION_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const IS_LINUX = platform() === 'linux';
 // substring anchor —— 同时匹配 Linux 的 `/.cache/coco/sessions/` 和 macOS 的
@@ -44,8 +48,8 @@ export interface CocoDrainResult {
   pendingTail: string;
 }
 
-export function cocoEventsPathForSession(sessionId: string): string {
-  return join(COCO_SESSIONS_ROOT, sessionId, 'events.jsonl');
+export function cocoEventsPathForSession(sessionId: string, home?: string): string {
+  return join(cocoSessionsRoot(home), sessionId, 'events.jsonl');
 }
 
 /** Find which CoCo session a running CoCo process is bound to by scanning
@@ -99,12 +103,20 @@ export function findCocoSessionByPid(
   return undefined;
 }
 
-function matchCocoSessionPath(target: string): { sessionId: string; eventsPath: string } | undefined {
+/** Derive {sessionId, eventsPath} from an open-fd target like
+ *  `<cacheBase>/coco/sessions/<sid>/session.log`. Round-4 coco state-only (蔻黛
+ *  P1): the eventsPath is derived FROM the fd target's own prefix, NOT recomputed
+ *  from the default cache base — so a clone's XDG_CACHE_HOME-scoped path is
+ *  preserved during adopt/PID discovery (else the bridge would bind to the 本体's
+ *  ~/.cache/coco and read the wrong / cross-talk events). Exported for testing. */
+export function matchCocoSessionPath(target: string): { sessionId: string; eventsPath: string } | undefined {
   const idx = target.indexOf(COCO_SESSIONS_ANCHOR);
   if (idx < 0) return undefined;
   const sid = target.slice(idx + COCO_SESSIONS_ANCHOR.length).split('/')[0];
   if (!sid || !SESSION_UUID_RE.test(sid)) return undefined;
-  return { sessionId: sid, eventsPath: cocoEventsPathForSession(sid) };
+  // Reconstruct the session dir from the SAME prefix the fd target carries.
+  const sessionDir = target.slice(0, idx) + COCO_SESSIONS_ANCHOR + sid;
+  return { sessionId: sid, eventsPath: join(sessionDir, 'events.jsonl') };
 }
 
 function messageText(content: unknown): string {

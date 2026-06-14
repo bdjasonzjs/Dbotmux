@@ -22,6 +22,10 @@ export interface PendingCloneSeat {
   /** Index into the request's seats[] this clone fills (stable across re-entry). */
   seatIndex: number;
   role: 'main' | 'collab' | 'observer';
+  /** Resolved target engine for this clone (bot-agnostic). The clone is built
+   *  from `bentiAppId` (the 本体 of `cliId`) and inherits its cliId. */
+  cliId: string;
+  bentiAppId: string;
   /** Set once the QR clone is written to bots.json. */
   appId?: string;
   /** Computed『本体名（N号机）』— the clone's addressable name. */

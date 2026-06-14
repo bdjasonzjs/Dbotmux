@@ -371,6 +371,22 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
   const bin = resolveCommand(pathOverride ?? 'claude');
   return {
     id: 'claude-code',
+    // Round-4: claude relocates its home via CLAUDE_CONFIG_DIR (the existing
+    // home-isolation mechanism). Lists mirror the original CLONE_SHARED_ENTRIES /
+    // CLONE_INDEPENDENT_DIRS exactly so claude clone setup is byte-equivalent.
+    cloneHome: {
+      tier: 'full',
+      envVar: 'CLAUDE_CONFIG_DIR',
+      dirName: '.claude',
+      defaultHome: () => join(homedir(), '.claude'),
+      sharedEntries: [
+        'CLAUDE.md', 'settings.json', 'settings.local.json', 'keybindings.json',
+        'skills', 'identity', 'plugins', 'hooks', '.credentials.json',
+      ],
+      copyEntries: [],
+      independentDirs: ['projects', 'sessions', 'todos', 'shell-snapshots', 'statsig'],
+      memorySeed: 'claude-projects',
+    },
     resolvedBin: bin,
     supportsTypeAhead: true,
 

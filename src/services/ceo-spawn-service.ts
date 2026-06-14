@@ -14,11 +14,13 @@ import { readFileSync, existsSync, mkdtempSync, writeFileSync, rmSync } from 'no
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { config } from '../config.js';
-import { getBot, getBotOpenId, getOwnerOpenId, registerBot, loadBotConfigs } from '../bot-registry.js';
-import { resolveBotIdent, HttpError } from '../core/main-bot-playbook.js';
+import { getBot, getBotOpenId, getOwnerOpenId, registerBot, loadBotConfigs, type BotConfig } from '../bot-registry.js';
+import { resolveBotIdent, HttpError, BOT_ALIAS_TO_CLI_ID } from '../core/main-bot-playbook.js';
 import { getSession } from './session-store.js';
 import { readBotsJsonOrEmpty } from '../setup/bots-store.js';
-import { listBotsByCli, defaultBotsJsonPath } from './bot-inventory.js';
+import { listBots, listBotsByCli, defaultBotsJsonPath } from './bot-inventory.js';
+import { createCliAdapterSync } from '../adapters/cli/registry.js';
+import type { CliId } from '../adapters/cli/types.js';
 import { resolveBotmuxPaths } from '../core/botmux-paths.js';
 import { pm2ListAppPids } from '../core/pm2-ecosystem.js';
 import { replyMessage, sendMessage, uploadImage } from '../im/lark/client.js';
@@ -28,10 +30,11 @@ import { cloneGrantScopes, buildAuthUrl, type CloneScopeProfile } from './clone-
 import { activateBot } from './bot-activate.js';
 import { createSubtask, slug, djb2 } from './subtask-orchestrator.js';
 import { addBotToSubTask, enqueueCommand } from './subtask-store.js';
-import { ensureClonesAndSpawn, type EnsureSpawnDeps, type EnsureSpawnReq, type EnsureSpawnOutcome } from './ceo-clone-orchestration.js';
+import { ensureClonesAndSpawn, type EnsureSpawnDeps, type EnsureSpawnReq, type EnsureSpawnOutcome, type AutoTarget } from './ceo-clone-orchestration.js';
 import { ceoSpawnKey, getCeoSpawnState, putCeoSpawnState, clearCeoSpawnState } from './ceo-spawn-store.js';
 import {
-  resolveReady, activationApproved, parseSeats, resolveCeoOwner, hotRegisterClone, type BotInfoLite, type ReadySnapshot,
+  resolveReady, activationApproved, parseSeats, resolveCeoOwner, hotRegisterClone,
+  resolveAutoTarget as resolveAutoTargetPure, type BotInfoLite, type ReadySnapshot,
 } from './ceo-spawn-wiring.js';
 import { logger } from '../utils/logger.js';
 
@@ -127,9 +130,33 @@ export async function ceoSpawn(req: CeoSpawnReq): Promise<EnsureSpawnOutcome> {
   const botReady = (appId: string): string | undefined =>
     appId === ceoAppId ? (getBotOpenId(ceoAppId) ?? owner) : resolveReady(appId, snap);
 
+  // ── Round-4 bot-agnostic resolvers (registry-driven, zero engine list) ──
+  /** Clone-isolation tier from cliId's adapter (Round-4 coco): 'full'/'state-only'
+   *  or undefined (no cloneHome → not cloneable). */
+  const cloneTier = (cliId: string): 'full' | 'state-only' | undefined => {
+    try { return createCliAdapterSync(cliId as CliId).cloneHome?.tier; } catch { return undefined; }
+  };
+  /** Resolve an auto seat's target → {cliId, 本体 appId} via the pure, open_id-
+   *  decoupled wiring helper (蔻黛 Batch1 Blocker2). */
+  const resolveAutoTarget = (autoTarget: string | undefined): AutoTarget | { error: string } =>
+    resolveAutoTargetPure(autoTarget, {
+      bots: listBots(botsJsonPath).map(b => ({ larkAppId: b.larkAppId, cliId: b.cliId, claudeConfigDir: b.claudeConfigDir })),
+      names: readBotsInfo(dataDir).map(e => ({ larkAppId: e.larkAppId, botName: (e as { botName?: string }).botName })),
+      aliasToCliId: BOT_ALIAS_TO_CLI_ID,
+      ceoCliId: getBot(ceoAppId).config.cliId ?? 'claude-code',
+    });
+  /** Ready (本体-first) addressable appIds of a cliId. */
+  const usableAppsByCli = (cliId: string): string[] =>
+    listBotsByCli(cliId, botsJsonPath)
+      .filter(b => botReady(b.larkAppId))
+      .sort((a, b) => (a.claudeConfigDir ? 1 : 0) - (b.claudeConfigDir ? 1 : 0))
+      .map(b => b.larkAppId);
+
   const deps: EnsureSpawnDeps = {
     getOwnerOpenId: () => owner,
-    listClaudeBots: () => listBotsByCli('claude-code', botsJsonPath),
+    resolveAutoTarget,
+    usableAppsByCli,
+    cloneTier,
     botOpenIdReady: botReady,
     displayNameForApp: (appId) => {
       const e = readBotsJsonOrEmpty(botsJsonPath).find((b: any) => b?.larkAppId === appId);
@@ -139,12 +166,27 @@ export async function ceoSpawn(req: CeoSpawnReq): Promise<EnsureSpawnOutcome> {
       const r = await createSubtask({ sessionId: req.sessionId, goal, bots });
       return { taskId: r.taskId, chatId: r.chatId, bots };
     },
-    cloneInChat: async ({ targetChatId, rootMessageId, senderOpenId }) => {
+    cloneInChat: async ({ targetChatId, rootMessageId, senderOpenId, sourceBentiAppId }) => {
+      // Bot-agnostic source: clone the TARGET engine's 本体 (resolved by the
+      // orchestrator), NOT the CEO. 本体 is loaded at daemon start so getBot works;
+      // fall back to bots.json config + bots-info name if the registry misses it.
+      let sourceBot: BotConfig;
+      let sourceDisplayName: string | undefined;
+      try {
+        const b = getBot(sourceBentiAppId);
+        sourceBot = b.config; sourceDisplayName = b.botName;
+      } catch {
+        const cfg = loadBotConfigs().find(c => c.larkAppId === sourceBentiAppId);
+        if (!cfg) return { ok: false, error: 'source_benti_not_found' };
+        sourceBot = cfg;
+        const info = readBotsInfo(dataDir).find(e => e.larkAppId === sourceBentiAppId) as { botName?: string } | undefined;
+        sourceDisplayName = info?.botName;
+      }
       const r = await cloneBotInChat(
         {
           ceoAppId, chatId: session.chatId, targetChatId, rootMessageId, senderOpenId,
-          sourceBot: getBot(ceoAppId).config,
-          sourceDisplayName: getBot(ceoAppId).botName, // 本体名 → 克隆『本体名（N号机）』
+          sourceBot,
+          sourceDisplayName, // 本体名 → 克隆『本体名（N号机）』
           // bots-info botName per appId → legacy clone-count supplement (round-3 #2).
           botNamesByAppId: Object.fromEntries(
             readBotsInfo(dataDir).filter(e => e.larkAppId && (e as any).botName).map(e => [e.larkAppId, (e as any).botName as string]),
