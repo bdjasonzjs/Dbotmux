@@ -65,6 +65,12 @@ vi.mock('../src/services/mailbox.js', () => ({
   expandLetters: (t: string) => mockExpandLetters(t),
 }));
 
+// round-5 wake-ack：spy recordWakeAck，验证「只在授权后才写回执」。
+const mockRecordWakeAck = vi.fn(async () => {});
+vi.mock('../src/services/subtask-store.js', () => ({
+  recordWakeAck: (...args: any[]) => mockRecordWakeAck(...args),
+}));
+
 let mockMainTopicChatId: string | undefined;
 vi.mock('../src/services/main-topic-config.js', () => ({
   getMainTopicChatId: () => mockMainTopicChatId,
@@ -95,7 +101,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 
 // ─── Imports (must be after mocks) ──────────────────────────────────────────
 
-import { isBotMentioned, startLarkEventDispatcher, writeBotInfoFile, parseUrgentSummon, urgentSummonBodyForBot, normalizeToTextMessage, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
+import { isBotMentioned, startLarkEventDispatcher, writeBotInfoFile, parseUrgentSummon, urgentSummonBodyForBot, summonMatchForBot, normalizeToTextMessage, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -1756,6 +1762,62 @@ describe('urgentSummonBodyForBot', () => {
   it('legacy clone (Lark botName set manually, no botmux displayName) still wakeable by botName', () => {
     setBotConfig('克劳德（初号机）', undefined);
     expect(urgentSummonBodyForBot(APP, msg('急急如律令：【克劳德（初号机）】x'))).toBe('x');
+  });
+});
+
+describe('summonMatchForBot — wake-ack 令牌解析（纯函数、不写 store）', () => {
+  const APP = 'app-claude';
+  function msg(text: string) { return { content: JSON.stringify({ text }) }; }
+  beforeEach(() => { vi.clearAllMocks(); mockGetBot.mockReturnValue({ botName: '克劳德', config: { larkAppId: APP } }); });
+
+  it('带 wake 令牌 → 抽出 {taskId,wakeId}，body 剥掉令牌；且**不写 store**（纯解析）', () => {
+    const r = summonMatchForBot(APP, msg('急急如律令：【克劳德】预热正文 [[wake-ack:st_a:wk9]]（预热#1·nn）'));
+    expect(r).not.toBeNull();
+    expect(r!.wakeAck).toEqual({ taskId: 'st_a', wakeId: 'wk9' });
+    expect(r!.body).not.toContain('[[wake-ack');   // 令牌已剥
+    expect(r!.body).toContain('预热正文');
+    expect(mockRecordWakeAck).not.toHaveBeenCalled();  // 解析阶段绝不写 store
+  });
+
+  it('无令牌 → wakeAck=null，body 原样（仅剥前缀）', () => {
+    const r = summonMatchForBot(APP, msg('急急如律令：【克劳德】做X'));
+    expect(r).toEqual({ body: '做X', wakeAck: null });
+    expect(mockRecordWakeAck).not.toHaveBeenCalled();
+  });
+
+  it('未点名本 bot → null', () => {
+    expect(summonMatchForBot(APP, msg('急急如律令：【缇蕾】x [[wake-ack:st_a:wk9]]'))).toBeNull();
+    expect(mockRecordWakeAck).not.toHaveBeenCalled();
+  });
+});
+
+describe('急急如律令 wake-ack 授权闸（蔻黛 blocker：先授权再写回执）', () => {
+  let handlers: ReturnType<typeof makeHandlers>;
+  const SUMMON = '急急如律令：【克劳德】预热 [[wake-ack:st_w:wk7]]（预热#1·ab）';
+  beforeEach(() => {
+    capturedHandlers = {};
+    handlers = makeHandlers();
+    mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
+    mockGetChatMode.mockResolvedValue('group');
+    vi.clearAllMocks();
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+  });
+
+  it('未授权 sender 带 wake token → 不写回执、不路由（防 spoof 污染 store）', async () => {
+    // 非空 allowlist 且不含 stranger → canTalk=false（空 allowlist 是 open-mode，全员放行，不能用来测「未授权」）。
+    mockGetBot.mockReturnValue({ botName: '克劳德', config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' }, botOpenId: MY_OPEN_ID, resolvedAllowedUsers: [USER_OPEN_ID] });
+    const event = makeUserMessageEvent({ senderOpenId: 'ou_stranger', content: JSON.stringify({ text: SUMMON }), messageId: 'm-spoof', chatId: 'chat-spoof', chatType: 'group' });
+    await capturedHandlers['im.message.receive_v1'](event);
+    expect(mockRecordWakeAck).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('授权 sender（allowedUsers）带 wake token → 授权后写回执 (taskId, 本 appId, wakeId)', async () => {
+    mockGetBot.mockReturnValue({ botName: '克劳德', config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' }, botOpenId: MY_OPEN_ID, resolvedAllowedUsers: [USER_OPEN_ID] });
+    const event = makeUserMessageEvent({ senderOpenId: USER_OPEN_ID, content: JSON.stringify({ text: SUMMON }), messageId: 'm-ok', chatId: 'chat-ok', chatType: 'group' });
+    await capturedHandlers['im.message.receive_v1'](event);
+    expect(mockRecordWakeAck).toHaveBeenCalledWith('st_w', MY_APP_ID, 'wk7');
   });
 });
 

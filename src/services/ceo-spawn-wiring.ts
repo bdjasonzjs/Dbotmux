@@ -6,6 +6,7 @@
  *   2. activation-approval = explicit owner-scope check, not just a CLI flag.
  */
 import { botProcessName } from '../setup/bot-config-editor.js';
+import { validateCloneName } from './clone-name.js';
 import type { SeatSpec, AutoTarget } from './ceo-clone-orchestration.js';
 
 export interface BotInfoLite {
@@ -173,33 +174,62 @@ export const AUTO_SEAT_REF = 'auto';
  * Parse `--seats` entries into SeatSpecs. Pure syntax only — does NOT validate
  * whether a ref exists or an engine is supported (that needs the runtime
  * registry; it happens in ensureClonesAndSpawn). Forms:
- *   - `<role>` / `auto:<role>`        → auto seat, default target (CEO engine)
- *   - `auto@<ref>:<role>`             → auto seat, target = ref (any bot/engine id)
- *   - `<ref>:<role>`                  → explicit already-registered bot, no clone
- * Throws on an invalid role or an empty `auto@` target.
+ *   - `<role>` / `auto:<role>`              → auto seat, default target (CEO engine)
+ *   - `auto:<role>:<cloneName>`             → auto seat, default target, custom name
+ *   - `auto@<ref>:<role>`                   → auto seat, target = ref (any bot/engine id)
+ *   - `auto@<ref>:<role>:<cloneName>`       → auto seat, target = ref, custom name
+ *   - `<ref>:<role>`                        → explicit already-registered bot, no clone
+ * The optional `<cloneName>` (3rd segment) is the auto seat's custom Feishu name:
+ * present → the clone is named this (overriding『本体名（N号机）』) and is FORCE-cloned
+ * (see planSeats — a named seat skips the ready pool). cloneName keeps any inner
+ * `:` (taken as the whole tail), is validated here (fail-fast), and is rejected on
+ * an explicit `<ref>` seat (already-registered bots aren't cloned, can't be renamed).
+ * Throws on an invalid role, an empty `auto@` target, an invalid cloneName, or a
+ * cloneName on a non-auto seat.
  */
 export function parseSeats(entries: string[]): SeatSpec[] {
   return entries.map(raw => {
     const entry = raw.trim();
     const ci = entry.indexOf(':');
     const head = (ci >= 0 ? entry.slice(0, ci) : '').trim();
-    let role = (ci >= 0 ? entry.slice(ci + 1) : entry).trim().toLowerCase();
+    // `rest` = everything after the first ':' = `role[:cloneName]`. Split role
+    // from the optional cloneName on the FIRST ':' in rest; cloneName takes the
+    // whole tail (slice, not split) so a name may itself contain ':'.
+    const rest = ci >= 0 ? entry.slice(ci + 1) : entry;
+    const ci2 = rest.indexOf(':');
+    let role = (ci2 >= 0 ? rest.slice(0, ci2) : rest).trim().toLowerCase();
+    const cloneNameRaw = ci2 >= 0 ? rest.slice(ci2 + 1) : undefined;
     if (!role) role = 'collab';
     if (!VALID_ROLES.has(role)) {
       throw new Error(`invalid role "${role}" in seat "${raw}" (allowed: main|collab|observer)`);
     }
     const r = role as SeatSpec['role'];
+
+    // Validate the custom name (fail-fast) once, up front. undefined → no name.
+    let cloneName: string | undefined;
+    if (cloneNameRaw !== undefined) {
+      const v = validateCloneName(cloneNameRaw);
+      if (!v.ok) throw new Error(`invalid clone name in seat "${raw}": ${v.error}`);
+      cloneName = v.name;
+    }
+
     // bare role or `auto` → auto seat, default target.
     if (!head || head.toLowerCase() === AUTO_SEAT_REF) {
-      return { auto: true, role: r };
+      return cloneName ? { auto: true, role: r, cloneName } : { auto: true, role: r };
     }
     // `auto@<ref>` → auto seat targeting a specific bot/engine.
     if (head.toLowerCase().startsWith(`${AUTO_SEAT_REF}@`)) {
       const target = head.slice(AUTO_SEAT_REF.length + 1).trim();
       if (!target) throw new Error(`auto@ requires a target in seat "${raw}"`);
-      return { auto: true, autoTarget: target, role: r };
+      return cloneName
+        ? { auto: true, autoTarget: target, role: r, cloneName }
+        : { auto: true, autoTarget: target, role: r };
     }
-    // `<ref>` → explicit already-registered bot.
+    // `<ref>` → explicit already-registered bot. A custom name makes no sense here
+    // (no clone happens), so reject it rather than silently dropping it.
+    if (cloneName !== undefined) {
+      throw new Error(`custom name not allowed on an explicit bot seat "${raw}" (only auto-clone seats can be renamed)`);
+    }
     return { ref: head, role: r };
   });
 }

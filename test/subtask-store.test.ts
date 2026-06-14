@@ -21,6 +21,7 @@ import {
   helpReportDelivery, staleHelpCommandIds,
   listObservations, pruneFinished, VersionConflictError, TaskNotFoundError, CommandRetryMismatchError, ACTIVE_STATUSES,
   StoreCorruptError, __resetForTesting, addBotToSubTask, type SubTaskBot,
+  recordWakeAck, hasWakeAck,
 } from '../src/services/subtask-store.js';
 
 const BOTS: SubTaskBot[] = [
@@ -506,5 +507,26 @@ describe('completeDispatch acked 单调性', () => {
     await claimCommandForDispatch(cmd.cmdId, 'A', 60_000, new Date());
     const after = await completeDispatch(cmd.cmdId, 'A', { deliveryStatus: 'sent', deliveredMessageId: 'om_y' });
     expect(after!.deliveryStatus).toBe('sent');
+  });
+});
+
+describe('wakeAck (round-5 冷启动唤醒回执)', () => {
+  it('record → has，按 (taskId, appId, wakeId) 三元组精确匹配', async () => {
+    await recordWakeAck('st_1', 'cli_a', 'w1');
+    expect(hasWakeAck('st_1', 'cli_a', 'w1')).toBe(true);
+    // 任一维度不同都不命中（防串轮/串分身/上一轮迟到回执误放行）
+    expect(hasWakeAck('st_1', 'cli_a', 'w2')).toBe(false);
+    expect(hasWakeAck('st_1', 'cli_b', 'w1')).toBe(false);
+    expect(hasWakeAck('st_2', 'cli_a', 'w1')).toBe(false);
+  });
+
+  it('幂等：同三元组重复 record 不产生重复条目', async () => {
+    await recordWakeAck('st_1', 'cli_a', 'w1');
+    await recordWakeAck('st_1', 'cli_a', 'w1');
+    expect(hasWakeAck('st_1', 'cli_a', 'w1')).toBe(true);
+  });
+
+  it('未 record → has 为 false', () => {
+    expect(hasWakeAck('st_none', 'cli_x', 'wz')).toBe(false);
   });
 });

@@ -205,4 +205,30 @@ describe('parseSeats (Round-4: bot-agnostic auto seats)', () => {
   it('empty auto@ target → throws', () => {
     expect(() => parseSeats(['auto@:collab'])).toThrow(/auto@ requires a target/);
   });
+
+  // ── 块8: optional 3rd segment = custom cloneName ──
+  it('auto@<ref>:role:cloneName → auto seat with cloneName', () => {
+    expect(parseSeats(['auto@codex:collab:评审甲'])).toEqual([
+      { auto: true, autoTarget: 'codex', role: 'collab', cloneName: '评审甲' },
+    ]);
+  });
+  it('auto:role:cloneName → default-target auto seat with cloneName', () => {
+    expect(parseSeats(['auto:main:队长'])).toEqual([
+      { auto: true, role: 'main', cloneName: '队长' },
+    ]);
+  });
+  it('no 3rd segment → no cloneName key (zero regression)', () => {
+    expect(parseSeats(['auto@codex:collab'])).toEqual([
+      { auto: true, autoTarget: 'codex', role: 'collab' },
+    ]);
+  });
+  it('cloneName on an explicit <ref> seat → throws (registered bots not renamable)', () => {
+    expect(() => parseSeats(['codex:main:别名'])).toThrow(/custom name not allowed/);
+  });
+  it('invalid cloneName (too long) → throws at parse time', () => {
+    expect(() => parseSeats(['auto@codex:collab:' + 'x'.repeat(21)])).toThrow(/invalid clone name/);
+  });
+  it('cloneName ending in（…号机）→ throws (namespace guard)', () => {
+    expect(() => parseSeats(['auto@codex:collab:克劳德（初号机）'])).toThrow(/invalid clone name/);
+  });
 });

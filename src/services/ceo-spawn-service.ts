@@ -30,6 +30,8 @@ import { cloneGrantScopes, buildAuthUrl, type CloneScopeProfile } from './clone-
 import { activateBot } from './bot-activate.js';
 import { createSubtask, slug, djb2 } from './subtask-orchestrator.js';
 import { addBotToSubTask, enqueueCommand } from './subtask-store.js';
+import { sendAsOwner } from './base-relay.js';
+import { preheatConfirmOnline } from './ceo-preheat.js';
 import { ensureClonesAndSpawn, type EnsureSpawnDeps, type EnsureSpawnReq, type EnsureSpawnOutcome, type AutoTarget } from './ceo-clone-orchestration.js';
 import { ceoSpawnKey, getCeoSpawnState, putCeoSpawnState, clearCeoSpawnState } from './ceo-spawn-store.js';
 import {
@@ -166,7 +168,7 @@ export async function ceoSpawn(req: CeoSpawnReq): Promise<EnsureSpawnOutcome> {
       const r = await createSubtask({ sessionId: req.sessionId, goal, bots });
       return { taskId: r.taskId, chatId: r.chatId, bots };
     },
-    cloneInChat: async ({ targetChatId, rootMessageId, senderOpenId, sourceBentiAppId }) => {
+    cloneInChat: async ({ targetChatId, rootMessageId, senderOpenId, sourceBentiAppId, cloneName }) => {
       // Bot-agnostic source: clone the TARGET engine's 本体 (resolved by the
       // orchestrator), NOT the CEO. 本体 is loaded at daemon start so getBot works;
       // fall back to bots.json config + bots-info name if the registry misses it.
@@ -186,7 +188,9 @@ export async function ceoSpawn(req: CeoSpawnReq): Promise<EnsureSpawnOutcome> {
         {
           ceoAppId, chatId: session.chatId, targetChatId, rootMessageId, senderOpenId,
           sourceBot,
-          sourceDisplayName, // 本体名 → 克隆『本体名（N号机）』
+          sourceDisplayName, // 本体名 → 克隆『本体名（N号机）』(仅在无 cloneName 时生效)
+          cloneName, // 自定义名：有则覆盖 N号机 作为预填 app 名 + bots.json displayName
+
           // bots-info botName per appId → legacy clone-count supplement (round-3 #2).
           botNamesByAppId: Object.fromEntries(
             readBotsInfo(dataDir).filter(e => e.larkAppId && (e as any).botName).map(e => [e.larkAppId, (e as any).botName as string]),
@@ -241,6 +245,15 @@ export async function ceoSpawn(req: CeoSpawnReq): Promise<EnsureSpawnOutcome> {
         idempotencyKey: `late-kickoff-${taskId}-${appId}`, expectedTaskVersion: null,
       });
     },
+    // round-5 冷启动修复：预热握手。注入的 sendOwnerSummon **直发一条新 record** 的 owner summon
+    // （不复用 record，规避 base-relay 防刷屏幂等的「只 poll 不 upsert」）；短 poll 只为快确认/捕获
+    // upsert 错误，真正的成功信号是分身命中后写的 store 回执（preheatConfirmOnline 轮询）。
+    preheatConfirmOnline: (target) => preheatConfirmOnline({
+      sendOwnerSummon: async (chatId, text) => {
+        const res = await sendAsOwner({ targetChatId: chatId, text, pollTimeoutMs: 3_000 });
+        return res.ok ? { ok: true } : { ok: false, error: res.error };
+      },
+    }, target),
     getState: getCeoSpawnState,
     putState: putCeoSpawnState,
     clearState: clearCeoSpawnState,

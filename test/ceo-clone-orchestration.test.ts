@@ -11,7 +11,7 @@ const baseReq = (over: Partial<EnsureSpawnReq> = {}): EnsureSpawnReq => ({
 
 function deps(over: Partial<EnsureSpawnDeps> = {}): { d: EnsureSpawnDeps; calls: any; store: Map<string, CeoSpawnState> } {
   const store = new Map<string, CeoSpawnState>();
-  const calls = { spawn: 0, cloneInChat: 0, activate: 0, registerActivatedBot: 0, isInChat: 0, addBotToChat: 0, addBotToSubTask: 0, lateKickoff: 0, replies: [] as string[], order: [] as string[], lateKickoffArgs: [] as any[], cloneArgs: [] as any[] };
+  const calls = { spawn: 0, cloneInChat: 0, activate: 0, registerActivatedBot: 0, isInChat: 0, addBotToChat: 0, addBotToSubTask: 0, lateKickoff: 0, preheat: 0, replies: [] as string[], order: [] as string[], lateKickoffArgs: [] as any[], preheatArgs: [] as any[], cloneArgs: [] as any[] };
   const d: EnsureSpawnDeps = {
     getOwnerOpenId: () => OWNER,
     // default auto target = the claude 本体 (cli_main); pool has only the 本体 ready.
@@ -29,6 +29,7 @@ function deps(over: Partial<EnsureSpawnDeps> = {}): { d: EnsureSpawnDeps; calls:
     addBotToChat: async () => { calls.addBotToChat++; return { ok: true }; },
     addBotToSubTask: async () => { calls.addBotToSubTask++; },
     lateKickoff: async (a) => { calls.lateKickoff++; calls.lateKickoffArgs.push(a); },
+    preheatConfirmOnline: async (t) => { calls.preheat++; calls.preheatArgs.push(t); return { ok: true, wakeId: 'wake_test', attempts: 1 }; },
     getState: (k) => store.get(k) ?? null,
     putState: (s) => { store.set(s.key, JSON.parse(JSON.stringify(s))); },
     clearState: (k) => { store.delete(k); },
@@ -57,6 +58,21 @@ describe('ensureClonesAndSpawn (subgroup-first #5)', () => {
     expect(calls.spawn).toBe(1);
     expect(calls.cloneInChat).toBe(0);
     expect(out.bots).toEqual(['cli_main:main', 'cli_clone:collab']);
+  });
+
+  it('块8 B1: a seat with cloneName is FORCE-cloned (skips ready pool) and cloneInChat receives the name', async () => {
+    // cli_main is READY for claude-code, yet the named seat must NOT reuse it.
+    const { d, calls } = deps({
+      usableAppsByCli: (cliId) => (cliId === 'claude-code' ? ['cli_main'] : []),
+      botOpenIdReady: (id) => (id === 'cli_main' ? 'ou_main' : undefined),
+    });
+    const out = await ensureClonesAndSpawn(
+      baseReq({ seats: [{ auto: true, role: 'collab', cloneName: '评审甲' }] }), d,
+    );
+    expect(out.status).toBe('awaiting_activation'); // a clone was needed (not filled from pool)
+    expect(calls.spawn).toBe(1);
+    expect(calls.cloneInChat).toBe(1);              // forced clone despite a ready bot
+    expect(calls.cloneArgs[0].cloneName).toBe('评审甲');
   });
 
   it('subgroup built FIRST, then QR clone; activation gate → awaiting_activation (spawn happened, clone scanned once)', async () => {
@@ -97,6 +113,40 @@ describe('ensureClonesAndSpawn (subgroup-first #5)', () => {
     expect(calls.addBotToSubTask).toBe(1);
     expect(calls.lateKickoff).toBe(1);
     expect(calls.lateKickoffArgs[0]).toMatchObject({ taskId: 'st_1', summonName: '克劳德（初号机）', appId: 'cli_new' });
+  });
+
+  it('round-5: 预热在 lateKickoff 前对分身跑一次（带 taskId/appId/displayName），成功则不告警', async () => {
+    let approved = false, activated = false;
+    const { d, calls } = deps({
+      activationApproved: () => approved,
+      activate: async () => { calls.activate++; activated = true; return { ok: true }; },
+      botOpenIdReady: (id) => (id === 'cli_main' ? 'ou_main' : (id === 'cli_new' && activated ? 'ou_new' : undefined)),
+    });
+    await ensureClonesAndSpawn(baseReq(), d);
+    approved = true;
+    const out = await ensureClonesAndSpawn(baseReq(), d);
+    expect(out.status).toBe('spawned');
+    expect(calls.preheat).toBe(1);
+    expect(calls.preheatArgs[0]).toMatchObject({ taskId: 'st_1', appId: 'cli_new', displayName: '克劳德（初号机）', subgroupChatId: 'oc_sub' });
+    expect(calls.lateKickoff).toBe(1);
+    // 成功上线 → 没有「未确认上线」告警
+    expect(calls.replies.some((m: string) => m.includes('未确认上线'))).toBe(false);
+  });
+
+  it('round-5: 预热耗尽未确认上线 → reply 告警，但不阻断（仍 lateKickoff + spawned）', async () => {
+    let approved = false, activated = false;
+    const { d, calls } = deps({
+      activationApproved: () => approved,
+      activate: async () => { calls.activate++; activated = true; return { ok: true }; },
+      botOpenIdReady: (id) => (id === 'cli_main' ? 'ou_main' : (id === 'cli_new' && activated ? 'ou_new' : undefined)),
+      preheatConfirmOnline: async () => { calls.preheat++; return { ok: false, wakeId: 'w_x', attempts: 3 }; },
+    });
+    await ensureClonesAndSpawn(baseReq(), d);
+    approved = true;
+    const out = await ensureClonesAndSpawn(baseReq(), d);
+    expect(out.status).toBe('spawned');           // 不阻断收尾
+    expect(calls.lateKickoff).toBe(1);            // 仍下发真任务 summon
+    expect(calls.replies.some((m: string) => m.includes('未确认上线'))).toBe(true);
   });
 
   it('addBotToChat fails → awaiting_clone_join, store NOT mutated (no addBotToSubTask/lateKickoff)', async () => {

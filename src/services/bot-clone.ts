@@ -29,6 +29,7 @@ import { botProcessName, normalizeBotProcessName, normalizeBotConfig } from '../
 import { readBotsJsonOrEmpty, writeBotsJsonAtomic } from '../setup/bots-store.js';
 import { tryRegisterApp, type RegisterAppOptions, type RegisterAppResult } from '../setup/register-app.js';
 import { fetchSourceBotAvatar, buildClonePreset } from './clone-app-preset.js';
+import { validateCloneName } from './clone-name.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliId, CloneHomeSpec } from '../adapters/cli/types.js';
 
@@ -317,8 +318,15 @@ export interface CloneBotInput {
    *  Explicit value still wins (tests inject a temp dir). */
   sourceClaudeHome?: string;
   /** Source 本体's display name (e.g. probed Lark botName "克劳德"), used to
-   *  compute the clone's『本体名（N号机）』displayName. Omit → no displayName. */
+   *  compute the clone's『本体名（N号机）』displayName. Omit → no displayName.
+   *  Ignored for naming when `cloneName` is set. */
   sourceDisplayName?: string;
+  /** Custom Feishu name (块8). When set: `appPreset.name` and the written
+   *  `displayName` both become this (overriding『本体名（N号机）』), independent of
+   *  `sourceDisplayName`; and the clone does NOT join N号机 sibling numbering
+   *  (`clonedFromName` is left unset, 蔻黛 B2). Validated defensively here too
+   *  (parseSeats already validates the CEO path; the CLI/other entrypoints may not). */
+  cloneName?: string;
   /** Optional bots-info botName per appId (runtime, possibly stale) — supplements
    *  the clone-count so LEGACY clones lacking clonedFromName/displayName are still
    *  counted (round-3 #2 命名 fix). Never overrides bots.json fields. */
@@ -356,6 +364,17 @@ export interface CloneBotDeps {
  * via bots-store); it is never returned, logged, or put in an error message.
  */
 export async function cloneBot(input: CloneBotInput, deps: CloneBotDeps = {}): Promise<CloneBotResult> {
+  // Custom-name defense (块8): validate FIRST — before any side effect — so an
+  // illegal name fails closed (no registerApp / QR / write). parseSeats already
+  // validates the CEO path; this covers direct CLI / other callers (fail-fast,
+  // not a silent fallback to N号机 — 蔻黛 review).
+  let cloneName: string | undefined;
+  if (input.cloneName !== undefined) {
+    const v = validateCloneName(input.cloneName);
+    if (!v.ok) return { ok: false, error: 'invalid_clone_name', message: `自定义名不合规：${v.error}` };
+    cloneName = v.name; // use the NORMALIZED (trimmed) value everywhere below — a
+                        // non-parseSeats caller may pass an untrimmed raw string.
+  }
   // Round-4 capability gate (蔻黛 Batch1 复审 Blocker) — FIRST, before any side
   // effect (no registerApp / no QR / no bots.json write). An engine whose adapter
   // doesn't declare cloneHome cannot be cloned: its home/setup isn't isolated yet,
@@ -385,7 +404,12 @@ export async function cloneBot(input: CloneBotInput, deps: CloneBotDeps = {}): P
   // the device-flow scan can take minutes; reusing a stale snapshot to write
   // would clobber any bot registered meanwhile).
   let appPreset: { name: string; avatar?: string } | undefined;
-  if (input.sourceDisplayName) {
+  if (cloneName) {
+    // 块8: custom name pre-fills the app name directly — independent of
+    // sourceDisplayName (蔻黛 B2: no dependency on the 本体 display name).
+    const avatar = await fetchAvatar(input.sourceBot.larkAppId, input.sourceBot.larkAppSecret);
+    appPreset = buildClonePreset(cloneName, avatar);
+  } else if (input.sourceDisplayName) {
     const preNaming = resolveCloneNaming(input.sourceDisplayName, toCountEntries(readBotsJsonOrEmpty(input.botsJsonPath)));
     const avatar = await fetchAvatar(input.sourceBot.larkAppId, input.sourceBot.larkAppSecret);
     appPreset = buildClonePreset(preNaming.displayName, avatar);
@@ -409,9 +433,16 @@ export async function cloneBot(input: CloneBotInput, deps: CloneBotDeps = {}): P
   // stays unique for 急急如律令 matching. Rare limit: if the same 本体 was cloned
   // again DURING this scan, the Lark pre-filled name (appPreset, computed pre-scan)
   // may be one ordinal behind the stored displayName — pre-fill is owner-editable.
-  const naming = input.sourceDisplayName
-    ? resolveCloneNaming(input.sourceDisplayName, toCountEntries(existing))
-    : undefined;
+  // 块8: a custom-named clone takes its name verbatim and is kept OFF the N号机
+  // numbering track — clonedFromName is left unset so resolveCloneNaming never
+  // counts it as a 本体 sibling (蔻黛 B2; keeps the visible 初/二/三 run contiguous
+  // and removes any dependency on sourceDisplayName). Otherwise the existing
+  // 『本体名（N号机）』path is unchanged.
+  const naming = cloneName
+    ? { clonedFromName: undefined, displayName: cloneName }
+    : input.sourceDisplayName
+      ? resolveCloneNaming(input.sourceDisplayName, toCountEntries(existing))
+      : undefined;
 
   const clone = buildCloneConfig(
     input.sourceBot,

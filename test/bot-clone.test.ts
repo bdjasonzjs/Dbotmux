@@ -437,6 +437,49 @@ describe('cloneBot', () => {
     expect(captured.appPreset).toEqual({ name: '克劳德（初号机）' });
   });
 
+  // ── 块8: custom cloneName overrides N号机, kept off the numbering track ──
+  it('cloneName → appPreset.name = cloneName (NOT N号机), even with sourceDisplayName present', async () => {
+    const { configDir, srcHome, botsJsonPath } = dirs();
+    let captured: any;
+    const res = await cloneBot(
+      { sourceBot: source(), configDir, botsJsonPath, sourceClaudeHome: srcHome, sourceDisplayName: '克劳德', cloneName: '评审甲' },
+      { registerApp: async (opts) => { captured = opts; return okScan; }, fetchSourceAvatar: async () => 'https://x/a.png' },
+    );
+    expect(res.ok).toBe(true);
+    expect(captured.appPreset).toEqual({ name: '评审甲', avatar: 'https://x/a.png' });
+    const bots = JSON.parse(readFileSync(botsJsonPath, 'utf-8'));
+    expect(bots[1].displayName).toBe('评审甲');
+    expect(bots[1].clonedFromName).toBeUndefined(); // off the N号机 track (B2)
+  });
+
+  it('cloneName works WITHOUT sourceDisplayName (no dependency on 本体 display name, B2)', async () => {
+    const { configDir, srcHome, botsJsonPath } = dirs();
+    let captured: any;
+    const res = await cloneBot(
+      { sourceBot: source(), configDir, botsJsonPath, sourceClaudeHome: srcHome, cloneName: '评审甲' },
+      { registerApp: async (opts) => { captured = opts; return okScan; }, fetchSourceAvatar: async () => undefined },
+    );
+    expect(res.ok).toBe(true);
+    expect(captured.appPreset).toEqual({ name: '评审甲' });
+    const bots = JSON.parse(readFileSync(botsJsonPath, 'utf-8'));
+    expect(bots[1].displayName).toBe('评审甲');
+    expect(bots[1].clonedFromName).toBeUndefined();
+  });
+
+  it('invalid cloneName → fail-closed BEFORE any scan / write', async () => {
+    const { configDir, srcHome, botsJsonPath } = dirs();
+    let scanned = false;
+    const res = await cloneBot(
+      { sourceBot: source(), configDir, botsJsonPath, sourceClaudeHome: srcHome, cloneName: '坏\n名' },
+      { registerApp: async () => { scanned = true; return okScan; } },
+    );
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+    expect(res.error).toBe('invalid_clone_name');
+    expect(scanned).toBe(false);
+    expect(JSON.parse(readFileSync(botsJsonPath, 'utf-8')).length).toBe(1); // nothing appended
+  });
+
   it('#2 blocker: a concurrent bots.json write DURING scan is preserved (re-reads latest before write)', async () => {
     const { configDir, srcHome, botsJsonPath } = dirs();
     const concurrent = { larkAppId: 'cli_concurrent', larkAppSecret: 'C', cliId: 'claude-code', name: 'concurrent' };

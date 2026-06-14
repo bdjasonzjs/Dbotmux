@@ -31,8 +31,13 @@ export interface CloneBotInChatArgs {
   senderOpenId: string;
   /** Source bot to clone. */
   sourceBot: BotConfig;
-  /** Source 本体's display name (probed Lark botName) → clone's『本体名（N号机）』. */
+  /** Source 本体's display name (probed Lark botName) → clone's『本体名（N号机）』
+   *  (only when no cloneName is given). */
   sourceDisplayName?: string;
+  /** Custom Feishu name for the clone (块8). When set, it overrides『本体名（N号机）』
+   *  both as the pre-filled app name and the bots.json displayName, and the clone
+   *  does NOT participate in N号机 sibling numbering (clonedFromName unset). */
+  cloneName?: string;
   /** bots-info botName per appId (legacy clone-count supplement, round-3 #2). */
   botNamesByAppId?: Record<string, string>;
   configDir: string;
@@ -133,11 +138,15 @@ export async function cloneBotInChat(
   }
 
   // UX compensation for #3 (Lark app display name 不可程序化设置): hint the owner
-  // to name the new app『本体名（N号机）』so the Feishu-visible name matches the
-  // botmux displayName. This is a hint only — NOT a link dependency (蔻黛 守点).
+  // what to name the new app so the Feishu-visible name matches the botmux
+  // displayName. With a cloneName the pre-fill already IS that name; otherwise it
+  // defaults to『本体名（N号机）』. This is a hint only — NOT a link dependency (蔻黛 守点).
+  const nameHint = args.cloneName
+    ? `（提示：扫码新建应用时，应用名已预填为「${args.cloneName}」，保持不变即可，使飞书显示名与分身可寻址名一致）`
+    : `（提示：扫码新建应用时，应用名请按「本体名（N号机）」格式填写，使飞书显示名与分身可寻址名一致）`;
   await reply(
-    `正在克隆「${args.sourceDisplayName ?? args.sourceBot.name ?? args.sourceBot.larkAppId}」，二维码马上发出，请扫码…\n` +
-    `（提示：扫码新建应用时，应用名请按「本体名（N号机）」格式填写，使飞书显示名与分身可寻址名一致）`,
+    `正在克隆「${args.sourceDisplayName ?? args.sourceBot.name ?? args.sourceBot.larkAppId}」` +
+    `${args.cloneName ? `为「${args.cloneName}」` : ''}，二维码马上发出，请扫码…\n` + nameHint,
   );
 
   const result = await cloneBot(
@@ -148,6 +157,7 @@ export async function cloneBotInChat(
       // sourceClaudeHome omitted → cloneBot derives it engine-aware (codex 本体 →
       // ~/.codex, not ~/.claude). Round-4 B4.
       sourceDisplayName: args.sourceDisplayName,
+      cloneName: args.cloneName,
       botNamesByAppId: args.botNamesByAppId,
     },
     { registerApp },

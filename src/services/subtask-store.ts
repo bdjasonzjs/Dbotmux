@@ -126,10 +126,22 @@ export interface Observation {
   hasExecutorActivity?: boolean;
 }
 
+/** 唤醒回执（round-5 冷启动修复）：分身 daemon 命中预热 summon 的那一刻写入，
+ *  证明「这条唤醒确实穿到了目标分身 daemon 且命中了目标名」。**只证明 daemon 收到**，
+ *  不证明 worker fork / 模型已处理（验收仍需后续 JSONL 检查）。跨进程靠共享 subtasks.json
+ *  传递：分身 daemon 写、CEO daemon 轮询读。绑 (taskId, appId, wakeId) 三元组防串轮。 */
+export interface WakeAck {
+  taskId: string;
+  appId: string;     // 命中的分身 larkAppId（= 自报身份，daemon 侧即 larkAppId 入参）
+  wakeId: string;    // 本次预热的唯一标识（CEO 侧生成、嵌进 summon 令牌）
+  ackedAt: string;
+}
+
 interface StoreFile {
   subtasks: SubTask[];
   commands: OutboxCommand[];
   observations: Observation[];
+  wakeAcks: WakeAck[];
 }
 
 // ─── 状态机 ──────────────────────────────────────────────────────────────────
@@ -171,11 +183,11 @@ function ensureDir(): void {
   if (!existsSync(d)) mkdirSync(d, { recursive: true });
 }
 function read(): StoreFile {
-  if (!existsSync(fp())) return { subtasks: [], commands: [], observations: [] };
+  if (!existsSync(fp())) return { subtasks: [], commands: [], observations: [], wakeAcks: [] };
   const raw = readFileSync(fp(), 'utf-8');
   try {
     const s = JSON.parse(raw) as Partial<StoreFile>;
-    return { subtasks: s.subtasks ?? [], commands: s.commands ?? [], observations: s.observations ?? [] };
+    return { subtasks: s.subtasks ?? [], commands: s.commands ?? [], observations: s.observations ?? [], wakeAcks: s.wakeAcks ?? [] };
   } catch (err) {
     // 上线前必修 (蔻黛克斯 review)：corrupt **绝不**返回空库 (会被下一次 write 覆盖 = 清库)。
     // 先把 corrupt 文件备份成 .corrupt-<ts> 留证，再 hard fail —— 上层 skip 本轮而非静默清库。
@@ -644,6 +656,22 @@ export function listPendingCommands(now: Date = new Date()): OutboxCommand[] {
     (c.dispatchingUntil == null || new Date(c.dispatchingUntil).getTime() <= now.getTime()),
   );
 }
+// ─── 唤醒回执（round-5 冷启动修复）─────────────────────────────────────────────
+/** 分身 daemon 命中预热 summon 时写入回执（幂等：同三元组只记一次）。跨进程安全（走 mutate）。 */
+export async function recordWakeAck(taskId: string, appId: string, wakeId: string): Promise<void> {
+  await mutate(s => {
+    if (s.wakeAcks.some(a => a.taskId === taskId && a.appId === appId && a.wakeId === wakeId)) {
+      return { result: undefined, dirty: false };
+    }
+    s.wakeAcks.push({ taskId, appId, wakeId, ackedAt: new Date().toISOString() });
+    return { result: undefined, dirty: true };
+  });
+}
+/** CEO 侧轮询：这次预热是否已被目标分身回执。绑 (taskId, appId, wakeId) 三元组防上一轮迟到回执误放行。 */
+export function hasWakeAck(taskId: string, appId: string, wakeId: string): boolean {
+  return read().wakeAcks.some(a => a.taskId === taskId && a.appId === appId && a.wakeId === wakeId);
+}
+
 export async function updateCommand(cmdId: string, patch: Partial<Omit<OutboxCommand, 'cmdId' | 'taskId'>>): Promise<OutboxCommand | null> {
   return mutate(s => {
     const idx = s.commands.findIndex(c => c.cmdId === cmdId);
@@ -822,5 +850,5 @@ export async function pruneFinished(now: Date = new Date(), ttlDays = 7): Promis
 
 /** 测试用 (直接写，不走锁)。 */
 export function __resetForTesting(): void {
-  write({ subtasks: [], commands: [], observations: [] });
+  write({ subtasks: [], commands: [], observations: [], wakeAcks: [] });
 }

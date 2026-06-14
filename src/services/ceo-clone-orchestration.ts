@@ -15,6 +15,7 @@
  * report; never crossed without 松松's approval.
  */
 import type { CeoSpawnState, PendingCloneSeat } from './ceo-spawn-store.js';
+import type { PreheatTarget } from './ceo-preheat.js';
 
 export interface SeatSpec {
   role: 'main' | 'collab' | 'observer';
@@ -28,6 +29,11 @@ export interface SeatSpec {
   auto?: boolean;
   /** The auto seat's @-target ref. Undefined → default target (CEO's cliId). */
   autoTarget?: string;
+  /** Optional custom Feishu name for an auto-clone seat (3rd seat segment). When
+   *  set, the clone is named this (overriding『本体名（N号机）』) AND the seat is
+   *  FORCE-cloned — it skips the ready pool, so a named seat always yields a fresh
+   *  distinct clone (蔻黛 B1). Validated at parse time. Only meaningful on auto seats. */
+  cloneName?: string;
 }
 
 /** Resolved target of an auto seat: which engine to fill/clone + its 本体. */
@@ -81,8 +87,10 @@ export interface EnsureSpawnDeps {
   spawnSubtask: (opts: { goal: string; bots: string[] }) => Promise<{ taskId: string; chatId: string; bots: string[] }>;
   /** Chat-native clone (block 5/#5): posts QR into targetChatId (= subgroup),
    *  blocks through the scan. Clones the given engine's 本体 (bot-agnostic source,
-   *  not the CEO). ok+appId, or error (qr_delivery_failed / expired…). */
-  cloneInChat: (args: { targetChatId: string; rootMessageId: string; senderOpenId: string; sourceCliId: string; sourceBentiAppId: string }) => Promise<{ ok: boolean; appId?: string; error?: string }>;
+   *  not the CEO). `cloneName` (when set) overrides『本体名（N号机）』as the new app's
+   *  pre-filled Feishu name + bots.json displayName. ok+appId, or error
+   *  (qr_delivery_failed / expired…). */
+  cloneInChat: (args: { targetChatId: string; rootMessageId: string; senderOpenId: string; sourceCliId: string; sourceBentiAppId: string; cloneName?: string }) => Promise<{ ok: boolean; appId?: string; error?: string }>;
   /** Deploy gate: has 松松 approved starting this clone's daemon this round? */
   activationApproved?: (appId: string) => boolean;
   activate: (appId: string) => Promise<{ ok: boolean; error?: string }>;
@@ -101,6 +109,9 @@ export interface EnsureSpawnDeps {
   addBotToSubTask: (taskId: string, bot: { appId: string; displayName?: string; role: SeatSpec['role'] }) => Promise<void>;
   /** Targeted late kickoff — wakes ONLY this clone (by its summon name), not main. */
   lateKickoff: (args: { taskId: string; subgroupChatId: string; summonName?: string; appId: string }) => Promise<void>;
+  /** round-5 冷启动修复：对刚激活的分身做有界预热握手，确认其 daemon 真的在线（命中即回执）。
+   *  生产注入真实实现（ceo-preheat.preheatConfirmOnline + owner 直发新 record）；测试可注入桩。 */
+  preheatConfirmOnline: (target: PreheatTarget) => Promise<{ ok: boolean; wakeId: string; attempts: number }>;
   getState: (key: string) => CeoSpawnState | null;
   putState: (state: CeoSpawnState) => void;
   clearState: (key: string) => void;
@@ -108,7 +119,7 @@ export interface EnsureSpawnDeps {
 }
 
 /** A pending auto seat that needs a clone, tagged with its resolved engine. */
-interface PlannedPendingSeat { seatIndex: number; role: SeatSpec['role']; cliId: string; bentiAppId: string }
+interface PlannedPendingSeat { seatIndex: number; role: SeatSpec['role']; cliId: string; bentiAppId: string; cloneName?: string }
 
 /**
  * Plan the subgroup's initial bots, fully engine-agnostic. Explicit `ref` seats
@@ -140,6 +151,10 @@ function planSeats(
     if (!s.autoTarget && deps.cloneTier(cliId) === 'state-only') {
       return { readyBotRefs, pending, error: `席位 ${i + 1}：引擎「${cliId}」是 state-only 档，默认 auto 不可选取（需显式 ${cliId}:${s.role} 或 auto@${cliId}:${s.role}）` };
     }
+    // 蔻黛 B1: a seat with a custom cloneName is FORCE-cloned — it must yield a
+    // fresh distinct clone bearing that name, so it skips the ready pool entirely
+    // (never consumes/advances the cursor). "I named it" = "I want a new one".
+    if (s.cloneName) { pending.push({ seatIndex: i, role: s.role, cliId, bentiAppId, cloneName: s.cloneName }); continue; }
     const p = pool(cliId);
     const cur = cursorByCli[cliId] ?? 0;
     if (cur < p.length) { readyBotRefs.push(`${p[cur]}:${s.role}`); cursorByCli[cliId] = cur + 1; continue; }
@@ -178,7 +193,8 @@ export async function ensureClonesAndSpawn(req: EnsureSpawnReq, deps: EnsureSpaw
     state = {
       key: req.requestKey, taskId: spawn.taskId, subgroupChatId: spawn.chatId,
       pendingClones: pending.map((p): PendingCloneSeat => ({
-        seatIndex: p.seatIndex, role: p.role, cliId: p.cliId, bentiAppId: p.bentiAppId, phase: 'pending',
+        seatIndex: p.seatIndex, role: p.role, cliId: p.cliId, bentiAppId: p.bentiAppId,
+        ...(p.cloneName ? { cloneName: p.cloneName } : {}), phase: 'pending',
       })),
       updatedAt: '',
     };
@@ -223,7 +239,7 @@ export async function ensureClonesAndSpawn(req: EnsureSpawnReq, deps: EnsureSpaw
     }
     const scan = await deps.cloneInChat({
       targetChatId: state.subgroupChatId, rootMessageId: req.rootMessageId, senderOpenId: req.senderOpenId,
-      sourceCliId: pc.cliId, sourceBentiAppId: pc.bentiAppId,
+      sourceCliId: pc.cliId, sourceBentiAppId: pc.bentiAppId, cloneName: pc.cloneName,
     });
     if (scan.error === 'qr_delivery_failed') {
       return { status: 'error', message: '二维码发送到子群失败，已中止克隆（未写入配置）。请稍后重试。' };
@@ -288,6 +304,17 @@ export async function ensureClonesAndSpawn(req: EnsureSpawnReq, deps: EnsureSpaw
     // re-entry after a partial failure補齐 without re-touching the chat add.
     await deps.addBotToSubTask(state.taskId, { appId: pc.appId!, displayName: pc.displayName, role: pc.role });
     if (pc.displayName) {
+      // round-5 冷启动修复：下发真任务 summon 前，先做一次**预热握手**确认这个刚激活的分身
+      // daemon 真的在线、能收到群推送并命中自己的名（堵住 round-4 那个 boot 订阅窗口——尤其
+      // reviewer 分身的首次真实唤醒会晚到 request_review，必须在那之前确认它在线）。
+      // 命中即回执是本轮最小可验证信号；耗尽 → 上报父群，但**不阻断** spawn 收尾（分身已在群+subtask，
+      // 仍可被后续 summon / 人工唤起），避免把整个建群流程卡死。
+      const pre = await deps.preheatConfirmOnline(
+        { taskId: state.taskId, subgroupChatId: state.subgroupChatId, appId: pc.appId!, displayName: pc.displayName },
+      );
+      if (!pre.ok) {
+        await deps.reply(`⚠️ 分身 ${pc.displayName}（${pc.appId}）预热 ${pre.attempts} 次仍未确认上线（wake=${pre.wakeId}）——它已在群+subtask，但首条自动唤醒可能不可靠，请留意是否需要手动 @ 唤起。`);
+      }
       await deps.lateKickoff({ taskId: state.taskId, subgroupChatId: state.subgroupChatId, summonName: pc.displayName, appId: pc.appId! });
     } else {
       // fail closed: no displayName → do NOT enqueue a kickoff (it would fall back

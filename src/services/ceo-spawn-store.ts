@@ -26,9 +26,14 @@ export interface PendingCloneSeat {
    *  from `bentiAppId` (the 本体 of `cliId`) and inherits its cliId. */
   cliId: string;
   bentiAppId: string;
+  /** Custom Feishu name for this clone (from the seat's 3rd segment). When set, it
+   *  overrides『本体名（N号机）』as the pre-filled app name + bots.json displayName
+   *  (蔻黛 B1/B2). Persisted so a mid-flow daemon restart keeps the requested name. */
+  cloneName?: string;
   /** Set once the QR clone is written to bots.json. */
   appId?: string;
-  /** Computed『本体名（N号机）』— the clone's addressable name. */
+  /** The clone's addressable name as written to bots.json — `cloneName` when given,
+   *  else the computed『本体名（N号机）』. */
   displayName?: string;
   phase: ClonePhase;
 }
