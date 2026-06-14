@@ -10,10 +10,11 @@
  * clear (owner scans, 松松 approves activation, clone surfaces). Re-entry binds to
  * THIS request via requestKey (= createSubtask's idempotencyKey).
  */
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { config } from '../config.js';
-import { getBot, getBotOpenId, getOwnerOpenId } from '../bot-registry.js';
+import { getBot, getBotOpenId, getOwnerOpenId, registerBot, loadBotConfigs } from '../bot-registry.js';
 import { resolveBotIdent, HttpError } from '../core/main-bot-playbook.js';
 import { getSession } from './session-store.js';
 import { readBotsJsonOrEmpty } from '../setup/bots-store.js';
@@ -22,14 +23,15 @@ import { resolveBotmuxPaths } from '../core/botmux-paths.js';
 import { pm2ListAppPids } from '../core/pm2-ecosystem.js';
 import { replyMessage, sendMessage, uploadImage } from '../im/lark/client.js';
 import { addBotToChat, isInChat } from './groups-store.js';
-import { cloneBotInChat } from './bot-clone-chat.js';
+import { cloneBotInChat, renderQrPng } from './bot-clone-chat.js';
+import { cloneGrantScopes, buildAuthUrl, type CloneScopeProfile } from './clone-auth-link.js';
 import { activateBot } from './bot-activate.js';
 import { createSubtask, slug, djb2 } from './subtask-orchestrator.js';
 import { addBotToSubTask, enqueueCommand } from './subtask-store.js';
 import { ensureClonesAndSpawn, type EnsureSpawnDeps, type EnsureSpawnReq, type EnsureSpawnOutcome } from './ceo-clone-orchestration.js';
 import { ceoSpawnKey, getCeoSpawnState, putCeoSpawnState, clearCeoSpawnState } from './ceo-spawn-store.js';
 import {
-  resolveReady, activationApproved, parseSeats, resolveCeoOwner, type BotInfoLite, type ReadySnapshot,
+  resolveReady, activationApproved, parseSeats, resolveCeoOwner, hotRegisterClone, type BotInfoLite, type ReadySnapshot,
 } from './ceo-spawn-wiring.js';
 import { logger } from '../utils/logger.js';
 
@@ -40,6 +42,34 @@ export interface CeoSpawnReq {
   seats?: string[];
   /** appId the CEO asserts 松松 approved for activation (deploy gate). */
   activationApprovedAppId?: string;
+  /** scope-grant profile for the clone's auth link (块7 第三轮 #1): 'core' (默认,
+   *  子群工作基础授权) or 'full' (与本体全量对等, owner 显式选择). */
+  cloneScopeProfile?: CloneScopeProfile;
+}
+
+/**
+ * Post the one-click scope-grant auth link into the subgroup (块7 第三轮 #1).
+ * SEPARATE best-effort step AFTER the clone is written — a delivery failure must
+ * NOT roll back the clone (蔻黛 守点4); it returns false and the caller warns
+ * "可重试补发". Link carries only appId + scopes (no secret, 守点6).
+ */
+async function postScopeAuthLink(ceoAppId: string, chatId: string, appId: string, profile: CloneScopeProfile): Promise<boolean> {
+  const scopes = cloneGrantScopes(profile); // throws (fail-closed) if no scopes → caught by caller
+  const url = buildAuthUrl(appId, scopes);
+  const label = profile === 'full' ? '与本体全量对等授权' : '子群工作基础授权';
+  const dir = mkdtempSync(join(tmpdir(), 'clone-auth-qr-'));
+  try {
+    const png = await renderQrPng(url);
+    const p = join(dir, 'auth.png');
+    writeFileSync(p, png);
+    const imageKey = await uploadImage(ceoAppId, p);
+    await sendMessage(ceoAppId, chatId, JSON.stringify({ image_key: imageKey }), 'image');
+    await sendMessage(ceoAppId, chatId,
+      `👆 给分身 ${appId} 开通权限（${label}，共 ${scopes.length} 项）：点开链接 → 全选 → 确认。\n${url}`);
+    return true;
+  } finally {
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* */ }
+  }
 }
 
 function readBotsInfo(dataDir: string): BotInfoLite[] {
@@ -115,13 +145,28 @@ export async function ceoSpawn(req: CeoSpawnReq): Promise<EnsureSpawnOutcome> {
           ceoAppId, chatId: session.chatId, targetChatId, rootMessageId, senderOpenId,
           sourceBot: getBot(ceoAppId).config,
           sourceDisplayName: getBot(ceoAppId).botName, // 本体名 → 克隆『本体名（N号机）』
+          // bots-info botName per appId → legacy clone-count supplement (round-3 #2).
+          botNamesByAppId: Object.fromEntries(
+            readBotsInfo(dataDir).filter(e => e.larkAppId && (e as any).botName).map(e => [e.larkAppId, (e as any).botName as string]),
+          ),
           configDir: paths.configDir, botsJsonPath,
         },
         // QR + status post into the SUBGROUP via sendMessage (fresh message, not a
         // foreign-thread reply, 蔻黛 blocker1). owner gate uses resolved `owner`.
         { getOwnerOpenId: () => owner, uploadImage, postToChat: sendMessage },
       );
-      return r.ok ? { ok: true, appId: r.appId } : { ok: false, error: r.error };
+      if (!r.ok) return { ok: false, error: r.error };
+      // 块7 第三轮 #1: SEPARATE best-effort scope-grant auth link into the subgroup.
+      // Failure must NOT roll back the clone (蔻黛 守点4) — clone is already written.
+      try {
+        await postScopeAuthLink(ceoAppId, targetChatId, r.appId!, req.cloneScopeProfile ?? 'core');
+      } catch (err: any) {
+        // Log raw error server-side; the chat notice stays generic — no raw
+        // err.message (local path / SDK detail) leaks into the subgroup (蔻黛 review).
+        logger.warn(`[ceo-spawn] scope auth link failed (clone kept, retryable): ${err?.message ?? err}`);
+        await sendMessage(ceoAppId, targetChatId, `⚠️ 分身 ${r.appId} 已建好，但权限开通链接生成/发送失败，可稍后重试补发。`).catch(() => '');
+      }
+      return { ok: true, appId: r.appId };
     },
     activationApproved: (appId) => activationApproved({
       approvedAppId: req.activationApprovedAppId, senderOpenId: sender, ownerOpenId: owner,
@@ -131,6 +176,10 @@ export async function ceoSpawn(req: CeoSpawnReq): Promise<EnsureSpawnOutcome> {
       const r = await activateBot(appId, { ecosystem: paths.ecosystem, pm2Home: paths.pm2Home, botsJsonPath });
       return r.ok ? { ok: true } : { ok: false, error: r.error };
     },
+    registerActivatedBot: async (appId) =>
+      // Hot-add the freshly-activated clone into THIS daemon's runtime registry
+      // (round-3 追加, fail-closed clone-only — logic in testable hotRegisterClone).
+      hotRegisterClone(appId, { loadBotConfigs, registerBot }),
     addBotToChat: async (chatId, appId) => {
       const res = await addBotToChat(ceoAppId, chatId, [appId]); // proxy = CEO (already in subgroup as worker)
       const r0 = res[0];

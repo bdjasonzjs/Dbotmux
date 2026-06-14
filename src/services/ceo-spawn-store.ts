@@ -16,7 +16,7 @@ import { dirname, join } from 'node:path';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 
-export type ClonePhase = 'pending' | 'cloned' | 'activated' | 'in_chat' | 'joined';
+export type ClonePhase = 'pending' | 'cloned' | 'activated' | 'registered' | 'in_chat' | 'joined';
 
 export interface PendingCloneSeat {
   /** Index into the request's seats[] this clone fills (stable across re-entry). */

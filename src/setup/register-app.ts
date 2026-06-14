@@ -60,6 +60,12 @@ export interface RegisterAppOptions {
   onQRCodeReady?: (info: { url: string; expireIn: number }) => void;
   /** 状态变更回调, 主要用于"已切换到 Lark 域名"提示. */
   onStatusChange?: (info: { status: string; interval?: number }) => void;
+  /**
+   * 块7 第三轮 #2: 预填新应用创建页的 name / avatar / desc（飞书"预填、owner 仍可
+   * 在页面编辑"语义，非强制设定）。透传给 SDK registerApp 的 appPreset。**缺省不传
+   * → 行为与旧版逐字等价**（passthrough 单测锁定）。
+   */
+  appPreset?: { name?: string; avatar?: string | string[]; desc?: string };
 }
 
 function defaultPrintQRCode(info: { url: string; expireIn: number }): void {
@@ -94,6 +100,9 @@ export async function tryRegisterApp(opts: RegisterAppOptions = {}): Promise<Reg
       source: 'botmux',
       onQRCodeReady: onQR,
       onStatusChange: onStatus,
+      // Only attach appPreset when provided → absent path stays byte-identical
+      // to the pre-#2 behavior (蔻黛 守点2a passthrough equivalence).
+      ...(opts.appPreset ? { appPreset: opts.appPreset } : {}),
     });
 
     if (!result.client_id || !result.client_secret) {

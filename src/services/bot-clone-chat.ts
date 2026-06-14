@@ -34,6 +34,8 @@ export interface CloneBotInChatArgs {
   sourceBot: BotConfig;
   /** Source 本体's display name (probed Lark botName) → clone's『本体名（N号机）』. */
   sourceDisplayName?: string;
+  /** bots-info botName per appId (legacy clone-count supplement, round-3 #2). */
+  botNamesByAppId?: Record<string, string>;
   configDir: string;
   botsJsonPath: string;
 }
@@ -61,9 +63,10 @@ export type CloneBotInChatResult =
 
 const REPLY_IN_THREAD = true;
 
-async function defaultRenderQrPng(url: string): Promise<Buffer> {
+export async function renderQrPng(url: string): Promise<Buffer> {
   return QRCode.toBuffer(url, { type: 'png', width: 320, margin: 2, errorCorrectionLevel: 'M' });
 }
+const defaultRenderQrPng = renderQrPng;
 
 /**
  * Run the clone end-to-end inside a chat thread. Owner-gated; posts the QR as an
@@ -145,6 +148,7 @@ export async function cloneBotInChat(
       botsJsonPath: args.botsJsonPath,
       sourceClaudeHome: resolveClaudeHome(args.sourceBot.claudeConfigDir),
       sourceDisplayName: args.sourceDisplayName,
+      botNamesByAppId: args.botNamesByAppId,
     },
     { registerApp },
   );

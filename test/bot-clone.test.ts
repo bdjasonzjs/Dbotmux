@@ -307,6 +307,60 @@ describe('cloneBot', () => {
     expect(bots[1].clonedFromName).toBeUndefined();
   });
 
+  it('#2: passes appPreset {name=displayName, avatar=source avatar} into registerApp', async () => {
+    const { configDir, srcHome, botsJsonPath } = dirs();
+    let captured: any;
+    const res = await cloneBot(
+      { sourceBot: source(), configDir, botsJsonPath, sourceClaudeHome: srcHome, sourceDisplayName: '克劳德' },
+      { registerApp: async (opts) => { captured = opts; return okScan; }, fetchSourceAvatar: async () => 'https://x/a.png' },
+    );
+    expect(res.ok).toBe(true);
+    expect(captured.appPreset).toEqual({ name: '克劳德（初号机）', avatar: 'https://x/a.png' });
+  });
+
+  it('#2: avatar fetch returns undefined → appPreset has name only (fail-soft, no desc)', async () => {
+    const { configDir, srcHome, botsJsonPath } = dirs();
+    let captured: any;
+    await cloneBot(
+      { sourceBot: source(), configDir, botsJsonPath, sourceClaudeHome: srcHome, sourceDisplayName: '克劳德' },
+      { registerApp: async (opts) => { captured = opts; return okScan; }, fetchSourceAvatar: async () => undefined },
+    );
+    expect(captured.appPreset).toEqual({ name: '克劳德（初号机）' });
+  });
+
+  it('#2 blocker: a concurrent bots.json write DURING scan is preserved (re-reads latest before write)', async () => {
+    const { configDir, srcHome, botsJsonPath } = dirs();
+    const concurrent = { larkAppId: 'cli_concurrent', larkAppSecret: 'C', cliId: 'claude-code', name: 'concurrent' };
+    const res = await cloneBot(
+      { sourceBot: source(), configDir, botsJsonPath, sourceClaudeHome: srcHome, sourceDisplayName: '克劳德' },
+      {
+        // Simulate another register/clone appending to bots.json while the
+        // device-flow scan is in flight.
+        registerApp: async () => {
+          const cur = JSON.parse(readFileSync(botsJsonPath, 'utf-8'));
+          writeFileSync(botsJsonPath, JSON.stringify([...cur, concurrent]));
+          return okScan;
+        },
+        fetchSourceAvatar: async () => undefined,
+      },
+    );
+    expect(res.ok).toBe(true);
+    const ids = JSON.parse(readFileSync(botsJsonPath, 'utf-8')).map((b: any) => b.larkAppId);
+    expect(ids).toContain('cli_source');      // original kept
+    expect(ids).toContain('cli_concurrent');  // concurrent write NOT clobbered
+    expect(ids).toContain('cli_new');         // new clone appended
+  });
+
+  it('#2: no sourceDisplayName → no appPreset passed (pre-#2 equivalent)', async () => {
+    const { configDir, srcHome, botsJsonPath } = dirs();
+    let captured: any;
+    await cloneBot(
+      { sourceBot: source(), configDir, botsJsonPath, sourceClaudeHome: srcHome },
+      { registerApp: async (opts) => { captured = opts; return okScan; } },
+    );
+    expect(captured?.appPreset).toBeUndefined();
+  });
+
   it('scan failure → returns error, writes nothing, creates no home', async () => {
     const { configDir, srcHome, botsJsonPath } = dirs();
     const res = await cloneBot(

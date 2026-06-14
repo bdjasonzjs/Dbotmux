@@ -127,6 +127,15 @@ describe('createSubtask', () => {
     expect(getByChatId('oc_sub_new')!.taskId).toBe(res.taskId); // getByChatId 命中 = 归新 observer
   });
 
+  // 块7 第三轮 #1 owner-visibility 不变量（蔻黛 守点5）：子群必须邀请 owner，否则 CEO
+  // 把 scope auth 链接发进子群时 owner 看不见。若此邀请被改掉，本测试炸。
+  it('[#1 owner-visibility] subgroup invites the owner (auth link must be visible to them)', async () => {
+    mainSession();
+    await createSubtask({ sessionId: 'sess_main', goal: 'owner visibility lock' });
+    const groupOpts = mockCreateGroup.mock.calls[0][0];
+    expect(groupOpts.userOpenIds).toContain('ou_jason'); // owner invited → in the subgroup
+  });
+
   it('N-bot: --bots 引 clone (按 name) → larkAppIds/participants/store 带 clone, role=collab, 记 larkAppId', async () => {
     mainSession();
     const res = await createSubtask({ sessionId: 'sess_main', goal: 'n-bot clone test', bots: ['claude', 'claude-clone'] });

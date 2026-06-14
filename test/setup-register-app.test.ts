@@ -57,6 +57,23 @@ describe('tryRegisterApp', () => {
     expect(r2.ok && r2.userOpenId).toBeUndefined();
   });
 
+  // 块7 第三轮 #2 appPreset passthrough (蔻黛 守点2)
+  it('without appPreset → SDK options carry NO appPreset (equivalent to pre-#2)', async () => {
+    mockedRegisterApp.mockResolvedValue({ client_id: 'c', client_secret: 's', user_info: { tenant_brand: 'feishu' } });
+    await tryRegisterApp({ onQRCodeReady: () => {}, onStatusChange: () => {} });
+    const opts = mockedRegisterApp.mock.calls[0][0];
+    expect('appPreset' in opts).toBe(false);
+    expect(opts.source).toBe('botmux'); // old params intact
+    expect(typeof opts.onQRCodeReady).toBe('function');
+  });
+
+  it('with appPreset → SDK registerApp receives name/avatar/desc verbatim', async () => {
+    mockedRegisterApp.mockResolvedValue({ client_id: 'c', client_secret: 's', user_info: { tenant_brand: 'feishu' } });
+    const appPreset = { name: '克劳德（初号机）', avatar: 'https://x/a.png', desc: 'd' };
+    await tryRegisterApp({ onQRCodeReady: () => {}, onStatusChange: () => {}, appPreset });
+    expect(mockedRegisterApp.mock.calls[0][0].appPreset).toEqual(appPreset);
+  });
+
   it('returns brand=lark when SDK reports tenant_brand=lark', async () => {
     mockedRegisterApp.mockResolvedValue({
       client_id: 'cli_lark',

@@ -28,6 +28,7 @@ import type { BotConfig } from '../bot-registry.js';
 import { botProcessName, normalizeBotProcessName, normalizeBotConfig } from '../setup/bot-config-editor.js';
 import { readBotsJsonOrEmpty, writeBotsJsonAtomic } from '../setup/bots-store.js';
 import { tryRegisterApp, type RegisterAppOptions, type RegisterAppResult } from '../setup/register-app.js';
+import { fetchSourceBotAvatar, buildClonePreset } from './clone-app-preset.js';
 
 /**
  * Persona / auth / config entries shared with the source via symlink (when they
@@ -124,12 +125,35 @@ export function cloneBaseName(name: string): string {
  * Concurrency note: counting is snapshot-based; the owner-single-line scan flow
  * means no two clones are built concurrently, so no lock is needed (蔻黛 watchpoint).
  */
+export interface CloneCountEntry {
+  /** bots.json clonedFromName (authoritative base). */
+  clonedFromName?: string;
+  /** bots.json displayName『base（N号机）』. */
+  displayName?: string;
+  /** runtime bots-info botName『base（N号机）』— legacy supplement only. */
+  botName?: string;
+  /** true iff this entry is a clone (has claudeConfigDir / isClone marker). */
+  isClone?: boolean;
+}
+
 export function resolveCloneNaming(
   sourceDisplayName: string,
-  existingBots: Array<{ clonedFromName?: string }>,
+  existingBots: Array<CloneCountEntry>,
 ): { clonedFromName: string; displayName: string } {
   const base = cloneBaseName(sourceDisplayName);
-  const count = existingBots.filter(b => b.clonedFromName === base).length;
+  // Count ONLY clones of this base (蔻黛 守点4: 本体/isClone=false never counts).
+  // Each clone's base is derived with priority clonedFromName > displayName >
+  // botName (守点5: bots.json fields win; runtime bots-info botName is just a
+  // legacy supplement for pre-#2 clones that lack clonedFromName/displayName).
+  const count = existingBots.filter(b => {
+    if (!b.isClone) return false;
+    const effective = b.clonedFromName
+      ? b.clonedFromName
+      : b.displayName ? cloneBaseName(b.displayName)
+        : b.botName ? cloneBaseName(b.botName)
+          : undefined;
+    return effective === base;
+  }).length;
   return { clonedFromName: base, displayName: `${base}（${cloneOrdinal(count)}号机）` };
 }
 
@@ -283,11 +307,18 @@ export interface CloneBotInput {
   /** Source 本体's display name (e.g. probed Lark botName "克劳德"), used to
    *  compute the clone's『本体名（N号机）』displayName. Omit → no displayName. */
   sourceDisplayName?: string;
+  /** Optional bots-info botName per appId (runtime, possibly stale) — supplements
+   *  the clone-count so LEGACY clones lacking clonedFromName/displayName are still
+   *  counted (round-3 #2 命名 fix). Never overrides bots.json fields. */
+  botNamesByAppId?: Record<string, string>;
 }
 
 export interface CloneBotDeps {
   /** Injectable scan (device-flow). Defaults to the real tryRegisterApp. */
   registerApp?: (opts?: RegisterAppOptions) => Promise<RegisterAppResult>;
+  /** Injectable source-bot avatar fetch (块7 #2). Defaults to fetchSourceBotAvatar
+   *  (/bot/v3/info, fail-soft). Lets tests avoid the network. */
+  fetchSourceAvatar?: (appId: string, appSecret: string) => Promise<string | undefined>;
 }
 
 /**
@@ -307,23 +338,48 @@ export interface CloneBotDeps {
  */
 export async function cloneBot(input: CloneBotInput, deps: CloneBotDeps = {}): Promise<CloneBotResult> {
   const registerApp = deps.registerApp ?? tryRegisterApp;
-  const scan = await registerApp();
+  const fetchAvatar = deps.fetchSourceAvatar ?? fetchSourceBotAvatar;
+  // Build clone-count entries from a bots.json snapshot, enriched with bots-info
+  // botName (legacy-count supplement, round-3 #2). isClone = has claudeConfigDir.
+  const toCountEntries = (bots: any[]) => bots.map(b => ({
+    clonedFromName: b?.clonedFromName, displayName: b?.displayName,
+    botName: input.botNamesByAppId?.[b?.larkAppId], isClone: !!b?.claudeConfigDir,
+  }));
+
+  // #2: appPreset must be passed INTO the scan (registerApp pre-fills the new
+  // app's name/avatar), so it's computed from a PRE-scan snapshot. This snapshot
+  // is used ONLY for the preset — NOT for the bots.json write-back (蔻黛 blocker:
+  // the device-flow scan can take minutes; reusing a stale snapshot to write
+  // would clobber any bot registered meanwhile).
+  let appPreset: { name: string; avatar?: string } | undefined;
+  if (input.sourceDisplayName) {
+    const preNaming = resolveCloneNaming(input.sourceDisplayName, toCountEntries(readBotsJsonOrEmpty(input.botsJsonPath)));
+    const avatar = await fetchAvatar(input.sourceBot.larkAppId, input.sourceBot.larkAppSecret);
+    appPreset = buildClonePreset(preNaming.displayName, avatar);
+  }
+
+  const scan = await registerApp(appPreset ? { appPreset } : {});
   if (!scan.ok) return { ok: false, error: scan.error, message: scan.message };
   if (scan.brand === 'lark') {
     return { ok: false, error: 'lark_unsupported', message: 'botmux 当前 daemon 运行链路仅支持飞书 (feishu.cn) 租户' };
   }
 
+  // RE-READ the LATEST bots.json after the scan (蔻黛 blocker): all write-back
+  // decisions (dedup / slug / numbering / append) use the fresh snapshot so a
+  // concurrent register/clone during the scan is never clobbered.
   const existing = readBotsJsonOrEmpty(input.botsJsonPath);
   if (existing.some((b: any) => b?.larkAppId === scan.appId)) {
     return { ok: false, error: 'duplicate_app', message: `App ID ${scan.appId} 已存在于 bots.json` };
   }
-
   const slug = cloneNameSlug(input.sourceBot, existing);
-  // Compute『本体名（N号机）』when we know the source 本体's display name. Counts
-  // siblings from the bots.json snapshot (`existing`) by clonedFromName (蔻黛 守点2).
+  // displayName/clonedFromName re-derived off the LATEST snapshot → stored ordinal
+  // stays unique for 急急如律令 matching. Rare limit: if the same 本体 was cloned
+  // again DURING this scan, the Lark pre-filled name (appPreset, computed pre-scan)
+  // may be one ordinal behind the stored displayName — pre-fill is owner-editable.
   const naming = input.sourceDisplayName
-    ? resolveCloneNaming(input.sourceDisplayName, existing)
+    ? resolveCloneNaming(input.sourceDisplayName, toCountEntries(existing))
     : undefined;
+
   const clone = buildCloneConfig(
     input.sourceBot,
     { appId: scan.appId, appSecret: scan.appSecret, userOpenId: scan.userOpenId },

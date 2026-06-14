@@ -95,6 +95,28 @@ export function resolveCeoOwner(configOwner: string | undefined, sessionOwner: s
   return configOwner ?? sessionOwner;
 }
 
+export interface HotRegisterDeps {
+  /** Latest bots.json configs (e.g. bot-registry.loadBotConfigs). */
+  loadBotConfigs: () => Array<{ larkAppId: string; claudeConfigDir?: string }>;
+  /** Hot-add a bot into the runtime registry (e.g. bot-registry.registerBot). */
+  registerBot: (cfg: any) => void;
+}
+
+/**
+ * Hot-register a just-activated clone into the running daemon's registry
+ * (round-3 追加). FAIL CLOSED (蔻黛 守点3): register ONLY a clone (has
+ * claudeConfigDir) found in the LATEST bots.json — never the 本体 or an unknown
+ * app. Pure over injected deps so the not_in_bots_json / not_a_clone / throws
+ * paths are unit-testable.
+ */
+export function hotRegisterClone(appId: string, deps: HotRegisterDeps): { ok: boolean; error?: string } {
+  const cfg = deps.loadBotConfigs().find(b => b.larkAppId === appId);
+  if (!cfg) return { ok: false, error: 'not_in_bots_json' };
+  if (!cfg.claudeConfigDir) return { ok: false, error: 'not_a_clone' };
+  try { deps.registerBot(cfg); return { ok: true }; }
+  catch (e: any) { return { ok: false, error: String(e?.message ?? e) }; }
+}
+
 const VALID_ROLES = new Set(['main', 'collab', 'observer']);
 /** Reserved ref meaning "fill this seat with a claude seat (本体 or a clone)". */
 export const AUTO_SEAT_REF = 'auto';

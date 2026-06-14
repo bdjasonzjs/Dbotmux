@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       '@larksuiteoapi/node-sdk':
-        specifier: ^1.64.0
-        version: 1.64.0
+        specifier: ^1.66.1
+        version: 1.66.1
       '@napi-rs/canvas':
         specifier: ^0.1.65
         version: 0.1.99
@@ -662,8 +662,8 @@ packages:
     peerDependencies:
       tslib: '2'
 
-  '@larksuiteoapi/node-sdk@1.64.0':
-    resolution: {integrity: sha512-r3ae0lAi3ipH1g1geUo1fmb7DK5e0WAKrrrDi25yJCKBvxtiKLsR3ldss3OZnqyfP7yGHkjeN0BYuzyaWgxFoA==}
+  '@larksuiteoapi/node-sdk@1.66.1':
+    resolution: {integrity: sha512-W1rIAs/8Oc/rEYuWc0sxGvR8iLwd8p5D2RS4ODMqs8htIxK8yIa8sb22EDv/OEBqUpKXZaNLydTz7Oq8HOQROg==}
 
   '@midscene/core@1.7.6':
     resolution: {integrity: sha512-6rqqhjxZAE73s6gHHjSq4Mx6yw2dEvv/iEMZpF7zrvGQ2wWP4tIQTqJvm5vhHxoJdRppuHkVJBwdMldI/DMnoA==}
@@ -3112,7 +3112,7 @@ snapshots:
       '@jsonjoy.com/codegen': 17.67.0(tslib@2.8.1)
       tslib: 2.8.1
 
-  '@larksuiteoapi/node-sdk@1.64.0':
+  '@larksuiteoapi/node-sdk@1.66.1':
     dependencies:
       axios: 1.13.5
       lodash.identity: 3.0.0

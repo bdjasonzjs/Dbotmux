@@ -15,7 +15,7 @@ const clone = (id = 'cli_clone'): BotInventoryEntry => ({ larkAppId: id, cliId: 
 
 function deps(over: Partial<EnsureSpawnDeps> = {}): { d: EnsureSpawnDeps; calls: any; store: Map<string, CeoSpawnState> } {
   const store = new Map<string, CeoSpawnState>();
-  const calls = { spawn: 0, cloneInChat: 0, activate: 0, isInChat: 0, addBotToChat: 0, addBotToSubTask: 0, lateKickoff: 0, replies: [] as string[], lateKickoffArgs: [] as any[] };
+  const calls = { spawn: 0, cloneInChat: 0, activate: 0, registerActivatedBot: 0, isInChat: 0, addBotToChat: 0, addBotToSubTask: 0, lateKickoff: 0, replies: [] as string[], order: [] as string[], lateKickoffArgs: [] as any[] };
   const d: EnsureSpawnDeps = {
     getOwnerOpenId: () => OWNER,
     listClaudeBots: () => [main()],
@@ -24,8 +24,9 @@ function deps(over: Partial<EnsureSpawnDeps> = {}): { d: EnsureSpawnDeps; calls:
     spawnSubtask: async ({ bots }) => { calls.spawn++; return { taskId: 'st_1', chatId: 'oc_sub', bots }; },
     cloneInChat: async () => { calls.cloneInChat++; return { ok: true, appId: 'cli_new' }; },
     activationApproved: () => false,
-    activate: async () => { calls.activate++; return { ok: true }; },
-    isInChat: async () => { calls.isInChat++; return false; },
+    activate: async () => { calls.activate++; calls.order.push('activate'); return { ok: true }; },
+    registerActivatedBot: async () => { calls.registerActivatedBot++; calls.order.push('register'); return { ok: true }; },
+    isInChat: async () => { calls.isInChat++; calls.order.push('isInChat'); return false; },
     addBotToChat: async () => { calls.addBotToChat++; return { ok: true }; },
     addBotToSubTask: async () => { calls.addBotToSubTask++; },
     lateKickoff: async (a) => { calls.lateKickoff++; calls.lateKickoffArgs.push(a); },
@@ -173,6 +174,33 @@ describe('ensureClonesAndSpawn (subgroup-first #5)', () => {
     expect(out.status).toBe('spawned');
     expect(calls.lateKickoff).toBe(0);    // fail closed
     expect(calls.addBotToSubTask).toBe(1); // clone still joined the subtask
+  });
+
+  // round-3 追加 (hot-register): registerActivatedBot runs after activate, before isInChat.
+  it('round-3: registerActivatedBot runs AFTER activate and BEFORE isInChat', async () => {
+    let activated = false;
+    const { d, calls } = deps({
+      activationApproved: () => true,
+      activate: async () => { calls.activate++; calls.order.push('activate'); activated = true; return { ok: true }; },
+      botOpenIdReady: (id) => (id === 'cli_main' ? 'ou_main' : (id === 'cli_new' && activated ? 'ou_new' : undefined)),
+    });
+    const out = await ensureClonesAndSpawn(baseReq(), d);
+    expect(out.status).toBe('spawned');
+    expect(calls.order).toEqual(['activate', 'register', 'isInChat']);
+  });
+
+  it('round-3: registerActivatedBot failure → awaiting_clone_join (retryable), never reaches isInChat', async () => {
+    let activated = false;
+    const { d, calls } = deps({
+      activationApproved: () => true,
+      activate: async () => { calls.activate++; activated = true; return { ok: true }; },
+      botOpenIdReady: (id) => (id === 'cli_main' ? 'ou_main' : (id === 'cli_new' && activated ? 'ou_new' : undefined)),
+      registerActivatedBot: async () => { calls.registerActivatedBot++; return { ok: false, error: 'not_a_clone' }; },
+    });
+    const out = await ensureClonesAndSpawn(baseReq(), d);
+    expect(out.status).toBe('awaiting_clone_join');
+    expect(calls.isInChat).toBe(0);
+    expect(calls.addBotToChat).toBe(0);
   });
 
   it('activation failure → error + rollback reply, no chat add', async () => {

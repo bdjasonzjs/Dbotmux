@@ -60,6 +60,11 @@ export interface EnsureSpawnDeps {
   /** Deploy gate: has 松松 approved starting this clone's daemon this round? */
   activationApproved?: (appId: string) => boolean;
   activate: (appId: string) => Promise<{ ok: boolean; error?: string }>;
+  /** Hot-register the just-activated clone into the main daemon's runtime registry
+   *  (round-3 追加): without it, clone-scoped calls (isInChat/getBotClient) throw
+   *  'Bot not registered'. Called after activate, before any clone-scoped call.
+   *  Failure → retryable (orchestration returns awaiting_clone_join). */
+  registerActivatedBot: (appId: string) => Promise<{ ok: boolean; error?: string }>;
   /** Pull the activated clone into the subgroup chat (must succeed before store change). */
   addBotToChat: (chatId: string, appId: string) => Promise<{ ok: boolean; error?: string }>;
   /** Deterministic membership check — lets re-entry skip re-adding a clone that is
@@ -165,6 +170,21 @@ export async function ensureClonesAndSpawn(req: EnsureSpawnReq, deps: EnsureSpaw
   }
 
   if (pc.phase === 'activated') {
+    // round-3 追加: the just-activated clone runs as its own pm2 process but the
+    // main daemon's runtime registry doesn't know it yet → any clone-scoped call
+    // (isInChat/getBotClient) would throw 'Bot not registered'. Hot-register it
+    // into THIS daemon's registry BEFORE any such call (蔻黛 守点1/2). On failure
+    // return a retryable status and do NOT proceed to isInChat; re-entry retries
+    // register (idempotent) without re-activating.
+    const reg = await deps.registerActivatedBot(pc.appId!);
+    if (!reg.ok) {
+      return { status: 'awaiting_clone_join', taskId: state.taskId, chatId: state.subgroupChatId, message: `分身 ${pc.appId} 已激活，但热加入运行时 registry 失败（${reg.error ?? 'unknown'}），可重试。` };
+    }
+    pc.phase = 'registered';
+    deps.putState(state);
+  }
+
+  if (pc.phase === 'registered') {
     if (!deps.botOpenIdReady(pc.appId!)) {
       return { status: 'awaiting_openid', appId: pc.appId!, message: `分身 ${pc.appId} 已激活，等它在子群露面拿到 open_id 后我继续。` };
     }

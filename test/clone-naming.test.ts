@@ -26,25 +26,39 @@ describe('cloneBaseName (剥离『（N号机）』后缀)', () => {
   });
 });
 
-describe('resolveCloneNaming (按 bots.json 快照中同 clonedFromName 计数)', () => {
+describe('resolveCloneNaming (count clones-only by base; bots-info supplement)', () => {
+  const clone = (o: any) => ({ isClone: true, ...o });
   it('first clone of 克劳德 → 初号机', () => {
     expect(resolveCloneNaming('克劳德', [])).toEqual({ clonedFromName: '克劳德', displayName: '克劳德（初号机）' });
   });
   it('second clone of 克劳德 → 二号机', () => {
-    expect(resolveCloneNaming('克劳德', [{ clonedFromName: '克劳德' }]))
+    expect(resolveCloneNaming('克劳德', [clone({ clonedFromName: '克劳德' })]))
       .toEqual({ clonedFromName: '克劳德', displayName: '克劳德（二号机）' });
   });
   it('clone-of-clone strips（N号机）→ counts off the 本体 base', () => {
-    // source is itself『克劳德（初号机）』, one 克劳德 clone already exists → next is 二号机
-    expect(resolveCloneNaming('克劳德（初号机）', [{ clonedFromName: '克劳德' }]))
+    expect(resolveCloneNaming('克劳德（初号机）', [clone({ clonedFromName: '克劳德' })]))
       .toEqual({ clonedFromName: '克劳德', displayName: '克劳德（二号机）' });
   });
   it('counts only same base — 缇蕾 unaffected by 克劳德 clones', () => {
-    const existing = [{ clonedFromName: '克劳德' }, { clonedFromName: '缇蕾' }, { clonedFromName: '克劳德' }];
-    expect(resolveCloneNaming('缇蕾', existing).displayName).toBe('缇蕾（二号机）'); // 1 existing 缇蕾 → 二
-    expect(resolveCloneNaming('克劳德', existing).displayName).toBe('克劳德（三号机）'); // 2 existing 克劳德 → 三
+    const existing = [clone({ clonedFromName: '克劳德' }), clone({ clonedFromName: '缇蕾' }), clone({ clonedFromName: '克劳德' })];
+    expect(resolveCloneNaming('缇蕾', existing).displayName).toBe('缇蕾（二号机）');
+    expect(resolveCloneNaming('克劳德', existing).displayName).toBe('克劳德（三号机）');
   });
-  it('entries without clonedFromName (本体 / pre-feature) are not counted', () => {
-    expect(resolveCloneNaming('克劳德', [{}, { clonedFromName: undefined }]).displayName).toBe('克劳德（初号机）');
+
+  // round-3 #2 守点4/5: legacy clones (no clonedFromName) counted via botName;
+  // 本体 (isClone=false) never counted; bots.json fields win over stale bots-info.
+  it('本体 (isClone=false, botName=克劳德) is NOT counted', () => {
+    expect(resolveCloneNaming('克劳德', [{ isClone: false, botName: '克劳德' }]).displayName).toBe('克劳德（初号机）');
+  });
+  it('legacy clone (no clonedFromName, botName=克劳德（初号机）) IS counted → next is 二号机', () => {
+    expect(resolveCloneNaming('克劳德', [clone({ botName: '克劳德（初号机）' })]).displayName).toBe('克劳德（二号机）');
+  });
+  it('clonedFromName wins over a stale/mismatched bots-info botName', () => {
+    // clonedFromName says 克劳德; stale botName says something else → still counts as 克劳德 clone
+    expect(resolveCloneNaming('克劳德', [clone({ clonedFromName: '克劳德', botName: '缇蕾（初号机）' })]).displayName)
+      .toBe('克劳德（二号机）');
+  });
+  it('legacy clone of a DIFFERENT 本体 (botName=缇蕾（初号机）) does not affect 克劳德 count', () => {
+    expect(resolveCloneNaming('克劳德', [clone({ botName: '缇蕾（初号机）' })]).displayName).toBe('克劳德（初号机）');
   });
 });

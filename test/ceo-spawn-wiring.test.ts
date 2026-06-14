@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
-  resolveReady, activationApproved, parseSeats, resolveCeoOwner,
+  resolveReady, activationApproved, parseSeats, resolveCeoOwner, hotRegisterClone,
   type ReadySnapshot, type ActivationApprovalCheck,
 } from '../src/services/ceo-spawn-wiring.js';
 import { parseCeoSpawnArgs } from '../src/cli/bot-clone.js';
@@ -86,6 +86,34 @@ describe('parseCeoSpawnArgs (CLI↔service field contract)', () => {
   });
   it('missing value → throws', () => {
     expect(() => parseCeoSpawnArgs(['--goal'])).toThrow(/missing value/);
+  });
+});
+
+describe('hotRegisterClone (round-3 追加: fail-closed clone-only register)', () => {
+  const cloneCfg = { larkAppId: 'cli_new', claudeConfigDir: '/c/cli_new/.claude' };
+  const bentiCfg = { larkAppId: 'cli_main' }; // 本体: no claudeConfigDir
+  it('clone found → registerBot called, ok', () => {
+    const registered: any[] = [];
+    const r = hotRegisterClone('cli_new', { loadBotConfigs: () => [bentiCfg, cloneCfg], registerBot: (c) => registered.push(c) });
+    expect(r.ok).toBe(true);
+    expect(registered).toEqual([cloneCfg]);
+  });
+  it('appId not in bots.json → not_in_bots_json, registerBot NOT called', () => {
+    let called = false;
+    const r = hotRegisterClone('cli_ghost', { loadBotConfigs: () => [bentiCfg, cloneCfg], registerBot: () => { called = true; } });
+    expect(r).toEqual({ ok: false, error: 'not_in_bots_json' });
+    expect(called).toBe(false);
+  });
+  it('本体 (no claudeConfigDir) → not_a_clone, registerBot NOT called (never register 本体)', () => {
+    let called = false;
+    const r = hotRegisterClone('cli_main', { loadBotConfigs: () => [bentiCfg], registerBot: () => { called = true; } });
+    expect(r).toEqual({ ok: false, error: 'not_a_clone' });
+    expect(called).toBe(false);
+  });
+  it('registerBot throws → {ok:false} with error (caught, not propagated)', () => {
+    const r = hotRegisterClone('cli_new', { loadBotConfigs: () => [cloneCfg], registerBot: () => { throw new Error('client init boom'); } });
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/client init boom/);
   });
 });
 
