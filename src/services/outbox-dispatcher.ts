@@ -19,9 +19,21 @@ import { randomUUID } from 'node:crypto';
 import { logger } from '../utils/logger.js';
 import {
   listPendingCommands, listUnconfirmedCommands, claimCommandForDispatch, completeDispatch,
-  supersedeCommand, getSubTask, getCommand,
+  supersedeCommand, getSubTask, getCommand, isManager,
   type OutboxCommand, type SubTask,
 } from './subtask-store.js';
+
+/** 经理群上报泄漏修复 · 投递层单一收口兜底（蔻黛克斯 review blocker）。
+ *  manager 子群对 CEO 的实时唤醒唯一合法路径 = report_urgent；任何 child_to_parent 的 report_help
+ *  （无论存量 pending / 未来绕过三处入口直接 enqueue）都不该被渲染成急急如律令。投递层是急急如律令**真正发出前**
+ *  的最后一道闸——命中即拦下。三处入队点（shouldRealtimePush / planCommit / reportProgress+escalate）已对
+ *  manager 折叠进 digest，此处是 last line of defense。 */
+function isManagerHelpLeak(cmd: OutboxCommand, task: SubTask | null): boolean {
+  return task != null
+    && cmd.direction === 'child_to_parent'
+    && cmd.commandType === 'report_help'
+    && isManager(task);
+}
 
 export interface DispatchExecutors {
   /** 写 record 触发自动化发送 (**非阻塞、不轮询**)。成功返 {ok:true, relayRecordId}；
@@ -55,6 +67,9 @@ export type DispatchAction = { action: 'send' } | { action: 'skip'; reason: stri
 export function planDispatch(cmd: OutboxCommand, task: SubTask | null): DispatchAction {
   if (!task) return { action: 'skip', reason: 'orphan-task-gone' };
   if (cmd.supersededBy != null) return { action: 'skip', reason: 'superseded' }; // 双保险
+  // 经理群上报泄漏兜底：manager report_help 绝不实时投递（record 尚未写出 → 硬闭环）。
+  // 由 dispatchPending 在「首次判定 + claim 后 recheck」两处调用即拦下存量 pending 与未来绕路。
+  if (isManagerHelpLeak(cmd, task)) return { action: 'skip', reason: 'manager-help-no-realtime' };
   if (cmd.deliveryStatus !== 'pending') return { action: 'skip', reason: `status-${cmd.deliveryStatus}` };
   // E2E 抓到的 bug: finish 命令必须**豁免**终态 skip —— 它的语义就是"通知子群任务已 finished"，
   // task 进 finished 后才会产生 finish 命令，若被终态守卫 skip 掉，子群永远收不到结束通知。
@@ -171,6 +186,16 @@ async function reconcileUnconfirmed(now: Date, exec: DispatchExecutors, stats: D
       const fresh = getCommand(cmd.cmdId);
       if (!fresh || fresh.deliveryStatus !== 'sent_unconfirmed') {
         await completeDispatch(cmd.cmdId, attemptId, {}); // 清 lease，不动状态 (acked-guard 也兜底)
+        continue;
+      }
+      // 经理群上报泄漏兜底（reconcile 侧）：sent_unconfirmed 的 manager report_help —— record 已写出，
+      // 代码层**只能阻止再次重发**（不能撤回已写 record，残余发送风险靠上线前扫描门控）。命中即 supersede + warn，
+      // **不重发、不改 failed**（保持「契约拦截」语义，不污染重发健康统计；蔻黛克斯 review 点 2）。
+      if (isManagerHelpLeak(fresh, getSubTask(fresh.taskId))) {
+        await supersedeCommand(cmd.cmdId, 'manager-help-no-realtime');
+        await completeDispatch(cmd.cmdId, attemptId, {}); // 仅清 lease，不动终态字段
+        stats.skipped += 1;
+        logger.warn(`[outbox-dispatcher] BACKSTOP manager report_help cmd ${cmd.cmdId} sent_unconfirmed → supersede, no resend (residual record risk handled by pre-deploy scan)`);
         continue;
       }
       if (!fresh.relayRecordId) {

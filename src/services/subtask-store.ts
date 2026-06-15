@@ -112,21 +112,16 @@ export function isManager(t: SubTask): boolean {
 
 /** 双层汇报推送门控：某条 child→parent 上报是否应**实时**推父群 (急急如律令)。
  *  - executor (缺省)：恒 true —— 行为与存量字节级一致。
- *  - manager：只「真紧急」实时推 —— done/normal 路径走定期 digest，不实时惊动父群。
- *    真紧急 = need_help (auto/manual) 与停滞 escalate；routine = done (auto/manual)。
+ *  - manager：恒 false —— **任何** report_help/report_done 都不实时惊动父群。
+ *    经理子群对 CEO 的实时唤醒**唯一合法路径** = 显式 urgent (managerReport(urgency=urgent) → report_urgent)，
+ *    该路径不经本函数 (走 ceo-inbox + 独立 report_urgent 命令)。其余 (done/need_help/停滞 escalate) 一律
+ *    折叠进 4h digest，不实时推。
+ *    ⚠️ 契约纠正 (经理群上报泄漏修复)：need_help **不等于** urgent —— 旧实现把 auto/manual_help 与
+ *    stall_escalate 当"真紧急"实时推，违反「仅 digest/request/urgent」静默契约，此处改为恒 false。
  *  kind 覆盖全部 child→parent 上报入口 (planCommit 自动判 / reportProgress 手动 / stall escalate)。 */
 export type PushKind = 'auto_done' | 'auto_help' | 'manual_done' | 'manual_help' | 'stall_escalate';
-export function shouldRealtimePush(t: SubTask, kind: PushKind): boolean {
-  if (!isManager(t)) return true;                  // executor 全推 (旧行为)
-  switch (kind) {
-    case 'auto_done':
-    case 'manual_done':
-      return false;                                // routine 完成 → 进 digest，不实时推
-    case 'auto_help':
-    case 'manual_help':
-    case 'stall_escalate':
-      return true;                                 // 真紧急 → 实时推
-  }
+export function shouldRealtimePush(t: SubTask, _kind: PushKind): boolean {
+  return !isManager(t);                             // executor 全推 (旧行为)；manager 全不推 (走 digest/urgent)
 }
 
 /** Outbox 投递信封：双向命令统一建模。 */
@@ -552,6 +547,43 @@ export async function recordManualDoneObservation(opts: {
   });
 }
 
+/** 经理群上报泄漏修复：manager 子群手动 need_help 的折叠落点 (recordManualDoneObservation 的 help 版兄弟)。
+ *  写一条游标中性、signal='need_help' 的 observation 保住显式 summary (供定期 digest 按 signal 聚合呈现
+ *  「⚠️ 受阻」)，**不入队任何 report_help 命令** → 绝不实时唤父群。幂等键防重试重复落。允许时停泊到
+ *  reported_help (状态机一致：该 manager 子任务确实受阻，只是不实时惊动 CEO)。 */
+export async function recordManualHelpObservation(opts: {
+  taskId: string; summary: string; manualDedupeKey: string; sourceMessageIds?: string[];
+}): Promise<{ observation: Observation; transitioned: boolean; deduped: boolean } | null> {
+  return mutate<{ observation: Observation; transitioned: boolean; deduped: boolean } | null>(s => {
+    const idx = s.subtasks.findIndex(t => t.taskId === opts.taskId);
+    if (idx < 0) return { result: null, dirty: false };
+    const cur = s.subtasks[idx];
+    const dup = s.observations.find(o => o.taskId === opts.taskId && o.manualDedupeKey === opts.manualDedupeKey);
+    if (dup) {
+      logger.info(`[subtask-store] recordManualHelp ${opts.taskId} dedupe hit key=${opts.manualDedupeKey} → ${dup.obsId}`);
+      return { result: { observation: dup, transitioned: false, deduped: true }, dirty: false };
+    }
+    const now = new Date().toISOString();
+    const observation: Observation = {
+      obsId: genId('ob'), taskId: opts.taskId, at: now,
+      readFromCursor: cur.committedCursor, readToCursor: cur.committedCursor,
+      analyzedMessageIds: [], evidenceLinks: opts.sourceMessageIds ?? [],
+      summary: opts.summary, signal: 'need_help', hasExecutorActivity: true,
+      manualDedupeKey: opts.manualDedupeKey,
+    };
+    s.observations.push(observation);
+    const canPark = isTransitionAllowed(cur.status, 'reported_help');
+    s.subtasks[idx] = {
+      ...cur,
+      status: canPark ? 'reported_help' : cur.status,
+      version: cur.version + 1, updatedAt: now,
+      lastExecutorActivityAt: now, lastNudgeAt: null, nudgeCount: 0,
+    };
+    logger.info(`[subtask-store] recordManualHelp ${opts.taskId}: obs=${observation.obsId}${canPark ? ' →reported_help' : ` (stay ${cur.status})`} (manager digest, no realtime)`);
+    return { result: { observation, transitioned: canPark, deduped: false }, dirty: true };
+  });
+}
+
 // ─── Outbox 命令 ─────────────────────────────────────────────────────────────
 
 /** 入队一条 outbox 命令 (主bot 发 finish/supplement 给子群，或主动补一条上报)。
@@ -704,8 +736,8 @@ export async function enqueueNudgeAndUpdateStats(opts: {
  */
 export async function escalateStalledTask(opts: {
   taskId: string; idempotencyKey: string; summary: string; expectedVersion?: number;
-}): Promise<{ task: SubTask; command: OutboxCommand } | null> {
-  return mutate(s => {
+}): Promise<{ task: SubTask; command: OutboxCommand | null } | null> {
+  return mutate<{ task: SubTask; command: OutboxCommand | null } | null>(s => {
     const idx = s.subtasks.findIndex(t => t.taskId === opts.taskId);
     if (idx < 0) throw new TaskNotFoundError(opts.taskId);
     const cur = s.subtasks[idx];
@@ -717,6 +749,23 @@ export async function escalateStalledTask(opts: {
     if (cur.status !== 'observing') return { result: null, dirty: false };
     if (!isTransitionAllowed('observing', 'reported_help')) return { result: null, dirty: false };
     const now = new Date().toISOString();
+    // 经理群上报泄漏修复：manager 停滞 escalate **不实时唤 CEO** —— 停滞 escalate 不属「仅 digest/request/urgent」
+    // 3 条合法实时路径。改为落一条 signal='need_help' 的 observation (供定期 digest 携带「⚠️ 受阻」)，
+    // 仍转 reported_help (停滞门控转态后自然不再触发)，但**不入队 report_help 命令**。
+    if (isManager(cur)) {
+      const dupObs = s.observations.find(o => o.taskId === opts.taskId && o.manualDedupeKey === opts.idempotencyKey);
+      if (dupObs) return { result: { task: cur, command: null }, dirty: false }; // 幂等：同 episode 已落
+      const observation: Observation = {
+        obsId: genId('ob'), taskId: opts.taskId, at: now,
+        readFromCursor: cur.committedCursor, readToCursor: cur.committedCursor,
+        analyzedMessageIds: [], evidenceLinks: [], summary: opts.summary, signal: 'need_help',
+        hasExecutorActivity: false, manualDedupeKey: opts.idempotencyKey,
+      };
+      s.observations.push(observation);
+      s.subtasks[idx] = { ...cur, status: 'reported_help', version: cur.version + 1, updatedAt: now };
+      logger.info(`[subtask-store] stall escalate ${opts.taskId} (manager): observing→reported_help obs=${observation.obsId} (digest, no realtime)`);
+      return { result: { task: s.subtasks[idx], command: null }, dirty: true };
+    }
     const command: OutboxCommand = {
       cmdId: genId('cmd'), taskId: opts.taskId, direction: 'child_to_parent', targetChatId: cur.parentChatId,
       commandType: 'report_help', payload: { summary: opts.summary }, idempotencyKey: opts.idempotencyKey,

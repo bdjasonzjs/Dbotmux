@@ -26,7 +26,7 @@ import type { Session } from '../types.js';
 import {
   createSubTask, getSubTask, getByChatId, getCommand, transitionStatus, enqueueCommand, ackCommand,
   transitionAndEnqueueCommand, listObservations, listCommands, listSubTasks,
-  helpReportDelivery, ACTIVE_STATUSES, isManager, shouldRealtimePush, recordManualDoneObservation,
+  helpReportDelivery, ACTIVE_STATUSES, isManager, shouldRealtimePush, recordManualDoneObservation, recordManualHelpObservation,
   VersionConflictError, CommandRetryMismatchError,
   type SubTask, type SubTaskBot, type SubTaskStatus, type OutboxCommand, type Observation,
   type CommandTargetRole,
@@ -365,16 +365,11 @@ export async function reportProgress(req: ReportProgressReq): Promise<{ cmdId?: 
     throw new HttpError(403, `reporting bot (larkAppId=${session.larkAppId}) is not a participant of this subtask`);
   }
   if (!req.summary?.trim()) throw new HttpError(400, 'missing summary');
-  // 蔻黛 M2：manager 的实时上报(need_help/askforhelp) 与 manager-report urgent 共用同一个机制闸 ——
-  // 任何 manager 实时 push 都必须带非空 reason/summary（这里 summary 即 reason），统一防"无理由打扰 CEO"。
-  if (req.type === 'need_help' && isManager(task)) {
-    assertManagerRealtimeJustified('need_help', req.summary);
-  }
   if (task.status === 'finished' || task.status === 'stopped') {
     throw new HttpError(409, `subtask already ${task.status}; ${req.type} report suppressed`);
   }
   // 双层汇报推送门控：manager 子群的手动 done 是 routine，不实时推父群——落一条游标中性 observation
-  // (signal=done, statusTo=reported_done, 幂等) 保住显式 summary，由定期 digest 上报。need_help 仍实时推 (真紧急)。
+  // (signal=done, statusTo=reported_done, 幂等) 保住显式 summary，由定期 digest 上报。
   if (req.type === 'done' && isManager(task) && !shouldRealtimePush(task, 'manual_done')) {
     const dedupeKey = req.idempotencyKey
       ?? (req.sourceMessageIds?.length ? `manualdone-${req.sourceMessageIds.join(',')}` : `manualdone-${task.taskId}-${djb2(req.summary)}`);
@@ -383,6 +378,21 @@ export async function reportProgress(req: ReportProgressReq): Promise<{ cmdId?: 
     });
     if (!res) throw new HttpError(404, `subtask not found: ${req.taskId}`);
     logger.info(`[subtask-orch] report_progress ${task.taskId} manager manual_done → digest (obs=${res.observation.obsId} deduped=${res.deduped})`);
+    return { taskId: task.taskId, suppressed: true, enteredDigest: true, obsId: res.observation.obsId, deduped: res.deduped };
+  }
+  // 经理群上报泄漏修复：manager 子群的手动 need_help / askforhelp **也是 routine**（need_help ≠ urgent）——
+  // 与 manual_done 对称折叠：落 signal='need_help' 游标中性 observation 保住 summary，由定期 digest 携带「⚠️ 受阻」，
+  // **不入队 report_help、不实时唤 CEO**。manager 唯一实时路径 = subtask-manager-report --urgency urgent（report_urgent）。
+  // （原 assertManagerRealtimeJustified('need_help') 已移除：need_help 不再实时，该 reason 门控对它失去意义；
+  //   summary 非空已在上方强校验。urgent 路径的 reason 门控在 managerReport 内保留。）
+  if (req.type === 'need_help' && isManager(task) && !shouldRealtimePush(task, 'manual_help')) {
+    const dedupeKey = req.idempotencyKey
+      ?? (req.sourceMessageIds?.length ? `manualhelp-${req.sourceMessageIds.join(',')}` : `manualhelp-${task.taskId}-${djb2(req.summary)}`);
+    const res = await recordManualHelpObservation({
+      taskId: task.taskId, summary: req.summary, manualDedupeKey: dedupeKey, sourceMessageIds: req.sourceMessageIds,
+    });
+    if (!res) throw new HttpError(404, `subtask not found: ${req.taskId}`);
+    logger.info(`[subtask-orch] report_progress ${task.taskId} manager manual_help → digest (obs=${res.observation.obsId} deduped=${res.deduped})`);
     return { taskId: task.taskId, suppressed: true, enteredDigest: true, obsId: res.observation.obsId, deduped: res.deduped };
   }
   // 边界5: 手动上报走 enqueueCommand，**不推 committedCursor、不建 Observation**，跟 observer 高水位分离。
@@ -430,8 +440,9 @@ export interface AskForHelpReq {
  * 由 coco(dispatcher) 异步触发急急如律令 base relay 唤主 bot。「本质上是一种内存共享式的通信」(松松)。
  * 等价 reportProgress(type='need_help')，但语义面向执行者 (注入小尾巴里告诉子 bot「卡住用 askforhelp、别硬扛」)。
  */
-export async function askForHelp(req: AskForHelpReq): Promise<{ cmdId?: string; taskId: string }> {
-  // type=need_help → 走 reportProgress 的 enqueue 路径 (manager 也实时推，真紧急)，恒返 cmdId。
+export async function askForHelp(req: AskForHelpReq): Promise<{ cmdId?: string; taskId: string; suppressed?: boolean; enteredDigest?: boolean; obsId?: string; deduped?: boolean }> {
+  // type=need_help → 走 reportProgress：executor 子群 enqueue report_help 实时推 (返 cmdId)；
+  // 经理群上报泄漏修复后，manager 子群折叠进 digest (返 suppressed/enteredDigest，不实时唤 CEO)。
   return reportProgress({ sessionId: req.sessionId, taskId: req.taskId, type: 'need_help', summary: req.summary, sourceMessageIds: req.sourceMessageIds, idempotencyKey: req.idempotencyKey });
 }
 
