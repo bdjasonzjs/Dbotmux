@@ -1,4 +1,5 @@
-import { networkInterfaces } from 'node:os';
+import { networkInterfaces, homedir } from 'node:os';
+import { join } from 'node:path';
 import { probeTmuxFunctional } from './setup/ensure-tmux.js';
 
 /** Get the first non-loopback IPv4 address, fallback to localhost. */
@@ -29,7 +30,18 @@ export const config = {
     appSecret: process.env.LARK_APP_SECRET ?? '',
   },
   session: {
-    dataDir: process.env.SESSION_DATA_DIR ?? new URL('../data', import.meta.url).pathname,
+    // Default to the homedir data dir (~/.botmux/data) — that's where the
+    // daemon actually persists everything in production, and it matches
+    // resolveDataDir()'s documented default (cli.ts). The old default was
+    // `../data` relative to the compiled module (i.e. <install-dir>/data),
+    // which only exists in a dev checkout. That stale default is the root
+    // cause of the dashboard reading an *empty* topology after a clean
+    // restart: PM2 launches dist/dashboard.js without SESSION_DATA_DIR, so
+    // `dataDir` resolved to the (non-existent) install-dir/data and
+    // readTopology() returned an empty graph even though ~/.botmux/data
+    // had 180+ nodes. Daemons set SESSION_DATA_DIR explicitly so they were
+    // never affected; only env-less entrypoints (the dashboard) regressed.
+    dataDir: process.env.SESSION_DATA_DIR ?? join(homedir(), '.botmux', 'data'),
   },
   daemon: {
     cliId: (process.env.CLI_ID ?? 'claude-code') as import('./adapters/cli/types.js').CliId,

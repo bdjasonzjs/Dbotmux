@@ -534,19 +534,44 @@ const server = createServer(async (req, res) => {
       const filterOrigin = url.searchParams.get('originType') as 'p2p' | 'human_created' | 'bot_spawned' | null;
       const topo = readTopology();
       let nodes = filterOrigin ? topo.nodes.filter(n => n.originType === filterOrigin) : topo.nodes;
+
+      // Inspection view (B): join subtask-store by chatId so each node carries
+      // its task role (manager vs executor) + live task status + a one-line
+      // "what's it doing". Unlike readTopology (which returns empty on a bad
+      // file), subtask-store throws on a corrupt subtasks.json — so the join
+      // is wrapped: any failure degrades to topology-only and surfaces
+      // `subtaskJoinError:true` instead of turning /api/topology into a 500.
+      let subtaskByChat = new Map<string, any>();
+      let subtaskJoinError = false;
+      try {
+        const { listSubTasks } = await import('./services/subtask-store.js');
+        for (const t of listSubTasks()) subtaskByChat.set(t.chatId, t);
+      } catch (err) {
+        subtaskJoinError = true;
+        logger.error(`[dashboard/topology] subtask-store join failed, degrading to topology-only: ${err}`);
+      }
+
       // Enrich each node with lifecycle status from ChatContext so the
       // frontend can render archived chats in a separate section.
       nodes = nodes.map(n => {
         const ctx = readCtx(n.chatId);
+        const st = subtaskByChat.get(n.chatId);
         return {
           ...n,
           status: (ctx?.status ?? 'active') as 'active' | 'archived',
           archivedAt: ctx?.archivedAt ?? null,
           // P1 commit #10: enrich taskType for dashboard filtering / display
           taskType: ctx?.taskType,
+          // Inspection view (B): subtask role + status + one-line goal.
+          // Absent (= plain chat, no subtask record) → frontend treats it as
+          // a non-task group, behaviour unchanged.
+          reportingMode: st?.reportingMode,                 // 'manager' | 'executor' | undefined
+          subtaskStatus: st?.status,                        // SubTaskStatus | undefined
+          subtaskGoal: st?.compactSummary || st?.goal || undefined,
+          subtaskDepth: st?.depth,
         } as any;
       });
-      return jsonRes(res, 200, { ...topo, nodes });
+      return jsonRes(res, 200, { ...topo, nodes, subtaskJoinError });
     }
     // chatId in API paths needs strict whitelist BEFORE the store accepts
     // it as a filename: decodeURIComponent already turned `%2F` into `/`,

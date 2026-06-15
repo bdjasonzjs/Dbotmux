@@ -253,6 +253,13 @@ function ecosystemConfig(): string {
     out_file: join(LOG_DIR, 'dashboard-out.log'),
     merge_logs: true,
     env: {
+      // Belt-and-suspenders for the topology-empty-after-restart bug: pin the
+      // dashboard's data dir to the same place the daemons write (DATA_DIR =
+      // ~/.botmux/data). config.ts now also defaults here, so this is a
+      // defensive duplicate — if someone reverts the config default, the
+      // dashboard still resolves the daemon's data dir instead of the empty
+      // install-dir/data.
+      SESSION_DATA_DIR: DATA_DIR,
       BOTMUX_DASHBOARD_HOST: process.env.BOTMUX_DASHBOARD_HOST ?? '0.0.0.0',
       BOTMUX_DASHBOARD_PORT: process.env.BOTMUX_DASHBOARD_PORT ?? '7891',
     },
