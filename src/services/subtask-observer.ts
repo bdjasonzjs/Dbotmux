@@ -360,18 +360,25 @@ export function planCommit(
   reportingMode: 'manager' | 'executor' = 'executor',
 ): CommitPlan {
   const plan = planCommitBase(status, signal, readToCursor, pendingDoneCmdIds, helpDelivery, staleHelpCmdIds, observingHelpHasNewProgress);
-  // manager 推送门控：done 是 routine，不实时推父群——剥掉 report_done（状态转移保留），
-  // 完成信息由定期 digest 上报。need_help/normal 路径不变（need_help=真紧急仍实时推；含现有防刷屏）。
-  if (reportingMode === 'manager' && signal === 'done' && plan.report?.commandType === 'report_done') {
-    const { report: _drop, ...rest } = plan;
-    // 蔻黛克斯 final blocker1：剥掉 done 上报后，若还有未 superseded 的旧 report_help（进 reported_help 时
-    // 发的、可能尚未投递），它仍会被 dispatcher 急急如律令推父群 → "已 done 还求助" 假紧急。
-    // 故 manager 转 done 时一并 supersede 这些旧 help（与既有 supersedeCommandIds 合并）。
-    const staleHelp = staleHelpCmdIds();
-    if (staleHelp.length) {
-      rest.supersedeCommandIds = [...new Set([...(rest.supersedeCommandIds ?? []), ...staleHelp])];
+  if (reportingMode === 'manager') {
+    // manager 推送门控：done 是 routine，不实时推父群——剥掉 report_done（状态转移保留），完成信息由定期 digest 上报。
+    if (signal === 'done' && plan.report?.commandType === 'report_done') {
+      const { report: _drop, ...rest } = plan;
+      // 蔻黛克斯 final blocker1：剥掉 done 上报后，若还有未 superseded 的旧 report_help（进 reported_help 时
+      // 发的、可能尚未投递），它仍会被 dispatcher 急急如律令推父群 → "已 done 还求助" 假紧急。
+      // 故 manager 转 done 时一并 supersede 这些旧 help（与既有 supersedeCommandIds 合并）。
+      const staleHelp = staleHelpCmdIds();
+      if (staleHelp.length) {
+        rest.supersedeCommandIds = [...new Set([...(rest.supersedeCommandIds ?? []), ...staleHelp])];
+      }
+      return rest;
     }
-    return rest;
+    // 经理群上报泄漏修复：need_help 也是 routine（need_help ≠ urgent）——剥掉 report_help（状态转移保留），
+    // observation 仍按 signal='need_help' 写入，由定期 digest 携带「⚠️ 受阻」。manager 唯一实时路径=report_urgent。
+    if (plan.report?.commandType === 'report_help') {
+      const { report: _drop, ...rest } = plan;
+      return rest;
+    }
   }
   return plan;
 }

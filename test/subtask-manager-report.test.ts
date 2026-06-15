@@ -152,14 +152,16 @@ describe('manager-report 机制门控', () => {
   });
 });
 
-describe('M2: manager 实时上报统一闸（need_help 与 manager-report urgent 共用 reason 校验）', () => {
-  it('manager need_help 缺 summary → 400；带 summary → report_help', async () => {
+describe('manager need_help（经理群泄漏修复：折叠进 digest，不再实时 report_help）', () => {
+  it('manager need_help 缺 summary → 400；带 summary → 折叠 digest、不入队 report_help', async () => {
     const tid = await mkManager('oc_mgrH', 'kh');
     const sid = subSession('s', 'oc_mgrH');
     await expect(reportProgress({ sessionId: sid, taskId: tid, type: 'need_help', summary: '  ' })).rejects.toMatchObject({ status: 400 });
     const r = await reportProgress({ sessionId: sid, taskId: tid, type: 'need_help', summary: '真卡住了' });
-    expect(r.cmdId).toBeTruthy();
-    expect(listCommands(tid).filter(c => c.commandType === 'report_help')).toHaveLength(1);
+    // 契约纠正：need_help ≠ urgent —— manager 折叠进 digest（suppressed/enteredDigest），不实时 report_help。
+    expect(r.suppressed).toBe(true);
+    expect(r.enteredDigest).toBe(true);
+    expect(listCommands(tid).filter(c => c.commandType === 'report_help')).toHaveLength(0);
   });
 });
 

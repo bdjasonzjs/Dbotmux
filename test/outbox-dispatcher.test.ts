@@ -96,6 +96,21 @@ describe('planDispatch', () => {
     const cmd = { deliveryStatus: 'pending', supersededBy: null, direction: 'child_to_parent' } as any;
     expect(planDispatch(cmd, { status: 'reported_help' } as any).action).toBe('send');
   });
+  // ─── 经理群上报泄漏兜底 (蔻黛克斯 blocker) ───
+  it('backstop: manager + child→parent + report_help → skip:manager-help-no-realtime (拦下存量/绕路)', () => {
+    const cmd = { deliveryStatus: 'pending', supersededBy: null, direction: 'child_to_parent', commandType: 'report_help' } as any;
+    const r = planDispatch(cmd, { status: 'reported_help', reportingMode: 'manager' } as any);
+    expect(r.action).toBe('skip');
+    expect((r as any).reason).toBe('manager-help-no-realtime');
+  });
+  it('backstop: executor + report_help → send (回归，不误伤普通子群)', () => {
+    const cmd = { deliveryStatus: 'pending', supersededBy: null, direction: 'child_to_parent', commandType: 'report_help' } as any;
+    expect(planDispatch(cmd, { status: 'reported_help', reportingMode: 'executor' } as any).action).toBe('send');
+  });
+  it('backstop: manager + report_done → 不被本兜底拦 (走既有 routine 路径)', () => {
+    const cmd = { deliveryStatus: 'pending', supersededBy: null, direction: 'child_to_parent', commandType: 'report_done' } as any;
+    expect(planDispatch(cmd, { status: 'reported_done', reportingMode: 'manager' } as any).action).toBe('send');
+  });
 });
 
 // ─── planBackoff 退避 ────────────────────────────────────────────────────────
@@ -381,5 +396,55 @@ describe('runDispatcherTick — planDispatch skip / 终态', () => {
     expect(getCommand(cmdId)!.supersededBy).not.toBeNull();
     expect(getCommand(cmdId)!.dispatchAttemptId).toBeNull();
     spy.mockRestore();
+  });
+});
+
+// ─── 经理群上报泄漏兜底 · 投递层 E2E (蔻黛克斯 blocker) ──────────────────────────
+describe('runDispatcherTick — manager report_help 投递层兜底', () => {
+  async function mkManagerHelp(deliveryOver?: Partial<ReturnType<typeof getCommand>>) {
+    const t = await createSubTask({
+      chatId: 'oc_sub', parentChatId: 'oc_parent', parentMessageId: 'om_src',
+      goal: '经理任务', acceptance: null, bots: BOTS, requester: 'ou_jason', createdBy: 'ou_claude',
+      idempotencyKey: 'kmgr', reportingMode: 'manager',
+    });
+    await transitionStatus(t.taskId, 'observing');
+    await transitionStatus(t.taskId, 'reported_help');
+    const cmd = await enqueueCommand({
+      taskId: t.taskId, direction: 'child_to_parent', targetChatId: 'oc_parent',
+      commandType: 'report_help', payload: { summary: '卡住' }, idempotencyKey: 'mgrhelp1',
+    });
+    if (deliveryOver) await store.updateCommand(cmd.cmdId, deliveryOver as any);
+    return { taskId: t.taskId, cmdId: cmd.cmdId };
+  }
+
+  it('存量 pending manager report_help → 不写 record (硬闭环) + supersede', async () => {
+    const { cmdId } = await mkManagerHelp();
+    const exec = mkExec();
+    const stats = await runDispatcherTick(new Date(), exec);
+    expect(exec.writeAndSend).not.toHaveBeenCalled();   // 急急如律令绝不发出
+    expect(stats.skipped).toBeGreaterThanOrEqual(1);
+    expect(getCommand(cmdId)!.supersededBy).not.toBeNull();
+  });
+
+  it('回归: executor pending report_help → 照常写 record', async () => {
+    const { cmdId } = await mkTaskWithCommand();   // executor，report_help
+    const exec = mkExec();
+    await runDispatcherTick(new Date(), exec);
+    expect(exec.writeAndSend).toHaveBeenCalled();
+    expect(getCommand(cmdId)!.deliveryStatus).toBe('sent_unconfirmed');
+  });
+
+  it('存量 sent_unconfirmed manager report_help → 不重发 (只防重发) + supersede + 不改 failed', async () => {
+    const oldSent = new Date(Date.now() - RESEND_DEADLINE_MS - 60_000).toISOString();
+    const { cmdId } = await mkManagerHelp({
+      deliveryStatus: 'sent_unconfirmed', relayRecordId: 'rec_legacy',
+      sentAt: oldSent, nextRetryAt: new Date(Date.now() - 1000).toISOString(), retryCount: 0,
+    } as any);
+    const exec = mkExec({ check: async () => 'pending' as const });
+    await runDispatcherTick(new Date(), exec);
+    expect(exec.writeAndSend).not.toHaveBeenCalled();   // 不再写新 record (不重发)
+    const c = getCommand(cmdId)!;
+    expect(c.supersededBy).not.toBeNull();              // 契约拦截语义
+    expect(c.deliveryStatus).not.toBe('failed');        // 不误改 failed (蔻黛 review 点2)
   });
 });

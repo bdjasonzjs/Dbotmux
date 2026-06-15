@@ -44,7 +44,8 @@ vi.mock('../src/services/base-relay.js', () => ({ sendAsOwner: vi.fn(), DEFAULT_
 
 import {
   createSubTask, getSubTask, getByChatId, transitionStatus, enqueueCommand, listCommands, getCommand,
-  listObservations, updateSubTask, recordManualDoneObservation, isManager, shouldRealtimePush,
+  listObservations, updateSubTask, recordManualDoneObservation, recordManualHelpObservation,
+  escalateStalledTask, isManager, shouldRealtimePush,
   __resetForTesting, type SubTaskBot, type SubTask,
 } from '../src/services/subtask-store.js';
 import { planCommit } from '../src/services/subtask-observer.js';
@@ -95,12 +96,12 @@ describe('shouldRealtimePush', () => {
       expect(shouldRealtimePush(exec, k)).toBe(true);
     }
   });
-  it('manager: done 不推、help/escalate 推', () => {
+  it('manager: 全不推 (经理群泄漏修复——need_help≠urgent，唯一实时路径=report_urgent)', () => {
     expect(shouldRealtimePush(mgr, 'auto_done')).toBe(false);
     expect(shouldRealtimePush(mgr, 'manual_done')).toBe(false);
-    expect(shouldRealtimePush(mgr, 'auto_help')).toBe(true);
-    expect(shouldRealtimePush(mgr, 'manual_help')).toBe(true);
-    expect(shouldRealtimePush(mgr, 'stall_escalate')).toBe(true);
+    expect(shouldRealtimePush(mgr, 'auto_help')).toBe(false);
+    expect(shouldRealtimePush(mgr, 'manual_help')).toBe(false);
+    expect(shouldRealtimePush(mgr, 'stall_escalate')).toBe(false);
   });
   it('isManager', () => {
     expect(isManager(mgr)).toBe(true);
@@ -121,10 +122,20 @@ describe('planCommit manager 门控', () => {
     expect(p.report).toBeUndefined();
     expect(p.statusTo).toBe('reported_done');
   });
-  it('manager observing+need_help → 仍推 report_help (真紧急)', () => {
+  it('manager observing+need_help → 剥 report_help、仍转 reported_help (经理群泄漏修复，进 digest 不实时推)', () => {
     const p = planCommit('observing', 'need_help', 'm1', noop, undefined, undefined, () => true, 'manager');
+    expect(p.report).toBeUndefined();
+    expect(p.statusTo).toBe('reported_help');
+  });
+  it('executor observing+need_help → 仍推 report_help (旧行为不变，回归)', () => {
+    const p = planCommit('observing', 'need_help', 'm1', noop, undefined, undefined, () => true);   // executor
     expect(p.report?.commandType).toBe('report_help');
     expect(p.statusTo).toBe('reported_help');
+  });
+  it('manager reported_help+need_help (补发分支) → 也剥 report_help', () => {
+    // reported_help 下 helpDelivery=none → planCommitBase 会产 helpReport 补发；manager 须剥掉
+    const p = planCommit('reported_help', 'need_help', 'm1', noop, () => 'none', () => [], () => true, 'manager');
+    expect(p.report).toBeUndefined();
   });
   it('manager observing+normal → 仅记观测 (同)', () => {
     const p = planCommit('observing', 'normal', 'm1', noop, undefined, undefined, undefined, 'manager');
@@ -204,11 +215,80 @@ describe('reportProgress 手动 done 门控', () => {
     expect(r.cmdId).toBeTruthy();
     expect(listCommands(t.taskId).filter(c => c.commandType === 'report_done')).toHaveLength(1);
   });
-  it('manager 手动 need_help → 仍 enqueue report_help (真紧急)', async () => {
+  it('manager 手动 need_help → suppressed+enteredDigest、不 enqueue report_help (经理群泄漏修复)', async () => {
     const t = await mkTask({ reportingMode: 'manager' });
+    const sid = subSession();
+    const r = await reportProgress({ sessionId: sid, taskId: t.taskId, type: 'need_help', summary: '卡住，需要 https://x 决策' });
+    expect(r.suppressed).toBe(true);
+    expect(r.enteredDigest).toBe(true);
+    expect(listCommands(t.taskId).filter(c => c.commandType === 'report_help')).toHaveLength(0);
+    const obs = listObservations(t.taskId).filter(o => o.signal === 'need_help');
+    expect(obs).toHaveLength(1);
+    expect(obs[0].summary).toContain('https://x');
+  });
+  it('executor 手动 need_help → 照常 enqueue report_help (旧行为不变，回归)', async () => {
+    const t = await mkTask();   // executor
     const sid = subSession();
     const r = await reportProgress({ sessionId: sid, taskId: t.taskId, type: 'need_help', summary: '卡住' });
     expect(r.cmdId).toBeTruthy();
+    expect(listCommands(t.taskId).filter(c => c.commandType === 'report_help')).toHaveLength(1);
+  });
+});
+
+// ─── recordManualHelpObservation (经理群泄漏修复) ───────────────────────────────
+describe('recordManualHelpObservation', () => {
+  it('落 signal=need_help observation + 转 reported_help + 保 summary、不入队命令', async () => {
+    const t = await mkTask({ reportingMode: 'manager' });
+    const r = await recordManualHelpObservation({ taskId: t.taskId, summary: '受阻，见 https://x/blocker', manualDedupeKey: 'h1' });
+    expect(r?.transitioned).toBe(true);
+    expect(r?.deduped).toBe(false);
+    const obs = listObservations(t.taskId);
+    expect(obs).toHaveLength(1);
+    expect(obs[0].signal).toBe('need_help');
+    expect(obs[0].summary).toContain('https://x/blocker');
+    expect(getSubTask(t.taskId)!.status).toBe('reported_help');
+    expect(listCommands(t.taskId)).toHaveLength(0);   // 绝不入队 report_help
+  });
+  it('幂等：同 key 重试不重复落', async () => {
+    const t = await mkTask({ reportingMode: 'manager' });
+    await recordManualHelpObservation({ taskId: t.taskId, summary: 's', manualDedupeKey: 'kdup' });
+    const r2 = await recordManualHelpObservation({ taskId: t.taskId, summary: 's', manualDedupeKey: 'kdup' });
+    expect(r2?.deduped).toBe(true);
+    expect(listObservations(t.taskId)).toHaveLength(1);
+  });
+  it('digest 收录 manager 受阻 observation', async () => {
+    const t = await mkTask({ reportingMode: 'manager' });
+    await recordManualHelpObservation({ taskId: t.taskId, summary: '受阻子项B', manualDedupeKey: 'k' });
+    const body = composeDigest(getSubTask(t.taskId)!, new Date());
+    expect(body).toBeTruthy();
+    expect(body!).toContain('受阻子项B');
+  });
+});
+
+// ─── escalateStalledTask manager 门控 (经理群泄漏修复 · 停滞 escalate) ──────────
+describe('escalateStalledTask manager 门控', () => {
+  it('manager 停滞 escalate → 落 need_help observation、转 reported_help、不入队 report_help', async () => {
+    const t = await mkTask({ reportingMode: 'manager' });
+    const r = await escalateStalledTask({ taskId: t.taskId, idempotencyKey: 'esc1', summary: '疑似执行者断开' });
+    expect(r).toBeTruthy();
+    expect(r!.command).toBeNull();
+    expect(getSubTask(t.taskId)!.status).toBe('reported_help');
+    expect(listCommands(t.taskId).filter(c => c.commandType === 'report_help')).toHaveLength(0);
+    const obs = listObservations(t.taskId).filter(o => o.signal === 'need_help');
+    expect(obs).toHaveLength(1);
+    expect(obs[0].summary).toContain('疑似执行者断开');
+  });
+  it('manager 停滞 escalate 幂等：同 idempotencyKey 不重复落 observation', async () => {
+    const t = await mkTask({ reportingMode: 'manager' });
+    await escalateStalledTask({ taskId: t.taskId, idempotencyKey: 'escdup', summary: 's' });
+    await escalateStalledTask({ taskId: t.taskId, idempotencyKey: 'escdup', summary: 's' });
+    expect(listObservations(t.taskId).filter(o => o.signal === 'need_help')).toHaveLength(1);
+  });
+  it('executor 停滞 escalate → 仍入队 report_help (旧行为不变，回归)', async () => {
+    const t = await mkTask();   // executor
+    const r = await escalateStalledTask({ taskId: t.taskId, idempotencyKey: 'esc2', summary: '断开' });
+    expect(r!.command).toBeTruthy();
+    expect(r!.command!.commandType).toBe('report_help');
     expect(listCommands(t.taskId).filter(c => c.commandType === 'report_help')).toHaveLength(1);
   });
 });
