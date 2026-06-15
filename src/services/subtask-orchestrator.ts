@@ -26,12 +26,14 @@ import type { Session } from '../types.js';
 import {
   createSubTask, getSubTask, getByChatId, getCommand, transitionStatus, enqueueCommand, ackCommand,
   transitionAndEnqueueCommand, listObservations, listCommands, listSubTasks,
-  helpReportDelivery, ACTIVE_STATUSES,
+  helpReportDelivery, ACTIVE_STATUSES, isManager, shouldRealtimePush, recordManualDoneObservation,
   VersionConflictError, CommandRetryMismatchError,
   type SubTask, type SubTaskBot, type SubTaskStatus, type OutboxCommand, type Observation,
   type CommandTargetRole,
 } from './subtask-store.js';
 import { SUBTASK_COLLAB_NORMS } from './subtask-norms.js';
+import { writeLetter, readLetter } from './mailbox.js';
+import { enqueueEntry, listInbox, markRead, type ReportKind, type InboxEntry } from './ceo-inbox-store.js';
 
 /** v2 编排链路标记 —— 进 chatContext.relatedRefs，dashboard/welcome card 可见，
  *  跟旧 watcher 链路区分 (边界3)。 */
@@ -217,6 +219,8 @@ export interface CreateSubtaskReq {
   parentDigest?: string;
   /** G1: 新任务是否允许其子群再 spawn（create 一锤定音，默认 false）。 */
   spawnable?: boolean;
+  /** 双层汇报：true=部门经理(manager，门控+定期 digest)；缺省/false=执行者(executor，实时直报)。 */
+  manager?: boolean;
 }
 
 export async function createSubtask(req: CreateSubtaskReq): Promise<{ taskId: string; chatId: string; isNew: boolean }> {
@@ -233,27 +237,41 @@ export async function createSubtask(req: CreateSubtaskReq): Promise<{ taskId: st
   if (req.spawnable === true && newDepth >= maxSubtaskDepth()) {
     throw new HttpError(400, `spawnable 无意义：新任务 depth=${newDepth} 已达上限 ${maxSubtaskDepth()}，其子群不可能再 spawn（去掉 --spawnable 重试）`);
   }
+  // 双层汇报 Block4：创建 manager 的**授权边界**（防预算绕过）。manager 不占/不受 fork-bomb 预算，
+  // 若任何 spawnable executor 都能给孙群加 --manager，预算闸就被 worker 自助软绕开。规则：manager 只能由
+  // **主话题（depth 0，主 bot）** 或 **本身是 manager 的父任务** 创建；executor 子群创建 manager → 403。
+  if (req.manager === true) {
+    const allowed = ctx.parentTask === null || isManager(ctx.parentTask);
+    if (!allowed) {
+      throw new HttpError(403, 'executor 子群不能创建 manager 子群（防预算绕过）；manager 由主话题或上级 manager 创建');
+    }
+  }
   if (ctx.parentTask) {
     if (newDepth > maxSubtaskDepth()) {
       throw new HttpError(422, `subtask depth limit exceeded (depth=${newDepth} > max=${maxSubtaskDepth()}); 把这一步并入当前任务或上报父群拆解`);
     }
     assertNoCycle(ctx.callerChatId, getMainTopicChatId()!);
-    const active = listSubTasks({ statuses: ACTIVE_STATUSES });
-    const mainTopicForRoot = getMainTopicChatId();
-    const siblings = active.filter(t => t.parentChatId === ctx.callerChatId);
-    if (siblings.length >= maxActiveChildren()) {
-      throw new HttpError(429, `active children limit reached for this chat (${siblings.length}/${maxActiveChildren()}); 先收尾再派新的`);
-    }
-    const treePeers = active.filter(t => rootOf(t, mainTopicForRoot) === ctx.rootChatId);
-    if (treePeers.length >= maxActivePerTree()) {
-      throw new HttpError(429, `active subtask budget for this tree reached (${treePeers.length}/${maxActivePerTree()}, root=${ctx.rootChatId.slice(0, 12)})`);
-    }
-    if (active.length >= maxActiveGlobal()) {
-      throw new HttpError(429, `global active subtask limit reached (${active.length}/${maxActiveGlobal()})`);
-    }
-    const newestInTree = treePeers.map(t => t.createdAt).sort().at(-1);
-    if (newestInTree && Date.now() - Date.parse(newestInTree) < spawnMinIntervalMs()) {
-      throw new HttpError(429, `spawning too fast in this tree (min interval ${spawnMinIntervalMs()}ms); 稍后重试`);
+    // 双层汇报 Block4：预算闸（G3/G4/G5/G6）只统计 **executor** 子任务——manager 是组织协调层，
+    // 不计入预算、也不受预算限制。① 新建 manager → 整块跳过；② 新建 executor → 用 activeExecutors 当分母。
+    if (req.manager !== true) {
+      const active = listSubTasks({ statuses: ACTIVE_STATUSES });
+      const activeExecutors = active.filter(t => !isManager(t));   // manager 不占预算
+      const mainTopicForRoot = getMainTopicChatId();
+      const siblings = activeExecutors.filter(t => t.parentChatId === ctx.callerChatId);
+      if (siblings.length >= maxActiveChildren()) {
+        throw new HttpError(429, `active children limit reached for this chat (${siblings.length}/${maxActiveChildren()}); 先收尾再派新的`);
+      }
+      const treePeers = activeExecutors.filter(t => rootOf(t, mainTopicForRoot) === ctx.rootChatId);
+      if (treePeers.length >= maxActivePerTree()) {
+        throw new HttpError(429, `active subtask budget for this tree reached (${treePeers.length}/${maxActivePerTree()}, root=${ctx.rootChatId.slice(0, 12)})`);
+      }
+      if (activeExecutors.length >= maxActiveGlobal()) {
+        throw new HttpError(429, `global active subtask limit reached (${activeExecutors.length}/${maxActiveGlobal()})`);
+      }
+      const newestInTree = treePeers.map(t => t.createdAt).sort().at(-1);
+      if (newestInTree && Date.now() - Date.parse(newestInTree) < spawnMinIntervalMs()) {
+        throw new HttpError(429, `spawning too fast in this tree (min interval ${spawnMinIntervalMs()}ms); 稍后重试`);
+      }
     }
   }
 
@@ -305,6 +323,7 @@ export async function createSubtask(req: CreateSubtaskReq): Promise<{ taskId: st
     createdBy: sessionBotKey(session?.larkAppId) ?? 'claude',   // 记真实创建 bot（嵌套后不再恒为 claude）
     idempotencyKey,
     depth: newDepth, rootChatId: ctx.rootChatId, spawnable: req.spawnable === true,
+    reportingMode: req.manager === true ? 'manager' : 'executor',
   });
   // 群已建好 = 激活成功 → creating 转 observing 让 observer 接管。已 observing 不重复转。
   if (task.status === 'creating') await transitionStatus(task.taskId, 'observing');
@@ -332,7 +351,7 @@ export interface ReportProgressReq {
   idempotencyKey?: string;
 }
 
-export async function reportProgress(req: ReportProgressReq): Promise<{ cmdId: string; taskId: string }> {
+export async function reportProgress(req: ReportProgressReq): Promise<{ cmdId?: string; taskId: string; suppressed?: boolean; enteredDigest?: boolean; obsId?: string; deduped?: boolean }> {
   const session = getSession(req.sessionId);
   if (!session) throw new HttpError(403, `unknown session: ${req.sessionId}`);
   const task = getSubTask(req.taskId);
@@ -346,8 +365,25 @@ export async function reportProgress(req: ReportProgressReq): Promise<{ cmdId: s
     throw new HttpError(403, `reporting bot (larkAppId=${session.larkAppId}) is not a participant of this subtask`);
   }
   if (!req.summary?.trim()) throw new HttpError(400, 'missing summary');
+  // 蔻黛 M2：manager 的实时上报(need_help/askforhelp) 与 manager-report urgent 共用同一个机制闸 ——
+  // 任何 manager 实时 push 都必须带非空 reason/summary（这里 summary 即 reason），统一防"无理由打扰 CEO"。
+  if (req.type === 'need_help' && isManager(task)) {
+    assertManagerRealtimeJustified('need_help', req.summary);
+  }
   if (task.status === 'finished' || task.status === 'stopped') {
     throw new HttpError(409, `subtask already ${task.status}; ${req.type} report suppressed`);
+  }
+  // 双层汇报推送门控：manager 子群的手动 done 是 routine，不实时推父群——落一条游标中性 observation
+  // (signal=done, statusTo=reported_done, 幂等) 保住显式 summary，由定期 digest 上报。need_help 仍实时推 (真紧急)。
+  if (req.type === 'done' && isManager(task) && !shouldRealtimePush(task, 'manual_done')) {
+    const dedupeKey = req.idempotencyKey
+      ?? (req.sourceMessageIds?.length ? `manualdone-${req.sourceMessageIds.join(',')}` : `manualdone-${task.taskId}-${djb2(req.summary)}`);
+    const res = await recordManualDoneObservation({
+      taskId: task.taskId, summary: req.summary, manualDedupeKey: dedupeKey, sourceMessageIds: req.sourceMessageIds,
+    });
+    if (!res) throw new HttpError(404, `subtask not found: ${req.taskId}`);
+    logger.info(`[subtask-orch] report_progress ${task.taskId} manager manual_done → digest (obs=${res.observation.obsId} deduped=${res.deduped})`);
+    return { taskId: task.taskId, suppressed: true, enteredDigest: true, obsId: res.observation.obsId, deduped: res.deduped };
   }
   // 边界5: 手动上报走 enqueueCommand，**不推 committedCursor、不建 Observation**，跟 observer 高水位分离。
   const commandType = req.type === 'done' ? 'report_done' : 'report_help';
@@ -394,7 +430,8 @@ export interface AskForHelpReq {
  * 由 coco(dispatcher) 异步触发急急如律令 base relay 唤主 bot。「本质上是一种内存共享式的通信」(松松)。
  * 等价 reportProgress(type='need_help')，但语义面向执行者 (注入小尾巴里告诉子 bot「卡住用 askforhelp、别硬扛」)。
  */
-export async function askForHelp(req: AskForHelpReq): Promise<{ cmdId: string; taskId: string }> {
+export async function askForHelp(req: AskForHelpReq): Promise<{ cmdId?: string; taskId: string }> {
+  // type=need_help → 走 reportProgress 的 enqueue 路径 (manager 也实时推，真紧急)，恒返 cmdId。
   return reportProgress({ sessionId: req.sessionId, taskId: req.taskId, type: 'need_help', summary: req.summary, sourceMessageIds: req.sourceMessageIds, idempotencyKey: req.idempotencyKey });
 }
 
@@ -639,4 +676,161 @@ export async function supplementSubtask(req: SupplementSubtaskReq): Promise<{ ta
   if (!result) throw new HttpError(409, 'supplement illegal transition');
   logger.info(`[subtask-orch] supplement ${req.taskId} cmd=${result.command.cmdId}`);
   return { taskId: req.taskId, cmdId: result.command.cmdId, status: result.task.status };
+}
+
+// ─── 双层汇报 v6：经理汇报邮件 (manager-report) + CEO 主动 pull (request-report) ──────
+
+/** 双层汇报 B1 机制门控（蔻黛架构 review）：manager 任何**实时**上报必须携带非空理由/摘要，否则拒。
+ *  统一在此断言，杜绝"无理由实时打扰 CEO"。executor 不过此闸。kind 仅用于报错文案。 */
+export function assertManagerRealtimeJustified(kind: string, reason: string | undefined | null): void {
+  if (!reason || !reason.trim()) {
+    throw new HttpError(400, `manager 实时上报(${kind})必须给理由/摘要（机制门控：要打扰 CEO 就得写清为什么）；常规进展请用 normal 进收件箱`);
+  }
+}
+
+/** 解析一封汇报邮件的寻址 + 溯源（嵌套逐级：收件人=直接父群 orchestrator）。 */
+function inboxAddressing(task: SubTask): {
+  recipientChatId: string; recipientBotOpenId: string; fromLabel: string;
+  parentTaskId: string | null; rootTaskId: string | null; depth: number;
+} {
+  const parentTask = getByChatId(task.parentChatId);
+  return {
+    recipientChatId: task.parentChatId,
+    recipientBotOpenId: parentOrchestratorOpenId(task),
+    fromLabel: task.bots.find(b => b.role === 'main')?.name ?? task.goal.slice(0, 24),
+    parentTaskId: parentTask?.taskId ?? null,
+    rootTaskId: task.rootChatId ? (getByChatId(task.rootChatId)?.taskId ?? null) : null,
+    depth: task.depth ?? 1,
+  };
+}
+
+export interface ManagerReportCoreOpts {
+  summary: string; body?: string | null;
+  reportKind: ReportKind; urgency: 'normal' | 'urgent'; reason?: string | null;
+  requestCommandId?: string | null; sourceObservationIds?: string[];
+  windowStart?: string | null; windowEnd?: string | null;
+  idempotencyKey: string;
+}
+
+/** 核心：把一封经理汇报落收件箱（正文→mailbox letter；urgent→额外 report_urgent 实时唤父群）。
+ *  无 session —— CLI 包装(managerReport)做鉴权后调；digest tick 内部也直接调（reportKind=scheduled）。 */
+export async function managerReportCore(task: SubTask, opts: ManagerReportCoreOpts): Promise<{ entryId: string; letterId: string | null; urgentCmdId: string | null; inserted: boolean }> {
+  let letterId: string | null = null;
+  if (opts.body && opts.body.trim()) {
+    // letter 幂等键与 inbox 对齐（蔻黛 minor4），重跑不产多封正文。
+    const letter = writeLetter(opts.body, { idempotencyKey: `mrletter-${opts.idempotencyKey}`, taskId: task.taskId, commandType: 'report_digest' });
+    letterId = letter.letterId;
+  }
+  const addr = inboxAddressing(task);
+  const { entry, inserted } = await enqueueEntry({
+    ...addr,
+    fromTaskId: task.taskId, fromChatId: task.chatId,
+    reportKind: opts.reportKind, summary: opts.summary, letterId,
+    windowStart: opts.windowStart ?? null, windowEnd: opts.windowEnd ?? null,
+    sourceObservationIds: opts.sourceObservationIds ?? [],
+    requestCommandId: opts.requestCommandId ?? null,
+    urgency: opts.urgency, urgentReason: opts.urgency === 'urgent' ? (opts.reason ?? null) : null,
+    idempotencyKey: opts.idempotencyKey,
+  });
+  let urgentCmdId: string | null = null;
+  if (opts.urgency === 'urgent' && inserted) {
+    // 蔻黛 M3：report_urgent 独立类型，带 inboxEntryId discriminator，实时唤父群但不进 help 生命周期。
+    const cmd = await enqueueCommand({
+      taskId: task.taskId, direction: 'child_to_parent', targetChatId: task.parentChatId,
+      commandType: 'report_urgent', payload: { summary: opts.summary, inboxEntryId: entry.id },
+      idempotencyKey: `urgent-${opts.idempotencyKey}`, expectedTaskVersion: task.version,
+    });
+    urgentCmdId = cmd.cmdId;
+  }
+  logger.info(`[subtask-orch] manager-report ${task.taskId} kind=${opts.reportKind} urgency=${opts.urgency} entry=${entry.id} letter=${letterId ?? '-'}${urgentCmdId ? ` urgent=${urgentCmdId}` : ''}`);
+  return { entryId: entry.id, letterId, urgentCmdId, inserted };
+}
+
+export interface ManagerReportReq {
+  sessionId: string; taskId: string; summary: string; body?: string;
+  urgency?: 'normal' | 'urgent'; reason?: string;
+  reportKind?: ReportKind;
+  /** CEO request-report 履约关联：CLI --request-id（蔻黛 B2，写回 entry.requestCommandId）。 */
+  requestId?: string; requestCommandId?: string;
+  sourceMessageIds?: string[]; idempotencyKey?: string;
+}
+
+const URGENCY_VALUES = ['normal', 'urgent'] as const;
+const REPORT_KIND_VALUES = ['scheduled', 'manual', 'requested', 'urgent'] as const;
+
+/** CLI/IPC：经理子群的 main bot 写一封汇报邮件进收件箱。normal 不唤醒；urgent 必须带 reason（机制门控）。 */
+export async function managerReport(req: ManagerReportReq): Promise<{ taskId: string; entryId: string; letterId: string | null; urgentCmdId: string | null }> {
+  const session = getSession(req.sessionId);
+  if (!session) throw new HttpError(403, `unknown session: ${req.sessionId}`);
+  const task = getSubTask(req.taskId);
+  if (!task) throw new HttpError(404, `subtask not found: ${req.taskId}`);
+  if (!isManager(task)) throw new HttpError(400, `manager-report 仅 manager 子群适用（task ${req.taskId} 是 executor）`);
+  if (session.chatId !== task.chatId) throw new HttpError(403, `manager-report must come from the manager subtask chat`);
+  const botOpenId = sessionBotOpenId(session.larkAppId);
+  const me = botOpenId ? task.bots.find(b => b.openId === botOpenId) : undefined;
+  if (!me || me.role !== 'main') throw new HttpError(403, `only the manager's executor(main) bot can manager-report`);
+  if (!req.summary?.trim()) throw new HttpError(400, 'missing summary');
+  // 蔻黛 M1：运行时枚举校验（TS 类型挡不住 IPC/CLI 输入）。非法 urgency 会绕过 reason 门控、写脏 store。
+  const urgency = req.urgency ?? 'normal';
+  if (!URGENCY_VALUES.includes(urgency as any)) throw new HttpError(400, `invalid urgency: ${req.urgency} (use normal|urgent)`);
+  const reportKind = req.reportKind ?? 'manual';
+  if (!REPORT_KIND_VALUES.includes(reportKind as any)) throw new HttpError(400, `invalid report-kind: ${req.reportKind} (use scheduled|manual|requested|urgent)`);
+  if (urgency === 'urgent') assertManagerRealtimeJustified('manager-report urgent', req.reason);
+  if (task.status === 'finished' || task.status === 'stopped') throw new HttpError(409, `subtask already ${task.status}`);
+  const idempotencyKey = req.idempotencyKey
+    ?? (req.sourceMessageIds?.length ? `mr-${req.taskId}-${req.sourceMessageIds.join(',')}` : `mr-${req.taskId}-${randomUUID()}`);
+  const r = await managerReportCore(task, {
+    summary: req.summary, body: req.body, reportKind,
+    urgency, reason: req.reason,
+    // 蔻黛 B2：CLI --request-id → requestId，写回 entry.requestCommandId（履约闭环）。
+    requestCommandId: req.requestId ?? req.requestCommandId,
+    sourceObservationIds: req.sourceMessageIds, idempotencyKey,
+  });
+  return { taskId: req.taskId, entryId: r.entryId, letterId: r.letterId, urgentCmdId: r.urgentCmdId };
+}
+
+export interface RequestReportReq { sessionId: string; taskId: string; note?: string; }
+
+/** CLI/IPC：CEO(父群 orchestrator) 主动命令某经理立即产 digest 邮件。区别于被动 subtask-query。 */
+export async function requestReport(req: RequestReportReq): Promise<{ taskId: string; cmdId: string; requestId: string }> {
+  const { task } = authzParentBot(req.sessionId, req.taskId);
+  if (!isManager(task)) throw new HttpError(400, `request-report 仅对 manager 子群有意义（task ${req.taskId} 是 executor）`);
+  if (task.status === 'finished' || task.status === 'stopped') throw new HttpError(409, `subtask already ${task.status}`);
+  const requestId = randomUUID();
+  const cmd = await enqueueCommand({
+    taskId: task.taskId, direction: 'parent_to_child', targetChatId: task.chatId,
+    commandType: 'request_report', payload: { content: req.note, requestId, targetRole: 'main' },
+    idempotencyKey: `reqreport-${requestId}`, expectedTaskVersion: task.version,
+  });
+  logger.info(`[subtask-orch] request-report ${task.taskId} cmd=${cmd.cmdId} requestId=${requestId}`);
+  return { taskId: req.taskId, cmdId: cmd.cmdId, requestId };
+}
+
+// ─── 双层汇报 v6：CEO 收件箱 list / read（收件人=自己的群、reader=自己，鉴权天然逐级隔离）──────
+
+export interface ListInboxReq { sessionId: string; unreadOnly?: boolean; since?: string; limit?: number; withBody?: boolean; }
+
+/** 列调用者(收件人)自己群的收件箱。reader=调用 bot；只能看投给"自己群+自己"的邮件（蔻黛 B2 鉴权）。 */
+export async function listManagerInbox(req: ListInboxReq): Promise<{ entries: Array<InboxEntry & { body?: string | null }> }> {
+  const session = getSession(req.sessionId);
+  if (!session) throw new HttpError(403, `unknown session: ${req.sessionId}`);
+  const botOpenId = sessionBotOpenId(session.larkAppId);
+  if (!botOpenId) throw new HttpError(403, `cannot identify caller bot (larkAppId=${session.larkAppId})`);
+  const entries = listInbox(session.chatId, botOpenId, { unreadOnly: req.unreadOnly, since: req.since, limit: req.limit });
+  if (!req.withBody) return { entries };
+  // 可选展开正文（从 mailbox letter 取）—— 便于 CEO 一次读全。
+  return { entries: entries.map(e => ({ ...e, body: e.letterId ? (readLetter(e.letterId)?.payload ?? null) : null })) };
+}
+
+export interface MarkInboxReadReq { sessionId: string; ids: string[]; }
+
+/** 标自己收件箱里若干邮件已读（per-reader）。 */
+export async function markInboxRead(req: MarkInboxReadReq): Promise<{ marked: number }> {
+  const session = getSession(req.sessionId);
+  if (!session) throw new HttpError(403, `unknown session: ${req.sessionId}`);
+  const botOpenId = sessionBotOpenId(session.larkAppId);
+  if (!botOpenId) throw new HttpError(403, `cannot identify caller bot`);
+  // 蔻黛 B1：按 (自己群, 自己) 双匹配才标已读，杜绝凭 id 跨箱写 readBy。
+  const marked = await markRead(session.chatId, botOpenId, req.ids ?? []);
+  return { marked };
 }

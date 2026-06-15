@@ -1396,6 +1396,11 @@ const SUBTASK_ORCH_ROUTES: Array<[string, string]> = [
   ['/api/subtask-orch-supplement', 'supplementSubtask'],
   ['/api/subtask-orch-askforhelp', 'askForHelp'],
   ['/api/subtask-orch-request-review', 'requestReview'],   // 优化 #1: 执行者唤起 reviewer
+  // 双层汇报 v6 (经理汇报制度)：
+  ['/api/subtask-orch-manager-report', 'managerReport'],   // 经理写汇报邮件进收件箱 (normal/urgent)
+  ['/api/subtask-orch-request-report', 'requestReport'],   // CEO 主动 pull：命令经理立即汇报
+  ['/api/subtask-orch-inbox-list', 'listManagerInbox'],    // CEO 列自己收件箱
+  ['/api/subtask-orch-inbox-read', 'markInboxRead'],       // CEO 标已读
 ];
 for (const [path, fnName] of SUBTASK_ORCH_ROUTES) {
   ipcRoute('POST', path, async (req, res) => {
@@ -3021,6 +3026,30 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     process.on('SIGTERM', () => clearInterval(dispatchHandle));
     process.on('SIGINT', () => clearInterval(dispatchHandle));
     logger.info(`[outbox-dispatcher] cron registered (every ${SUBTASK_DISPATCH_TICK_MS / 1000}s, claim/lease + retry) on coco daemon`);
+
+    // ── 子任务编排 · 双层汇报 Block 3 digest cron (2026-06-13): manager 子群定期把近期进展编成
+    // digest 推一条 (report_digest，不带急急如律令) 给直接父群。per-task 周期门控在 runDigestTick 内
+    // (lastDigestAt + INTERVAL + 空窗跳过)，所以扫描可勤跑；in-flight guard 防重叠。
+    const SUBTASK_DIGEST_TICK_MS = 5 * 60 * 1000;
+    let digestTickInFlight = false;
+    const digestHandle = setInterval(async () => {
+      if (digestTickInFlight) { logger.info('[subtask-digest] previous tick in flight — skip'); return; }
+      digestTickInFlight = true;
+      try {
+        const { runDigestTick } = await import('./services/subtask-digest.js');
+        const stats = await runDigestTick(new Date());
+        if (stats.pushed > 0) {
+          logger.info(`[subtask-digest] tick: checked=${stats.checked} pushed=${stats.pushed} skippedEmpty=${stats.skippedEmpty}`);
+        }
+      } catch (err) {
+        logger.error(`[subtask-digest] tick failed: ${err}`);
+      } finally {
+        digestTickInFlight = false;
+      }
+    }, SUBTASK_DIGEST_TICK_MS);
+    process.on('SIGTERM', () => clearInterval(digestHandle));
+    process.on('SIGINT', () => clearInterval(digestHandle));
+    logger.info(`[subtask-digest] cron registered (every ${SUBTASK_DIGEST_TICK_MS / 1000}s scan, per-task INTERVAL gate) on coco daemon`);
   }
 
   logger.info('Daemon is running. Press Ctrl+C to stop.');

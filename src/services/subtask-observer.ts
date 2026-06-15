@@ -188,6 +188,8 @@ async function tickOne(t: SubTask, now: Date, exec: ObserverExecutors): Promise<
       return hasNewHelpProgress(prev, analyzedMessageIds, judged.summary, prev?.respondedBySupplement ?? false)
         || shouldStaleRereport(prev, now);
     },
+    // 双层汇报: manager 门控 done 不实时推（剥 report_done）；executor 不传=旧行为。
+    t.reportingMode ?? 'executor',
   );
 
   try {
@@ -354,6 +356,33 @@ export function planCommit(
   // B 方案: observing 路径再判 need_help 时是否有"新实质进展"(相对上次 help)。
   // 默认 true = 旧行为 (无条件上报)，observer tickOne 注入真实判断。
   observingHelpHasNewProgress: () => boolean = () => true,
+  // 双层汇报: manager 门控。缺省 'executor' → 行为字节不变 (旧调用方不传)。
+  reportingMode: 'manager' | 'executor' = 'executor',
+): CommitPlan {
+  const plan = planCommitBase(status, signal, readToCursor, pendingDoneCmdIds, helpDelivery, staleHelpCmdIds, observingHelpHasNewProgress);
+  // manager 推送门控：done 是 routine，不实时推父群——剥掉 report_done（状态转移保留），
+  // 完成信息由定期 digest 上报。need_help/normal 路径不变（need_help=真紧急仍实时推；含现有防刷屏）。
+  if (reportingMode === 'manager' && signal === 'done' && plan.report?.commandType === 'report_done') {
+    const { report: _drop, ...rest } = plan;
+    // 蔻黛克斯 final blocker1：剥掉 done 上报后，若还有未 superseded 的旧 report_help（进 reported_help 时
+    // 发的、可能尚未投递），它仍会被 dispatcher 急急如律令推父群 → "已 done 还求助" 假紧急。
+    // 故 manager 转 done 时一并 supersede 这些旧 help（与既有 supersedeCommandIds 合并）。
+    const staleHelp = staleHelpCmdIds();
+    if (staleHelp.length) {
+      rest.supersedeCommandIds = [...new Set([...(rest.supersedeCommandIds ?? []), ...staleHelp])];
+    }
+    return rest;
+  }
+  return plan;
+}
+
+/** executor 基础决策（旧逻辑，字节不变）。manager 门控在 planCommit 外层做 done 的 report 剥离。 */
+function planCommitBase(
+  status: SubTaskStatus, signal: Signal, readToCursor: string | null,
+  pendingDoneCmdIds: () => string[],
+  helpDelivery: () => HelpDelivery,
+  staleHelpCmdIds: () => string[],
+  observingHelpHasNewProgress: () => boolean,
 ): CommitPlan {
   const helpReport = { commandType: 'report_help' as const, idempotencyKey: `help_${readToCursor}` };
   const doneReport = { commandType: 'report_done' as const, idempotencyKey: `done_${readToCursor}` };

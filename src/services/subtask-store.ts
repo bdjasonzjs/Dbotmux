@@ -35,7 +35,14 @@ export type Signal = 'normal' | 'need_help' | 'done';
 export type OutboxDirection = 'child_to_parent' | 'parent_to_child';
 export type CommandType = 'report_help' | 'report_done' | 'finish' | 'supplement' | 'kickoff'
   // 优化 #1 (时序门控)：执行者产出后显式唤 reviewer。优化 #3：停滞自动唤醒执行者。
-  | 'request_review' | 'nudge';
+  | 'request_review' | 'nudge'
+  // 双层汇报：manager 子群定期业务汇报 (child→parent，**不带急急如律令**、不唤醒，纯 FYI)。
+  | 'report_digest'
+  // 双层汇报 v6：manager 业务**紧急** (child→parent，带急急如律令实时唤父群，指向收件箱 entry)。
+  //   与 report_help 区别：不进 reported_help 状态机、不参与 help dedup/supersede (蔻黛 M3 类型隔离)。
+  | 'report_urgent'
+  // 双层汇报 v6：CEO 主动 pull (parent→child，唤经理立即产 digest 邮件)。
+  | 'request_report';
 /** 命令定向角色 (优化 #1/#3)。缺省 (老命令/未写) 由 dispatcher 解释为 legacy=all，保持旧行为。 */
 export type CommandTargetRole = 'main' | 'collab' | 'all';
 
@@ -77,6 +84,43 @@ export interface SubTask {
   rootChatId?: string;
   /** G1 可裂变开关：create 一锤定音，true 才允许本任务子群再 subtask-start（缺省 false）。 */
   spawnable?: boolean;
+  // 双层汇报 (manager vs executor)：均为加法、可选；缺省语义见注释，零迁移。
+  /** 子群汇报模式：'manager'=部门经理(推送门控 + 定期 digest)；'executor'=执行者(实时直报)。
+   *  缺省 (老数据/未写) = executor，行为与存量字节级一致。create 一锤定音。 */
+  reportingMode?: 'manager' | 'executor';
+  /** 最近一次定期 digest 推送时间 (仅 manager 用)。缺省 = 从未 digest (首窗按 createdAt 起算)。 */
+  lastDigestAt?: string | null;
+  /** 本任务最近一次 digest 的摘要正文 (仅 manager 用)。供父任务 digest 逐级 store 级聚合读取
+   *  (孙群 digest 走 owner relay 会被父 observer 的 owner-only 回声过滤跳过，故聚合靠此字段而非聊天回读)。 */
+  lastDigestSummary?: string | null;
+  /** lastDigestSummary **内容产生**的时间 (仅 manager 用，蔻黛克斯 review blocker)。与 lastDigestAt 解耦：
+   *  lastDigestAt 是窗口游标 (空窗也推进)，本字段只在**真推非空 digest** 时随 summary 一起更新。父 rollup
+   *  按本字段判"子是否本窗有新活动"，避免空窗推进 lastDigestAt 把上一周期旧摘要误当新动静重复卷进父 digest。 */
+  lastDigestSummaryAt?: string | null;
+}
+
+/** 是否部门经理子群 (双层汇报)。缺省/executor → false (旧行为)。 */
+export function isManager(t: SubTask): boolean {
+  return t.reportingMode === 'manager';
+}
+
+/** 双层汇报推送门控：某条 child→parent 上报是否应**实时**推父群 (急急如律令)。
+ *  - executor (缺省)：恒 true —— 行为与存量字节级一致。
+ *  - manager：只「真紧急」实时推 —— done/normal 路径走定期 digest，不实时惊动父群。
+ *    真紧急 = need_help (auto/manual) 与停滞 escalate；routine = done (auto/manual)。
+ *  kind 覆盖全部 child→parent 上报入口 (planCommit 自动判 / reportProgress 手动 / stall escalate)。 */
+export type PushKind = 'auto_done' | 'auto_help' | 'manual_done' | 'manual_help' | 'stall_escalate';
+export function shouldRealtimePush(t: SubTask, kind: PushKind): boolean {
+  if (!isManager(t)) return true;                  // executor 全推 (旧行为)
+  switch (kind) {
+    case 'auto_done':
+    case 'manual_done':
+      return false;                                // routine 完成 → 进 digest，不实时推
+    case 'auto_help':
+    case 'manual_help':
+    case 'stall_escalate':
+      return true;                                 // 真紧急 → 实时推
+  }
 }
 
 /** Outbox 投递信封：双向命令统一建模。 */
@@ -88,7 +132,11 @@ export interface OutboxCommand {
   commandType: CommandType;
   payload: { summary?: string; content?: string; sourceMessageIds?: string[];
     /** 优化 #1/#3：命令定向角色。缺省 → dispatcher 解释为 legacy=all (旧行为)。 */
-    targetRole?: CommandTargetRole };
+    targetRole?: CommandTargetRole;
+    /** 双层汇报 v6：report_urgent 关联的收件箱 entry id (discriminator，蔻黛 M3)。 */
+    inboxEntryId?: string;
+    /** 双层汇报 v6：request_report 的 requestId (履约闭环，蔻黛 M5)。 */
+    requestId?: string };
   idempotencyKey: string;          // 防重发
   expectedTaskVersion: number | null;
   deliveryStatus: DeliveryStatus;
@@ -121,6 +169,9 @@ export interface Observation {
   /** 优化 #3：本轮增量是否含**执行者侧实质活动** (排除 owner/base-relay 的 nudge 回声)。
    *  持久化此标记，停滞门控的 activity baseline 只认 true 的观测；缺省 (老数据) 视为 undefined。 */
   hasExecutorActivity?: boolean;
+  /** 双层汇报：manager 手动 done 落游标中性 observation 时的幂等键 (= reportProgress 的 idempotencyKey/
+   *  sourceMessageIds 派生)。同 task 同 key 已存在则不重复落 (重试安全)。缺省=非手动幂等场景。 */
+  manualDedupeKey?: string;
 }
 
 interface StoreFile {
@@ -243,6 +294,7 @@ export async function createSubTask(opts: {
   requester: string; createdBy: string; idempotencyKey: string;
   staleAfter?: number | null; deadline?: string | null;
   depth?: number; rootChatId?: string; spawnable?: boolean;
+  reportingMode?: 'manager' | 'executor';
 }): Promise<SubTask> {
   return mutate(s => {
     const existing = s.subtasks.find(t => t.idempotencyKey === opts.idempotencyKey);
@@ -259,6 +311,8 @@ export async function createSubTask(opts: {
       readCursor: null, committedCursor: null, deadline: opts.deadline ?? null,
       staleAfter: opts.staleAfter ?? null, compactSummary: null, lastError: null,
       depth: opts.depth, rootChatId: opts.rootChatId, spawnable: opts.spawnable,
+      reportingMode: opts.reportingMode ?? 'executor', lastDigestAt: null, lastDigestSummary: null,
+      lastDigestSummaryAt: null,
     };
     s.subtasks.push(t);
     logger.info(`[subtask-store] created subtask ${t.taskId} chat=${opts.chatId.slice(0, 12)}`);
@@ -352,11 +406,22 @@ export async function commitObservationTransaction(opts: {
    *  true → 记进 observation + 更新 lastExecutorActivityAt + 清 nudge 态 (执行者还活着)。
    *  false/缺省 → 仅推进 cursor (owner nudge 回声不当 activity，不动 nudge 态)。 */
   hasExecutorActivity?: boolean;
+  /** 双层汇报：manager 手动 done 落游标中性 observation 的幂等键。提供且同 task 已有同 key 的
+   *  observation → 直接返回既有 (不重复落)，重试安全。 */
+  manualDedupeKey?: string;
 }): Promise<{ observation: Observation; command: OutboxCommand | null } | null> {
   return mutate(s => {
     const idx = s.subtasks.findIndex(t => t.taskId === opts.taskId);
     if (idx < 0) return { result: null, dirty: false };
     const cur = s.subtasks[idx];
+    // 幂等 (manager manual_done)：同 task 已有同 manualDedupeKey 的 observation → 返既有、不重复落、不转态。
+    if (opts.manualDedupeKey) {
+      const dup = s.observations.find(o => o.taskId === opts.taskId && o.manualDedupeKey === opts.manualDedupeKey);
+      if (dup) {
+        logger.info(`[subtask-store] commit tx ${opts.taskId} manualDedupe hit key=${opts.manualDedupeKey} → ${dup.obsId}`);
+        return { result: { observation: dup, command: null }, dirty: false };
+      }
+    }
     if (opts.expectedVersion != null && cur.version !== opts.expectedVersion) {
       throw new VersionConflictError(opts.taskId, opts.expectedVersion, cur.version);
     }
@@ -386,6 +451,7 @@ export async function commitObservationTransaction(opts: {
       analyzedMessageIds: opts.analyzedMessageIds, evidenceLinks: opts.evidenceLinks ?? [],
       summary: opts.summary, signal: opts.signal,
       hasExecutorActivity: opts.hasExecutorActivity ?? false,
+      ...(opts.manualDedupeKey ? { manualDedupeKey: opts.manualDedupeKey } : {}),
     };
     s.observations.push(observation);
 
@@ -421,6 +487,62 @@ export async function commitObservationTransaction(opts: {
     };
     logger.info(`[subtask-store] commit tx ${opts.taskId}: obs=${observation.obsId}${command ? ` cmd=${command.cmdId}(${command.commandType})` : ''} cursor→${opts.readToCursor?.slice(0, 10) ?? 'null'}${opts.hasExecutorActivity ? ' [exec-activity]' : ''}`);
     return { result: { observation, command }, dirty: true };
+  });
+}
+
+/**
+ * 双层汇报：manager 手动 done 落「游标中性 observation」（不实时推父群、交给定期 digest）。
+ *
+ * 与 commitObservationTransaction 区别：committedCursor 在**锁内**读取并原样回写
+ * (readFrom=readTo=当前 committedCursor)，**不做** readFromCursor===committedCursor 的 TOCTOU 校验
+ * ——手动上报与 observer tick 可能并发推进 cursor，这里不该因 cursor 漂移而抛冲突 (manual 动作不能报错给用户)。
+ *
+ * 语义：
+ *  - 落一条 signal='done' 的中性 observation，保住执行者的显式 summary (含 doc 链接)，供 digest 消费。
+ *  - 同时尝试 statusTo='reported_done'（停泊、不再被 stall nudge/escalate 误升级；不合法则跳过转移）。
+ *  - 更新 lastExecutorActivityAt + 清 nudge 态（手动 done 是执行者实质活动，双保险防停滞误报）。
+ *  - 幂等：同 task 已有同 manualDedupeKey 的 observation → 返既有、不重复落。
+ */
+export async function recordManualDoneObservation(opts: {
+  taskId: string; summary: string; manualDedupeKey: string; sourceMessageIds?: string[];
+}): Promise<{ observation: Observation; transitioned: boolean; deduped: boolean } | null> {
+  return mutate<{ observation: Observation; transitioned: boolean; deduped: boolean } | null>(s => {
+    const idx = s.subtasks.findIndex(t => t.taskId === opts.taskId);
+    if (idx < 0) return { result: null, dirty: false };
+    const cur = s.subtasks[idx];
+    const dup = s.observations.find(o => o.taskId === opts.taskId && o.manualDedupeKey === opts.manualDedupeKey);
+    if (dup) {
+      logger.info(`[subtask-store] recordManualDone ${opts.taskId} dedupe hit key=${opts.manualDedupeKey} → ${dup.obsId}`);
+      return { result: { observation: dup, transitioned: false, deduped: true }, dirty: false };
+    }
+    const now = new Date().toISOString();
+    const observation: Observation = {
+      obsId: genId('ob'), taskId: opts.taskId, at: now,
+      readFromCursor: cur.committedCursor, readToCursor: cur.committedCursor,
+      analyzedMessageIds: [], evidenceLinks: opts.sourceMessageIds ?? [],
+      summary: opts.summary, signal: 'done', hasExecutorActivity: true,
+      manualDedupeKey: opts.manualDedupeKey,
+    };
+    s.observations.push(observation);
+    const canPark = isTransitionAllowed(cur.status, 'reported_done');
+    // 蔻黛克斯 final blocker1（同病修复）：manager 手动 done 停泊到 reported_done 时，把该 task 未 superseded
+    // 的 report_help 一并 supersede —— 否则进 reported_help 时发的旧 help 仍会被 dispatcher 急急如律令推父群，
+    // 形成"已 done 还求助"假紧急。
+    if (canPark) {
+      for (const c of s.commands) {
+        if (c.taskId === opts.taskId && c.commandType === 'report_help' && c.supersededBy == null) {
+          c.supersededBy = observation.obsId;
+        }
+      }
+    }
+    s.subtasks[idx] = {
+      ...cur,
+      status: canPark ? 'reported_done' : cur.status,
+      version: cur.version + 1, updatedAt: now,
+      lastExecutorActivityAt: now, lastNudgeAt: null, nudgeCount: 0,
+    };
+    logger.info(`[subtask-store] recordManualDone ${opts.taskId}: obs=${observation.obsId}${canPark ? ' →reported_done (+supersede stale help)' : ` (stay ${cur.status})`}`);
+    return { result: { observation, transitioned: canPark, deduped: false }, dirty: true };
   });
 }
 
@@ -766,9 +888,27 @@ export function latestHelpReport(taskId: string): {
 
 // ─── Observation ─────────────────────────────────────────────────────────────
 
-export function listObservations(taskId: string, limit?: number): Observation[] {
-  const obs = read().observations.filter(o => o.taskId === taskId);
-  return limit != null ? obs.slice(-limit) : obs;
+/** 列某 task 的 observation。
+ *  - 旧签名 `listObservations(taskId, 5)`：返回最近 limit 条 (尾部)，行为不变 (向后兼容)。
+ *  - 新签名 `listObservations(taskId, {since, limit})`：先按 `Observation.at >= since` 过滤 (bounded
+ *    lookback，digest 用)，再取尾部 limit 条。两参均可选。 */
+export function listObservations(
+  taskId: string,
+  limitOrOpts?: number | { since?: string; limit?: number },
+): Observation[] {
+  let obs = read().observations.filter(o => o.taskId === taskId);
+  if (typeof limitOrOpts === 'number') {
+    return obs.slice(-limitOrOpts);
+  }
+  if (limitOrOpts && typeof limitOrOpts === 'object') {
+    const { since, limit } = limitOrOpts;
+    if (since) {
+      const sinceMs = new Date(since).getTime();
+      if (Number.isFinite(sinceMs)) obs = obs.filter(o => new Date(o.at).getTime() >= sinceMs);
+    }
+    return limit != null ? obs.slice(-limit) : obs;
+  }
+  return obs;
 }
 
 // ─── 清理 ─────────────────────────────────────────────────────────────────────

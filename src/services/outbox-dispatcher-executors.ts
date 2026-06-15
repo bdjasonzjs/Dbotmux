@@ -88,6 +88,19 @@ function urgentSummon(names: string[], body: string): string {
 /** 子群 → 父群上报文案 (急急如律令唤主 bot)：**只给 taskId/commandId + query 指引**，
  *  绝不塞 LLM/子群总结 (不可信内容不进父群、不替主 bot 决策)。 */
 export function childToParentSummon(cmd: OutboxCommand, task: SubTask): string {
+  // 双层汇报：manager 定期 digest —— **不拼急急如律令前缀**，是普通 owner 消息 (FYI、不唤醒父群 bot)。
+  // 必须在 report_help/report_done 的「非 help 即 done」二分前拦截，否则会被误判成 done 且带急急如律令。
+  if (cmd.commandType === 'report_digest') {
+    const name = task.bots.find(b => b.role === 'main')?.name ?? task.goal.slice(0, 16);
+    return `📊【定期汇报｜${safeText(name, 24)}】${safeText(cmd.payload.summary ?? '', CONTENT_MAX)} （taskId=${task.taskId}，需详情可 botmux subtask-query）`;
+  }
+  // 双层汇报 v6：manager 业务紧急 —— **带急急如律令实时唤父群 orchestrator**，指向收件箱 entry。
+  // 与 report_help 区别：不进 help 生命周期、不触发 reported_help 状态/dedup（蔻黛 M3）。
+  if (cmd.commandType === 'report_urgent') {
+    const eid = cmd.payload.inboxEntryId ? ` 收件箱 entry=${cmd.payload.inboxEntryId}` : '';
+    const body = `🚨 经理紧急汇报：${safeText(cmd.payload.summary ?? '', CONTENT_MAX)}。taskId=${task.taskId}${eid}。请查看收件箱 \`botmux subtask-inbox-list\` 处理。`;
+    return urgentSummon([parentOrchestratorName(task)], body);
+  }
   const label = cmd.commandType === 'report_help' ? '需要协助' : '已完成（待确认）';
   const body = [
     `🛰️ 子任务状态变化：${label}。taskId=${task.taskId} commandId=${cmd.cmdId}。`,
@@ -124,6 +137,13 @@ function parentToChildSummonBody(cmd: OutboxCommand, task: SubTask): string {
     // 优化 #3：停滞自动唤醒——只唤执行者(main)，内容就一句 (松松指定)。
     return urgentSummon(resolveTargets(task, 'main'), '任务搞定没有？');
   }
+  if (cmd.commandType === 'request_report') {
+    // 双层汇报 v6：CEO 主动 pull —— 唤经理(main) 立即产 digest 邮件进收件箱。
+    const note = cmd.payload.content ? ` 关注点：${safeText(cmd.payload.content, CONTENT_MAX)}` : '';
+    const rid = cmd.payload.requestId ? ` --request-id ${cmd.payload.requestId}` : '';
+    return urgentSummon(resolveTargets(task, 'main'),
+      `📥 CEO 要你立刻汇报（taskId=${task.taskId}）。${note} 请运行 \`botmux subtask-manager-report --task-id ${task.taskId} --report-kind requested${rid} --summary "<一行进展>" [--body "<详情>"]\` 把汇报邮件投进收件箱。`);
+  }
   if (cmd.commandType === 'finish') {
     const note = cmd.payload.content ? ` 说明：${safeText(cmd.payload.content, CONTENT_MAX)}` : '';
     return urgentSummon(resolveTargets(task, 'all'), `✅ 主bot 已结束本子任务（taskId=${task.taskId}）。${note}`);
@@ -149,11 +169,13 @@ export function makeDispatchExecutors(): DispatchExecutors {
         existingRecordId: cmd.relayRecordId ?? undefined,
       });
       if (res.ok) {
-        logger.info(`[outbox-dispatcher-exec] summon sent cmd ${cmd.cmdId} (${cmd.commandType}) → ${cmd.targetChatId.slice(0, 12)} record=${res.recordId?.slice(0, 12) ?? '?'}`);
-        return { ok: true, messageId: res.recordId, relayRecordId: res.recordId };  // base relay 无真 messageId，用 recordId 追溯 (v3 锚点是 commandId)
+        // record 已写入 = 已投递 (at-least-once)。confirmed=false 表示已投递但自动化还没回写「已发送」。
+        logger.info(`[outbox-dispatcher-exec] summon sent cmd ${cmd.cmdId} (${cmd.commandType})${res.confirmed ? '' : ' [unconfirmed]'} → ${cmd.targetChatId.slice(0, 12)} record=${res.recordId?.slice(0, 12) ?? '?'}`);
+        return { ok: true, messageId: res.recordId, relayRecordId: res.recordId, confirmed: res.confirmed };  // base relay 无真 messageId，用 recordId 追溯 (v3 锚点是 commandId)
       }
-      logger.warn(`[outbox-dispatcher-exec] summon failed cmd ${cmd.cmdId}: ${res.error}`);
-      return { ok: false, error: res.error, relayRecordId: res.recordId };  // 带回 recordId：首发已建记录、poll 超时，下轮复用别重发
+      logger.warn(`[outbox-dispatcher-exec] summon failed cmd ${cmd.cmdId}${res.authError ? ' [AUTH]' : ''}${res.cancelled ? ' [CANCELLED]' : ''}: ${res.error}`);
+      // authError/cancelled 透传：dispatcher 据此累计 token 告警 / 终态作废 (不重试)。
+      return { ok: false, error: res.error, authError: res.authError, cancelled: res.cancelled, relayRecordId: res.recordId };  // 带回 recordId：首发已建记录、poll 超时，下轮复用别重发
     },
   };
 }
