@@ -30,7 +30,13 @@ export type SubTaskStatus =
   | 'reported_help' | 'reported_done' | 'finished'
   | 'paused' | 'error' | 'stopped';
 
-export type DeliveryStatus = 'pending' | 'sent' | 'acked' | 'failed';
+// 投递生命周期 (v2 at-least-once, 2026-06-15)：
+//   pending → (写 record 成功) → sent_unconfirmed → (异步对账确认) → sent → (主bot query) → acked
+//                                              └ (已取消) → failed   └ (写不进且重试耗尽) → failed
+// sent_unconfirmed = record 已 durably 写入飞书 base、自动化会发，但还没异步确认到「已发送」。
+//   · 读取方语义：listPendingCommands 不投它 (已写过)；reconcile 专门处理它；helpReportDelivery 当「在途」不补发。
+//   · ack 优先：主bot 可能在确认前就 query+ack → acked 是终态，completeDispatch 守卫绝不把它降级/重发。
+export type DeliveryStatus = 'pending' | 'sent_unconfirmed' | 'sent' | 'acked' | 'failed';
 export type Signal = 'normal' | 'need_help' | 'done';
 export type OutboxDirection = 'child_to_parent' | 'parent_to_child';
 export type CommandType = 'report_help' | 'report_done' | 'finish' | 'supplement' | 'kickoff'
@@ -741,6 +747,16 @@ export function listPendingCommands(now: Date = new Date()): OutboxCommand[] {
     (c.dispatchingUntil == null || new Date(c.dispatchingUntil).getTime() <= now.getTime()),
   );
 }
+
+/** v2 异步对账：待确认命令 (record 已写、等异步确认到「已发送」)。复用 nextRetryAt 当「下次核对时间」、
+ *  dispatchingUntil 当 lease。dispatcher 在投递 pending 之后再 reconcile 这批。 */
+export function listUnconfirmedCommands(now: Date = new Date()): OutboxCommand[] {
+  return read().commands.filter(c =>
+    c.deliveryStatus === 'sent_unconfirmed' && c.supersededBy == null &&
+    (c.nextRetryAt == null || new Date(c.nextRetryAt).getTime() <= now.getTime()) &&
+    (c.dispatchingUntil == null || new Date(c.dispatchingUntil).getTime() <= now.getTime()),
+  );
+}
 export async function updateCommand(cmdId: string, patch: Partial<Omit<OutboxCommand, 'cmdId' | 'taskId'>>): Promise<OutboxCommand | null> {
   return mutate(s => {
     const idx = s.commands.findIndex(c => c.cmdId === cmdId);
@@ -761,7 +777,9 @@ export async function claimCommandForDispatch(
     if (idx < 0) return { result: null, dirty: false };
     const c = s.commands[idx];
     const leaseHeld = c.dispatchingUntil != null && new Date(c.dispatchingUntil).getTime() > now.getTime();
-    if (c.deliveryStatus !== 'pending' || c.supersededBy != null || leaseHeld) {
+    // v2：pending (首投) 和 sent_unconfirmed (异步对账) 都可 claim；其余终态/superseded 不可。
+    const claimable = c.deliveryStatus === 'pending' || c.deliveryStatus === 'sent_unconfirmed';
+    if (!claimable || c.supersededBy != null || leaseHeld) {
       return { result: null, dirty: false };
     }
     s.commands[idx] = {
@@ -826,6 +844,11 @@ export function helpReportDelivery(taskId: string, now: Date, ackTimeoutMs: numb
     case 'acked': return 'acked';
     case 'failed': return 'failed';
     case 'pending': return 'pending';
+    // v2 P2 (蔻黛)：sent_unconfirmed = relay 还没确认送达 → **一律当在途 fresh、永不 expired**，
+    // 绝不走 help 层换新 cmdId 补发。「确认前的投递/重发」由 dispatcher Phase B 复用同 cmdId 负责
+    // (两层正交：Phase B=relay 投递层；help-respam=主bot 响应层)。只有**确认 sent 后**主bot 久未 ack，
+    // 才按 ackTimeout 走 help 兜底重报。这样不会出现「旧 record 延迟发 + 新 cmdId help」两条 help。
+    case 'sent_unconfirmed': return 'sent_unacked_fresh';
     case 'sent': {
       // 脏数据保守处理 (review P1-1): sent 却无有效 sentAt → 当没真送达, 偏 expired 允许补发,
       // 别因为缺时间戳就永远静默吞掉求助。

@@ -8,8 +8,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 import { config } from './config.js';
 import { statSync } from 'node:fs';
-import { getChatMode, replyMessage, resolveAllowedUsersWithMap, sendMessage, updateMessage } from './im/lark/client.js';
-import { loadBotConfigs, registerBot, getBot, getAllBots, findOncallChatForAnyBot, type BotState, type OncallChat } from './bot-registry.js';
+import { getChatMode, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
+import { loadBotConfigs, registerBot, getBot, getAllBots, getOwnerOpenId, findOncallChatForAnyBot, type BotState, type OncallChat } from './bot-registry.js';
 import * as sessionStore from './services/session-store.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { autoBindOncallFromDefault } from './services/oncall-store.js';
@@ -306,6 +306,61 @@ async function sessionReply(anchor: string, content: string, msgType: string = '
 
   // Thread-scope (or unknown / legacy): reply in thread.
   return replyMessage(appId, anchor, content, msgType, true);
+}
+
+/**
+ * relay 健康告警 (relay-health-alerter 判定后调用)。两类静默故障各一种文案：
+ *   · 'enqueue'      —— 连续写不进 record (消息根本没投出去)。鲁棒触发，不靠错误串解析；
+ *                       authFlavored=true 时已识别出授权失效信号 → 点名 token 重新授权。
+ *   · 'confirmation' —— record 写了但读不到「已发送」(如 record-get 被改坏)；消息很可能在送达、只是确认失败。
+ * **必须走 bot/app token** (sendMessage / sendUserMessage)，绝不走已死的 user token base relay。
+ * 落点：主话题 (topology.rootChatId) 发一条 @owner；失败/取不到 → 私聊 owner 兜底 (蔻黛 hardening：rootChat→ownerDM)。
+ * 返回 **是否真发出去** (蔻黛 P1)：true 才让上层 commit 限流窗口；false → 下个 tick 重试、不静音。
+ */
+async function sendRelayHealthAlert(kind: 'enqueue' | 'confirmation', consecutive: number, authFlavored: boolean): Promise<boolean> {
+  const appId = getAllBots()[0]?.config.larkAppId;
+  if (!appId) { logger.error('[relay-health] no bot app id — cannot send alert'); return false; }
+  const ownerOpenId = getOwnerOpenId(appId);
+  let rootChatId = '';
+  try {
+    const { readTopology } = await import('./services/chat-topology-store.js');
+    rootChatId = readTopology().rootChatId ?? '';
+  } catch { /* topology 读失败 → 走私聊兜底 */ }
+
+  const at = ownerOpenId ? `<at user_id="${ownerOpenId}"></at> ` : '';
+  const text = kind === 'enqueue'
+    ? `${at}🚨 botmux 告警：急急如律令 relay 投递持续失败\n`
+      + `现象：连续 ${consecutive} 轮写不进 record，消息根本没投出去。\n`
+      + (authFlavored ? `已识别到**授权失效信号**——大概率 owner user token 失效。\n` : `可能原因：owner user token 失效 / base 不可用 / 网络异常。\n`)
+      + `影响：主↔子群通信阻塞，子任务上报/下发卡住。\n`
+      + `处理：请优先在宿主机重新授权（device-flow，记得带 offline_access）：lark-cli auth login`
+    : `${at}⚠️ botmux 告警：急急如律令「确认环节」疑似坏了\n`
+      + `现象：连续 ${consecutive} 轮 record 写成功、却读不到「已发送」状态（消息很可能在送达、只是确认失败）。\n`
+      + (authFlavored ? `期间还检测到授权失效信号——也请顺手核对 owner user token。\n` : '')
+      + `常见原因：lark-cli record-get 输出格式/字段变更，或 base 自动化标记步异常。\n`
+      + `处理：核对 base-relay pollStatus 的 record-get 读取（参考 2026-06-09 record-get 默认 markdown 事件）。`;
+
+  // 先发主话题，失败再私聊 owner 兜底；任一成功即 true。
+  if (rootChatId) {
+    try {
+      await sendMessage(appId, rootChatId, text, 'text');
+      logger.warn(`[relay-health] ${kind.toUpperCase()} ALERT delivered (consecutive=${consecutive}, authFlavored=${authFlavored}, target=rootChat)`);
+      return true;
+    } catch (err) {
+      logger.error(`[relay-health] rootChat send failed, fall back to ownerDM: ${err}`);
+    }
+  }
+  if (ownerOpenId) {
+    try {
+      await sendUserMessage(appId, ownerOpenId, text);
+      logger.warn(`[relay-health] ${kind.toUpperCase()} ALERT delivered (consecutive=${consecutive}, authFlavored=${authFlavored}, target=ownerDM)`);
+      return true;
+    } catch (err) {
+      logger.error(`[relay-health] ownerDM send also failed: ${err}`);
+    }
+  }
+  logger.error('[relay-health] alert undeliverable (no working target) — will retry next tick');
+  return false;
 }
 
 // ─── PID file ────────────────────────────────────────────────────────────────
@@ -3014,8 +3069,32 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         const { runDispatcherTick } = await import('./services/outbox-dispatcher.js');
         const { makeDispatchExecutors } = await import('./services/outbox-dispatcher-executors.js');
         const stats = await runDispatcherTick(new Date(), makeDispatchExecutors());
-        if (stats.sent + stats.retried + stats.failed > 0) {
-          logger.info(`[outbox-dispatcher] tick: sent=${stats.sent} retried=${stats.retried} failed=${stats.failed} skipped=${stats.skipped}`);
+        if (stats.sent + stats.written + stats.retried + stats.failed + stats.resent > 0) {
+          logger.info(`[outbox-dispatcher] tick: written=${stats.written} sent=${stats.sent} resent=${stats.resent} retried=${stats.retried} failed=${stats.failed} skipped=${stats.skipped} enqueueFailures=${stats.enqueueFailures}(auth=${stats.authErrors}) confirmFailures=${stats.confirmFailures}`);
+        }
+        // relay 健康告警：①写入通道死(连续写不进 record，多半 token 失效) ②确认环节坏(写了读不到已发送) → 主动 @owner。
+        // 仅在有投递活动时过状态机 (纯 idle tick 不动计数)。告警走 bot/app token，不依赖已死的 user token。
+        if (stats.enqueueFailures > 0 || stats.confirmFailures > 0 || stats.written > 0 || stats.sent > 0) {
+          try {
+            const { getRelayHealthAlerter } = await import('./services/relay-health-alerter.js');
+            const alerter = getRelayHealthAlerter();
+            const nowMs = Date.now();
+            const decision = alerter.noteTick(
+              { enqueueFailures: stats.enqueueFailures, written: stats.written, confirmFailures: stats.confirmFailures, confirmed: stats.sent },
+              nowMs,
+            );
+            // 蔻黛 P1：**告警真发出去后**才 commit 限流；发送失败不 commit → 下个 tick 继续重试，不静音 30min。
+            // token 告警：触发靠鲁棒的「连续写不进 record」，措辞靠 authErrors 判断是否点名 token。
+            if (decision.tokenAlert && await sendRelayHealthAlert('enqueue', decision.tokenConsecutive, stats.authErrors > 0)) {
+              alerter.commitTokenAlert(nowMs);
+            }
+            // 确认告警：连续写了 record 却读不到「已发送」(如 record-get 被改坏) → 几分钟内报警，不再 6 天无人知。
+            if (decision.confirmationAlert && await sendRelayHealthAlert('confirmation', decision.confirmationConsecutive, stats.authErrors > 0)) {
+              alerter.commitConfirmationAlert(nowMs);
+            }
+          } catch (err) {
+            logger.error(`[relay-health] alert check failed: ${err}`);
+          }
         }
       } catch (err) {
         logger.error(`[outbox-dispatcher] tick failed: ${err}`);

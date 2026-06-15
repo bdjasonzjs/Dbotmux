@@ -75,10 +75,34 @@ export function isGroupFieldNotFoundError(out: { stdout: string; stderr: string 
   return raw.includes('800030410') && raw.includes('not_found');
 }
 
+/** owner user token 失效信号串 (lark-cli 在凭证缺失/失效时回吐)。`need_user_authorization`
+ *  已实测存在于 lark-cli 二进制；其余为防御性同义匹配。 */
+const USER_AUTH_ERROR_SIGNALS = ['need_user_authorization', 'token_missing', 'user_access_token', 'user access token'];
+
+/**
+ * 识别「owner user token 失效」—— 区别于普通可重试失败 (网络抖动/超时/group-not-ready)。
+ * 命中 → 上层据此做**连续失败升级告警** (token-health-alerter)，而非静默退避重试到任务卡死。
+ *
+ * 显式排除 `missing_scope`：那是 app/scope 配置问题、不是凭证失效，重新授权未必能修，
+ * 不应触发「token 没了、请 device-flow 重授」告警 (防误报)。
+ */
+export function isUserAuthError(out: { stdout: string; stderr: string }): boolean {
+  const raw = `${out.stdout}\n${out.stderr}`.toLowerCase();
+  if (raw.includes('missing_scope') || raw.includes('missing required scope')) return false;
+  if (USER_AUTH_ERROR_SIGNALS.some(s => raw.includes(s))) return true;
+  const d = parseAnyJsonLoose(out.stdout, out.stderr);
+  const type = String(d?.error?.type ?? '').toLowerCase();
+  const subtype = String(d?.error?.subtype ?? '').toLowerCase();
+  if (type === 'authorization' && /token|need_user|need_authorization|login|credential|unauthor/.test(subtype)) return true;
+  return false;
+}
+
 interface UpsertResult {
   ok: boolean;
   recordId?: string;
   retryableGroupNotReady?: boolean;
+  /** owner user token 失效 (need re-authorization) —— 触发连续失败升级告警，别静默重试。 */
+  authError?: boolean;
   error?: string;
 }
 
@@ -94,14 +118,19 @@ async function upsertRecordOnce(cfg: RelayConfig, title: string, targetChatId: s
     [recvKey]: [{ id: targetChatId }],
   });
   const out = await runLarkCli(
-    ['base', '+record-upsert', '--as', 'user', '--base-token', cfg.baseToken, '--table-id', cfg.tableId, '--json', json, '--jq', '.'],
+    // --format json 必带：lark-cli 把部分 base 子命令默认输出改成 markdown，markdown 与 --jq 互斥会报错
+    // (record-get 即因此从 2026-06-09 起每次报错、状态永远读不到，详见 docx §10)。显式锁 json 防同类回归。
+    ['base', '+record-upsert', '--as', 'user', '--base-token', cfg.baseToken, '--table-id', cfg.tableId, '--json', json, '--format', 'json', '--jq', '.'],
     CLI_TIMEOUT_MS,
   );
   if (out.code !== 0) {
     const retryableGroupNotReady = isGroup && isGroupFieldNotFoundError(out);
-    const error = retryableGroupNotReady ? 'group field target not ready (800030410 not_found)' : `upsert failed code=${out.code}`;
-    if (!retryableGroupNotReady) logger.warn(`[base-relay] upsert failed code=${out.code}: ${out.stderr.slice(0, 200)}`);
-    return { ok: false, retryableGroupNotReady, error };
+    const authError = isUserAuthError(out);
+    const error = retryableGroupNotReady ? 'group field target not ready (800030410 not_found)'
+      : authError ? 'user token auth error (need re-authorization)'
+      : `upsert failed code=${out.code}`;
+    if (!retryableGroupNotReady) logger.warn(`[base-relay] upsert failed code=${out.code}${authError ? ' [AUTH]' : ''}: ${out.stderr.slice(0, 200)}`);
+    return { ok: false, retryableGroupNotReady, authError, error };
   }
   const d = parseJsonLoose(out.stdout);
   const rid = d?.data?.record?.record_id_list?.[0];
@@ -137,23 +166,51 @@ function extractStatus(d: any): string | null {
   return typeof val === 'string' ? val : (val == null ? null : String(val));
 }
 
-/** 轮询 record 状态直到 已发送 / 已取消 / 超时。 */
-async function pollStatus(cfg: RelayConfig, recordId: string, timeoutMs: number): Promise<'sent' | 'cancelled' | 'timeout'> {
+/** 轮询 record 状态直到 已发送 / 已取消 / 超时 / 读不到。
+ *  **真根因修复 (docx §10)**：record-get 必带 `--format json`——lark-cli 把 record-get 默认输出改成
+ *  markdown，markdown 与 --jq 互斥会令命令每次报错、状态永远读不到 → 2026-06-09 起 sent=0、海量假阴性。
+ *  返回语义：
+ *   · 'sent'/'cancelled' —— 读到对应状态。
+ *   · 'auth_error' —— token 失效，早退（record 已写、消息仍会发，只是确认不了）。
+ *   · 'unknown' —— **整段轮询没有一次成功读到状态**（record-get 全程报错：CLI 变更/网络/限流）。
+ *     区别于 'timeout'：unknown=确认环节坏了（上层据此告警），timeout=读到了但自动化还没回写已发送。 */
+async function pollStatus(cfg: RelayConfig, recordId: string, timeoutMs: number): Promise<'sent' | 'cancelled' | 'timeout' | 'auth_error' | 'unknown'> {
   const deadline = Date.now() + timeoutMs;
+  let sawReadOk = false;
   while (Date.now() < deadline) {
     const out = await runLarkCli(
-      ['base', '+record-get', '--as', 'user', '--base-token', cfg.baseToken, '--table-id', cfg.tableId, '--record-id', recordId, '--jq', '.'],
+      ['base', '+record-get', '--as', 'user', '--base-token', cfg.baseToken, '--table-id', cfg.tableId, '--record-id', recordId, '--format', 'json', '--jq', '.'],
       CLI_TIMEOUT_MS,
     );
+    if (out.code !== 0) {
+      if (isUserAuthError(out)) return 'auth_error';
+      // record-get 报错 = 读不到状态，**绝不当「未发送」**。记一笔、继续轮询。
+      logger.warn(`[base-relay] record-get failed code=${out.code}: ${out.stderr.slice(0, 160)}`);
+      await sleep(POLL_INTERVAL_MS);
+      continue;
+    }
+    sawReadOk = true;
     const status = extractStatus(parseJsonLoose(out.stdout));
     if (status === '已发送') return 'sent';
     if (status === '已取消') return 'cancelled';
     await sleep(POLL_INTERVAL_MS);
   }
-  return 'timeout';
+  // 一次都没成功读到状态 → 确认环节坏了（unknown）；否则只是还没回写「已发送」（timeout）。
+  return sawReadOk ? 'timeout' : 'unknown';
 }
 
-export interface SendAsOwnerResult { ok: boolean; recordId?: string; error?: string; }
+export interface SendAsOwnerResult {
+  ok: boolean;
+  recordId?: string;
+  /** owner user token 失效 (upsert 写不进 record → 真没投递)。触发 token/写入告警。 */
+  authError?: boolean;
+  /** 自动化显式「已取消」= 故意不发 = 真失败 (不重试)。 */
+  cancelled?: boolean;
+  /** record 写成功但**确认读取整段失败** (record-get 全程报错)：确认环节坏了。record 已写、消息仍会发，
+   *  但我们读不到「已发送」→ 走重试 + 供上层判「确认连续失败」告警 (docx §10)。 */
+  confirmReadFailed?: boolean;
+  error?: string;
+}
 
 /**
  * 以 owner 身份往 targetChatId 发一条 text (= 急急如律令正文)。
@@ -172,15 +229,76 @@ export async function sendAsOwner(opts: { targetChatId: string; text: string; po
       recordId = opts.existingRecordId;
     } else {
       const upsert = await upsertRecord(cfg, opts.text, opts.targetChatId, opts.groupNotFoundRetryTimeoutMs ?? 0);
-      if (!upsert.ok || !upsert.recordId) return { ok: false, error: upsert.error ?? 'upsert returned no record_id' };
+      // upsert 失败 = record 没写进去 = 真没投递 → ok:false 走重试 (authError 另触发 token 告警)。
+      if (!upsert.ok || !upsert.recordId) return { ok: false, authError: upsert.authError, error: upsert.error ?? 'upsert returned no record_id' };
       recordId = upsert.recordId;
     }
+    // 确认轮询 (真根因修复后 record-get 能正常读到状态)：
+    //   · 已发送 → ok:true（确认送达）。
+    //   · 已取消 → ok:false cancelled（自动化显式不发 = 真失败，不重试）。
+    //   · token 失效 → ok:false authError（record 已写、消息仍会发，但 token 死要告警；retry 复用同 record）。
+    //   · 超时 → ok:false（自动化还没回写「已发送」→ dispatcher 退避重试，复用同 record 不重发 = 幂等）。
+    //   · unknown → ok:false confirmReadFailed（确认环节坏了：record-get 全程报错）→ retry + 确认健康告警。
     const status = await pollStatus(cfg, recordId, opts.pollTimeoutMs ?? DEFAULT_POLL_TIMEOUT_MS);
     if (status === 'sent') return { ok: true, recordId };
-    if (status === 'cancelled') return { ok: false, recordId, error: 'relay record cancelled (not sent)' };
+    if (status === 'cancelled') return { ok: false, recordId, cancelled: true, error: 'relay record cancelled (not sent)' };
+    if (status === 'auth_error') return { ok: false, recordId, authError: true, error: 'relay user token auth error (need re-authorization)' };
+    if (status === 'unknown') return { ok: false, recordId, confirmReadFailed: true, error: `relay confirm read failed (record-get error, record=${recordId})` };
     return { ok: false, recordId, error: `relay poll timeout (record=${recordId} not 已发送)` };
   } catch (err: any) {
     logger.warn(`[base-relay] sendAsOwner threw: ${err?.message ?? err}`);
     return { ok: false, error: err?.message ?? String(err) };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v2 非阻塞原语 (2026-06-15，松松「正确第一」at-least-once 方案)：把 sendAsOwner 的
+// 「写记录 + 阻塞轮询」拆成两个独立原语，让 dispatcher 写入即返回 sent_unconfirmed、
+// 确认走异步对账，**不再在投递路径阻塞 35s**。
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface WriteRelayRecordResult { ok: boolean; recordId?: string; authError?: boolean; error?: string; }
+
+/** 只写 record（upsert，触发飞书自动化发送），**不轮询**。成功返回 recordId。
+ *  upsert 失败 = record 没写进去 = 真没投递（authError=token 失效子集）。 */
+export async function writeRelayRecord(opts: { targetChatId: string; text: string; groupNotFoundRetryTimeoutMs?: number }): Promise<WriteRelayRecordResult> {
+  const cfg = relayConfig();
+  if (!cfg) return { ok: false, error: 'base relay not configured (set SUBTASK_RELAY_BASE_TOKEN / SUBTASK_RELAY_TABLE_ID)' };
+  try {
+    const upsert = await upsertRecord(cfg, opts.text, opts.targetChatId, opts.groupNotFoundRetryTimeoutMs ?? 0);
+    if (!upsert.ok || !upsert.recordId) return { ok: false, authError: upsert.authError, error: upsert.error ?? 'upsert returned no record_id' };
+    return { ok: true, recordId: upsert.recordId };
+  } catch (err: any) {
+    logger.warn(`[base-relay] writeRelayRecord threw: ${err?.message ?? err}`);
+    return { ok: false, error: err?.message ?? String(err) };
+  }
+}
+
+export type RelayStatus = 'sent' | 'cancelled' | 'pending' | 'unknown' | 'auth_error';
+
+/** 查一次 record 状态（**单次** record-get，非阻塞）。供异步对账用。
+ *   · 已发送 → 'sent'   · 已取消 → 'cancelled'   · 已确认待发送/待确认 → 'pending'
+ *   · token 失效 → 'auth_error'   · record-get 报错/未知状态值 → 'unknown'（**绝不当已发送/未发送**）。 */
+export async function checkRelayStatus(recordId: string): Promise<RelayStatus> {
+  const cfg = relayConfig();
+  if (!cfg) return 'unknown';
+  try {
+    const out = await runLarkCli(
+      ['base', '+record-get', '--as', 'user', '--base-token', cfg.baseToken, '--table-id', cfg.tableId, '--record-id', recordId, '--format', 'json', '--jq', '.'],
+      CLI_TIMEOUT_MS,
+    );
+    if (out.code !== 0) {
+      if (isUserAuthError(out)) return 'auth_error';
+      logger.warn(`[base-relay] checkRelayStatus record-get failed code=${out.code}: ${out.stderr.slice(0, 160)}`);
+      return 'unknown';
+    }
+    const status = extractStatus(parseJsonLoose(out.stdout));
+    if (status === '已发送') return 'sent';
+    if (status === '已取消') return 'cancelled';
+    if (status === '已确认待发送' || status === '待确认') return 'pending';
+    return 'unknown'; // 枚举外状态值 → unknown，不臆测
+  } catch (err: any) {
+    logger.warn(`[base-relay] checkRelayStatus threw: ${err?.message ?? err}`);
+    return 'unknown';
   }
 }

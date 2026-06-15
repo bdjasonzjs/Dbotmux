@@ -22,8 +22,10 @@ import {
 import * as store from '../src/services/subtask-store.js';
 import {
   runDispatcherTick, planDispatch, planBackoff, MAX_RETRY, DISPATCH_LEASE_MS,
+  RESEND_DEADLINE_MS,
   type DispatchExecutors,
 } from '../src/services/outbox-dispatcher.js';
+import { ackCommand } from '../src/services/subtask-store.js';
 
 const BOTS: SubTaskBot[] = [{ openId: 'ou_claude', name: '克劳德', role: 'main' }];
 
@@ -47,8 +49,16 @@ async function mkTaskWithCommand(over?: {
   return { taskId: t.taskId, cmdId: cmd.cmdId };
 }
 
-function mkDeliver(impl?: DispatchExecutors['deliver']): DispatchExecutors & { deliver: ReturnType<typeof vi.fn> } {
-  return { deliver: vi.fn(impl ?? (async () => ({ ok: true, messageId: 'om_sent' }))) } as any;
+type ExecMock = DispatchExecutors & { writeAndSend: ReturnType<typeof vi.fn>; checkStatus: ReturnType<typeof vi.fn> };
+function mkExec(over?: { write?: DispatchExecutors['writeAndSend']; check?: DispatchExecutors['checkStatus'] }): ExecMock {
+  return {
+    writeAndSend: vi.fn(over?.write ?? (async () => ({ ok: true, relayRecordId: 'rec_1' }))),
+    checkStatus: vi.fn(over?.check ?? (async () => 'sent' as const)),
+  } as any;
+}
+/** 推进到命令的 nextRetryAt 之后 (让对账/重试这一轮可见)。 */
+function afterNextRetry(cmdId: string): Date {
+  return new Date(new Date(getCommand(cmdId)!.nextRetryAt!).getTime() + 1);
 }
 
 beforeEach(() => {
@@ -142,41 +152,50 @@ describe('claim / lease', () => {
   });
 });
 
-// ─── runDispatcherTick 集成 ─────────────────────────────────────────────────
-describe('runDispatcherTick', () => {
-  it('投递成功 → sent + deliveredMessageId + sentAt + lease 清', async () => {
+// ─── runDispatcherTick 集成 (v2 两段式) ─────────────────────────────────────
+describe('runDispatcherTick — Phase A 投递 (写 record → sent_unconfirmed，不阻塞)', () => {
+  it('写入成功 → sent_unconfirmed（不直接 sent，本 tick 不对账自己）', async () => {
     const { cmdId } = await mkTaskWithCommand();
     const now = new Date();
-    const exec = mkDeliver(async () => ({ ok: true, messageId: 'om_real' }));
+    const exec = mkExec({ write: async () => ({ ok: true, relayRecordId: 'rec_a' }) });
     const stats = await runDispatcherTick(now, exec);
-    expect(stats.sent).toBe(1);
+    expect(stats.written).toBe(1);
+    expect(stats.sent).toBe(0);
     const c = getCommand(cmdId)!;
-    expect(c.deliveryStatus).toBe('sent');
-    expect(c.deliveredMessageId).toBe('om_real');
+    expect(c.deliveryStatus).toBe('sent_unconfirmed');
+    expect(c.relayRecordId).toBe('rec_a');
     expect(c.sentAt).not.toBeNull();
-    expect(c.dispatchingUntil).toBeNull();
     expect(c.dispatchAttemptId).toBeNull();
+    expect(exec.checkStatus).not.toHaveBeenCalled(); // 刚写、nextRetryAt 未到，本 tick 不对账
+    expect(exec.writeAndSend).toHaveBeenCalledTimes(1);
   });
 
-  it('投递失败 → retryCount++ + nextRetryAt(退避) 同一次写, 仍 pending', async () => {
+  it('写不进 record (无 relayRecordId) → enqueueFailures + 退避重试，仍 pending', async () => {
     const { cmdId } = await mkTaskWithCommand();
     const now = new Date();
-    const exec = mkDeliver(async () => ({ ok: false, error: 'lark 500' }));
+    const exec = mkExec({ write: async () => ({ ok: false, error: 'upsert failed' }) });
     const stats = await runDispatcherTick(now, exec);
+    expect(stats.enqueueFailures).toBe(1);
     expect(stats.retried).toBe(1);
+    expect(stats.written).toBe(0);
     const c = getCommand(cmdId)!;
     expect(c.deliveryStatus).toBe('pending');
     expect(c.retryCount).toBe(1);
-    expect(c.lastError).toBe('lark 500');
-    expect(new Date(c.nextRetryAt!).getTime()).toBe(now.getTime() + planBackoff(1)); // 退避算对
-    expect(c.dispatchingUntil).toBeNull(); // lease 清，nextRetryAt 控制下次
+    expect(new Date(c.nextRetryAt!).getTime()).toBe(now.getTime() + planBackoff(1));
   });
 
-  it('连续失败到 MAX_RETRY → failed (可见、不静默丢)', async () => {
+  it('authError 写不进 → authErrors + enqueueFailures', async () => {
+    await mkTaskWithCommand();
+    const exec = mkExec({ write: async () => ({ ok: false, authError: true, error: 'user token auth' }) });
+    const stats = await runDispatcherTick(new Date(), exec);
+    expect(stats.authErrors).toBe(1);
+    expect(stats.enqueueFailures).toBe(1);
+  });
+
+  it('写不进 record 连续失败到 MAX_RETRY → failed (真没投递)', async () => {
     const { cmdId } = await mkTaskWithCommand();
-    const exec = mkDeliver(async () => ({ ok: false, error: 'down' }));
+    const exec = mkExec({ write: async () => ({ ok: false, error: 'down' }) });
     let t = Date.now();
-    // 每轮把时间推过 nextRetryAt，直到 failed
     for (let i = 0; i < MAX_RETRY + 2; i++) {
       await runDispatcherTick(new Date(t), exec);
       const c = getCommand(cmdId)!;
@@ -188,64 +207,179 @@ describe('runDispatcherTick', () => {
     expect(c.retryCount).toBe(MAX_RETRY);
   });
 
-  it('未到 nextRetryAt → 本轮不投 (deliver 不被调用)', async () => {
+  it('未到 nextRetryAt → 本轮不写 (writeAndSend 不被调用)', async () => {
     const { cmdId } = await mkTaskWithCommand();
     const now = new Date();
-    const failExec = mkDeliver(async () => ({ ok: false, error: 'x' }));
-    await runDispatcherTick(now, failExec); // → retry, nextRetryAt = now+30s
+    const failExec = mkExec({ write: async () => ({ ok: false, error: 'x' }) });
+    await runDispatcherTick(now, failExec); // → retry, nextRetryAt=now+30s
     const c = getCommand(cmdId)!;
-    const exec2 = mkDeliver();
+    const exec2 = mkExec();
     await runDispatcherTick(new Date(now.getTime() + 1000), exec2); // 还没到 nextRetryAt
-    expect(exec2.deliver).not.toHaveBeenCalled();
-    expect(getCommand(cmdId)!.retryCount).toBe(c.retryCount); // 没变
+    expect(exec2.writeAndSend).not.toHaveBeenCalled();
+    expect(getCommand(cmdId)!.retryCount).toBe(c.retryCount);
+  });
+});
+
+describe('runDispatcherTick — Phase B 对账 (异步确认/重发/告警)', () => {
+  async function writeThenReconcile(cmdId: string, exec: ExecMock, t0 = new Date()) {
+    await runDispatcherTick(t0, exec);                       // tick1 → sent_unconfirmed
+    expect(getCommand(cmdId)!.deliveryStatus).toBe('sent_unconfirmed');
+    return runDispatcherTick(afterNextRetry(cmdId), exec);   // tick2 → 对账
+  }
+
+  it('对账读到「已发送」→ sent', async () => {
+    const { cmdId } = await mkTaskWithCommand();
+    const exec = mkExec({ write: async () => ({ ok: true, relayRecordId: 'rec_b' }), check: async () => 'sent' });
+    const stats = await writeThenReconcile(cmdId, exec);
+    expect(stats.sent).toBe(1);
+    expect(exec.checkStatus).toHaveBeenCalledWith('rec_b');
+    const c = getCommand(cmdId)!;
+    expect(c.deliveryStatus).toBe('sent');
+    expect(c.nextRetryAt).toBeNull();
   });
 
-  it('child→parent 上报: task 已 finished → skip + supersede (陈旧 need_help 不再投父群)', async () => {
+  it('对账读到「已取消」→ 终态 failed', async () => {
+    const { cmdId } = await mkTaskWithCommand();
+    const exec = mkExec({ check: async () => 'cancelled' });
+    const stats = await writeThenReconcile(cmdId, exec);
+    expect(stats.failed).toBe(1);
+    expect(getCommand(cmdId)!.deliveryStatus).toBe('failed');
+  });
+
+  it('对账 unknown → confirmFailures，绝不重发，保持 sent_unconfirmed', async () => {
+    const { cmdId } = await mkTaskWithCommand();
+    const exec = mkExec({ check: async () => 'unknown' });
+    const stats = await writeThenReconcile(cmdId, exec);
+    expect(stats.confirmFailures).toBe(1);
+    expect(stats.resent).toBe(0);
+    expect(exec.writeAndSend).toHaveBeenCalledTimes(1); // 只首投那一次，没重发
+    expect(getCommand(cmdId)!.deliveryStatus).toBe('sent_unconfirmed');
+  });
+
+  it('对账 auth_error → confirmFailures + authErrors，绝不重发，继续等', async () => {
+    const { cmdId } = await mkTaskWithCommand();
+    const exec = mkExec({ check: async () => 'auth_error' });
+    const stats = await writeThenReconcile(cmdId, exec);
+    expect(stats.confirmFailures).toBe(1);
+    expect(stats.authErrors).toBe(1);
+    expect(exec.writeAndSend).toHaveBeenCalledTimes(1);
+    expect(getCommand(cmdId)!.deliveryStatus).toBe('sent_unconfirmed');
+  });
+
+  it('对账 still-pending 未超 deadline → 继续等，不重发', async () => {
+    const { cmdId } = await mkTaskWithCommand();
+    const exec = mkExec({ check: async () => 'pending' });
+    const stats = await writeThenReconcile(cmdId, exec); // 对账发生在 ~now+15s，远未到 5min deadline
+    expect(stats.resent).toBe(0);
+    expect(exec.writeAndSend).toHaveBeenCalledTimes(1);
+    expect(getCommand(cmdId)!.deliveryStatus).toBe('sent_unconfirmed');
+  });
+
+  it('对账 still-pending 超 deadline → 幂等重发 (写新 record、复用 cmdId)，仍 sent_unconfirmed', async () => {
+    const { cmdId } = await mkTaskWithCommand();
+    let n = 0;
+    const exec = mkExec({
+      write: async () => ({ ok: true, relayRecordId: `rec_${n++}` }),
+      check: async () => 'pending',
+    });
+    const t0 = new Date();
+    await runDispatcherTick(t0, exec); // 首投 → sent_unconfirmed (rec_0, sentAt=t0)
+    const tLate = new Date(t0.getTime() + RESEND_DEADLINE_MS + 1000); // 超 deadline 且过 nextRetryAt
+    const stats = await runDispatcherTick(tLate, exec);
+    expect(stats.resent).toBe(1);
+    expect(exec.writeAndSend).toHaveBeenCalledTimes(2); // 首投 + 重发
+    const c = getCommand(cmdId)!;
+    expect(c.deliveryStatus).toBe('sent_unconfirmed');
+    expect(c.relayRecordId).toBe('rec_1'); // 换成新 record
+    expect(c.retryCount).toBe(1);          // 重发计数 +1
+  });
+
+  it('ack 优先：sent_unconfirmed 被主bot ack 后，对账不处理它 (不降级、不重发、不查状态)', async () => {
+    const { cmdId } = await mkTaskWithCommand();
+    const exec = mkExec({ check: async () => 'sent' });
+    await runDispatcherTick(new Date(), exec); // → sent_unconfirmed
+    await ackCommand(cmdId);                   // 主bot 在确认前就 ack
+    expect(getCommand(cmdId)!.deliveryStatus).toBe('acked');
+    const stats = await runDispatcherTick(afterNextRetry(cmdId), exec);
+    expect(stats.sent).toBe(0);
+    expect(exec.checkStatus).not.toHaveBeenCalled(); // acked 不在 listUnconfirmedCommands
+    expect(getCommand(cmdId)!.deliveryStatus).toBe('acked'); // 终态保持
+  });
+
+  it('P1: ack 落在 checkStatus 期间 (重发前) → 重发前重读拦下、不重发，命令保持 acked', async () => {
+    const { cmdId } = await mkTaskWithCommand();
+    const exec = mkExec({
+      write: async () => ({ ok: true, relayRecordId: 'rec_p1a' }),
+      check: async () => { await ackCommand(cmdId); return 'pending'; }, // ack 落在 checkStatus IO 中
+    });
+    const t0 = new Date();
+    await runDispatcherTick(t0, exec); // → sent_unconfirmed
+    const nraBefore = getCommand(cmdId)!.nextRetryAt; // 首投设的对账时间
+    const tLate = new Date(t0.getTime() + RESEND_DEADLINE_MS + 1000); // 超 deadline，本会触发重发
+    const stats = await runDispatcherTick(tLate, exec);
+    expect(stats.resent).toBe(0);                       // 重发前重读发现 acked → 不重发
+    expect(exec.writeAndSend).toHaveBeenCalledTimes(1); // 仅首投
+    expect(getCommand(cmdId)!.deliveryStatus).toBe('acked');
+    expect(getCommand(cmdId)!.nextRetryAt).toBe(nraBefore); // 蔻黛 P2 cleanup：仅清 lease，不给 acked 写 nextRetryAt
+    expect(getCommand(cmdId)!.dispatchAttemptId).toBeNull(); // lease 已清
+  });
+
+  it('P1: ack 落在 resend writeAndSend IO 中 → record 写出但写后重读拦下，不污染终态/元数据', async () => {
+    const { cmdId } = await mkTaskWithCommand();
+    let writeCalls = 0;
+    const exec = mkExec({
+      write: async () => {
+        writeCalls += 1;
+        if (writeCalls === 2) await ackCommand(cmdId); // 第二次(重发)写入 IO 中 ack
+        return { ok: true, relayRecordId: `rec_p1b_${writeCalls}` };
+      },
+      check: async () => 'pending',
+    });
+    const t0 = new Date();
+    await runDispatcherTick(t0, exec); // 首投 → sent_unconfirmed (rec_p1b_1)
+    const recBefore = getCommand(cmdId)!.relayRecordId;
+    const tLate = new Date(t0.getTime() + RESEND_DEADLINE_MS + 1000);
+    const stats = await runDispatcherTick(tLate, exec); // 重发 write#2 中途 ack → 写后重读拦下
+    expect(stats.resent).toBe(0);                        // 写后守卫拦下，没计 resent
+    expect(getCommand(cmdId)!.deliveryStatus).toBe('acked'); // 终态保持
+    expect(getCommand(cmdId)!.relayRecordId).toBe(recBefore); // 元数据没被重发覆盖
+  });
+});
+
+describe('runDispatcherTick — planDispatch skip / 终态', () => {
+  it('child→parent 上报: task 已 finished → skip + supersede', async () => {
     const { cmdId, taskId } = await mkTaskWithCommand();
     await transitionStatus(taskId, 'finished');
-    const exec = mkDeliver();
+    const exec = mkExec();
     const stats = await runDispatcherTick(new Date(), exec);
     expect(stats.skipped).toBe(1);
-    expect(exec.deliver).not.toHaveBeenCalled();
+    expect(exec.writeAndSend).not.toHaveBeenCalled();
     expect(getCommand(cmdId)!.supersededBy).not.toBeNull();
   });
 
-  it('parent→child supplement + task 终态 → skip + supersede (补充无意义)', async () => {
-    const { cmdId, taskId } = await mkTaskWithCommand({ direction: 'parent_to_child', commandType: 'supplement' });
-    await transitionStatus(taskId, 'reported_done');
-    await transitionStatus(taskId, 'finished');
-    const exec = mkDeliver();
-    const stats = await runDispatcherTick(new Date(), exec);
-    expect(stats.skipped).toBe(1);
-    expect(exec.deliver).not.toHaveBeenCalled();
-    expect(getCommand(cmdId)!.supersededBy).not.toBeNull();
-  });
-
-  it('E2E 修复: parent→child finish + task 已 finished → 真 deliver (子群收到结束通知)', async () => {
+  it('E2E: parent→child finish + task 已 finished → 真写 (子群收到结束通知 → sent_unconfirmed)', async () => {
     const { cmdId, taskId } = await mkTaskWithCommand({ direction: 'parent_to_child', commandType: 'finish' });
     await transitionStatus(taskId, 'reported_done');
     await transitionStatus(taskId, 'finished');
-    const exec = mkDeliver(async () => ({ ok: true, messageId: 'om_finish' }));
+    const exec = mkExec({ write: async () => ({ ok: true, relayRecordId: 'rec_fin' }) });
     const stats = await runDispatcherTick(new Date(), exec);
-    expect(stats.sent).toBe(1);                       // finish 没被终态 skip 掉
-    expect(exec.deliver).toHaveBeenCalled();
-    expect(getCommand(cmdId)!.deliveryStatus).toBe('sent');
-    expect(getCommand(cmdId)!.deliveredMessageId).toBe('om_finish');
+    expect(stats.written).toBe(1);
+    expect(exec.writeAndSend).toHaveBeenCalled();
+    expect(getCommand(cmdId)!.deliveryStatus).toBe('sent_unconfirmed');
   });
 
-  it('P1-2 TOCTOU: claim 后 task 被终态化 → 复核 skip + supersede + 不 deliver (supplement)', async () => {
+  it('P1-2 TOCTOU: claim 后 task 被终态化 → 复核 skip + supersede + 不写', async () => {
     const { cmdId, taskId } = await mkTaskWithCommand({ direction: 'parent_to_child', commandType: 'supplement' });
     const real = getSubTask(taskId)!;
-    // 初筛读到 observing(→send)，claim 后复核读到 finished(→skip)
     const spy = vi.spyOn(store, 'getSubTask')
       .mockReturnValueOnce(real)
       .mockReturnValueOnce({ ...real, status: 'finished' });
-    const exec = mkDeliver();
+    const exec = mkExec();
     const stats = await runDispatcherTick(new Date(), exec);
-    expect(exec.deliver).not.toHaveBeenCalled();   // 复核拦下，没投陈旧状态
+    expect(exec.writeAndSend).not.toHaveBeenCalled();
     expect(stats.skipped).toBe(1);
     expect(getCommand(cmdId)!.supersededBy).not.toBeNull();
-    expect(getCommand(cmdId)!.dispatchAttemptId).toBeNull(); // lease 已释放
+    expect(getCommand(cmdId)!.dispatchAttemptId).toBeNull();
     spy.mockRestore();
   });
 });

@@ -17,7 +17,7 @@
  *   bot 醒来读到同一状态、不会重复执行 (内存共享式通信天然容忍重复唤醒)。
  */
 import { logger } from '../utils/logger.js';
-import { DEFAULT_GROUP_NOT_FOUND_RETRY_TIMEOUT_MS, sendAsOwner } from './base-relay.js';
+import { DEFAULT_GROUP_NOT_FOUND_RETRY_TIMEOUT_MS, writeRelayRecord, checkRelayStatus } from './base-relay.js';
 import { SUBTASK_COLLAB_NORMS_ONELINE } from './subtask-norms.js';
 import type { DispatchExecutors } from './outbox-dispatcher.js';
 import { getByChatId, type CommandTargetRole, type OutboxCommand, type SubTask } from './subtask-store.js';
@@ -155,27 +155,27 @@ function parentToChildSummonBody(cmd: OutboxCommand, task: SubTask): string {
 
 export function makeDispatchExecutors(): DispatchExecutors {
   return {
-    async deliver(cmd: OutboxCommand, task: SubTask) {
+    // Phase A / 重发：写一条 base record 触发自动化发送，**不轮询**。每次调用都写新 record
+    //   (首投 = pending 首次；重发 = sent_unconfirmed 超 deadline)；接收侧按 cmdId 去重，重复唤醒无害。
+    async writeAndSend(cmd: OutboxCommand, task: SubTask) {
       const text = cmd.direction === 'child_to_parent'
         ? childToParentSummon(cmd, task)
         : parentToChildSummon(cmd, task);
-      // 以 owner 身份发急急如律令 base relay，阻塞轮询「已发送」(待定1)。失败返 {ok:false} 不抛。
-      // 幂等 (2026-06-10 修重复刷屏)：若本命令上次已写过 base 记录 (relayRecordId)，复用它**只重轮询**、
-      // 不再 upsert；首发拿到的 recordId 即使 poll 超时也带回 (relayRecordId)，由 dispatcher 落库供重试复用。
-      const res = await sendAsOwner({
+      const res = await writeRelayRecord({
         targetChatId: cmd.targetChatId,
         text,
         groupNotFoundRetryTimeoutMs: cmd.commandType === 'kickoff' ? DEFAULT_GROUP_NOT_FOUND_RETRY_TIMEOUT_MS : 0,
-        existingRecordId: cmd.relayRecordId ?? undefined,
       });
       if (res.ok) {
-        // record 已写入 = 已投递 (at-least-once)。confirmed=false 表示已投递但自动化还没回写「已发送」。
-        logger.info(`[outbox-dispatcher-exec] summon sent cmd ${cmd.cmdId} (${cmd.commandType})${res.confirmed ? '' : ' [unconfirmed]'} → ${cmd.targetChatId.slice(0, 12)} record=${res.recordId?.slice(0, 12) ?? '?'}`);
-        return { ok: true, messageId: res.recordId, relayRecordId: res.recordId, confirmed: res.confirmed };  // base relay 无真 messageId，用 recordId 追溯 (v3 锚点是 commandId)
+        logger.info(`[outbox-dispatcher-exec] record written cmd ${cmd.cmdId} (${cmd.commandType}) → ${cmd.targetChatId.slice(0, 12)} record=${res.recordId?.slice(0, 12) ?? '?'}`);
+        return { ok: true, relayRecordId: res.recordId };
       }
-      logger.warn(`[outbox-dispatcher-exec] summon failed cmd ${cmd.cmdId}${res.authError ? ' [AUTH]' : ''}${res.cancelled ? ' [CANCELLED]' : ''}: ${res.error}`);
-      // authError/cancelled 透传：dispatcher 据此累计 token 告警 / 终态作废 (不重试)。
-      return { ok: false, error: res.error, authError: res.authError, cancelled: res.cancelled, relayRecordId: res.recordId };  // 带回 recordId：首发已建记录、poll 超时，下轮复用别重发
+      logger.warn(`[outbox-dispatcher-exec] record write failed cmd ${cmd.cmdId}${res.authError ? ' [AUTH]' : ''}: ${res.error}`);
+      return { ok: false, authError: res.authError, error: res.error };
+    },
+    // Phase B 对账：查一次 record 状态 (非阻塞)。
+    async checkStatus(relayRecordId: string) {
+      return checkRelayStatus(relayRecordId);
     },
   };
 }

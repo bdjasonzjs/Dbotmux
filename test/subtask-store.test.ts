@@ -361,6 +361,11 @@ describe('helpReportDelivery 真映射 (store helper)', () => {
     await updateCommand(cmdId, { deliveryStatus: 'sent', sentAt: new Date(now.getTime() - TIMEOUT - 1).toISOString() });
     expect(helpReportDelivery(taskId, now, TIMEOUT)).toBe('sent_unacked_expired');
   });
+  it('v2 P2: sent_unconfirmed 即便超 ackTimeout 也归 sent_unacked_fresh (不换 cmdId 补发, Phase B 负责确认前恢复)', async () => {
+    const { taskId, cmdId } = await mkHelp();
+    await updateCommand(cmdId, { deliveryStatus: 'sent_unconfirmed', sentAt: new Date(now.getTime() - TIMEOUT - 1).toISOString() });
+    expect(helpReportDelivery(taskId, now, TIMEOUT)).toBe('sent_unacked_fresh');
+  });
   it('脏数据: sent 但 sentAt=null → 保守当 expired (允许补发, 不静默吞)', async () => {
     const { taskId, cmdId } = await mkHelp();
     await updateCommand(cmdId, { deliveryStatus: 'sent', sentAt: null });
