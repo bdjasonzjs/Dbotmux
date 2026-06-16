@@ -238,6 +238,8 @@ export interface CreateSubtaskReq {
   spawnable?: boolean;
   /** 双层汇报：true=部门经理(manager，门控+定期 digest)；缺省/false=执行者(executor，实时直报)。 */
   manager?: boolean;
+  /** Explicit opt-out for executor groups that intentionally do not want an observer bot. */
+  noObserver?: boolean;
 }
 
 export async function createSubtask(req: CreateSubtaskReq): Promise<{ taskId: string; chatId: string; isNew: boolean }> {
@@ -297,7 +299,7 @@ export async function createSubtask(req: CreateSubtaskReq): Promise<{ taskId: st
   // registered bot's name/appId (clones). Legacy aliases keep their exact
   // BOT_META name/role (byte-equivalent); arbitrary refs derive name from the
   // registry and default to 'collab' (explicit roles land in the CLI parser).
-  const resolved = botKeys.map(entry => {
+  const resolveBotEntry = (entry: string) => {
     // Each entry is `ref` or `ref:role` (role ∈ main|collab|observer). The role
     // suffix is an explicit override; without it we fall back to the alias's
     // legacy role, else 'collab'.
@@ -319,7 +321,13 @@ export async function createSubtask(req: CreateSubtaskReq): Promise<{ taskId: st
     const meta = metaKey ? BOT_META[metaKey] : undefined;
     const role = (explicitRole || meta?.role || 'collab') as SubTaskBot['role'];
     return { key: ref, ident, name: meta?.name ?? ident.name, role };
-  });
+  };
+  const resolved = botKeys.map(resolveBotEntry);
+  const isExecutorGroup = req.manager !== true && resolved.some(r => r.role === 'main');
+  const tillyApp = resolveBotIdent('tilly').larkAppId;
+  if (isExecutorGroup && req.noObserver !== true && !resolved.some(r => r.ident.larkAppId === tillyApp)) {
+    resolved.push(resolveBotEntry('tilly:observer'));
+  }
   const claudeApp = resolveBotIdent('claude').larkAppId;
   const larkAppIds = resolved.map(r => r.ident.larkAppId);
   const subtaskBots: SubTaskBot[] = resolved.map(r => ({ openId: r.ident.openId, name: r.name, role: r.role, larkAppId: r.ident.larkAppId }));

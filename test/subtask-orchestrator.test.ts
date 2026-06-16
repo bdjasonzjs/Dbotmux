@@ -140,14 +140,18 @@ describe('createSubtask', () => {
     mainSession();
     const res = await createSubtask({ sessionId: 'sess_main', goal: 'n-bot clone test', bots: ['claude', 'claude-clone'] });
     const groupOpts = mockCreateGroup.mock.calls[0][0];
-    expect(groupOpts.larkAppIds).toEqual(['app_claude', 'app_clone']);
+    expect(groupOpts.larkAppIds).toEqual(['app_claude', 'app_clone', 'app_coco']);
     expect(groupOpts.chatContext.participants).toEqual([
       { openId: 'ou_claude', role: 'main' },     // alias 保留 BOT_META role
       { openId: 'ou_clone', role: 'collab' },     // 任意 ref 默认 collab
+      { openId: 'ou_coco', role: 'observer' },    // executor 群自动补 observer，保证 observing 能回读
     ]);
     const task = getByChatId(res.chatId)!;
     expect(task.bots.find((b: any) => b.openId === 'ou_clone')).toMatchObject({
       name: 'claude-clone', role: 'collab', larkAppId: 'app_clone',
+    });
+    expect(task.bots.find((b: any) => b.openId === 'ou_coco')).toMatchObject({
+      name: '缇蕾', role: 'observer', larkAppId: 'app_coco',
     });
   });
 
@@ -170,7 +174,9 @@ describe('createSubtask', () => {
     mainSession();
     const res = await createSubtask({ sessionId: 'sess_main', goal: 'uppercase alias', bots: ['CLAUDE'] });
     const task = getByChatId(res.chatId)!;
-    expect(task.bots[0]).toMatchObject({ name: '克劳德', role: 'main' });
+    expect(task.bots.map((b: any) => [b.name, b.role])).toEqual([
+      ['克劳德', 'main'], ['缇蕾', 'observer'],
+    ]);
   });
 
   it('6b: --bots ref:role 显式角色覆盖默认 (claude:observer, clone:main)', async () => {
@@ -190,7 +196,66 @@ describe('createSubtask', () => {
   it('6b: 无 :role 后缀 → 默认角色不变 (claude→main)', async () => {
     mainSession();
     const res = await createSubtask({ sessionId: 'sess_main', goal: '6b no role', bots: ['claude'] });
-    expect(getByChatId(res.chatId)!.bots[0]).toMatchObject({ role: 'main', name: '克劳德' });
+    expect(getByChatId(res.chatId)!.bots.map((b: any) => [b.name, b.role])).toEqual([
+      ['克劳德', 'main'], ['缇蕾', 'observer'],
+    ]);
+  });
+
+  it('P0⑥: 显式 --bots 含 main 但无 observer → executor 群自动补 tilly:observer', async () => {
+    mainSession();
+    const res = await createSubtask({ sessionId: 'sess_main', goal: 'force observer', bots: ['codex:main', 'claude-clone:collab'] });
+    const groupOpts = mockCreateGroup.mock.calls[0][0];
+    expect(groupOpts.larkAppIds).toEqual(['app_codex', 'app_clone', 'app_coco']);
+    expect(groupOpts.chatContext.participants).toEqual([
+      { openId: 'ou_codex', role: 'main' },
+      { openId: 'ou_clone', role: 'collab' },
+      { openId: 'ou_coco', role: 'observer' },
+    ]);
+    expect(getByChatId(res.chatId)!.bots.map((b: any) => [b.openId, b.role, b.larkAppId])).toEqual([
+      ['ou_codex', 'main', 'app_codex'],
+      ['ou_clone', 'collab', 'app_clone'],
+      ['ou_coco', 'observer', 'app_coco'],
+    ]);
+  });
+
+  it('P0⑥ P1: 非 tilly observer 不能替代 coco 回读身份，仍自动补 tilly:observer', async () => {
+    mainSession();
+    const res = await createSubtask({ sessionId: 'sess_main', goal: 'non tilly observer', bots: ['codex:main', 'claude:observer'] });
+    const groupOpts = mockCreateGroup.mock.calls[0][0];
+    expect(groupOpts.larkAppIds).toEqual(['app_codex', 'app_claude', 'app_coco']);
+    expect(groupOpts.chatContext.participants).toEqual([
+      { openId: 'ou_codex', role: 'main' },
+      { openId: 'ou_claude', role: 'observer' },
+      { openId: 'ou_coco', role: 'observer' },
+    ]);
+    expect(getByChatId(res.chatId)!.bots.map((b: any) => [b.openId, b.role, b.larkAppId])).toEqual([
+      ['ou_codex', 'main', 'app_codex'],
+      ['ou_claude', 'observer', 'app_claude'],
+      ['ou_coco', 'observer', 'app_coco'],
+    ]);
+  });
+
+  it('P0⑥: noObserver 显式 opt-out 时不自动补 observer', async () => {
+    mainSession();
+    const res = await createSubtask({ sessionId: 'sess_main', goal: 'no observer by choice', bots: ['codex:main', 'claude-clone:collab'], noObserver: true });
+    const groupOpts = mockCreateGroup.mock.calls[0][0];
+    expect(groupOpts.larkAppIds).toEqual(['app_codex', 'app_clone']);
+    expect(groupOpts.chatContext.participants).toEqual([
+      { openId: 'ou_codex', role: 'main' },
+      { openId: 'ou_clone', role: 'collab' },
+    ]);
+    expect(getByChatId(res.chatId)!.bots.some((b: any) => b.role === 'observer')).toBe(false);
+  });
+
+  it('P0⑥: 没有 main 席位时不强加 observer', async () => {
+    mainSession();
+    const res = await createSubtask({ sessionId: 'sess_main', goal: 'discussion only', bots: ['claude-clone:collab'] });
+    const groupOpts = mockCreateGroup.mock.calls[0][0];
+    expect(groupOpts.larkAppIds).toEqual(['app_clone']);
+    expect(groupOpts.chatContext.participants).toEqual([
+      { openId: 'ou_clone', role: 'collab' },
+    ]);
+    expect(getByChatId(res.chatId)!.bots).toHaveLength(1);
   });
 
   it('v3 kickoff: create 后 enqueue 一条 kickoff (parent→child, 投子群, 幂等不重复)', async () => {
