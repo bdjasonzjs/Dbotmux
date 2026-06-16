@@ -314,27 +314,29 @@ export function buildSubtaskMemberBlock(chatId: string | undefined, larkAppId: s
   if (!task) return '';
   if (task.status === 'finished' || task.status === 'stopped') return ''; // 终态不再注入
 
-  // 角色定义 (v3：claude=执行者 / codex=Reviewer / coco=超级Subagent)
-  // 优化 #1：把角色说硬——executor 驱动+产出主交付物、产出后唤 reviewer；reviewer 三句负约束、不抢执行。
-  const ROLE_BY_CLI: Record<string, string> = {
-    'claude-code': '执行者(主推进者) —— 你驱动任务、方案/代码/文档都由你产出。产出第一份可 review 物后，用 `botmux subtask-request-review --task-id <id> --summary "<可打开的链接/绝对路径>"` 唤起 reviewer；别闷头到底。对 reviewer 的意见要独立思考、别轻易全盘接受——reviewer 经常给过于保守、不一定合理的建议；逐条判断是不是真正值得改的，值得才改、不值得就简述理由驳回，不被它带着无谓地反复返工。想清楚、改完就直接推进并 push。',
-    codex: 'Reviewer —— 只 review/challenge：**不驱动任务、不产主交付物、不直接实现**。只在执行者已有方案/代码/明确请求 review 时再 review，发现问题挑出来交执行者改，别自己上手抢执行。',
-    coco: '超级 Subagent —— Token 不限量，承接 token 消耗大但相对简单的活',
-  };
-  const ROLE_BY_NAME: Record<string, string> = {
-    克劳德: ROLE_BY_CLI['claude-code'], 蔻黛克斯: ROLE_BY_CLI['codex'], 缇蕾: ROLE_BY_CLI['coco'],
+  // 角色定义按本子任务的席位注入，而不是按 bot 引擎(cliId)或名字推断。
+  // 同一个引擎可同时坐 main/collab/observer，不同席位必须拿到不同职责文案。
+  const ROLE_BY_SEAT: Record<'main' | 'collab' | 'observer', string> = {
+    main: '执行者(主推进者) —— 你驱动任务、方案/代码/文档都由你产出。产出第一份可 review 物后，用 `botmux subtask-request-review --task-id <id> --summary "<可打开的链接/绝对路径>"` 唤起 reviewer；别闷头到底。对 reviewer 的意见要独立思考、别轻易全盘接受——reviewer 经常给过于保守、不一定合理的建议；逐条判断是不是真正值得改的，值得才改、不值得就简述理由驳回，不被它带着无谓地反复返工。全程遵守本任务 kickoff/补充指令里的 commit、push、部署边界；没有显式授权就只停在 working tree。',
+    collab: 'Reviewer —— 只 review/challenge：**不驱动任务、不产主交付物、不直接实现**。只在执行者已有方案/代码/明确请求 review 时再 review，发现问题挑出来交执行者改，别自己上手抢执行。',
+    observer: '观测/盯群、触发唤醒（不参与执行）',
   };
   let selfOpenId: string | null = null;
   let selfRole = '(未识别角色，按子任务目标干活)';
-  try { const b = getBot(larkAppId); selfOpenId = b.botOpenId ?? null; selfRole = ROLE_BY_CLI[b.config.cliId] ?? selfRole; } catch { /* xref 缺失 → 用兜底 */ }
+  try {
+    const b = getBot(larkAppId);
+    selfOpenId = b.botOpenId ?? null;
+    const selfSeat = task.bots.find(bot => bot.openId === selfOpenId)?.role;
+    if (selfSeat) selfRole = ROLE_BY_SEAT[selfSeat] ?? selfRole;
+  } catch { /* xref 缺失 → 用兜底 */ }
 
   const others = task.bots
     .filter(b => b.openId !== selfOpenId)
-    .map(b => `  - ${b.name}：${ROLE_BY_NAME[b.name] ?? (b.role === 'observer' ? '观测/盯群、触发唤醒（不参与执行）' : '协作')}`);
+    .map(b => `  - ${b.name}：${ROLE_BY_SEAT[b.role] ?? '协作'}`);
   const accLine = task.acceptance ? `\n【验收标准】${task.acceptance}` : '';
 
   // 嵌套裂变授权（双帽角色重述）：仅 task.spawnable===true 且本 bot 是执行者(main) 时注入；
-  // 其余场景（含全部存量任务）输出与此前**逐字一致**（快照测试钉死）。
+  // 无裂变段时保持【你的角色】与【群里其他成员】的结构锚点，角色文案按席位语义渲染。
   let spawnableBlock = '';
   const mainBot = task.bots.find(b => b.role === 'main');
   if (task.spawnable === true && selfOpenId && selfOpenId === mainBot?.openId) {
