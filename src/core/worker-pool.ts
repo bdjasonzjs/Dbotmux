@@ -19,6 +19,7 @@ import { logger } from '../utils/logger.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { botLocale, localeForBot, t as tr } from '../i18n/index.js';
 import { claudeJsonlPathForSession } from '../adapters/cli/claude-code.js';
+import { resolveClaudeHome, resolveClaudeHomeForAdopt } from './claude-home.js';
 import { buildMarkdownCard, buildContextualReplyCard } from '../im/lark/md-card.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { getBot, getAllBots } from '../bot-registry.js';
@@ -791,6 +792,7 @@ function doForkWorker(ds: DaemonSession, prompt: string, resume = false, followu
     botName: bot.botName,
     botOpenId: bot.botOpenId,
     locale: botLocale(botCfg),
+    claudeConfigDir: botCfg.claudeConfigDir,
   };
   // Install handlers and mark this worker current BEFORE send, so a fast
   // exit/error/ready can't slip through unhandled (which would leak the boot
@@ -1520,9 +1522,12 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
   //     to re-probe via session.log / traces.jsonl fds).
   // Other CLIs fall back to legacy screen-capture only.
   const adoptedCliId = adopted.cliId ?? 'claude-code';
+  // Adopt precedence: the adopted process's own CLAUDE_CONFIG_DIR wins over the
+  // adopting bot's config, so the bridge tails the live process's real home.
+  const adoptedClaudeConfigDir = adopted.claudeConfigDir ?? botCfg.claudeConfigDir;
   const bridgeJsonlPath =
     adoptedCliId === 'claude-code' && adopted.sessionId
-      ? claudeJsonlPathForSession(adopted.sessionId, adopted.cwd)
+      ? claudeJsonlPathForSession(adopted.sessionId, adopted.cwd, resolveClaudeHomeForAdopt(adopted.claudeConfigDir, botCfg.claudeConfigDir))
       : undefined;
   const isStructuredBridge = adoptedCliId === 'codex' || adoptedCliId === 'coco';
 
@@ -1544,6 +1549,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     botName: bot.botName,
     botOpenId: bot.botOpenId,
     locale: botLocale(botCfg),
+    claudeConfigDir: adoptedClaudeConfigDir,
     adoptMode: true,
     adoptTmuxTarget: adopted.tmuxTarget,
     adoptPaneCols: adopted.paneCols,

@@ -170,6 +170,42 @@ describe('MainBotPlaybook.spawnSubTask (P1 commit #6)', () => {
     });
   });
 
+  describe('P-S5b — clone (claude-code, isClone) 不能冒充 CEO spawn (本体按 isClone 认, 非 index 0)', () => {
+    it('clone session is rejected even when the clone is at bots-info index 0', async () => {
+      // CLONE placed at index 0 on purpose: if CEO were identified by array
+      // position, the clone would wrongly pass authz. It must be rejected.
+      writeFileSync(join(tempDir, 'bots-info.json'), JSON.stringify([
+        { cliId: 'claude-code', larkAppId: 'cli_clone', botName: 'claude-clone', botOpenId: 'ou_clone', isClone: true },
+        { cliId: 'claude-code', larkAppId: 'cli_claude', botName: 'claude', botOpenId: 'ou_claude' },
+        { cliId: 'codex', larkAppId: 'cli_codex', botName: 'codex', botOpenId: 'ou_codex' },
+        { cliId: 'coco', larkAppId: 'cli_tilly', botName: 'tilly', botOpenId: 'ou_tilly' },
+      ]), 'utf-8');
+      const { pb } = await freshImport();
+      fakeSessions.set('s_clone', {
+        sessionId: 's_clone',
+        chatId: MAIN_TOPIC,
+        larkAppId: 'cli_clone',   // the clone tries to spawn
+        rootMessageId: 'om_clone',
+      });
+      await expect(pb.spawnSubTask({ sessionId: 's_clone', purpose: 'x', taskType: 'misc' }))
+        .rejects.toThrow(/only main bot can spawn subtasks/);
+    });
+
+    it('本体 claude session still spawns OK with the clone present at index 0', async () => {
+      writeFileSync(join(tempDir, 'bots-info.json'), JSON.stringify([
+        { cliId: 'claude-code', larkAppId: 'cli_clone', botName: 'claude-clone', botOpenId: 'ou_clone', isClone: true },
+        { cliId: 'claude-code', larkAppId: 'cli_claude', botName: 'claude', botOpenId: 'ou_claude' },
+        { cliId: 'codex', larkAppId: 'cli_codex', botName: 'codex', botOpenId: 'ou_codex' },
+        { cliId: 'coco', larkAppId: 'cli_tilly', botName: 'tilly', botOpenId: 'ou_tilly' },
+      ]), 'utf-8');
+      const { pb } = await freshImport();
+      fakeSessions.set('s_main', {
+        sessionId: 's_main', chatId: MAIN_TOPIC, larkAppId: 'cli_claude', rootMessageId: 'om_main',
+      });
+      await expect(pb.spawnSubTask({ sessionId: 's_main', purpose: 'x', taskType: 'misc' })).resolves.toBeDefined();
+    });
+  });
+
   describe('P-S6 — default bot list = 三 bot 全拉', () => {
     it('larkAppIds passed to createGroupWithBots contains all 3 bot app ids', async () => {
       const { pb } = await freshImport();

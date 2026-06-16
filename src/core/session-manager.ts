@@ -234,7 +234,7 @@ export function buildMainBotPromptBlock(chatId: string | undefined, larkAppId: s
 
 **任务分派（核心，默认倾向分派）**：
 - 能用子群解决的 → **尽量 subtask-start 分派出去**（这是常态，不是例外）。复杂任务（PRD 分析 / bug 清单 / 跨多群事项 / 需多 bot 协作 / 预期多轮）尤其要拉子群。
-  → 调用 \`botmux subtask-start --goal "..." [--acceptance "..."] [--bots c,k,t]\`（可选 \`--task-type prd|bug|misc\`、\`--name "<群名>"\`）
+  → 调用 \`botmux subtask-start --goal "..." [--acceptance "..."] [--bots <ref>[:role],...]\`（ref=c|k|t / 名字 / appId，含分身；role=main|collab|observer；可选 \`--task-type prd|bug|misc\`、\`--name "<群名>"\`）
   → 阻塞等待返回 chatId
   → 主话题简短回报「✅ 已建子群 [群名]（oc_xxx），进展会自动汇报回来」
 - 只有一句话能搞定的即时答疑 / 闲聊（拉群纯属浪费）才自己直接答。

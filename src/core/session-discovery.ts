@@ -9,6 +9,8 @@ import { readFileSync, readlinkSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
 import { basename, join } from 'node:path';
 import type { CliId } from '../adapters/cli/types.js';
+import { claudePidStatePath } from '../adapters/cli/claude-code.js';
+import { resolveClaudeHome, defaultClaudeHome } from './claude-home.js';
 import { findCodexRolloutByPid } from '../services/codex-transcript.js';
 import { findCocoSessionByPid } from '../services/coco-transcript.js';
 import { tmuxEnv } from '../setup/ensure-tmux.js';
@@ -28,6 +30,10 @@ export interface AdoptableSession {
   startedAt?: number;       // epoch ms
   paneCols: number;         // current pane width
   paneRows: number;         // current pane height
+  /** The adopted process's own CLAUDE_CONFIG_DIR (claude-code only), discovered
+   *  from /proc/<pid>/environ. Undefined → default ~/.claude. Threaded so the
+   *  adopt bridge tails the process's real home, not the adopting bot's config. */
+  claudeConfigDir?: string;
 }
 
 // ─── CLI process name → CliId mapping ────────────────────────────────────────
@@ -178,9 +184,52 @@ function findCliProcess(
  * Try to read Claude Code session metadata from ~/.claude/sessions/<PID>.json.
  * Returns { sessionId, cwd, startedAt } or undefined.
  */
+/**
+ * Pure parser: a `/proc/<pid>/environ` blob (NUL-separated KEY=VALUE entries)
+ * → the process's CLAUDE_CONFIG_DIR value, or undefined when unset/blank.
+ */
+export function parseClaudeConfigDirFromEnviron(raw: string): string | undefined {
+  const PREFIX = 'CLAUDE_CONFIG_DIR=';
+  for (const entry of raw.split('\0')) {
+    if (entry.startsWith(PREFIX)) {
+      const v = entry.slice(PREFIX.length);
+      return v.trim() ? v : undefined;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Resolve a pid's Claude home by reading its own CLAUDE_CONFIG_DIR from
+ * `/proc/<pid>/environ` (Linux). This is how adopt-discovery finds a cloned
+ * bot's pid-state without any bot context. Tolerates a just-exited / race /
+ * unreadable proc entry and non-Linux by falling back to ~/.claude — never
+ * throws. Only hit during user-initiated adopt discovery, not the
+ * transcript-follow hot path, so the per-pid read is fine.
+ */
+/**
+ * Read a pid's own CLAUDE_CONFIG_DIR (raw; undefined when unset/non-Linux/
+ * unreadable). Never throws — a just-exited / racing proc entry → undefined.
+ */
+function readPidClaudeConfigDir(pid: number): string | undefined {
+  if (IS_LINUX) {
+    try {
+      const raw = readFileSync(`/proc/${pid}/environ`, 'utf-8');
+      return parseClaudeConfigDirFromEnviron(raw);
+    } catch {
+      // process exited / unreadable → undefined
+    }
+  }
+  return undefined;
+}
+
+function readPidClaudeHome(pid: number): string {
+  return resolveClaudeHome(readPidClaudeConfigDir(pid));
+}
+
 function readClaudeSessionMeta(pid: number): { sessionId?: string; cwd?: string; startedAt?: number } | undefined {
   try {
-    const metaPath = join(homedir(), '.claude', 'sessions', `${pid}.json`);
+    const metaPath = claudePidStatePath(pid, readPidClaudeHome(pid));
     const raw = readFileSync(metaPath, 'utf-8');
     const data = JSON.parse(raw) as Record<string, unknown>;
     return {
@@ -268,12 +317,16 @@ export function discoverAdoptableSessions(filterCliId?: CliId): AdoptableSession
     // 5. Try to read CLI session metadata
     let sessionId: string | undefined;
     let startedAt: number | undefined;
+    let claudeConfigDir: string | undefined;
     if (match.cliId === 'claude-code') {
       const meta = readClaudeSessionMeta(match.pid);
       if (meta) {
         sessionId = meta.sessionId;
         startedAt = meta.startedAt;
       }
+      // Capture the process's own CLAUDE_CONFIG_DIR so the adopt bridge tails
+      // its real home (clone or default), independent of the adopting bot.
+      claudeConfigDir = readPidClaudeConfigDir(match.pid);
     } else if (match.cliId === 'codex') {
       // Codex has no per-pid state file — bind via the open rollout fd in
       // /proc. Worker-side has the same probe as a fallback so this is
@@ -304,6 +357,7 @@ export function discoverAdoptableSessions(filterCliId?: CliId): AdoptableSession
       startedAt,
       paneCols: dims.cols,
       paneRows: dims.rows,
+      claudeConfigDir,
     });
   }
 
@@ -337,4 +391,5 @@ export function validateAdoptTarget(tmuxTarget: string, expectedPid: number): bo
 // 的回归路径。生产代码不要直接消费这些导出。
 export const __testOnly_readComm = readComm;
 export const __testOnly_readCwd = readCwd;
+export const __testOnly_parseClaudeConfigDirFromEnviron = parseClaudeConfigDirFromEnviron;
 export const __testOnly_getChildPids = getChildPids;

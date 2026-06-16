@@ -826,11 +826,11 @@ description: 子任务编排 v2 —— 主 bot 在主话题把一件事派成独
 
 \`\`\`bash
 botmux subtask-start --goal "修登录态丢失问题" --task-type bug \\
-  [--acceptance "复现路径不再丢登录态"] [--bots c,k,t] [--name "群名"] [--related-refs url1,url2]
+  [--acceptance "复现路径不再丢登录态"] [--bots claude:main,k:collab] [--name "群名"] [--related-refs url1,url2]
 \`\`\`
 
 - \`--goal\` 必传（一句话任务目标）；\`--task-type\` prd|bug|misc。
-- \`--bots\` 逗号分隔 c|k|t（claude/codex/tilly），默认全拉三个。
+- \`--bots\` 逗号分隔，每项 \`<ref>[:role]\`：ref = c|k|t / claude|codex|tilly / 已注册 bot 的 name 或 appId（含克隆分身）；role ∈ main|collab|observer（省略走默认：内建 bot 保留原角色，其它 collab）。默认全拉三个。
 - 返回 \`{taskId, chatId, isNew}\`。子群建好后缇蕾会自动观测，你**不用**盯着子群——它有事会上报回主话题。
 
 ## 作为主 bot：收到「🛰️ 子任务状态变化」卡片
@@ -888,6 +888,37 @@ botmux subtask-report --task-id <taskId> --type need_help|done --summary "一句
 - 409 = 版本/状态冲突 → 重新 query 拿最新状态再决策。403 = 鉴权（非主话题主 bot / 非该子群参与者）。
 `;
 
+const BOT_CEO_SKILL = `---
+name: botmux-bot-ceo
+description: 当 owner 在聊天里说"建个子群推 XX 任务，worker/reviewer 都用克劳德分身"（或类似：用克隆分身建群、给某任务配 worker+reviewer 分身）时触发。你（CEO 克劳德）端到端编排：数够不够 claude 分身 → 不够则聊天里克隆（发二维码 @owner 扫）→ owner 批准后激活 → 拉进群给角色建子群。命令：botmux bot ceo-spawn。仅 owner 可用。
+---
+
+# botmux-bot-ceo — CEO 端到端建群编排
+
+owner 一句话 → 你自动建子群、按需克隆 claude 分身、给角色。**全程聊天里完成**，你只调命令、不让 owner 开终端。
+
+## 何时用
+owner（且只有 owner）说类似「建个子群推 X，worker+reviewer 都用克劳德分身」「用克隆分身给这个任务配主+reviewer」。非 owner 触发 → 命令会 refused，照此回复对方无权限。
+
+## 命令
+\`\`\`bash
+botmux bot ceo-spawn --goal "<任务目标>" --seats auto:main,auto:collab
+\`\`\`
+- \`--seats\`：每项 \`<role>\` 或 \`auto:<role>\`（=claude 自动席，本体或克隆来填）或 \`<ref>:<role>\`（指定已注册 bot）。role ∈ main|collab|observer。缺省 = \`auto:main,auto:collab\`（worker=本体 main、reviewer=克隆 collab）。
+- 这是**一步一转移的可恢复状态机**：每次调用推进一步并返回 outcome；你根据 outcome 决定下一步，**门清后重调同一条命令**。
+
+## 按 outcome 驱动循环
+- \`spawned\`：子群建好，收工，把 chatId 告诉 owner。
+- \`awaiting_activation\`（带 appId）：已扫码+写配置，但**让分身生效要起新进程＝部署动作，必须 owner 批准**。转达 owner「需起新进程激活该分身，是否批准」；**得到 owner 明确批准后**带 \`--activation-approved <appId>\` 重调同一命令（daemon 会再独立做 owner-scope 校验，伪造无效）。
+- \`awaiting_openid\`（带 appId）：分身已激活，正在等它在群里露面拿到 open_id；稍候**原样重调**命令即可继续。
+- \`refused\`：触发者非 owner，照实回复无权限。
+- \`error\`：按 message 处理——\`二维码…失败\`＝QR 没投进群已中止（重试）；\`扫码未完成\`＝扫码超时（重试）；其它＝读 message。
+
+## 红线
+- 激活＝起 pm2 新进程＝部署，**只在 owner 明确批准后**才带 \`--activation-approved\` 重调；绝不自作主张激活。
+- 克隆/激活是特权操作，命令侧已锁 owner；你也别替非 owner 代跑。
+`;
+
 export const BUILTIN_SKILLS: SkillDef[] = [
   { name: 'botmux-schedule', content: SCHEDULE_SKILL },
   { name: 'botmux-history', content: HISTORY_SKILL },
@@ -896,6 +927,7 @@ export const BUILTIN_SKILLS: SkillDef[] = [
   { name: 'botmux-bots', content: BOTS_SKILL },
   { name: 'botmux-workflow-create', content: WORKFLOW_CREATE_SKILL },
   { name: 'botmux-subtask', content: SUBTASK_SKILL },
+  { name: 'botmux-bot-ceo', content: BOT_CEO_SKILL },
 ];
 
 /** Skills that earlier botmux versions installed but no longer ship. The

@@ -23,12 +23,24 @@ vi.mock('../src/core/main-bot-playbook.js', () => {
   class HttpError extends Error {
     constructor(public status: number, msg: string) { super(msg); this.name = 'HttpError'; }
   }
-  const idents: Record<string, { larkAppId: string; openId: string }> = {
-    claude: { larkAppId: 'app_claude', openId: 'ou_claude' },
-    codex: { larkAppId: 'app_codex', openId: 'ou_codex' },
-    tilly: { larkAppId: 'app_coco', openId: 'ou_coco' },
+  const idents: Record<string, { larkAppId: string; openId: string; name: string }> = {
+    claude: { larkAppId: 'app_claude', openId: 'ou_claude', name: '克劳德' },
+    codex: { larkAppId: 'app_codex', openId: 'ou_codex', name: '蔻黛克斯' },
+    tilly: { larkAppId: 'app_coco', openId: 'ou_coco', name: '缇蕾' },
+    // a registered clone referenced by name/appId (N-bot)
+    'claude-clone': { larkAppId: 'app_clone', openId: 'ou_clone', name: 'claude-clone' },
   };
-  return { HttpError, authzCheck: (...a: any[]) => mockAuthzCheck(...a), resolveBotIdent: (k: string) => idents[k] };
+  // Mirror real resolveBotIdent: built-in aliases (c/k/t + full names, any case)
+  // canonicalize first; unknown ref throws (→ orchestrator maps to 400).
+  const ALIAS: Record<string, string> = {
+    claude: 'claude', c: 'claude', codex: 'codex', k: 'codex', tilly: 'tilly', t: 'tilly',
+  };
+  const resolveBotIdent = (k: string) => {
+    const v = idents[ALIAS[k.toLowerCase()] ?? k];
+    if (!v) throw new HttpError(500, `bot ref "${k}" not found`);
+    return v;
+  };
+  return { HttpError, authzCheck: (...a: any[]) => mockAuthzCheck(...a), resolveBotIdent };
 });
 vi.mock('../src/services/group-creator.js', () => ({ createGroupWithBots: (...a: any[]) => mockCreateGroup(...a) }));
 vi.mock('../src/services/spawn-idempotency-store.js', () => ({
@@ -113,6 +125,72 @@ describe('createSubtask', () => {
     expect(task.parentChatId).toBe('oc_main');
     expect(task.chatId).toBe('oc_sub_new');
     expect(getByChatId('oc_sub_new')!.taskId).toBe(res.taskId); // getByChatId 命中 = 归新 observer
+  });
+
+  // 块7 第三轮 #1 owner-visibility 不变量（蔻黛 守点5）：子群必须邀请 owner，否则 CEO
+  // 把 scope auth 链接发进子群时 owner 看不见。若此邀请被改掉，本测试炸。
+  it('[#1 owner-visibility] subgroup invites the owner (auth link must be visible to them)', async () => {
+    mainSession();
+    await createSubtask({ sessionId: 'sess_main', goal: 'owner visibility lock' });
+    const groupOpts = mockCreateGroup.mock.calls[0][0];
+    expect(groupOpts.userOpenIds).toContain('ou_jason'); // owner invited → in the subgroup
+  });
+
+  it('N-bot: --bots 引 clone (按 name) → larkAppIds/participants/store 带 clone, role=collab, 记 larkAppId', async () => {
+    mainSession();
+    const res = await createSubtask({ sessionId: 'sess_main', goal: 'n-bot clone test', bots: ['claude', 'claude-clone'] });
+    const groupOpts = mockCreateGroup.mock.calls[0][0];
+    expect(groupOpts.larkAppIds).toEqual(['app_claude', 'app_clone']);
+    expect(groupOpts.chatContext.participants).toEqual([
+      { openId: 'ou_claude', role: 'main' },     // alias 保留 BOT_META role
+      { openId: 'ou_clone', role: 'collab' },     // 任意 ref 默认 collab
+    ]);
+    const task = getByChatId(res.chatId)!;
+    expect(task.bots.find((b: any) => b.openId === 'ou_clone')).toMatchObject({
+      name: 'claude-clone', role: 'collab', larkAppId: 'app_clone',
+    });
+  });
+
+  it('alias role/name 兼容: bots 用短码 c/k/t 与大写 CLAUDE → 保留 main/collab/observer 不降级', async () => {
+    mainSession();
+    const res = await createSubtask({ sessionId: 'sess_main', goal: 'alias role test', bots: ['c', 'k', 't'] });
+    const groupOpts = mockCreateGroup.mock.calls[0][0];
+    expect(groupOpts.chatContext.participants).toEqual([
+      { openId: 'ou_claude', role: 'main' },      // c → claude 本体, NOT demoted to collab
+      { openId: 'ou_codex', role: 'collab' },
+      { openId: 'ou_coco', role: 'observer' },
+    ]);
+    const task = getByChatId(res.chatId)!;
+    expect(task.bots.map((b: any) => [b.name, b.role])).toEqual([
+      ['克劳德', 'main'], ['蔻黛克斯', 'collab'], ['缇蕾', 'observer'],
+    ]);
+  });
+
+  it('alias 大小写不敏感: bots:[CLAUDE] → claude 本体 main', async () => {
+    mainSession();
+    const res = await createSubtask({ sessionId: 'sess_main', goal: 'uppercase alias', bots: ['CLAUDE'] });
+    const task = getByChatId(res.chatId)!;
+    expect(task.bots[0]).toMatchObject({ name: '克劳德', role: 'main' });
+  });
+
+  it('6b: --bots ref:role 显式角色覆盖默认 (claude:observer, clone:main)', async () => {
+    mainSession();
+    const res = await createSubtask({ sessionId: 'sess_main', goal: '6b role override', bots: ['claude:observer', 'claude-clone:main'] });
+    const task = getByChatId(res.chatId)!;
+    expect(task.bots.find((b: any) => b.openId === 'ou_claude')).toMatchObject({ role: 'observer', name: '克劳德' }); // 显式 observer 覆盖默认 main
+    expect(task.bots.find((b: any) => b.openId === 'ou_clone')).toMatchObject({ role: 'main', larkAppId: 'app_clone' }); // clone 显式 main
+  });
+
+  it('6b: 非法 role → 400', async () => {
+    mainSession();
+    await expect(createSubtask({ sessionId: 'sess_main', goal: '6b bad role', bots: ['claude:boss'] }))
+      .rejects.toMatchObject({ status: 400 });
+  });
+
+  it('6b: 无 :role 后缀 → 默认角色不变 (claude→main)', async () => {
+    mainSession();
+    const res = await createSubtask({ sessionId: 'sess_main', goal: '6b no role', bots: ['claude'] });
+    expect(getByChatId(res.chatId)!.bots[0]).toMatchObject({ role: 'main', name: '克劳德' });
   });
 
   it('v3 kickoff: create 后 enqueue 一条 kickoff (parent→child, 投子群, 幂等不重复)', async () => {

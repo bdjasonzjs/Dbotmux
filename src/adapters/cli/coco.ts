@@ -1,17 +1,33 @@
 import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
+import { homedir, platform } from 'node:os';
 import { join } from 'node:path';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { cocoCacheRoot } from '../../services/coco-paths.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 
-/** Global submit log — CoCo appends one JSON line here on every successful
- *  user submit across all sessions (mode:"user"). Format observed:
- *  `{"content":"...","mode":"user","timestamp":"..."}`. Used the same way
- *  the Codex adapter uses ~/.codex/history.jsonl: write → poll for our
- *  marker → retry Enter if missing → return {submitted:false, recheck}
- *  on final failure so worker can surface a Lark warning. */
-const HISTORY_PATH = join(cocoCacheRoot(), 'history.jsonl');
+/** CoCo's global submit log (one JSON line per user submit, mode:"user"). Used
+ *  like the Codex adapter's history.jsonl: write → poll for our marker → retry.
+ *
+ *  Round-4 coco state-only clone: a clone runs with XDG_CACHE_HOME=<cloneDir>, so
+ *  its history.jsonl is under that cache; reading the 本体's would cross-talk.
+ *  `home` = the XDG_CACHE_HOME value (clone's cfg.claudeConfigDir); omit → 本体. */
+function historyPath(home?: string): string {
+  return join(cocoCacheRoot(home), 'history.jsonl');
+}
+
+/** Default XDG cache base (= coco state-only 本体's home, no XDG_CACHE_HOME). */
+function defaultCocoCacheBase(): string {
+  return platform() === 'darwin'
+    ? join(homedir(), 'Library', 'Caches')
+    : join(homedir(), '.cache');
+}
+
+/** Shell-quote a path for safe embedding in a copy-paste command (蔻黛 guardrail
+ *  3): single-quote and escape any embedded single quotes. */
+function shQuote(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`;
+}
 
 function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -117,6 +133,24 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
   const bin = resolveCommand(pathOverride ?? 'coco');
   return {
     id: 'coco',
+    // Round-4: coco is a STATE-ONLY clone tier. Only session/cache state isolates
+    // (via XDG_CACHE_HOME → CoCo writes <cloneDir>/coco/); persona/config/memory
+    // stay in ~/.coco + ~/.trae ($HOME, no relocation env) and are SHARED. botmux
+    // does NOT enforce read-only on them — the current coco version was OBSERVED
+    // not to write them during a session (sharedEntries=[] means no writable copy
+    // is made). 'state-only' is never auto-selected by default; explicit ref only.
+    // NOTE: envVar=XDG_CACHE_HOME relocates the WHOLE process-tree cache (ripgrep/
+    // plugins/event-queue too), all under the clone-scoped dir.
+    cloneHome: {
+      tier: 'state-only',
+      envVar: 'XDG_CACHE_HOME',
+      dirName: 'coco-cache',
+      defaultHome: defaultCocoCacheBase,
+      sharedEntries: [],
+      copyEntries: [],
+      independentDirs: [],
+      memorySeed: 'none',
+    },
     resolvedBin: bin,
 
     buildArgs({ sessionId, resume }) {
@@ -131,8 +165,14 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
       return args;
     },
 
-    buildResumeCommand({ sessionId }) {
-      return `coco --resume ${sessionId}`;
+    buildResumeCommand({ sessionId, cliHome }) {
+      // Round-4 coco state-only clone (蔻黛 guardrail 3+4): the clone's session
+      // lives under its clone-scoped XDG_CACHE_HOME, so a manual terminal resume
+      // must set it too (else coco looks in the 本体 cache). cliHome present ⇒
+      // clone → shell-safe-quoted prefix; absent ⇒ 本体 → plain command.
+      return cliHome
+        ? `XDG_CACHE_HOME=${shQuote(cliHome)} coco --resume ${sessionId}`
+        : `coco --resume ${sessionId}`;
     },
 
     async writeInput(pty: PtyHandle, content: string) {
@@ -171,6 +211,9 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
       // user-submit line whose decoded `content` starts with our prefix.
       // Retry Enter up to 3 times, then return {submitted:false, recheck}
       // for the worker's deferred recheck + Lark warning path.
+      // Round-4 coco state-only clone: read history.jsonl from THIS session's
+      // cache (clone → its XDG_CACHE_HOME via pty.claudeHome; 本体 → default).
+      const HISTORY_PATH = historyPath(pty.claudeHome);
       const hasImagePath = /\.(jpe?g|png|gif|webp|svg|bmp)\b/i.test(content);
       const submitDelay = hasImagePath ? 800 : 500;
 

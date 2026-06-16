@@ -2,6 +2,7 @@ import { existsSync, statSync, openSync, readSync, closeSync, readFileSync, read
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { resolveCommand } from './registry.js';
+import { resolveClaudeHome } from '../../core/claude-home.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { findJsonlContainingFingerprint, jsonlContainsFingerprint, normaliseForFingerprint } from '../../services/claude-transcript.js';
 import { t } from '../../i18n/index.js';
@@ -24,9 +25,9 @@ function realpathCwd(cwd: string): string {
  *  Claude Code's project-hash scheme replaces every non-[A-Za-z0-9-] char with `-`
  *  (observed: `/foo/life_workspace` → `-foo-life-workspace`; `/`, `.`, `_` all become `-`).
  *  Always operates on realpath(cwd) — see realpathCwd above. */
-export function claudeJsonlPathForSession(sessionId: string, cwd: string): string {
+export function claudeJsonlPathForSession(sessionId: string, cwd: string, claudeHome: string = resolveClaudeHome()): string {
   const projectHash = realpathCwd(cwd).replace(/[^A-Za-z0-9-]/g, '-');
-  return join(homedir(), '.claude', 'projects', projectHash, `${sessionId}.jsonl`);
+  return join(claudeHome, 'projects', projectHash, `${sessionId}.jsonl`);
 }
 
 /** Substrings that indicate Claude Code received our submit. We accept either:
@@ -89,8 +90,8 @@ const SESSION_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-
  *  rely on this for rotation tracking must therefore treat a "matching
  *  sessionId" answer as "no spawn-time rotation observed", not "no
  *  rotation at all" — the latter requires fingerprint corroboration. */
-export function claudePidStatePath(pid: number): string {
-  return join(homedir(), '.claude', 'sessions', `${pid}.json`);
+export function claudePidStatePath(pid: number, claudeHome: string = resolveClaudeHome()): string {
+  return join(claudeHome, 'sessions', `${pid}.json`);
 }
 
 /** Linux-only: read /proc/<pid>/stat field 22 (starttime). Returns null when
@@ -117,11 +118,11 @@ function readProcStarttime(pid: number): string | null {
  *  also matches procStart against /proc/<pid>/stat to reject PID reuse. If
  *  procStart is present but cannot be verified on Linux, fail closed; callers
  *  fall back to fingerprint detection. */
-export function resolveJsonlFromPid(pid: number, expectedCwd: string): { path: string; cliSessionId: string } | null {
+export function resolveJsonlFromPid(pid: number, expectedCwd: string, claudeHome: string = resolveClaudeHome()): { path: string; cliSessionId: string } | null {
   if (!Number.isInteger(pid) || pid <= 0) return null;
   let parsed: any;
   try {
-    parsed = JSON.parse(readFileSync(claudePidStatePath(pid), 'utf8'));
+    parsed = JSON.parse(readFileSync(claudePidStatePath(pid, claudeHome), 'utf8'));
   } catch {
     return null;
   }
@@ -150,7 +151,7 @@ export function resolveJsonlFromPid(pid: number, expectedCwd: string): { path: s
   }
   if (!procStartVerified && realpathCwd(parsed.cwd) !== realpathCwd(expectedCwd)) return null;
   return {
-    path: claudeJsonlPathForSession(parsed.sessionId, parsed.cwd),
+    path: claudeJsonlPathForSession(parsed.sessionId, parsed.cwd, claudeHome),
     cliSessionId: parsed.sessionId,
   };
 }
@@ -170,7 +171,7 @@ export function resolveJsonlFromPid(pid: number, expectedCwd: string): { path: s
  *  Returns deduplicated sessionIds in arbitrary order; caller picks one
  *  (typically by mtime of the corresponding jsonl). Returns [] on
  *  non-Linux platforms or if /proc lookup fails. */
-export function findOpenClaudeSessionIds(pid: number): string[] {
+export function findOpenClaudeSessionIds(pid: number, claudeHome: string = resolveClaudeHome()): string[] {
   if (!Number.isInteger(pid) || pid <= 0) return [];
   if (process.platform !== 'linux') return [];
   let entries: string[];
@@ -179,7 +180,7 @@ export function findOpenClaudeSessionIds(pid: number): string[] {
   } catch {
     return [];
   }
-  const tasksPrefix = join(homedir(), '.claude', 'tasks') + '/';
+  const tasksPrefix = join(claudeHome, 'tasks') + '/';
   const projectsInfix = '/.claude/projects/';
   const out = new Set<string>();
   for (const name of entries) {
@@ -370,6 +371,22 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
   const bin = resolveCommand(pathOverride ?? 'claude');
   return {
     id: 'claude-code',
+    // Round-4: claude relocates its home via CLAUDE_CONFIG_DIR (the existing
+    // home-isolation mechanism). Lists mirror the original CLONE_SHARED_ENTRIES /
+    // CLONE_INDEPENDENT_DIRS exactly so claude clone setup is byte-equivalent.
+    cloneHome: {
+      tier: 'full',
+      envVar: 'CLAUDE_CONFIG_DIR',
+      dirName: '.claude',
+      defaultHome: () => join(homedir(), '.claude'),
+      sharedEntries: [
+        'CLAUDE.md', 'settings.json', 'settings.local.json', 'keybindings.json',
+        'skills', 'identity', 'plugins', 'hooks', '.credentials.json',
+      ],
+      copyEntries: [],
+      independentDirs: ['projects', 'sessions', 'todos', 'shell-snapshots', 'statsig'],
+      memorySeed: 'claude-projects',
+    },
     resolvedBin: bin,
     supportsTypeAhead: true,
 
@@ -511,7 +528,7 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
         return false;
       };
       if (pty.cliPid && pty.cliCwd) {
-        const resolved = resolveJsonlFromPid(pty.cliPid, pty.cliCwd);
+        const resolved = resolveJsonlFromPid(pty.cliPid, pty.cliCwd, pty.claudeHome);
         if (resolved) applyResolved(resolved);
       }
       // baseByte is recomputed at this point (after any entry-time path swap)
@@ -591,7 +608,7 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
         // the rotated file. For (b), poll from the rotated file's own current
         // size so an older, larger startPath cannot hide a delayed append.
         if (pty.cliPid && pty.cliCwd) {
-          const resolved = resolveJsonlFromPid(pty.cliPid, pty.cliCwd);
+          const resolved = resolveJsonlFromPid(pty.cliPid, pty.cliCwd, pty.claudeHome);
           if (resolved) {
             const switched = applyResolved(resolved);
             const newPath = pty.claudeJsonlPath;
@@ -683,7 +700,7 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
         if (!submitFingerprint) return false;
         // Latest pid → path; covers post-failure rotations (/clear, /resume).
         if (pty.cliPid && pty.cliCwd) {
-          const resolved = resolveJsonlFromPid(pty.cliPid, pty.cliCwd);
+          const resolved = resolveJsonlFromPid(pty.cliPid, pty.cliCwd, pty.claudeHome);
           if (resolved) applyResolved(resolved);
         }
         const currentPath = pty.claudeJsonlPath;

@@ -28,10 +28,30 @@ export function relayConfig(): RelayConfig | null {
   return { baseToken, tableId };
 }
 
-const CLI_TIMEOUT_MS = 20_000;
+export const CLI_TIMEOUT_MS = 20_000;
 const POLL_INTERVAL_MS = 2_000;
-/** 轮询「已发送」的默认上限。必须 < dispatch lease，留出余量给 dispatcher CAS 回写。 */
-export const DEFAULT_POLL_TIMEOUT_MS = 35_000;
+/**
+ * 轮询「已发送」的默认上限。35s 太短 < 飞书自动化积压延迟 → 过早判 timeout→retry，徒增轮次/刷屏感
+ * (2026-06-14 调大到 75s)。caller (dispatcher) 应传 resolvePollTimeoutMs(lease) 进来确保不破不变量；
+ * 此常量仅作未传时的独立默认值。
+ */
+export const DEFAULT_POLL_TIMEOUT_MS = 75_000;
+/** 一次 sendAsOwner 在 pollTimeout 之外的最坏额外耗时：group-not-found 重试(≤10s) + 末次 CLI 调用(20s)*2。 */
+export const RELAY_WORST_CASE_OVERHEAD_MS = 10_000 + CLI_TIMEOUT_MS + CLI_TIMEOUT_MS;
+/**
+ * poll 超时安全上限：保证 worst-case (overhead + poll) < dispatch lease，再留 5s 余量。
+ * 🔒 不变量 (蔻黛克斯 review P1-5)：lease 过期会让别的 dispatcher 重 claim → 并发投递/回写竞争。
+ */
+export function maxSafePollTimeoutMs(dispatchLeaseMs: number): number {
+  return Math.max(POLL_INTERVAL_MS, dispatchLeaseMs - RELAY_WORST_CASE_OVERHEAD_MS - 5_000);
+}
+/** 解析 poll 超时：env `SUBTASK_RELAY_POLL_TIMEOUT_MS` 覆盖 → 缺省 75s；统一 clamp 到 [interval, maxSafe]，
+ *  env 误配也打不破「worst-case < lease」不变量。 */
+export function resolvePollTimeoutMs(dispatchLeaseMs: number): number {
+  const env = Number(process.env.SUBTASK_RELAY_POLL_TIMEOUT_MS);
+  const want = Number.isFinite(env) && env > 0 ? Math.floor(env) : DEFAULT_POLL_TIMEOUT_MS;
+  return Math.min(Math.max(want, POLL_INTERVAL_MS), maxSafePollTimeoutMs(dispatchLeaseMs));
+}
 export const GROUP_NOT_FOUND_RETRY_INTERVAL_MS = 5_000;
 export const DEFAULT_GROUP_NOT_FOUND_RETRY_TIMEOUT_MS = 10_000;
 

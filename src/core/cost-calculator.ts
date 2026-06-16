@@ -3,9 +3,9 @@
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { homedir } from 'node:os';
 import { logger } from '../utils/logger.js';
 import { expandHome } from './session-manager.js';
+import { defaultClaudeHome } from './claude-home.js';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -20,17 +20,18 @@ export interface SessionCost {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-export function getSessionJsonlPath(sessionId: string, cwd: string): string | null {
+export function getSessionJsonlPath(sessionId: string, cwd: string, claudeHome: string = defaultClaudeHome()): string | null {
   const resolvedCwd = resolve(expandHome(cwd));
-  // Claude stores sessions at ~/.claude/projects/<project-key>/<sessionId>.jsonl
-  // where project-key = absolute path with / replaced by -
+  // Claude stores sessions at <claudeHome>/projects/<project-key>/<sessionId>.jsonl
+  // where project-key = absolute path with / replaced by -. claudeHome defaults
+  // to ~/.claude; a cloned bot passes its isolated home.
   const projectKey = resolvedCwd.replace(/\//g, '-');
-  const jsonlPath = join(homedir(), '.claude', 'projects', projectKey, `${sessionId}.jsonl`);
+  const jsonlPath = join(claudeHome, 'projects', projectKey, `${sessionId}.jsonl`);
   return existsSync(jsonlPath) ? jsonlPath : null;
 }
 
-export function getSessionCost(sessionId: string, cwd: string): SessionCost | null {
-  const jsonlPath = getSessionJsonlPath(sessionId, cwd);
+export function getSessionCost(sessionId: string, cwd: string, claudeHome: string = defaultClaudeHome()): SessionCost | null {
+  const jsonlPath = getSessionJsonlPath(sessionId, cwd, claudeHome);
   if (!jsonlPath) return null;
 
   let inputTokens = 0;

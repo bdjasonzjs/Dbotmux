@@ -329,6 +329,9 @@ export async function handleCommand(
               return adapter.buildResumeCommand?.({
                 sessionId: closedSessionId,
                 cliSessionId: ds.session.cliSessionId,
+                // Round-4 B4: clone-aware home so codex resume-fallback reads the
+                // right history.jsonl (clone home, or the engine default for 本体).
+                cliHome: botCfg.claudeConfigDir ?? adapter.cloneHome?.defaultHome(),
               }) ?? null;
             } catch { return null; }
           })();
@@ -995,6 +998,7 @@ export async function startAdoptSession(
     cwd: target.cwd,
     paneCols: target.paneCols,
     paneRows: target.paneRows,
+    claudeConfigDir: target.claudeConfigDir,
   };
   ds.session.adoptedFrom = { ...ds.adoptedFrom };
   sessionStore.updateSession(ds.session);

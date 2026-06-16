@@ -5,11 +5,17 @@ import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 
-/** Global submit log — Codex appends one JSON line here on every successful
- *  user submit across all sessions. Far better than the per-session rollout
- *  file, which Codex creates lazily at the first submit (chicken-and-egg:
- *  you can't use it to verify the *first* submit that we're trying to fix). */
-const HISTORY_PATH = join(homedir(), '.codex', 'history.jsonl');
+/** Codex's global submit log — one JSON line per successful user submit across
+ *  all sessions. Far better than the per-session rollout file, which Codex creates
+ *  lazily at the first submit (chicken-and-egg: you can't use it to verify the
+ *  *first* submit that we're trying to fix).
+ *
+ *  Round-4 B4: per home — a cloned codex bot runs with CODEX_HOME=<clone home>, so
+ *  its history.jsonl is under that home; reading the global ~/.codex would cross-talk
+ *  with the 本体. `home` undefined → global ~/.codex (本体, unchanged). */
+function historyPath(home?: string): string {
+  return join(home && home.trim() ? home : join(homedir(), '.codex'), 'history.jsonl');
+}
 
 function delay(ms: number): Promise<void> {
   return new Promise(r => setTimeout(r, ms));
@@ -75,7 +81,8 @@ function historyMarker(content: string): string {
   return JSON.stringify(prefix).slice(1, -1);  // strip surrounding quotes
 }
 
-function latestCodexSessionForBotmuxSession(botmuxSessionId: string): string | undefined {
+function latestCodexSessionForBotmuxSession(botmuxSessionId: string, home?: string): string | undefined {
+  const HISTORY_PATH = historyPath(home);
   if (!existsSync(HISTORY_PATH)) return undefined;
   try {
     const size = statSync(HISTORY_PATH).size;
@@ -108,9 +115,25 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
   const bin = resolveCommand(pathOverride ?? 'codex');
   return {
     id: 'codex',
+    // Round-4 B4: codex relocates its home via CODEX_HOME (verified). Classification
+    // from the ~/.codex inventory: symlink read-only persona; COPY auth.json/config.toml
+    // (mutable creds/config — codex may atomic-rename them, which would clobber a
+    // symlink / cross-pollute the 本体); seed NO memory (codex memory is live SQLite —
+    // copying a 2.3GB WAL would risk a corrupt DB); independentDirs empty (codex
+    // creates sessions/history/*.sqlite itself on first run in a fresh CODEX_HOME).
+    cloneHome: {
+      tier: 'full',
+      envVar: 'CODEX_HOME',
+      dirName: '.codex',
+      defaultHome: () => join(homedir(), '.codex'),
+      sharedEntries: ['AGENTS.md', 'hooks.json', 'agents', 'bin', 'identity', 'plugins', 'skills', 'rules', 'model-catalogs'],
+      copyEntries: ['auth.json', 'config.toml'],
+      independentDirs: [],
+      memorySeed: 'none',
+    },
     resolvedBin: bin,
 
-    buildArgs({ sessionId, resume, resumeSessionId, workingDir }) {
+    buildArgs({ sessionId, resume, resumeSessionId, workingDir, cliHome }) {
       const baseArgs = [
         '--dangerously-bypass-approvals-and-sandbox',
         '--no-alt-screen',
@@ -121,17 +144,18 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
         : baseArgs;
       if (!resume) return freshArgs;
 
-      const codexSessionId = resumeSessionId ?? latestCodexSessionForBotmuxSession(sessionId);
+      // resume-fallback reads history.jsonl in THIS session's home (clone-aware).
+      const codexSessionId = resumeSessionId ?? latestCodexSessionForBotmuxSession(sessionId, cliHome);
       if (!codexSessionId) return freshArgs;
       return ['resume', ...baseArgs, codexSessionId];
     },
 
-    buildResumeCommand({ sessionId, cliSessionId }) {
+    buildResumeCommand({ sessionId, cliSessionId, cliHome }) {
       // Codex's `resume` is a subcommand (not a flag) and takes Codex's own
       // UUID, not the botmux sessionId. Prefer the persisted cliSessionId;
       // fall back to scanning ~/.codex/history.jsonl for the most recent
       // codex session id that referenced this botmux session.
-      const sid = cliSessionId ?? latestCodexSessionForBotmuxSession(sessionId);
+      const sid = cliSessionId ?? latestCodexSessionForBotmuxSession(sessionId, cliHome);
       if (!sid) return null;
       return `codex resume ${sid}`;
     },
@@ -162,6 +186,9 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
         }
       };
 
+      // Round-4 B4: this session's history.jsonl (clone reads its own CODEX_HOME via
+      // pty.claudeHome; 本体 → global ~/.codex when unset).
+      const HISTORY_PATH = historyPath(pty.claudeHome);
       const baseByte = currentFileSize(HISTORY_PATH);
       const marker = historyMarker(content);
 

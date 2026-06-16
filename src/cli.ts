@@ -22,7 +22,6 @@ import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
-import { createRequire } from 'node:module';
 import { createHmac, randomBytes } from 'node:crypto';
 import { validateWorkingDir } from './core/working-dir.js';
 import { enableAutostart, disableAutostart, autostartStatus, refreshAutostart } from './autostart.js';
@@ -49,6 +48,15 @@ import {
 } from './cli/bots-list-output.js';
 import { isLocale, setDefaultLocale, SUPPORTED_LOCALES, type Locale } from './i18n/index.js';
 import { readGlobalConfig, setGlobalLocale, globalConfigPath } from './global-config.js';
+import {
+  pm2Bin as ecoPm2Bin,
+  pm2Env as ecoPm2Env,
+  listPm2GodDaemonPids as ecoListPm2GodDaemonPids,
+  killDuplicatePm2GodDaemons as ecoKillDuplicatePm2GodDaemons,
+  runPm2 as ecoRunPm2,
+  writeEcosystemConfig,
+  type EcosystemPaths,
+} from './core/pm2-ecosystem.js';
 
 // Resolve the CLI's UI locale once from the global config file, so subsequent
 // CLI output (and any t() callers that don't pass an explicit locale) honour
@@ -67,7 +75,6 @@ logger.setSilent(true);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-const require = createRequire(import.meta.url);
 
 // Package root is one level up from dist/
 const PKG_ROOT = dirname(__dirname);
@@ -86,6 +93,16 @@ const PM2_NAME = 'botmux';
  */
 const PM2_HOME = join(CONFIG_DIR, 'pm2');
 
+/** `~/.botmux` layout passed to the shared pm2-ecosystem helpers. */
+const ECOSYSTEM_PATHS: EcosystemPaths = {
+  configDir: CONFIG_DIR,
+  dataDir: DATA_DIR,
+  logDir: LOG_DIR,
+  heapshotDir: HEAPSHOT_DIR,
+  pkgRoot: PKG_ROOT,
+  pm2Name: PM2_NAME,
+};
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function ensureConfigDir(): void {
@@ -94,84 +111,28 @@ function ensureConfigDir(): void {
   }
 }
 
-/**
- * Resolve the pm2 CLI script path. Uses require.resolve so it always lands
- * on the pm2 bundled with this package, never on a PATH-resolved pm2 that
- * may belong to an unrelated installation (e.g. IDE remote extensions).
- */
+// PM2 / ecosystem plumbing now lives in ./core/pm2-ecosystem.ts (shared with
+// the bot-clone flow). These thin wrappers keep cli.ts's existing call sites
+// and default-PM2_HOME behaviour unchanged while delegating the logic.
 function pm2Bin(): string {
-  try {
-    return require.resolve('pm2/bin/pm2');
-  } catch { /* fall through */ }
-  // Fallbacks for unusual installation layouts
-  const direct = join(PKG_ROOT, 'node_modules', 'pm2', 'bin', 'pm2');
-  if (existsSync(direct)) return direct;
-  const symlink = join(PKG_ROOT, 'node_modules', '.bin', 'pm2');
-  if (existsSync(symlink)) return symlink;
-  return 'pm2';
+  return ecoPm2Bin(PKG_ROOT);
 }
 
 /** Env for pm2 invocations with an isolated PM2_HOME. */
 function pm2Env(home: string = PM2_HOME): NodeJS.ProcessEnv {
-  return { ...process.env, PM2_HOME: home };
+  return ecoPm2Env(home);
 }
 
 function listPm2GodDaemonPids(home: string = PM2_HOME): number[] {
-  if (process.platform !== 'linux') return [];
-  const marker = `God Daemon (${home})`;
-  const pids: number[] = [];
-  try {
-    for (const ent of readdirSync('/proc')) {
-      if (!/^\d+$/.test(ent)) continue;
-      const pid = parseInt(ent, 10);
-      if (!pid) continue;
-      try {
-        const cmd = readFileSync(`/proc/${pid}/cmdline`, 'utf-8').replace(/\u0000/g, ' ').trim();
-        if (cmd.includes('PM2 v') && cmd.includes(marker)) pids.push(pid);
-      } catch { /* ignore unreadable proc entries */ }
-    }
-  } catch { /* ignore proc scan failure */ }
-  return pids.sort((a, b) => a - b);
+  return ecoListPm2GodDaemonPids(home);
 }
 
 function killDuplicatePm2GodDaemons(home: string = PM2_HOME): boolean {
-  const pids = listPm2GodDaemonPids(home);
-  if (pids.length <= 1) return false;
-
-  const pidFile = join(home, 'pm2.pid');
-  let keepPid = 0;
-  if (existsSync(pidFile)) {
-    try {
-      const parsed = parseInt(readFileSync(pidFile, 'utf-8').trim(), 10);
-      if (pids.includes(parsed)) keepPid = parsed;
-    } catch { /* ignore malformed pid file */ }
-  }
-  if (!keepPid) keepPid = pids[pids.length - 1];
-
-  const dupes = pids.filter(pid => pid !== keepPid);
-  if (dupes.length === 0) return false;
-
-  for (const pid of dupes) {
-    try { process.kill(pid, 'SIGTERM'); } catch { /* ignore */ }
-    try {
-      process.kill(pid, 0);
-      process.kill(pid, 'SIGKILL');
-    } catch { /* ignore */ }
-  }
-
-  try {
-    writeFileSync(pidFile, `${keepPid}\n`, 'utf-8');
-  } catch { /* ignore */ }
-
-  console.warn(`⚠️  检测到同一 PM2_HOME (${home}) 下存在多个 PM2 God Daemon，已清理重复实例；保留 pid ${keepPid}，移除: ${dupes.join(', ')}`);
-  return true;
+  return ecoKillDuplicatePm2GodDaemons(home);
 }
 
 function runPm2(args: string[], inherit = true, home: string = PM2_HOME): void {
-  execSync(`${pm2Bin()} ${args.join(' ')}`, {
-    stdio: inherit ? 'inherit' : 'pipe',
-    env: pm2Env(home),
-  });
+  ecoRunPm2(args, { pkgRoot: PKG_ROOT, pm2Home: home, inherit });
 }
 
 function loadBotsJson(): any[] {
@@ -206,69 +167,12 @@ function ensureUniqueBotProcessNames(bots: any[]): void {
 }
 
 function ecosystemConfig(): string {
-  const daemonScript = join(PKG_ROOT, 'dist', 'index-daemon.js');
   const bots = loadBotsJson();
   ensureUniqueBotProcessNames(bots);
-
-  const baseApp = {
-    script: daemonScript,
-    cwd: CONFIG_DIR,
-    autorestart: true,
-    max_restarts: 10,
-    restart_delay: 3000,
-    log_date_format: 'YYYY-MM-DD HH:mm:ss',
-    merge_logs: true,
-    node_args: [
-      '--max-old-space-size=8192',
-      // Do not enable --heapsnapshot-near-heap-limit here. On large V8
-      // heaps the snapshot generator is synchronous, can add many GiB of
-      // RSS, and blocks the daemon before our memdiag timer can run.
-      `--diagnostic-dir=${HEAPSHOT_DIR}`,
-    ],
-  };
-
-  const apps: any[] = bots.map((_bot: any, i: number) => ({
-    ...baseApp,
-    name: botProcessName(_bot, i, PM2_NAME),
-    error_file: join(LOG_DIR, `daemon-${i}-error.log`),
-    out_file: join(LOG_DIR, `daemon-${i}-out.log`),
-    env: {
-      SESSION_DATA_DIR: DATA_DIR,
-      BOTMUX_BOT_INDEX: String(i),
-      // Native-memory diagnostics. Default off; operator can flip it on
-      // ad-hoc (e.g. `BOTMUX_MEMORY_DIAG_INTERVAL_MS=5000`) when chasing an
-      // RSS regression — turned off in master so logs stay quiet.
-      BOTMUX_MEMORY_DIAG_INTERVAL_MS: process.env.BOTMUX_MEMORY_DIAG_INTERVAL_MS ?? '0',
-    },
-  }));
-
-  apps.push({
-    name: 'botmux-dashboard',
-    script: join(PKG_ROOT, 'dist', 'dashboard.js'),
-    cwd: PKG_ROOT,
-    autorestart: true,
-    max_restarts: 10,
-    restart_delay: 3000,
-    error_file: join(LOG_DIR, 'dashboard-error.log'),
-    out_file: join(LOG_DIR, 'dashboard-out.log'),
-    merge_logs: true,
-    env: {
-      // Belt-and-suspenders for the topology-empty-after-restart bug: pin the
-      // dashboard's data dir to the same place the daemons write (DATA_DIR =
-      // ~/.botmux/data). config.ts now also defaults here, so this is a
-      // defensive duplicate — if someone reverts the config default, the
-      // dashboard still resolves the daemon's data dir instead of the empty
-      // install-dir/data.
-      SESSION_DATA_DIR: DATA_DIR,
-      BOTMUX_DASHBOARD_HOST: process.env.BOTMUX_DASHBOARD_HOST ?? '0.0.0.0',
-      BOTMUX_DASHBOARD_PORT: process.env.BOTMUX_DASHBOARD_PORT ?? '7891',
-    },
-  });
-
-  const cfg = { apps };
-  const tmpFile = join(CONFIG_DIR, 'ecosystem.config.json');
-  writeFileSync(tmpFile, JSON.stringify(cfg, null, 2));
-  return tmpFile;
+  // Generation logic lives in ./core/pm2-ecosystem.ts (shared with bot-clone).
+  // Bug A (topology-empty-after-restart) fix lives in buildEcosystemConfig:
+  // both daemon apps and the dashboard app pin SESSION_DATA_DIR to dataDir.
+  return writeEcosystemConfig(bots, ECOSYSTEM_PATHS);
 }
 
 function hasConfig(): boolean {
@@ -2074,6 +1978,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
                                        拉取当前会话的消息历史 (JSON)。默认按 session scope：话题/话题群 → 话题内，普通群 → 整群；
                                        thread 会话里可用 --scope ambient 读取 thread 外的群聊上下文
   quoted <message_id>                  拉取被引用的单条消息 (JSON)，message_id 取自 daemon 注入的引用提示行
+  mailbox read <letterId> [--json]     读急急如律令信箱里的长文 (收端 auto-expand 的人工兜底)；mailbox gc 清过期
 
 新建飞书群:
   create-group --bot <name> [--bot ...] [--name "群名"]
@@ -3275,7 +3180,11 @@ const command = process.argv[2];
 // reconcile.  Read-only commands (history, quoted, bots list, etc.)
 // stay allowed because they're useful for agents to introspect.
 if (process.env.BOTMUX_WORKFLOW === '1') {
-  const blockedRoot = new Set(['send', 'create-group', 'setup']);
+  // 'bot' (bot clone) is a privileged side-effecting command (QR scan, writes
+  // bots.json, creates clone home) — it must go through the hostExecutor /
+  // effectAttempted / reconcile loop + chat-side owner gate, never a raw
+  // subagent shell-out, so it's blocked inside workflow subagents.
+  const blockedRoot = new Set(['send', 'create-group', 'setup', 'bot']);
   const isSchedule = command === 'schedule';
   const scheduleSub = isSchedule ? (process.argv[3] ?? '') : '';
   const blockedScheduleSub = new Set([
@@ -3377,7 +3286,19 @@ switch (command) {
     await cmdMonitorReportConsume(process.argv.slice(3));
     break;
   }
+  case 'mailbox': {
+    // 先固定 dataDir 再 import，否则 mailbox 读默认 <repo>/data 而非 daemon 的 ~/.botmux/data
+    process.env.SESSION_DATA_DIR ??= resolveDataDir();
+    const { cmdMailbox } = await import('./cli/mailbox.js');
+    await cmdMailbox(process.argv[3] ?? '', process.argv.slice(4));
+    break;
+  }
   case 'bots':     await cmdBots(process.argv[3] ?? 'list', process.argv.slice(4)); break;
+  case 'bot': {
+    const { cmdBot } = await import('./cli/bot-clone.js');
+    await cmdBot(process.argv[3] ?? '', process.argv.slice(4));
+    break;
+  }
   case 'history':  await cmdHistory(process.argv.slice(3)); break;
   case 'quoted':   await cmdQuoted(process.argv.slice(3)); break;
   case 'lang':     cmdLang(process.argv.slice(3)); break;

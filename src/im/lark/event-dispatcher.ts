@@ -23,6 +23,8 @@ import { handleChatMemberBotAdded } from './chat-created-handler.js';
 import { bumpMessage as topologyBumpMessage } from '../../services/chat-topology-store.js';
 import { markStale as digestMarkStale } from '../../services/main-bot-digest-store.js';
 import { isArchived as ctxIsArchived, unarchive as ctxUnarchive } from '../../services/chat-context-store.js';
+import { expandLetters } from '../../services/mailbox.js';
+import { recordWakeAck } from '../../services/subtask-store.js';
 
 // ─── Bot identity ─────────────────────────────────────────────────────────
 
@@ -39,7 +41,7 @@ export function writeBotInfoFile(dataDir: string): void {
   if (!existsSync(dataDir)) mkdirSync(dataDir, { recursive: true });
 
   // Read existing entries from other daemon processes
-  type BotInfoEntry = { larkAppId: string; botOpenId: string | null; botName: string | null; cliId: string };
+  type BotInfoEntry = { larkAppId: string; botOpenId: string | null; botName: string | null; cliId: string; isClone?: boolean };
   let existing: BotInfoEntry[] = [];
   try {
     if (existsSync(filePath)) {
@@ -60,6 +62,9 @@ export function writeBotInfoFile(dataDir: string): void {
       botOpenId: b.botOpenId ?? null,
       botName: b.botName ?? null,
       cliId: b.config.cliId,
+      // Intrinsic "is this a clone" marker (clones get an isolated claudeConfigDir).
+      // Lets resolveBotIdent pick the canonical 本体 without relying on array order.
+      isClone: !!b.config.claudeConfigDir,
     });
   }
 
@@ -505,11 +510,15 @@ export function parseUrgentSummon(
   return { names, body: m[2].trim() };
 }
 
-/** 触发名单里的某个名字是否指向 botName（含别名表，大小写不敏感）。 */
-function summonNameMatchesBot(name: string, botName: string): boolean {
+/** 触发名单里的某个名字是否指向本 bot（大小写不敏感）。匹配候选：
+ *  - Lark botName 精确匹配 + SUMMON_ALIASES（原行为，保持不动）；
+ *  - clone 的 botmux displayName『本体名（N号机）』精确匹配（块7 第二轮 #4 动态认分身——
+ *    无需硬编码克隆名，且不依赖手填 Lark 名）。 */
+function summonNameMatchesBot(name: string, botName?: string, displayName?: string): boolean {
   const n = name.toLowerCase();
-  if (n === botName.toLowerCase()) return true;
-  const aliases = SUMMON_ALIASES[botName];
+  if (botName && n === botName.toLowerCase()) return true;
+  if (displayName && n === displayName.toLowerCase()) return true;
+  const aliases = botName ? SUMMON_ALIASES[botName] : undefined;
   return !!aliases && aliases.includes(n);
 }
 
@@ -531,16 +540,38 @@ function extractSummonText(message: any): string | null {
   return null;
 }
 
-/** 这条消息是不是一个"急急如律令"且点名了本 daemon 的 bot（同步判定，不含卡片
- *  REST 解析——interactive 场景由调用方先 resolveNonsupportMessage 再调本函数）。
- *  命中返 body（剥前缀后的正文），否则 null。 */
-export function urgentSummonBodyForBot(larkAppId: string, message: any): string | null {
-  const botName = getBot(larkAppId).botName;
-  if (!botName) return null;
+/** round-5 冷启动修复：summon 命中本 bot 的结构化结果。
+ *  - body：剥掉 summon 前缀**和** wake-ack 令牌后的干净正文（喂 CLI 用）。
+ *  - wakeAck：预热 summon 携带的回执意图（taskId/wakeId），命中才非 null。
+ *    **本函数纯解析、绝不写 store**——回执必须由路由层在 isAllowed 授权通过后才落库
+ *    （蔻黛 review blocker：否则未授权 sender 能 spoof wake token 先污染 store、误放行 lateKickoff）。 */
+export interface SummonMatch { body: string; wakeAck: { taskId: string; wakeId: string } | null; }
+
+/** wake-ack 令牌：`[[wake-ack:taskId:wakeId]]`。预热 summon 嵌在正文里，命中后由路由层剥掉再喂 CLI。 */
+const WAKE_ACK_TOKEN_RE = /\s*\[\[wake-ack:([^:\]\s]+):([^:\]\s]+)\]\]\s*/;
+/** 纯函数：抽取并剥掉 wake-ack 令牌（不写 store）。无令牌 → 原样返回、wakeAck=null。 */
+function extractAndStripWakeToken(body: string): SummonMatch {
+  const m = WAKE_ACK_TOKEN_RE.exec(body);
+  if (!m) return { body, wakeAck: null };
+  return { body: body.replace(WAKE_ACK_TOKEN_RE, ' ').trim(), wakeAck: { taskId: m[1]!, wakeId: m[2]! } };
+}
+
+/** 这条消息是否点名本 daemon 的 bot（同步判定）。命中返 {干净 body, wakeAck}，否则 null。
+ *  纯解析、不写 store（回执写在路由层授权后，见 SummonMatch 注释）。 */
+export function summonMatchForBot(larkAppId: string, message: any): SummonMatch | null {
+  const bot = getBot(larkAppId);
+  const botName = bot.botName;
+  const displayName = bot.config.displayName; // clone『本体名（N号机）』(undefined on 本体)
+  if (!botName && !displayName) return null;
   const parsed = parseUrgentSummon(extractSummonText(message));
   if (!parsed) return null;
-  if (!parsed.names.some(n => summonNameMatchesBot(n, botName))) return null;
-  return parsed.body;
+  if (!parsed.names.some(n => summonNameMatchesBot(n, botName, displayName))) return null;
+  return extractAndStripWakeToken(parsed.body);
+}
+
+/** 命中返干净 body（剥前缀 + 剥 wake 令牌），否则 null。保持原 string 契约（既有调用方/单测）。 */
+export function urgentSummonBodyForBot(larkAppId: string, message: any): string | null {
+  return summonMatchForBot(larkAppId, message)?.body ?? null;
 }
 
 /** 把消息就地规整成干净 text 消息（content={text} + message_type='text'）。
@@ -955,9 +986,9 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         // content 串里没有 "急急如律令" 就跳过，避免给每条卡片白调一次 REST。
         // 安全闸：仍要求发送者 canTalk（松松是 owner 会过；陌生人不过）。
         {
-          let summonBody = urgentSummonBodyForBot(larkAppId, message);
+          let summonMatch = summonMatchForBot(larkAppId, message);
           if (
-            summonBody === null &&
+            summonMatch === null &&
             message.message_type === 'interactive' &&
             typeof message.content === 'string' &&
             message.content.includes(URGENT_SUMMON_TAG)
@@ -965,13 +996,26 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
             try { await resolveNonsupportMessage(data, larkAppId); } catch (err) {
               logger.debug(`[${larkAppId}] 急急如律令 card resolve failed: ${err}`);
             }
-            summonBody = urgentSummonBodyForBot(larkAppId, message);
+            summonMatch = summonMatchForBot(larkAppId, message);
           }
-          if (summonBody !== null) {
+          if (summonMatch !== null) {
             if (!isAllowed) {
               logger.debug(`[${larkAppId}] 急急如律令 from non-allowed sender ${senderOpenId} — ignored`);
               return;
             }
+            // round-5 冷启动修复：wake-ack **只在授权(isAllowed)通过后才落库**（蔻黛 blocker）——
+            // 否则未授权 sender 能 spoof 一条带 wake 令牌的假 summon 先污染 store、误放行 CEO 的 lateKickoff。
+            // 走到这里 = 发送者已过安全闸（owner / base-relay owner 身份），回执才代表「可信唤醒穿到了本分身」。
+            if (summonMatch.wakeAck) {
+              const { taskId, wakeId } = summonMatch.wakeAck;
+              void recordWakeAck(taskId, larkAppId, wakeId).catch(err =>
+                logger.debug(`[${larkAppId}] recordWakeAck failed (task=${taskId} wake=${wakeId}): ${err}`));
+            }
+            let summonBody = summonMatch.body;
+            // 信箱 auto-expand (2026-06-14)：正文里的 ⟪letter:lt_xxx⟫ 哨兵就地换成信件全文，
+            // 让长 supplement/kickoff 完整进 CLI 上下文 = 系统保证，而非靠 agent 自觉读信。
+            // 同机共享 ~/.botmux/data/mailbox；读不到则保留人工 read 提示 (见 expandLetters)。
+            summonBody = expandLetters(summonBody);
             // 剥前缀 + 把卡片规整成 text，让 CLI 拿到干净指令。
             normalizeToTextMessage(message, summonBody);
             const summonRouting = await decideRouting(larkAppId, message);

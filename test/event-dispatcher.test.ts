@@ -59,6 +59,18 @@ vi.mock('../src/services/observed-bots-store.js', () => ({
   listObservedBots: (...args: any[]) => mockListObservedBots(...args),
 }));
 
+// 信箱 auto-expand：默认透传 (无哨兵原样)；新增 summon 集成测试里改成「把哨兵替换为全文」。
+let mockExpandLetters: (t: string) => string = (t: string) => t;
+vi.mock('../src/services/mailbox.js', () => ({
+  expandLetters: (t: string) => mockExpandLetters(t),
+}));
+
+// round-5 wake-ack：spy recordWakeAck，验证「只在授权后才写回执」。
+const mockRecordWakeAck = vi.fn(async () => {});
+vi.mock('../src/services/subtask-store.js', () => ({
+  recordWakeAck: (...args: any[]) => mockRecordWakeAck(...args),
+}));
+
 let mockMainTopicChatId: string | undefined;
 vi.mock('../src/services/main-topic-config.js', () => ({
   getMainTopicChatId: () => mockMainTopicChatId,
@@ -89,7 +101,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 
 // ─── Imports (must be after mocks) ──────────────────────────────────────────
 
-import { isBotMentioned, startLarkEventDispatcher, writeBotInfoFile, parseUrgentSummon, urgentSummonBodyForBot, normalizeToTextMessage, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
+import { isBotMentioned, startLarkEventDispatcher, writeBotInfoFile, parseUrgentSummon, urgentSummonBodyForBot, summonMatchForBot, normalizeToTextMessage, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -1729,6 +1741,84 @@ describe('urgentSummonBodyForBot', () => {
     const card = { content: JSON.stringify({ title: '急急如律令：【克劳德】标题正文', elements: [] }) };
     expect(urgentSummonBodyForBot(APP, card)).toBe('标题正文');
   });
+
+  // 块7 第二轮 #4 动态认分身: clone matched by botmux config.displayName『本体名（N号机）』
+  function setBotConfig(botName: string | null, displayName?: string) {
+    mockGetBot.mockReturnValue({ botName, config: { larkAppId: APP, displayName } });
+  }
+  it('clone matched by displayName『克劳德（初号机）』(even with no Lark botName)', () => {
+    setBotConfig(null, '克劳德（初号机）');
+    expect(urgentSummonBodyForBot(APP, msg('急急如律令：【克劳德（初号机）】干活'))).toBe('干活');
+  });
+  it('本体 (no displayName) is NOT matched by a clone name; still summonable by its own name', () => {
+    setBotName('克劳德'); // displayName undefined
+    expect(urgentSummonBodyForBot(APP, msg('急急如律令：【克劳德（初号机）】x'))).toBeNull();
+    expect(urgentSummonBodyForBot(APP, msg('急急如律令：【克劳德】x'))).toBe('x');
+  });
+  it('clone with displayName is NOT matched by a different clone name', () => {
+    setBotConfig(null, '克劳德（初号机）');
+    expect(urgentSummonBodyForBot(APP, msg('急急如律令：【克劳德（二号机）】x'))).toBeNull();
+  });
+  it('legacy clone (Lark botName set manually, no botmux displayName) still wakeable by botName', () => {
+    setBotConfig('克劳德（初号机）', undefined);
+    expect(urgentSummonBodyForBot(APP, msg('急急如律令：【克劳德（初号机）】x'))).toBe('x');
+  });
+});
+
+describe('summonMatchForBot — wake-ack 令牌解析（纯函数、不写 store）', () => {
+  const APP = 'app-claude';
+  function msg(text: string) { return { content: JSON.stringify({ text }) }; }
+  beforeEach(() => { vi.clearAllMocks(); mockGetBot.mockReturnValue({ botName: '克劳德', config: { larkAppId: APP } }); });
+
+  it('带 wake 令牌 → 抽出 {taskId,wakeId}，body 剥掉令牌；且**不写 store**（纯解析）', () => {
+    const r = summonMatchForBot(APP, msg('急急如律令：【克劳德】预热正文 [[wake-ack:st_a:wk9]]（预热#1·nn）'));
+    expect(r).not.toBeNull();
+    expect(r!.wakeAck).toEqual({ taskId: 'st_a', wakeId: 'wk9' });
+    expect(r!.body).not.toContain('[[wake-ack');   // 令牌已剥
+    expect(r!.body).toContain('预热正文');
+    expect(mockRecordWakeAck).not.toHaveBeenCalled();  // 解析阶段绝不写 store
+  });
+
+  it('无令牌 → wakeAck=null，body 原样（仅剥前缀）', () => {
+    const r = summonMatchForBot(APP, msg('急急如律令：【克劳德】做X'));
+    expect(r).toEqual({ body: '做X', wakeAck: null });
+    expect(mockRecordWakeAck).not.toHaveBeenCalled();
+  });
+
+  it('未点名本 bot → null', () => {
+    expect(summonMatchForBot(APP, msg('急急如律令：【缇蕾】x [[wake-ack:st_a:wk9]]'))).toBeNull();
+    expect(mockRecordWakeAck).not.toHaveBeenCalled();
+  });
+});
+
+describe('急急如律令 wake-ack 授权闸（蔻黛 blocker：先授权再写回执）', () => {
+  let handlers: ReturnType<typeof makeHandlers>;
+  const SUMMON = '急急如律令：【克劳德】预热 [[wake-ack:st_w:wk7]]（预热#1·ab）';
+  beforeEach(() => {
+    capturedHandlers = {};
+    handlers = makeHandlers();
+    mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
+    mockGetChatMode.mockResolvedValue('group');
+    vi.clearAllMocks();
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+  });
+
+  it('未授权 sender 带 wake token → 不写回执、不路由（防 spoof 污染 store）', async () => {
+    // 非空 allowlist 且不含 stranger → canTalk=false（空 allowlist 是 open-mode，全员放行，不能用来测「未授权」）。
+    mockGetBot.mockReturnValue({ botName: '克劳德', config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' }, botOpenId: MY_OPEN_ID, resolvedAllowedUsers: [USER_OPEN_ID] });
+    const event = makeUserMessageEvent({ senderOpenId: 'ou_stranger', content: JSON.stringify({ text: SUMMON }), messageId: 'm-spoof', chatId: 'chat-spoof', chatType: 'group' });
+    await capturedHandlers['im.message.receive_v1'](event);
+    expect(mockRecordWakeAck).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('授权 sender（allowedUsers）带 wake token → 授权后写回执 (taskId, 本 appId, wakeId)', async () => {
+    mockGetBot.mockReturnValue({ botName: '克劳德', config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' }, botOpenId: MY_OPEN_ID, resolvedAllowedUsers: [USER_OPEN_ID] });
+    const event = makeUserMessageEvent({ senderOpenId: USER_OPEN_ID, content: JSON.stringify({ text: SUMMON }), messageId: 'm-ok', chatId: 'chat-ok', chatType: 'group' });
+    await capturedHandlers['im.message.receive_v1'](event);
+    expect(mockRecordWakeAck).toHaveBeenCalledWith('st_w', MY_APP_ID, 'wk7');
+  });
 });
 
 describe('normalizeToTextMessage', () => {
@@ -1785,6 +1875,7 @@ describe('im.message.receive_v1 — 急急如律令 summon routing', () => {
     mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
     mockGetChatMode.mockResolvedValue('group');
     mockReadFileSync.mockReturnValue('[]');
+    mockExpandLetters = (t: string) => t; // 默认透传
     startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
   });
 
@@ -1818,5 +1909,36 @@ describe('im.message.receive_v1 — 急急如律令 summon routing', () => {
     await capturedHandlers['im.message.receive_v1'](event);
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  // 信箱 auto-expand 集成回归 (蔻黛克斯 code review P1)：B1 核心系统保证 —— 入口必须把哨兵
+  // 展开成全文后再喂 CLI，且 routed message 里不能残留裸哨兵。锁住这条链路别被无意打断。
+  it('auto-expands a letter sentinel in the summon body before routing (new topic)', async () => {
+    mockExpandLetters = (t: string) => t.replace('⟪letter:lt_abc⟫', '这是信箱里的长全文');
+    const event = makeUserSummon('急急如律令：【克劳德】📨 补充：⟪letter:lt_abc⟫ 末尾');
+    await capturedHandlers['im.message.receive_v1'](event);
+    expect(handlers.handleNewTopic).toHaveBeenCalled();
+    const routed = JSON.parse(event.message.content).text;
+    expect(routed).toBe('📨 补充：这是信箱里的长全文 末尾'); // 哨兵已被全文替换
+    expect(routed).not.toContain('⟪letter:');                  // 无裸哨兵
+  });
+
+  it('auto-expands the sentinel on the already-owned thread branch too', async () => {
+    handlers.isSessionOwner.mockReturnValue(true);
+    mockExpandLetters = (t: string) => t.replace('⟪letter:lt_xyz⟫', '全文XYZ');
+    const event = makeUserSummon('急急如律令：【克劳德】⟪letter:lt_xyz⟫');
+    await capturedHandlers['im.message.receive_v1'](event);
+    expect(handlers.handleThreadReply).toHaveBeenCalled();
+    expect(JSON.parse(event.message.content).text).toBe('全文XYZ');
+  });
+
+  it('miss-path: unreadable letter leaves manual-read hint, never a bare sentinel', async () => {
+    // 真实 expandLetters 的降级语义由 mailbox 单测覆盖；此处验证入口把降级结果原样下发、不裸露哨兵
+    mockExpandLetters = (t: string) => t.replace(/⟪letter:lt_gone⟫/, '（信箱取信失败 lt_gone，请手动运行 botmux mailbox read lt_gone 取全文）');
+    const event = makeUserSummon('急急如律令：【克劳德】⟪letter:lt_gone⟫');
+    await capturedHandlers['im.message.receive_v1'](event);
+    const routed = JSON.parse(event.message.content).text;
+    expect(routed).not.toContain('⟪letter:');
+    expect(routed).toContain('botmux mailbox read lt_gone');
   });
 });

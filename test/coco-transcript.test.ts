@@ -137,4 +137,41 @@ describe('cocoEventsPathForSession', () => {
     );
     expect(out).toContain(sid);
   });
+
+  it('Round-4 coco state-only: reads the GIVEN home (clone XDG_CACHE_HOME base), not the 本体 cache', async () => {
+    const { cocoEventsPathForSession } = await import('../src/services/coco-transcript.js');
+    const sid = '8db7d911-96f3-4764-a310-e42ae4cb626f';
+    // home = a clone's XDG_CACHE_HOME value; coco appends /coco/sessions/<sid>/...
+    const out = cocoEventsPathForSession(sid, '/tmp/clones/cli_x/coco-cache');
+    expect(out).toBe(join('/tmp/clones/cli_x/coco-cache', 'coco', 'sessions', sid, 'events.jsonl'));
+  });
+});
+
+describe('matchCocoSessionPath (Round-4 coco state-only: adopt/PID keeps clone cache path)', () => {
+  const sid = '8db7d911-96f3-4764-a310-e42ae4cb626f';
+
+  it('derives eventsPath FROM the fd target (clone XDG_CACHE_HOME preserved, 蔻黛 P1)', async () => {
+    const { matchCocoSessionPath } = await import('../src/services/coco-transcript.js');
+    // fd target lives under a clone's clone-scoped cache (含空格目录)
+    const target = `/tmp/clone cache/coco/sessions/${sid}/session.log`;
+    expect(matchCocoSessionPath(target)).toEqual({
+      sessionId: sid,
+      eventsPath: `/tmp/clone cache/coco/sessions/${sid}/events.jsonl`,
+    });
+  });
+
+  it('本体 fd target → eventsPath under that same (default) cache, sid extracted', async () => {
+    const { matchCocoSessionPath } = await import('../src/services/coco-transcript.js');
+    const target = `/home/u/.cache/coco/sessions/${sid}/traces.jsonl`;
+    expect(matchCocoSessionPath(target)).toEqual({
+      sessionId: sid,
+      eventsPath: `/home/u/.cache/coco/sessions/${sid}/events.jsonl`,
+    });
+  });
+
+  it('non-session fd target / bad sid → undefined', async () => {
+    const { matchCocoSessionPath } = await import('../src/services/coco-transcript.js');
+    expect(matchCocoSessionPath('/tmp/x/coco/plugins/foo')).toBeUndefined();
+    expect(matchCocoSessionPath('/x/coco/sessions/not-a-uuid/session.log')).toBeUndefined();
+  });
 });

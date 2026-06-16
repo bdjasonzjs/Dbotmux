@@ -308,6 +308,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           return adapter.buildResumeCommand?.({
             sessionId: closedSessionId,
             cliSessionId: ds.session.cliSessionId,
+            // Round-4 B4: clone-aware home (codex resume-fallback reads the right
+            // history.jsonl — clone home, or the engine default for 本体).
+            cliHome: botCfg.claudeConfigDir ?? adapter.cloneHome?.defaultHome(),
           }) ?? null;
         } catch { return null; }
       })();

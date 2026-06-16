@@ -35,6 +35,17 @@ export interface BotConfig {
   larkAppSecret: string;
   /** Optional process-name suffix; the daemon's process name is rendered as `botmux-<name>` (defaults to `botmux-<index>`). */
   name?: string;
+  /**
+   * Clone display name『本体名（N号机）』(块7 第二轮 #2). Computed at clone time
+   * from the source 本体's display name + the count of existing clones of that
+   * 本体. Authoritative addressable name (drives 急急如律令 dynamic recognition);
+   * decoupled from the manually-set Lark app display name. Unset on 本体 /
+   * pre-feature clones → falls back to botName everywhere (no behavior change).
+   */
+  displayName?: string;
+  /** The source 本体's base display name (e.g. "克劳德"), set on a clone so its
+   *  siblings can be counted (`（N号机）` numbering) without reading Lark botName. */
+  clonedFromName?: string;
   cliId: CliId;
   cliPathOverride?: string;
   backendType?: 'pty' | 'tmux';
@@ -55,6 +66,17 @@ export interface BotConfig {
    * NOT change the canTalk / canOperate permission model (unlike defaultOncall).
    */
   defaultWorkingDir?: string;
+  /**
+   * Per-bot isolated home directory + the universal CLONE MARKER (Round-4: name
+   * kept for back-compat, but it is NOT claude-specific anymore). A clone gets a
+   * dedicated dir here (`<botmux>/clones/<appId>/.claude|.codex|…`) so its
+   * sessions/state/memory are isolated while persona is symlink-shared. The worker
+   * injects it into the spawn env via the ENGINE's home env var (claude-code →
+   * CLAUDE_CONFIG_DIR, codex → CODEX_HOME) from the adapter's cloneHome — so do NOT
+   * assume this maps to CLAUDE_CONFIG_DIR. Unset ⇒ a 本体 (uses the engine default
+   * home; original behaviour, no migration). Presence ⇒ this bot is a clone.
+   */
+  claudeConfigDir?: string;
   /** Per-bot default: auto-bind every new group chat to oncall on first new-topic. */
   defaultOncall?: BotDefaultOncall;
   /**
@@ -327,6 +349,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       larkAppId: entry.larkAppId,
       larkAppSecret: entry.larkAppSecret,
       name: typeof entry.name === 'string' && entry.name.trim() ? entry.name.trim() : undefined,
+      displayName: typeof entry.displayName === 'string' && entry.displayName.trim() ? entry.displayName.trim() : undefined,
+      clonedFromName: typeof entry.clonedFromName === 'string' && entry.clonedFromName.trim() ? entry.clonedFromName.trim() : undefined,
       cliId: entry.cliId ?? 'claude-code',
       cliPathOverride: entry.cliPathOverride,
       backendType: entry.backendType,
@@ -338,6 +362,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       defaultOncallAutoboundChats,
       defaultWorkingDir: typeof entry.defaultWorkingDir === 'string' && entry.defaultWorkingDir.trim()
         ? entry.defaultWorkingDir.trim()
+        : undefined,
+      claudeConfigDir: typeof entry.claudeConfigDir === 'string' && entry.claudeConfigDir.trim()
+        ? entry.claudeConfigDir.trim()
         : undefined,
       chatGrants,
       lang: isLocale(entry.lang) ? entry.lang : undefined,

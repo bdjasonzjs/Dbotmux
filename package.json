@@ -34,7 +34,7 @@
     "prepare": "git config core.hooksPath scripts/git-hooks 2>/dev/null || true"
   },
   "dependencies": {
-    "@larksuiteoapi/node-sdk": "^1.64.0",
+    "@larksuiteoapi/node-sdk": "^1.66.1",
     "@napi-rs/canvas": "^0.1.65",
     "@xterm/addon-unicode11": "^0.9.0",
     "@xterm/headless": "^6.0.0",
@@ -43,6 +43,7 @@
     "markdown-it": "^14.1.1",
     "node-pty": "^1.1.0",
     "pm2": "^6.0.0",
+    "qrcode": "^1.5.4",
     "qrcode-terminal": "^0.12.0",
     "ws": "^8.19.0",
     "zod": "^3.23.0"

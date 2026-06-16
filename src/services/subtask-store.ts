@@ -52,7 +52,7 @@ export type CommandType = 'report_help' | 'report_done' | 'finish' | 'supplement
 /** 命令定向角色 (优化 #1/#3)。缺省 (老命令/未写) 由 dispatcher 解释为 legacy=all，保持旧行为。 */
 export type CommandTargetRole = 'main' | 'collab' | 'all';
 
-export interface SubTaskBot { openId: string; name: string; role: 'main' | 'observer' | 'collab'; }
+export interface SubTaskBot { openId: string; name: string; role: 'main' | 'observer' | 'collab'; larkAppId?: string; }
 
 export interface SubTask {
   taskId: string;
@@ -137,7 +137,10 @@ export interface OutboxCommand {
     /** 双层汇报 v6：report_urgent 关联的收件箱 entry id (discriminator，蔻黛 M3)。 */
     inboxEntryId?: string;
     /** 双层汇报 v6：request_report 的 requestId (履约闭环，蔻黛 M5)。 */
-    requestId?: string };
+    requestId?: string;
+    /** 块7 第二轮 #5 late-kickoff：定向唤起单个 bot（用其 summon 名，即 clone 的
+     *  displayName『本体名（N号机）』）。设置后 kickoff 只唤这一个，绝不唤 main。 */
+    targetSummonName?: string };
   idempotencyKey: string;          // 防重发
   expectedTaskVersion: number | null;
   deliveryStatus: DeliveryStatus;
@@ -175,10 +178,22 @@ export interface Observation {
   manualDedupeKey?: string;
 }
 
+/** 唤醒回执（round-5 冷启动修复）：分身 daemon 命中预热 summon 的那一刻写入，
+ *  证明「这条唤醒确实穿到了目标分身 daemon 且命中了目标名」。**只证明 daemon 收到**，
+ *  不证明 worker fork / 模型已处理（验收仍需后续 JSONL 检查）。跨进程靠共享 subtasks.json
+ *  传递：分身 daemon 写、CEO daemon 轮询读。绑 (taskId, appId, wakeId) 三元组防串轮。 */
+export interface WakeAck {
+  taskId: string;
+  appId: string;     // 命中的分身 larkAppId（= 自报身份，daemon 侧即 larkAppId 入参）
+  wakeId: string;    // 本次预热的唯一标识（CEO 侧生成、嵌进 summon 令牌）
+  ackedAt: string;
+}
+
 interface StoreFile {
   subtasks: SubTask[];
   commands: OutboxCommand[];
   observations: Observation[];
+  wakeAcks: WakeAck[];
 }
 
 // ─── 状态机 ──────────────────────────────────────────────────────────────────
@@ -220,11 +235,11 @@ function ensureDir(): void {
   if (!existsSync(d)) mkdirSync(d, { recursive: true });
 }
 function read(): StoreFile {
-  if (!existsSync(fp())) return { subtasks: [], commands: [], observations: [] };
+  if (!existsSync(fp())) return { subtasks: [], commands: [], observations: [], wakeAcks: [] };
   const raw = readFileSync(fp(), 'utf-8');
   try {
     const s = JSON.parse(raw) as Partial<StoreFile>;
-    return { subtasks: s.subtasks ?? [], commands: s.commands ?? [], observations: s.observations ?? [] };
+    return { subtasks: s.subtasks ?? [], commands: s.commands ?? [], observations: s.observations ?? [], wakeAcks: s.wakeAcks ?? [] };
   } catch (err) {
     // 上线前必修 (蔻黛克斯 review)：corrupt **绝不**返回空库 (会被下一次 write 覆盖 = 清库)。
     // 先把 corrupt 文件备份成 .corrupt-<ts> 留证，再 hard fail —— 上层 skip 本轮而非静默清库。
@@ -318,6 +333,28 @@ export async function createSubTask(opts: {
     s.subtasks.push(t);
     logger.info(`[subtask-store] created subtask ${t.taskId} chat=${opts.chatId.slice(0, 12)}`);
     return { result: t, dirty: true };
+  });
+}
+
+/**
+ * Add a bot to an existing subtask (块7 第二轮 #5: a late-activated clone joins
+ * the already-created subgroup). Idempotent by larkAppId — re-entry after a
+ * partial failure won't duplicate the bot. Bumps version + updatedAt.
+ * Returns the updated task, or null if the task is gone.
+ */
+export async function addBotToSubTask(taskId: string, bot: SubTaskBot): Promise<SubTask | null> {
+  return mutate(s => {
+    const idx = s.subtasks.findIndex(t => t.taskId === taskId);
+    if (idx < 0) return { result: null, dirty: false };
+    const cur = s.subtasks[idx];
+    if (cur.bots.some(b => b.larkAppId && b.larkAppId === bot.larkAppId)) {
+      return { result: cur, dirty: false }; // idempotent: already a member
+    }
+    s.subtasks[idx] = {
+      ...cur, bots: [...cur.bots, bot],
+      version: cur.version + 1, updatedAt: new Date().toISOString(),
+    };
+    return { result: s.subtasks[idx], dirty: true };
   });
 }
 
@@ -806,6 +843,23 @@ export function listUnconfirmedCommands(now: Date = new Date()): OutboxCommand[]
     (c.dispatchingUntil == null || new Date(c.dispatchingUntil).getTime() <= now.getTime()),
   );
 }
+
+// ─── 唤醒回执（round-5 冷启动修复）─────────────────────────────────────────────
+/** 分身 daemon 命中预热 summon 时写入回执（幂等：同三元组只记一次）。跨进程安全（走 mutate）。 */
+export async function recordWakeAck(taskId: string, appId: string, wakeId: string): Promise<void> {
+  await mutate(s => {
+    if (s.wakeAcks.some(a => a.taskId === taskId && a.appId === appId && a.wakeId === wakeId)) {
+      return { result: undefined, dirty: false };
+    }
+    s.wakeAcks.push({ taskId, appId, wakeId, ackedAt: new Date().toISOString() });
+    return { result: undefined, dirty: true };
+  });
+}
+/** CEO 侧轮询：这次预热是否已被目标分身回执。绑 (taskId, appId, wakeId) 三元组防上一轮迟到回执误放行。 */
+export function hasWakeAck(taskId: string, appId: string, wakeId: string): boolean {
+  return read().wakeAcks.some(a => a.taskId === taskId && a.appId === appId && a.wakeId === wakeId);
+}
+
 export async function updateCommand(cmdId: string, patch: Partial<Omit<OutboxCommand, 'cmdId' | 'taskId'>>): Promise<OutboxCommand | null> {
   return mutate(s => {
     const idx = s.commands.findIndex(c => c.cmdId === cmdId);
@@ -1009,5 +1063,5 @@ export async function pruneFinished(now: Date = new Date(), ttlDays = 7): Promis
 
 /** 测试用 (直接写，不走锁)。 */
 export function __resetForTesting(): void {
-  write({ subtasks: [], commands: [], observations: [] });
+  write({ subtasks: [], commands: [], observations: [], wakeAcks: [] });
 }

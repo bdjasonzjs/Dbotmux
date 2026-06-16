@@ -20,7 +20,8 @@ import {
   updateCommand, claimCommandForDispatch, completeDispatch, transitionAndEnqueueCommand,
   helpReportDelivery, staleHelpCommandIds,
   listObservations, pruneFinished, VersionConflictError, TaskNotFoundError, CommandRetryMismatchError, ACTIVE_STATUSES,
-  StoreCorruptError, __resetForTesting, type SubTaskBot,
+  StoreCorruptError, __resetForTesting, addBotToSubTask, type SubTaskBot,
+  recordWakeAck, hasWakeAck,
 } from '../src/services/subtask-store.js';
 
 const BOTS: SubTaskBot[] = [
@@ -78,6 +79,24 @@ describe('SubTask CRUD + 幂等', () => {
     const t = await mkObserving('k', 'oc_x');
     expect(getByChatId('oc_x')?.taskId).toBe(t.taskId);
     expect(listSubTasks({ statuses: ['observing'] }).map(x => x.taskId)).toEqual([t.taskId]);
+  });
+});
+
+describe('addBotToSubTask (块7 #5: late clone joins existing subtask)', () => {
+  it('appends a new bot + bumps version; idempotent by larkAppId', async () => {
+    const t = await mk('kadd');
+    const v0 = getSubTask(t.taskId)!.version;
+    const clone: SubTaskBot = { openId: 'ou_new', name: '克劳德（初号机）', role: 'collab', larkAppId: 'cli_new' };
+    const after = await addBotToSubTask(t.taskId, clone);
+    expect(after!.bots.map(b => b.larkAppId)).toContain('cli_new');
+    expect(after!.version).toBe(v0 + 1);
+    // idempotent: adding the same larkAppId again is a no-op (no dup, no version bump)
+    const again = await addBotToSubTask(t.taskId, clone);
+    expect(again!.bots.filter(b => b.larkAppId === 'cli_new')).toHaveLength(1);
+    expect(again!.version).toBe(v0 + 1);
+  });
+  it('unknown taskId → null', async () => {
+    expect(await addBotToSubTask('st_nope', { openId: 'o', name: 'n', role: 'collab', larkAppId: 'a' })).toBeNull();
   });
 });
 
@@ -493,5 +512,26 @@ describe('completeDispatch acked 单调性', () => {
     await claimCommandForDispatch(cmd.cmdId, 'A', 60_000, new Date());
     const after = await completeDispatch(cmd.cmdId, 'A', { deliveryStatus: 'sent', deliveredMessageId: 'om_y' });
     expect(after!.deliveryStatus).toBe('sent');
+  });
+});
+
+describe('wakeAck (round-5 冷启动唤醒回执)', () => {
+  it('record → has，按 (taskId, appId, wakeId) 三元组精确匹配', async () => {
+    await recordWakeAck('st_1', 'cli_a', 'w1');
+    expect(hasWakeAck('st_1', 'cli_a', 'w1')).toBe(true);
+    // 任一维度不同都不命中（防串轮/串分身/上一轮迟到回执误放行）
+    expect(hasWakeAck('st_1', 'cli_a', 'w2')).toBe(false);
+    expect(hasWakeAck('st_1', 'cli_b', 'w1')).toBe(false);
+    expect(hasWakeAck('st_2', 'cli_a', 'w1')).toBe(false);
+  });
+
+  it('幂等：同三元组重复 record 不产生重复条目', async () => {
+    await recordWakeAck('st_1', 'cli_a', 'w1');
+    await recordWakeAck('st_1', 'cli_a', 'w1');
+    expect(hasWakeAck('st_1', 'cli_a', 'w1')).toBe(true);
+  });
+
+  it('未 record → has 为 false', () => {
+    expect(hasWakeAck('st_none', 'cli_x', 'wz')).toBe(false);
   });
 });
