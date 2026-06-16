@@ -35,6 +35,17 @@ const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 const BOTS_JSON_PATH = join(homedir(), '.botmux', 'bots.json');
 const REGISTRY_DIR = join(homedir(), '.botmux', 'data', 'dashboard-daemons');
 
+// 巡检视图 age-aware（迭代2 A1）：reported_help 是「粘性」状态，报了不会自动消。
+// 超过本阈值仍未被(重新)发起的求助归为「陈旧求助」，不计入顶部红色 Needs-you。
+// 阈值默认 24h，env BOTMUX_STALE_HELP_HOURS 可调（与 BOTMUX_MAX_* 命名一致）。
+// 新鲜度基准用 SubTask.updatedAt（= 进 reported_help 的转移时刻；停滞自动 escalate 只刷
+// updatedAt 不刷 lastExecutorActivityAt，故 updatedAt 才是「这条求助最后被实质发起」的正确锚点）。
+const STALE_HELP_DEFAULT_HOURS = 24;
+function staleHelpThresholdMs(): number {
+  const h = Number(process.env.BOTMUX_STALE_HELP_HOURS);
+  return (Number.isFinite(h) && h > 0 ? h : STALE_HELP_DEFAULT_HOURS) * 60 * 60 * 1000;
+}
+
 let activeToken: string | null = null;
 
 // In-memory device flow sessions, keyed by user_code. The user_code is what
@@ -543,13 +554,19 @@ const server = createServer(async (req, res) => {
       // `subtaskJoinError:true` instead of turning /api/topology into a 500.
       let subtaskByChat = new Map<string, any>();
       let subtaskJoinError = false;
+      // 经理群「下次汇报倒计时」用的 digest 间隔（env-aware；前端读不到 process.env，
+      // 故由后端随 topology 一起传给前端按它本地 1s tick 算倒计时）。默认 4h。
+      let managerDigestIntervalMs = 4 * 60 * 60 * 1000;
       try {
         const { listSubTasks } = await import('./services/subtask-store.js');
         for (const t of listSubTasks()) subtaskByChat.set(t.chatId, t);
+        const { DIGEST_INTERVAL_MS } = await import('./services/subtask-digest.js');
+        managerDigestIntervalMs = DIGEST_INTERVAL_MS();
       } catch (err) {
         subtaskJoinError = true;
         logger.error(`[dashboard/topology] subtask-store join failed, degrading to topology-only: ${err}`);
       }
+      const staleHelpMs = staleHelpThresholdMs();
 
       // Enrich each node with lifecycle status from ChatContext so the
       // frontend can render archived chats in a separate section.
@@ -569,9 +586,18 @@ const server = createServer(async (req, res) => {
           subtaskStatus: st?.status,                        // SubTaskStatus | undefined
           subtaskGoal: st?.compactSummary || st?.goal || undefined,
           subtaskDepth: st?.depth,
+          // 迭代2 A1: age-aware「陈旧求助」。新鲜度基准 = updatedAt（进 reported_help 的
+          // 转移时刻；停滞 escalate 只刷 updatedAt 不刷 lastExecutorActivityAt，故 updatedAt
+          // 才是「这条求助最后被实质发起」的正确锚点）。仅对执行群求助判陈旧——经理群另走
+          // A2 专属展示，不在此判 needs-you。
+          subtaskUpdatedAt: st?.updatedAt,
+          subtaskHelpStale: !!(st && st.status === 'reported_help' && st.reportingMode !== 'manager'
+            && st.updatedAt && (Date.now() - new Date(st.updatedAt).getTime()) > staleHelpMs),
+          // 迭代2 A2: 经理群「下次汇报倒计时」基准时刻（digest 窗口游标）。
+          subtaskLastDigestAt: st?.lastDigestAt ?? null,
         } as any;
       });
-      return jsonRes(res, 200, { ...topo, nodes, subtaskJoinError });
+      return jsonRes(res, 200, { ...topo, nodes, subtaskJoinError, managerDigestIntervalMs });
     }
     // chatId in API paths needs strict whitelist BEFORE the store accepts
     // it as a filename: decodeURIComponent already turned `%2F` into `/`,

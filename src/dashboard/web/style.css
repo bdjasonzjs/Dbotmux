@@ -1397,6 +1397,7 @@ input.row-select,
 .topo-insp-sum { font-weight: 600; font-size: 14px; padding: 4px 12px; border-radius: 999px; }
 .topo-insp-sum.needs { background: #fee2e2; color: #991b1b; }
 .topo-insp-sum.work { background: #fef3c7; color: #78350f; }
+.topo-insp-sum.stale { background: #f1f5f9; color: #94a3b8; }
 .topo-insp-sum.done { background: #dcfce7; color: #166534; }
 .topo-insp-degraded { background: #fef3c7; color: #78350f; border: 1px solid #fcd34d; border-radius: 6px; padding: 6px 10px; font-size: 13px; }
 .topo-insp-section > h3 { margin: 4px 0 8px; font-size: 13px; color: #64748b; text-transform: uppercase; letter-spacing: .04em; }
@@ -1439,6 +1440,10 @@ input.row-select,
 .topo-insp-status.st-finished { background: #f1f5f9; color: #475569; }
 .topo-insp-status.st-paused { background: #f1f5f9; color: #64748b; }
 .topo-insp-status.st-idle { background: #f1f5f9; color: #94a3b8; }
+/* 陈旧求助：置灰、不抢眼 */
+.topo-insp-status.st-stale_help { background: #f1f5f9; color: #94a3b8; }
+/* 经理群专属展示：汇报倒计时，紫调中性、非红绿灯 */
+.topo-insp-status.st-manager { background: #ede9fe; color: #5b21b6; }
 
 .topo-insp-orgtag { font-size: 10px; color: #64748b; background: #f1f5f9; padding: 1px 6px; border-radius: 4px; }
 .topo-insp-line2 { font-size: 13px; color: #334155; margin: 3px 0; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
@@ -1451,3 +1456,9 @@ input.row-select,
 .topo-insp-done-fold > summary { cursor: pointer; font-size: 12px; color: #64748b; padding: 4px 0; }
 /* children inside a done-fold already carry their own --insp-depth indent */
 .topo-insp-done-fold .topo-insp-row { margin-left: 0; }
+/* 陈旧求助折叠段（root 级 + 每个父节点子级），置灰、非红 */
+.topo-insp-stale { margin-top: 8px; }
+.topo-insp-stale > summary { cursor: pointer; font-size: 13px; color: #94a3b8; padding: 6px 0; }
+.topo-insp-stale-fold { margin: 2px 0 2px calc(var(--insp-depth, 0) * 22px); }
+.topo-insp-stale-fold > summary { cursor: pointer; font-size: 12px; color: #94a3b8; padding: 4px 0; }
+.topo-insp-stale-fold .topo-insp-row { margin-left: 0; }

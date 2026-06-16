@@ -46,6 +46,10 @@ interface ChatNode {
   subtaskStatus?: string;   // real SubTaskStatus: observing|reported_help|reported_done|finished|paused|error|stopped|creating|activation_failed
   subtaskGoal?: string;     // one-line "what's it doing" (compactSummary || goal)
   subtaskDepth?: number;
+  // 迭代2: age-aware「陈旧求助」+ 经理群汇报倒计时（后端 /api/topology join 派生）。
+  subtaskUpdatedAt?: string;        // 进 reported_help 转移时刻；age-aware 新鲜度基准
+  subtaskHelpStale?: boolean;       // reported_help && 非 manager && now-updatedAt > 阈值
+  subtaskLastDigestAt?: string | null;  // 经理 digest 窗口游标；下次汇报倒计时基准
 }
 
 /** Extra relationship edge (chat-topology-store ChatEdge). Inspection view
@@ -65,6 +69,8 @@ interface ApiTopology {
   /** true when the subtask-store join degraded (corrupt subtasks.json); the
    *  inspection view still renders topology, just without task status. */
   subtaskJoinError?: boolean;
+  /** 经理群「下次汇报倒计时」用的 digest 间隔 (ms)，env-aware，由后端传。 */
+  managerDigestIntervalMs?: number;
 }
 
 type ViewMode = 'inspect' | 'list' | 'graph' | 'tilly';
@@ -74,7 +80,7 @@ type GroupKind = 'main' | 'manager' | 'executor' | 'plain';
 
 /** Inspection status — derived from real SubTaskStatus + live metrics, with
  *  a severity used for sort/prominence (higher = more urgent → pinned top). */
-interface InspectStatus { key: string; cls: string; severity: number; archivedLike: boolean }
+interface InspectStatus { key: string; cls: string; severity: number; archivedLike: boolean; staleHelp?: boolean }
 
 interface GroupBrief { chatId: string; name?: string }
 
@@ -151,6 +157,26 @@ function isOrgLayer(k: GroupKind): boolean { return k === 'main' || k === 'manag
  *  3 = needs human (pinned top, red), 2 = done-pending, 1 = working/observing,
  *  0 = finished/paused/idle. archivedLike → render under the archived section. */
 function inspectStatusOf(node: ChatNode): InspectStatus {
+  // 迭代2 A2: 经理群是「中层管理者」，卡片不套执行态红绿灯（needs-you/done-pending）。
+  // 自身状态恒定为「组织层进行中」(severity 1, 不红、不计 needs-you)；卡片状态位由
+  // renderNodeCard 替换成「下次汇报倒计时」。真正的紧急来自子群冒泡 (subtreeMaxSev)，不丢。
+  // 仅 finished/paused/stopped 这种终态仍归档，让收尾的经理群正常折叠。
+  if (node.reportingMode === 'manager') {
+    switch (node.subtaskStatus) {
+      case 'finished':
+        return { key: 'topo.istatus.finished', cls: 'finished', severity: 0, archivedLike: true };
+      case 'paused':
+      case 'stopped':
+        return { key: 'topo.istatus.paused', cls: 'paused', severity: 0, archivedLike: true };
+      // 蔻黛 r5 P2: 经理群 error/activation_failed 是真问题，不该被「下次汇报倒计时」掩盖——
+      // 从倒计时展示里例外放出，按红色异常 surface (renderNodeCard 仅在 cls==='manager' 时才显倒计时)。
+      case 'error':
+      case 'activation_failed':
+        return { key: 'topo.istatus.error', cls: 'error', severity: 3, archivedLike: false };
+      default:
+        return { key: 'topo.istatus.observing', cls: 'manager', severity: 1, archivedLike: false };
+    }
+  }
   // An unanswered @human ping always means "needs you", regardless of the
   // subtask state machine — it's the most direct "look at me" signal.
   if (node.metrics.hasUnansweredPing) {
@@ -158,6 +184,11 @@ function inspectStatusOf(node: ChatNode): InspectStatus {
   }
   switch (node.subtaskStatus) {
     case 'reported_help':
+      // 迭代2 A1: age-aware。后端按 updatedAt 判过陈旧 (subtaskHelpStale)：陈旧求助
+      // 单独「💤 陈旧求助」桶、置灰、severity 0、不计 needs-you；新鲜的才红 (severity 3)。
+      if (node.subtaskHelpStale) {
+        return { key: 'topo.istatus.stale_help', cls: 'stale_help', severity: 0, archivedLike: false, staleHelp: true };
+      }
       return { key: 'topo.istatus.needs_human', cls: 'needs_human', severity: 3, archivedLike: false };
     case 'error':
     case 'activation_failed':
@@ -228,6 +259,7 @@ export function renderTopologyPage(root: HTMLElement): () => void {
     inspectSeeded: false,  // inspect view: one-time auto-expand seeding done
     lastLoadedAt: 0,  // ms epoch when latest topology data landed
     viewMode: 'inspect' as ViewMode,  // 巡检视图为默认 (邹劲松 2026-06-16)
+    managerDigestIntervalMs: 4 * 60 * 60 * 1000,  // 经理群汇报倒计时间隔 (后端 env-aware 覆盖)
   };
 
   const streamEl = document.getElementById('topo-stream')!;
@@ -382,29 +414,50 @@ export function renderTopologyPage(root: HTMLElement): () => void {
       sevCache.set(n.chatId, max);
       return max;
     }
-    function subtreeHasActive(n: ChatNode, seen = new Set<string>()): boolean {
-      if (seen.has(n.chatId)) return false;
+    // 迭代2: 三桶路由 (active / 💤陈旧求助 / 📦已完成)。一个节点的桶：
+    //   done  = archived/finished/paused (archivedLike)
+    //   stale = 陈旧求助 (reported_help 超阈值)
+    //   active= 其它 (含 needs_human / working / 经理群)
+    // 子树桶 = 子树里最「活」的桶 (active > stale > done)，用于 root/子级分段路由。
+    type InspBucket = 'active' | 'stale' | 'done';
+    const nodeBucket = (n: ChatNode): InspBucket => {
+      if (isArchivedLike(n)) return 'done';
+      if (inspectStatusOf(n).staleHelp) return 'stale';
+      return 'active';
+    };
+    const moreActive = (a: InspBucket, b: InspBucket): InspBucket => {
+      if (a === 'active' || b === 'active') return 'active';
+      if (a === 'stale' || b === 'stale') return 'stale';
+      return 'done';
+    };
+    const bucketCache = new Map<string, InspBucket>();
+    const subtreeBucket = (n: ChatNode, seen = new Set<string>()): InspBucket => {
+      if (bucketCache.has(n.chatId)) return bucketCache.get(n.chatId)!;
+      if (seen.has(n.chatId)) return 'done';
       seen.add(n.chatId);
-      if (!isArchivedLike(n)) return true;
-      return relevantChildren(n.chatId).some(c => subtreeHasActive(c, seen));
-    }
+      let b = nodeBucket(n);
+      for (const c of relevantChildren(n.chatId)) b = moreActive(b, subtreeBucket(c, seen));
+      bucketCache.set(n.chatId, b);
+      return b;
+    };
 
-    // Seed expand state once: open the main root + every node on a path to a
-    // "needs you" node, so urgent work is visible without clicking. User
-    // toggles thereafter are preserved across the 5s poll.
+    // 迭代2 B: 默认折叠、逐级 drill-down (邹劲松 2026-06-16)。不再自动展开通往
+    // needs-you 的路径——顶层只见根 (收起态)，点 ▸ 才逐级下钻。state.expanded 跨
+    // 5s 轮询持久 (同 session 记忆用户的展开)，inspectSeeded 仅作一次性闸门防重置。
     if (!state.inspectSeeded && state.nodes.length) {
-      const seedOpen = (n: ChatNode, seen = new Set<string>()): boolean => {
-        if (seen.has(n.chatId)) return false;
-        seen.add(n.chatId);
-        let openMe = inspectStatusOf(n).severity >= 3;
-        for (const c of relevantChildren(n.chatId)) if (seedOpen(c, seen)) openMe = true;
-        if (openMe) state.expanded.add(n.chatId);
-        return openMe;
-      };
-      for (const r of roots) seedOpen(r);
-      if (state.rootChatId) state.expanded.add(state.rootChatId);
       state.inspectSeeded = true;
     }
+
+    // 经理群「下次汇报倒计时」标签：lastDigestAt + 间隔 - now。逾期/缺基准 → 待汇报。
+    const managerDigestLabel = (n: ChatNode): string => {
+      const interval = state.managerDigestIntervalMs || 4 * 60 * 60 * 1000;
+      if (!n.subtaskLastDigestAt) return t('topo.inspect.managerDigestDue');
+      const rem = new Date(n.subtaskLastDigestAt).getTime() + interval - Date.now();
+      if (rem <= 0) return t('topo.inspect.managerDigestDue');
+      const mins = Math.floor(rem / 60000);
+      const when = mins >= 60 ? `${Math.floor(mins / 60)}h${mins % 60}m` : `${mins}m`;
+      return t('topo.inspect.managerNextDigest', { when });
+    };
 
     const sortNodes = (list: ChatNode[]): ChatNode[] =>
       [...list].sort((a, b) => {
@@ -454,7 +507,7 @@ export function renderTopologyPage(root: HTMLElement): () => void {
             <div class="topo-insp-line1">
               <span class="topo-insp-kind kind-${kind}">${t(kindKey(kind))}</span>
               <strong class="topo-insp-name" title="${escapeHtml(n.chatId)}">${escapeHtml(name)}</strong>
-              <span class="topo-insp-status st-${ist.cls}">${t(ist.key)}</span>
+              <span class="topo-insp-status st-${ist.cls}">${kind === 'manager' && ist.cls === 'manager' ? escapeHtml(managerDigestLabel(n)) : t(ist.key)}</span>
               ${orgTag}
             </div>
             <div class="topo-insp-line2" title="${escapeHtml(oneLinerFull)}">${escapeHtml(oneLiner)}</div>
@@ -468,41 +521,47 @@ export function renderTopologyPage(root: HTMLElement): () => void {
         </div>`;
       let childrenHtml = '';
       if (hasKids && expanded) {
-        // Same active/done split as the root level, applied at EVERY level:
-        // the main topic alone has ~89 children (most finished) in real data;
-        // without this a single expand floods the panel. Active children show
-        // inline (urgent first via sortNodes); fully-done children collapse
-        // into a per-parent "✅ N done" fold one click away.
-        const activeKids = kids.filter(c => subtreeHasActive(c));
-        const doneKids = kids.filter(c => !subtreeHasActive(c));
+        // 三桶 split，每一级都用：主话题单独就有 ~89 个子 (多数 finished)，不分段
+        // 一次展开会刷屏。active 子内联 (urgent 优先 via sortNodes)；陈旧求助折进
+        // 「💤 N 个陈旧求助」一栏 (置灰)；全完成的折进「✅ N 个已完成」一栏。
+        const activeKids = kids.filter(c => subtreeBucket(c) === 'active');
+        const staleKids = kids.filter(c => subtreeBucket(c) === 'stale');
+        const doneKids = kids.filter(c => subtreeBucket(c) === 'done');
         const activeHtml = activeKids.map(c => renderNodeCard(c, depth + 1, visited)).join('');
+        const staleHtml = staleKids.length
+          ? `<details class="topo-insp-stale-fold" style="--insp-depth:${depth + 1}"><summary>${t('topo.inspect.staleHelpFold', { n: staleKids.length })}</summary>${staleKids.map(c => renderNodeCard(c, depth + 1, visited)).join('')}</details>`
+          : '';
         const doneHtml = doneKids.length
           ? `<details class="topo-insp-done-fold" style="--insp-depth:${depth + 1}"><summary>${t('topo.inspect.doneFold', { n: doneKids.length })}</summary>${doneKids.map(c => renderNodeCard(c, depth + 1, visited)).join('')}</details>`
           : '';
-        childrenHtml = `<div class="topo-insp-children">${activeHtml}${doneHtml}</div>`;
+        childrenHtml = `<div class="topo-insp-children">${activeHtml}${staleHtml}${doneHtml}</div>`;
       }
       return card + childrenHtml;
     };
 
-    // Active vs archived routing at the root level: a root subtree with any
-    // active node → active section; a fully done/archived root → archived.
-    const activeRoots = sortNodes(roots.filter(r => subtreeHasActive(r)));
-    const archivedRoots = sortNodes(roots.filter(r => !subtreeHasActive(r)));
+    // 三桶路由 (root 级)：active 子树进进行中段；纯陈旧求助子树进「💤 陈旧求助」折叠段；
+    // 全完成/归档子树进「📦 已完成」折叠段。
+    const activeRoots = sortNodes(roots.filter(r => subtreeBucket(r) === 'active'));
+    const staleRoots = sortNodes(roots.filter(r => subtreeBucket(r) === 'stale'));
+    const archivedRoots = sortNodes(roots.filter(r => subtreeBucket(r) === 'done'));
 
     // Summary bar — count over the INSPECT-RELEVANT universe only (the nodes
     // that can actually appear in the tree), not all of topology. Counting all
     // nodes inflated "in progress" with ~130 plain chats that the view never
     // shows, contradicting "glance to see status" (Round 2 P1).
-    let needsHuman = 0, working = 0, done = 0;
+    // 迭代2: 陈旧求助单独计数 (置灰、不进 needs-you)；needs-you 只数 severity≥3 的新鲜求助。
+    let needsHuman = 0, working = 0, done = 0, staleHelp = 0;
     for (const n of relevantNodes) {
       const s = inspectStatusOf(n);
-      if (s.severity >= 3) needsHuman++;
+      if (s.staleHelp) staleHelp++;
+      else if (s.severity >= 3) needsHuman++;
       else if (s.severity >= 1) working++;
       else if (s.archivedLike) done++;
     }
     const summaryParts: string[] = [];
     if (needsHuman) summaryParts.push(`<span class="topo-insp-sum needs">${t('topo.inspect.summary.needsHuman', { n: needsHuman })}</span>`);
     if (working) summaryParts.push(`<span class="topo-insp-sum work">${t('topo.inspect.summary.working', { n: working })}</span>`);
+    if (staleHelp) summaryParts.push(`<span class="topo-insp-sum stale">${t('topo.inspect.summary.staleHelp', { n: staleHelp })}</span>`);
     if (done) summaryParts.push(`<span class="topo-insp-sum done">${t('topo.inspect.summary.done', { n: done })}</span>`);
 
     const degradedBanner = state.subtaskJoinError
@@ -543,6 +602,10 @@ export function renderTopologyPage(root: HTMLElement): () => void {
           ${matches.map(n => renderNodeCard(n, 0, visited, true)).join('') || `<div class="topo-v2-empty">${t('topo.inspect.empty')}</div>`}
         </section>`;
     } else {
+      const staleBlock = staleRoots.length
+        ? `<details class="topo-insp-stale"><summary>${t('topo.inspect.staleHelpHeader', { n: staleRoots.length })}</summary>
+             ${staleRoots.map(r => renderNodeCard(r, 0, new Set<string>())).join('')}</details>`
+        : '';
       const archivedBlock = archivedRoots.length
         ? `<details class="topo-insp-archived"><summary>${t('topo.inspect.archivedHeader', { n: archivedRoots.length })}</summary>
              ${archivedRoots.map(r => renderNodeCard(r, 0, new Set<string>())).join('')}</details>`
@@ -552,6 +615,7 @@ export function renderTopologyPage(root: HTMLElement): () => void {
           <h3>${t('topo.inspect.activeHeader')} (${activeRoots.length})</h3>
           ${activeRoots.map(r => renderNodeCard(r, 0, new Set<string>())).join('') || `<div class="topo-v2-empty">${t('topo.inspect.empty')}</div>`}
         </section>
+        ${staleBlock}
         ${archivedBlock}`;
     }
 
@@ -1171,6 +1235,9 @@ export function renderTopologyPage(root: HTMLElement): () => void {
       state.edges = topo.edges || [];
       state.rootChatId = topo.rootChatId || '';
       state.subtaskJoinError = !!topo.subtaskJoinError;
+      if (typeof topo.managerDigestIntervalMs === 'number' && topo.managerDigestIntervalMs > 0) {
+        state.managerDigestIntervalMs = topo.managerDigestIntervalMs;
+      }
       state.lastLoadedAt = Date.now();
       rerender();
     } catch (err) {
