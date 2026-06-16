@@ -1,6 +1,6 @@
-import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
+import { existsSync, statSync, openSync, readSync, closeSync, watch } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
@@ -16,6 +16,8 @@ import type { CliAdapter, PtyHandle } from './types.js';
 function historyPath(home?: string): string {
   return join(home && home.trim() ? home : join(homedir(), '.codex'), 'history.jsonl');
 }
+const INITIAL_CONFIRM_TIMEOUT_MS = 5_000;
+const RESCUE_CONFIRM_TIMEOUT_MS = 2_000;
 
 function delay(ms: number): Promise<void> {
   return new Promise(r => setTimeout(r, ms));
@@ -64,12 +66,39 @@ async function waitForHistoryAppend(
   path: string, fromByte: number, marker: string, timeoutMs: number,
 ): Promise<HistoryMatch> {
   const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const match = matchHistoryDelta(path, fromByte, marker);
-    if (match.found) return match;
-    await delay(100);
+  let wake: (() => void) | undefined;
+  let watcher: { close: () => void } | undefined;
+  try {
+    const watchTarget = existsSync(path) ? path : dirname(path);
+    watcher = watch(watchTarget, { persistent: false }, () => {
+      const fn = wake;
+      wake = undefined;
+      fn?.();
+    });
+  } catch {
+    // fs.watch is best-effort only; polling below is the portable fallback
+    // and also covers dropped watch events.
   }
-  return { found: false };
+  try {
+    while (Date.now() < deadline) {
+      const match = matchHistoryDelta(path, fromByte, marker);
+      if (match.found) return match;
+      const remaining = Math.max(0, deadline - Date.now());
+      await new Promise<void>(resolve => {
+        const timer = setTimeout(() => {
+          wake = undefined;
+          resolve();
+        }, Math.min(100, remaining));
+        wake = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+      });
+    }
+  } finally {
+    watcher?.close();
+  }
+  return matchHistoryDelta(path, fromByte, marker);
 }
 
 /** Build a JSON-escaped prefix of the content so substring-match against the
@@ -201,16 +230,17 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       await delay(200);
       if (!trySendEnter()) return { submitted: false };
 
-      for (let attempt = 0; attempt < 3; attempt++) {
-        const match = await waitForHistoryAppend(HISTORY_PATH, baseByte, marker, 800);
-        if (match.found) {
-          return match.cliSessionId
-            ? { submitted: true, cliSessionId: match.cliSessionId }
-            : undefined;
-        }
-        if (!trySendEnter()) return { submitted: false };
+      let match = await waitForHistoryAppend(HISTORY_PATH, baseByte, marker, INITIAL_CONFIRM_TIMEOUT_MS);
+      if (match.found) {
+        return match.cliSessionId
+          ? { submitted: true, cliSessionId: match.cliSessionId }
+          : undefined;
       }
-      const match = await waitForHistoryAppend(HISTORY_PATH, baseByte, marker, 800);
+      // One rescue Enter covers the genuine "initial Enter was eaten" path.
+      // After that, keep waiting/read-only; repeated Enter on a slow history
+      // append can turn a confirmed submit into duplicate or empty submits.
+      if (!trySendEnter()) return { submitted: false };
+      match = await waitForHistoryAppend(HISTORY_PATH, baseByte, marker, RESCUE_CONFIRM_TIMEOUT_MS);
       if (match.found) {
         return match.cliSessionId
           ? { submitted: true, cliSessionId: match.cliSessionId }

@@ -45,6 +45,7 @@ import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
 import type { CliAdapter, PtyHandle } from '../src/adapters/cli/types.js';
 import { appendFileSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import * as fs from 'node:fs';
 import { homedir, platform } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -52,20 +53,25 @@ import { dirname, join } from 'node:path';
 // Helpers
 // ---------------------------------------------------------------------------
 
-const CODEX_HISTORY_PATH = join(homedir(), '.codex', 'history.jsonl');
 const COCO_HISTORY_PATH = platform() === 'darwin'
   ? join(homedir(), 'Library', 'Caches', 'coco', 'history.jsonl')
   : join(homedir(), '.cache', 'coco', 'history.jsonl');
 const CLAUDE_KEYBINDINGS_PATH = join(homedir(), '.claude', 'keybindings.json');
 
-function appendCodexHistory(content: string, sessionId?: string): void {
-  mkdirSync(dirname(CODEX_HISTORY_PATH), { recursive: true });
-  appendFileSync(CODEX_HISTORY_PATH, JSON.stringify({ session_id: sessionId, text: content }) + '\n');
+function codexHistoryPath(home?: string): string {
+  return join(home ?? join(homedir(), '.codex'), 'history.jsonl');
 }
 
-function resetCodexHistory(): void {
-  mkdirSync(dirname(CODEX_HISTORY_PATH), { recursive: true });
-  writeFileSync(CODEX_HISTORY_PATH, '');
+function appendCodexHistory(content: string, sessionId?: string, home?: string): void {
+  const path = codexHistoryPath(home);
+  mkdirSync(dirname(path), { recursive: true });
+  appendFileSync(path, JSON.stringify({ session_id: sessionId, text: content }) + '\n');
+}
+
+function resetCodexHistory(home?: string): void {
+  const path = codexHistoryPath(home);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, '');
 }
 
 function appendCocoHistory(content: string): void {
@@ -89,16 +95,32 @@ function removeClaudeKeybindings(): void {
   try { rmSync(CLAUDE_KEYBINDINGS_PATH); } catch { /* absent */ }
 }
 
-function makeTmuxPty(opts?: { confirmCodexSubmit?: boolean; codexSessionId?: string }) {
+function makeTmuxPty(opts?: { confirmCodexSubmit?: boolean; codexSessionId?: string; codexHome?: string }) {
   const confirmCodexSubmit = opts?.confirmCodexSubmit ?? true;
   let submittedText = '';
   return {
     write: vi.fn(),
     sendText: vi.fn((text: string) => { submittedText = text; }),
     sendSpecialKeys: vi.fn((key: string) => {
-      if (confirmCodexSubmit && key === 'Enter') appendCodexHistory(submittedText, opts?.codexSessionId);
+      if (confirmCodexSubmit && key === 'Enter') appendCodexHistory(submittedText, opts?.codexSessionId, opts?.codexHome);
     }),
     pasteText: vi.fn((text: string) => { submittedText = text; }),
+    claudeHome: opts?.codexHome,
+  } satisfies PtyHandle;
+}
+
+function makeDelayedCodexTmuxPty(delayMs: number, opts?: { codexSessionId?: string; codexHome?: string }) {
+  let submittedText = '';
+  return {
+    write: vi.fn(),
+    sendText: vi.fn((text: string) => { submittedText = text; }),
+    sendSpecialKeys: vi.fn((key: string) => {
+      if (key === 'Enter') {
+        setTimeout(() => appendCodexHistory(submittedText, opts?.codexSessionId, opts?.codexHome), delayMs);
+      }
+    }),
+    pasteText: vi.fn((text: string) => { submittedText = text; }),
+    claudeHome: opts?.codexHome,
   } satisfies PtyHandle;
 }
 
@@ -909,7 +931,48 @@ describe('codex writeInput submission confirmation', () => {
     expect(result).toEqual({ submitted: true, cliSessionId: 'codex-thread-1' });
   });
 
-  it('retries Enter and reports failure when history.jsonl never records the prompt', async () => {
+  it('confirms a delayed history.jsonl append without pressing Enter again', async () => {
+    resetCodexHistory();
+    const pty = makeDelayedCodexTmuxPty(250, { codexSessionId: 'delayed-codex-thread' });
+    const adapter = createCodexAdapter('/bin/codex');
+    const result = await adapter.writeInput(pty, MULTILINE);
+
+    expect(result).toEqual({ submitted: true, cliSessionId: 'delayed-codex-thread' });
+    expect(pty.sendText).toHaveBeenCalledWith(MULTILINE);
+    expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(1);
+  });
+
+  it('falls back to polling when fs.watch is unavailable', async () => {
+    resetCodexHistory();
+    const watchSpy = vi.spyOn(fs, 'watch').mockImplementation(() => {
+      throw new Error('watch unavailable');
+    });
+    try {
+      const pty = makeDelayedCodexTmuxPty(250, { codexSessionId: 'polling-codex-thread' });
+      const adapter = createCodexAdapter('/bin/codex');
+      const result = await adapter.writeInput(pty, MULTILINE);
+
+      expect(result).toEqual({ submitted: true, cliSessionId: 'polling-codex-thread' });
+      expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(1);
+    } finally {
+      watchSpy.mockRestore();
+    }
+  });
+
+  it('uses the clone CODEX_HOME history for submit confirmation', async () => {
+    const cloneHome = join(homedir(), '.codex-clone-submit-confirm');
+    resetCodexHistory();
+    resetCodexHistory(cloneHome);
+    appendCodexHistory(MULTILINE, 'global-wrong-thread');
+    const pty = makeTmuxPty({ codexSessionId: 'clone-thread', codexHome: cloneHome });
+    const adapter = createCodexAdapter('/bin/codex');
+    const result = await adapter.writeInput(pty, MULTILINE);
+
+    expect(result).toEqual({ submitted: true, cliSessionId: 'clone-thread' });
+    expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses only one rescue Enter and reports failure when history.jsonl never records the prompt', async () => {
     resetCodexHistory();
     const pty = makeTmuxPty({ confirmCodexSubmit: false });
     const adapter = createCodexAdapter('/bin/codex');
@@ -922,7 +985,7 @@ describe('codex writeInput submission confirmation', () => {
     expect(typeof (result as any)?.recheck).toBe('function');
     expect((result as any).recheck()).toBe(false);
     expect(pty.sendText).toHaveBeenCalledWith(MULTILINE);
-    expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(4);
+    expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(2);
   });
 });
 

@@ -30,6 +30,7 @@ import { CodexBridgeQueue } from './services/codex-bridge-queue.js';
 import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff, extractLastCodexTurn } from './services/codex-transcript.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
 import { baselineJsonlCursor } from './services/jsonl-cursor.js';
+import { scheduleSubmitFailureRechecks, SUBMIT_RECHECK_DELAYS_MS, SUBMIT_RECHECK_TOTAL_MS } from './services/submit-failure-recheck.js';
 import { dirname } from 'node:path';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -2175,12 +2176,10 @@ function persistCliSessionId(cliSessionId: string): void {
   }
 }
 
-/** How long to wait before re-checking whether a submit-not-confirmed message
- *  eventually landed. Cold-start sessions and slow third-party hooks
- *  (UserPromptSubmit, SessionStart — e.g. superpowers' large skill injection)
- *  can defer Claude's jsonl append by 5–15s; a 20s deferred recheck covers
- *  both without being so long that a true failure goes unsurfaced. */
-const SUBMIT_DEFERRED_RECHECK_MS = 20_000;
+/** Fallback delay for adapters/errors that cannot provide a reliable recheck
+ *  signal. Keep the old 20s behavior here; the longer bounded schedule is
+ *  reserved for verifiable slow-history paths. */
+const SUBMIT_UNVERIFIABLE_NOTIFY_MS = 20_000;
 
 /** Worker-side handler for `submitted: false`. Defers the user-facing
  *  warning and runs the adapter-supplied `recheck` closure first; if the
@@ -2220,30 +2219,36 @@ function scheduleSubmitFailureNotify(
     });
     return;
   }
-  log(`writeInput: submit not confirmed after retries — deferred ${SUBMIT_DEFERRED_RECHECK_MS}ms recheck queued. preview="${preview}"`);
-  setTimeout(async () => {
-    if (recheck) {
-      try {
-        if (await recheck()) {
-          log(`Deferred recheck found submit in ${transcriptLabel} — suppressing warning. preview="${preview}"`);
-          return;
-        }
-      } catch (err: any) {
-        log(`Deferred recheck threw (${err?.message ?? err}); falling through to warning.`);
-      }
-    }
+  const notifyMissing = (waitMs: number, label: string): void => {
     if (usageLimitTracker.detectedThisTurn(turnSeq)) {
       dropBridgeMark();
       log(`Deferred recheck missing but usage limit was detected for this turn — suppressing submit warning. preview="${preview}"`);
       return;
     }
     dropBridgeMark();
-    log(`Deferred recheck still missing — notifying user. preview="${preview}"`);
+    log(`Deferred recheck still missing after ${waitMs}ms — notifying user. preview="${preview}"`);
     send({
       type: 'user_notify',
-      message: `⚠️ 刚才那条消息发给 ${cliName()} 后没能确认提交（重试 Enter 后等了 ${Math.round(SUBMIT_DEFERRED_RECHECK_MS / 1000)}s 仍未在${transcriptLabel}里看到新记录）。可能卡在输入框里——请去 Web 终端看一下，手动按 Enter 或重发。\n开头：${preview}`,
+      message: `⚠️ 刚才那条消息发给 ${cliName()} 后没能确认提交（${label}后仍未在${transcriptLabel}里看到新记录）。可能卡在输入框里——请去 Web 终端看一下，手动按 Enter 或重发。\n开头：${preview}`,
     });
-  }, SUBMIT_DEFERRED_RECHECK_MS);
+  };
+  if (!recheck) {
+    log(`writeInput: submit not confirmed and no recheck is available — deferred ${SUBMIT_UNVERIFIABLE_NOTIFY_MS}ms warning queued. preview="${preview}"`);
+    setTimeout(() => notifyMissing(SUBMIT_UNVERIFIABLE_NOTIFY_MS, `等了 ${Math.round(SUBMIT_UNVERIFIABLE_NOTIFY_MS / 1000)}s 且没有可用确认信号`), SUBMIT_UNVERIFIABLE_NOTIFY_MS);
+    return;
+  }
+  log(`writeInput: submit not confirmed after retries — deferred bounded recheck queued (${SUBMIT_RECHECK_TOTAL_MS}ms max, ${SUBMIT_RECHECK_DELAYS_MS.length} attempts). preview="${preview}"`);
+  scheduleSubmitFailureRechecks({
+    setTimeout,
+    recheck,
+    onFound: attempt => {
+      log(`Deferred recheck found submit in ${transcriptLabel} on attempt ${attempt}/${SUBMIT_RECHECK_DELAYS_MS.length} — suppressing warning. preview="${preview}"`);
+    },
+    onError: (err, attempt) => {
+      log(`Deferred recheck attempt ${attempt}/${SUBMIT_RECHECK_DELAYS_MS.length} threw (${(err as any)?.message ?? err}); continuing bounded rechecks.`);
+    },
+    onExhausted: () => notifyMissing(SUBMIT_RECHECK_TOTAL_MS, `有界多次重查约 ${Math.round(SUBMIT_RECHECK_TOTAL_MS / 1000)}s`),
+  });
 }
 
 /**
