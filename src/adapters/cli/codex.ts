@@ -18,6 +18,7 @@ function historyPath(home?: string): string {
 }
 const INITIAL_CONFIRM_TIMEOUT_MS = 5_000;
 const RESCUE_CONFIRM_TIMEOUT_MS = 2_000;
+const MAX_ENTER_ATTEMPTS = 5;
 
 function delay(ms: number): Promise<void> {
   return new Promise(r => setTimeout(r, ms));
@@ -31,6 +32,12 @@ function currentFileSize(path: string): number {
 interface HistoryMatch {
   found: boolean;
   cliSessionId?: string;
+}
+
+function submitResult(match: HistoryMatch): void | { submitted: true; cliSessionId?: string } {
+  return match.cliSessionId
+    ? { submitted: true, cliSessionId: match.cliSessionId }
+    : undefined;
 }
 
 function matchHistoryDelta(path: string, fromByte: number, marker: string): HistoryMatch {
@@ -101,13 +108,13 @@ async function waitForHistoryAppend(
   return matchHistoryDelta(path, fromByte, marker);
 }
 
-/** Build a JSON-escaped prefix of the content so substring-match against the
- *  raw history.jsonl file content (where text fields store \n as the two-char
- *  escape `\n`, not a literal newline) finds our line. The prefix length is
- *  chosen to be unique-enough even when two bots submit near-identical text. */
+/** Build a JSON-escaped full-content marker so substring-match against the raw
+ *  history.jsonl file content (where text fields store \n as the two-char
+ *  escape `\n`, not a literal newline) only accepts the complete prompt.
+ *  A prefix marker is unsafe for Codex: multiline send-keys bursts can submit
+ *  a first-line fragment before the paste detector commits the whole prompt. */
 function historyMarker(content: string): string {
-  const prefix = content.slice(0, 40);
-  return JSON.stringify(prefix).slice(1, -1);  // strip surrounding quotes
+  return JSON.stringify(content).slice(1, -1);  // strip surrounding quotes
 }
 
 function latestCodexSessionForBotmuxSession(botmuxSessionId: string, home?: string): string | undefined {
@@ -228,23 +235,19 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
         return { submitted: false };
       }
       await delay(200);
-      if (!trySendEnter()) return { submitted: false };
 
-      let match = await waitForHistoryAppend(HISTORY_PATH, baseByte, marker, INITIAL_CONFIRM_TIMEOUT_MS);
-      if (match.found) {
-        return match.cliSessionId
-          ? { submitted: true, cliSessionId: match.cliSessionId }
-          : undefined;
-      }
-      // One rescue Enter covers the genuine "initial Enter was eaten" path.
-      // After that, keep waiting/read-only; repeated Enter on a slow history
-      // append can turn a confirmed submit into duplicate or empty submits.
-      if (!trySendEnter()) return { submitted: false };
-      match = await waitForHistoryAppend(HISTORY_PATH, baseByte, marker, RESCUE_CONFIRM_TIMEOUT_MS);
-      if (match.found) {
-        return match.cliSessionId
-          ? { submitted: true, cliSessionId: match.cliSessionId }
-          : undefined;
+      // Codex 0.140 in --no-alt-screen still needs multiple Enter presses for
+      // some multiline send-keys bursts before its paste detector submits the
+      // whole prompt. Keep the budget bounded, and check history before every
+      // press so a slow-but-already-confirmed submit stops immediately.
+      for (let attempt = 0; attempt < MAX_ENTER_ATTEMPTS; attempt++) {
+        const alreadySubmitted = matchHistoryDelta(HISTORY_PATH, baseByte, marker);
+        if (alreadySubmitted.found) return submitResult(alreadySubmitted);
+
+        if (!trySendEnter()) return { submitted: false };
+        const timeout = attempt === 0 ? INITIAL_CONFIRM_TIMEOUT_MS : RESCUE_CONFIRM_TIMEOUT_MS;
+        const match = await waitForHistoryAppend(HISTORY_PATH, baseByte, marker, timeout);
+        if (match.found) return submitResult(match);
       }
       // In-band budget exhausted. Hand the worker a recheck closure: a
       // slow-startup Codex (or one whose first turn is delayed by a heavy

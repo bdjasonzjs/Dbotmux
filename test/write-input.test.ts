@@ -20,8 +20,9 @@
  *   history.jsonl.
  * - CoCo (raw PTY): same explicit \x1b[200~...\x1b[201~ wrap as claude-code.
  * - Other adapters (Aiden/Codex/Gemini/OpenCode): use plain sendText + Enter
- *   in tmux, or write(content) + \r in raw mode. The whole content (including
- *   newlines) is sent in one sendText call — those CLIs tolerate raw LF.
+ *   in tmux, or write(content) + \r in raw mode. Codex additionally verifies
+ *   history.jsonl and may send a bounded series of Enter presses for multiline
+ *   prompts that need multiple paste-detector nudges.
  *
  * Run:  pnpm vitest run test/write-input.test.ts
  */
@@ -117,6 +118,49 @@ function makeDelayedCodexTmuxPty(delayMs: number, opts?: { codexSessionId?: stri
     sendSpecialKeys: vi.fn((key: string) => {
       if (key === 'Enter') {
         setTimeout(() => appendCodexHistory(submittedText, opts?.codexSessionId, opts?.codexHome), delayMs);
+      }
+    }),
+    pasteText: vi.fn((text: string) => { submittedText = text; }),
+    claudeHome: opts?.codexHome,
+  } satisfies PtyHandle;
+}
+
+function makeCodexTmuxPtyConfirmingOnEnter(
+  submitEnterNumber: number,
+  opts?: { codexSessionId?: string; codexHome?: string },
+) {
+  let submittedText = '';
+  let enterCount = 0;
+  return {
+    write: vi.fn(),
+    sendText: vi.fn((text: string) => { submittedText = text; }),
+    sendSpecialKeys: vi.fn((key: string) => {
+      if (key !== 'Enter') return;
+      enterCount++;
+      if (enterCount === submitEnterNumber) {
+        appendCodexHistory(submittedText, opts?.codexSessionId, opts?.codexHome);
+      }
+    }),
+    pasteText: vi.fn((text: string) => { submittedText = text; }),
+    claudeHome: opts?.codexHome,
+  } satisfies PtyHandle;
+}
+
+function makeCodexTmuxPtyAppendingByEnter(
+  entriesByEnter: Record<number, string>,
+  opts?: { codexSessionId?: string; codexHome?: string },
+) {
+  let submittedText = '';
+  let enterCount = 0;
+  return {
+    write: vi.fn(),
+    sendText: vi.fn((text: string) => { submittedText = text; }),
+    sendSpecialKeys: vi.fn((key: string) => {
+      if (key !== 'Enter') return;
+      enterCount++;
+      const entry = entriesByEnter[enterCount];
+      if (entry !== undefined) {
+        appendCodexHistory(entry === '<FULL>' ? submittedText : entry, opts?.codexSessionId, opts?.codexHome);
       }
     }),
     pasteText: vi.fn((text: string) => { submittedText = text; }),
@@ -942,6 +986,33 @@ describe('codex writeInput submission confirmation', () => {
     expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(1);
   });
 
+  it('keeps sending bounded Enter attempts until a multiline prompt is submitted', async () => {
+    resetCodexHistory();
+    const pty = makeCodexTmuxPtyConfirmingOnEnter(3, { codexSessionId: 'multi-enter-thread' });
+    const adapter = createCodexAdapter('/bin/codex');
+    const result = await adapter.writeInput(pty, MULTILINE);
+
+    expect(result).toEqual({ submitted: true, cliSessionId: 'multi-enter-thread' });
+    expect(pty.sendText).toHaveBeenCalledWith(MULTILINE);
+    expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(3);
+  });
+
+  it('does not confirm a first-line fragment before the full multiline prompt is recorded', async () => {
+    resetCodexHistory();
+    const longFirstLine = 'fragment-prefix-that-used-to-match-the-first-forty-characters-before-any-newline';
+    const multiline = `${longFirstLine}\nsecond line\nthird line`;
+    const pty = makeCodexTmuxPtyAppendingByEnter({
+      1: longFirstLine,
+      3: '<FULL>',
+    }, { codexSessionId: 'full-prompt-thread' });
+    const adapter = createCodexAdapter('/bin/codex');
+    const result = await adapter.writeInput(pty, multiline);
+
+    expect(result).toEqual({ submitted: true, cliSessionId: 'full-prompt-thread' });
+    expect(pty.sendText).toHaveBeenCalledWith(multiline);
+    expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(3);
+  });
+
   it('falls back to polling when fs.watch is unavailable', async () => {
     resetCodexHistory();
     const watchSpy = vi.spyOn(fs, 'watch').mockImplementation(() => {
@@ -972,7 +1043,7 @@ describe('codex writeInput submission confirmation', () => {
     expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(1);
   });
 
-  it('uses only one rescue Enter and reports failure when history.jsonl never records the prompt', async () => {
+  it('uses a bounded Enter budget and reports failure when history.jsonl never records the prompt', async () => {
     resetCodexHistory();
     const pty = makeTmuxPty({ confirmCodexSubmit: false });
     const adapter = createCodexAdapter('/bin/codex');
@@ -985,7 +1056,7 @@ describe('codex writeInput submission confirmation', () => {
     expect(typeof (result as any)?.recheck).toBe('function');
     expect((result as any).recheck()).toBe(false);
     expect(pty.sendText).toHaveBeenCalledWith(MULTILINE);
-    expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(2);
+    expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(5);
   });
 });
 
