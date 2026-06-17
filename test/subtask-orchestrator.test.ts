@@ -215,6 +215,20 @@ describe('createSubtask', () => {
       .rejects.toMatchObject({ status: 400 });
   });
 
+  it('P1④: --bots auto-clone 语法 → 清晰 400 指引, 不建群', async () => {
+    mainSession();
+    await expect(createSubtask({ sessionId: 'sess_main', goal: 'auto clone unsupported', bots: ['auto@codex:collab:初号机'] }))
+      .rejects.toMatchObject({
+        status: 400,
+        message: expect.stringContaining('subtask-start --bots does not support auto-clone syntax'),
+      });
+    await expect(createSubtask({ sessionId: 'sess_main', goal: 'auto clone unsupported 2', bots: ['auto:collab'] }))
+      .rejects.toThrow(/ceo-spawn --seats/);
+    await expect(createSubtask({ sessionId: 'sess_main', goal: 'auto clone unsupported 3', bots: ['auto@codex:collab'] }))
+      .rejects.toThrow(/appId\/name/);
+    expect(mockCreateGroup).not.toHaveBeenCalled();
+  });
+
   it('6b: 无 :role 后缀 → 默认角色不变 (claude→main)', async () => {
     mainSession();
     const res = await createSubtask({ sessionId: 'sess_main', goal: '6b no role', bots: ['claude'] });

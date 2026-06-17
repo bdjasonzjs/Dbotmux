@@ -59,6 +59,11 @@ const ALIAS_TO_META_KEY: Record<string, keyof typeof BOT_META> = {
 /** Roles a `--bots ref:role` suffix may set. */
 const VALID_ROLES = new Set<string>(['main', 'collab', 'observer']);
 
+function isAutoCloneBotEntry(entry: string): boolean {
+  const lower = entry.trim().toLowerCase();
+  return lower.startsWith('auto@') || lower.startsWith('auto:');
+}
+
 /** Exported so the CEO-spawn key (ceo-spawn-store) mirrors createSubtask's
  *  idempotencyKey exactly (块7 第二轮 #5: subgroup + CEO-spawn state share one key). */
 export function slug(s: string): string {
@@ -304,6 +309,9 @@ export async function createSubtask(req: CreateSubtaskReq): Promise<{ taskId: st
     // Each entry is `ref` or `ref:role` (role ∈ main|collab|observer). The role
     // suffix is an explicit override; without it we fall back to the alias's
     // legacy role, else 'collab'.
+    if (isAutoCloneBotEntry(entry)) {
+      throw new HttpError(400, `subtask-start --bots does not support auto-clone syntax "${entry}"; use an existing clone appId/name in --bots (for example cli_xxx:collab), or use ceo-spawn --seats for auto-clone`);
+    }
     const ci = entry.indexOf(':');
     const ref = ci >= 0 ? entry.slice(0, ci) : entry;
     const explicitRole = ci >= 0 ? entry.slice(ci + 1).trim().toLowerCase() : '';
