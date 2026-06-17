@@ -32,6 +32,7 @@ import { scanProjects, scanMultipleProjects } from './services/project-scanner.j
 import { buildRepoSelectCard, buildStreamingCard, getCliDisplayName } from './im/lark/card-builder.js';
 import { t as tr, botLocale, localeForBot } from './i18n/index.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
+import { cliBinaryUnavailableMessage } from './adapters/cli/binary-health.js';
 import {
   initWorkerPool,
   setActiveSessionsRegistry,
@@ -486,7 +487,12 @@ function refreshCliVersion(cliId: CliId, cliPathOverride?: string): boolean {
     logger.info(`CLI version: ${newVersion} (${adapter.id})`);
     return false;
   } catch (err: any) {
-    logger.warn(`Failed to get CLI version for ${cliId}: ${err.message}`);
+    // P2⑤: a failing `<bin> --version` almost always means the CLI binary is
+    // unavailable/broken — not on PATH, or (e.g. codex) its platform-native
+    // sub-binary (codex-linux-x64) is missing. Left silent this crash-loops
+    // EVERY session of that engine ("crashed N times"); surface it loudly +
+    // actionably at startup instead of a bland "version unknown".
+    logger.error(cliBinaryUnavailableMessage(cliId, err?.message ?? String(err)));
     return false;
   }
 }
