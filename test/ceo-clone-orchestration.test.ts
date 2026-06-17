@@ -11,7 +11,7 @@ const baseReq = (over: Partial<EnsureSpawnReq> = {}): EnsureSpawnReq => ({
 
 function deps(over: Partial<EnsureSpawnDeps> = {}): { d: EnsureSpawnDeps; calls: any; store: Map<string, CeoSpawnState> } {
   const store = new Map<string, CeoSpawnState>();
-  const calls = { spawn: 0, cloneInChat: 0, activate: 0, registerActivatedBot: 0, isInChat: 0, addBotToChat: 0, addBotToSubTask: 0, lateKickoff: 0, preheat: 0, replies: [] as string[], order: [] as string[], lateKickoffArgs: [] as any[], preheatArgs: [] as any[], cloneArgs: [] as any[] };
+  const calls = { spawn: 0, cloneInChat: 0, activate: 0, registerActivatedBot: 0, ensureCloneScopesProvisioned: 0, isInChat: 0, addBotToChat: 0, addBotToSubTask: 0, lateKickoff: 0, preheat: 0, replies: [] as string[], order: [] as string[], lateKickoffArgs: [] as any[], preheatArgs: [] as any[], cloneArgs: [] as any[], scopeGateArgs: [] as any[] };
   const d: EnsureSpawnDeps = {
     getOwnerOpenId: () => OWNER,
     // default auto target = the claude 本体 (cli_main); pool has only the 本体 ready.
@@ -25,6 +25,7 @@ function deps(over: Partial<EnsureSpawnDeps> = {}): { d: EnsureSpawnDeps; calls:
     activationApproved: () => false,
     activate: async () => { calls.activate++; calls.order.push('activate'); return { ok: true }; },
     registerActivatedBot: async () => { calls.registerActivatedBot++; calls.order.push('register'); return { ok: true }; },
+    ensureCloneScopesProvisioned: async (a) => { calls.ensureCloneScopesProvisioned++; calls.order.push('scopeGate'); calls.scopeGateArgs.push(a); },
     isInChat: async () => { calls.isInChat++; calls.order.push('isInChat'); return false; },
     addBotToChat: async () => { calls.addBotToChat++; return { ok: true }; },
     addBotToSubTask: async () => { calls.addBotToSubTask++; },
@@ -164,6 +165,33 @@ describe('ensureClonesAndSpawn (subgroup-first #5)', () => {
     expect(calls.lateKickoff).toBe(0);
   });
 
+  it('Phase B scope gate fails before addBotToChat → awaiting_clone_join, no chat add/store/kickoff', async () => {
+    let activated = false;
+    const { d, calls } = deps({
+      activationApproved: () => true,
+      activate: async () => { calls.activate++; activated = true; return { ok: true }; },
+      botOpenIdReady: (id) => (id === 'cli_main' ? 'ou_main' : (id === 'cli_new' && activated ? 'ou_new' : undefined)),
+      ensureCloneScopesProvisioned: async (a) => {
+        calls.ensureCloneScopesProvisioned++;
+        calls.order.push('scopeGate');
+        calls.scopeGateArgs.push(a);
+        throw new Error('clone cli_new missing required scopes: im:message.group_msg');
+      },
+    });
+    const out = await ensureClonesAndSpawn(baseReq(), d);
+    expect(out.status).toBe('awaiting_clone_join');
+    expect(calls.scopeGateArgs[0]).toMatchObject({
+      chatId: 'oc_sub',
+      appId: 'cli_new',
+      displayName: '克劳德（初号机）',
+      role: 'collab',
+    });
+    expect(calls.addBotToChat).toBe(0);
+    expect(calls.addBotToSubTask).toBe(0);
+    expect(calls.lateKickoff).toBe(0);
+    expect(calls.isInChat).toBe(0);
+  });
+
   // blocker1: after addBotToChat success, store/kickoff failure must re-enter at
   // 'in_chat' (NOT re-add to chat) and complete — no permanent awaiting_clone_join.
   it('re-entry after lateKickoff failure: completes without re-adding to chat', async () => {
@@ -237,7 +265,7 @@ describe('ensureClonesAndSpawn (subgroup-first #5)', () => {
     });
     const out = await ensureClonesAndSpawn(baseReq(), d);
     expect(out.status).toBe('spawned');
-    expect(calls.order).toEqual(['activate', 'register', 'isInChat']);
+    expect(calls.order).toEqual(['activate', 'register', 'scopeGate', 'isInChat']);
   });
 
   it('round-3: registerActivatedBot failure → awaiting_clone_join (retryable), never reaches isInChat', async () => {

@@ -22,6 +22,7 @@ import { getOrCompute, type IdempotencyEntry } from './spawn-idempotency-store.j
 import { createGroupWithBots } from './group-creator.js';
 import { getSession } from './session-store.js';
 import { logger } from '../utils/logger.js';
+import { ensureCloneScopesProvisioned } from './clone-scope-provisioning.js';
 import type { Session } from '../types.js';
 import {
   createSubTask, getSubTask, getByChatId, getCommand, transitionStatus, enqueueCommand, ackCommand,
@@ -331,6 +332,12 @@ export async function createSubtask(req: CreateSubtaskReq): Promise<{ taskId: st
   const claudeApp = resolveBotIdent('claude').larkAppId;
   const larkAppIds = resolved.map(r => r.ident.larkAppId);
   const subtaskBots: SubTaskBot[] = resolved.map(r => ({ openId: r.ident.openId, name: r.name, role: r.role, larkAppId: r.ident.larkAppId }));
+
+  await ensureCloneScopesProvisioned({
+    creatorLarkAppId: claudeApp,
+    chatId: ctx.callerChatId,
+    bots: resolved.map(r => ({ larkAppId: r.ident.larkAppId, name: r.name, role: r.role })),
+  });
 
   // 边界4: 建群 + 登记串同一 idempotencyKey。crash window 安全靠两步同 key。
   // review Blocker: slug(goal) 对中文全压成 'task' → 同 root 下不同中文 goal 会碰撞 dedup。

@@ -27,6 +27,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 import * as sdk from '@larksuiteoapi/node-sdk';
 import {
   validateCredentials,
+  listGrantedTenantScopes,
   checkRequiredScopes,
   applyScopesUnverified,
   buildScopeDeepLink,
@@ -139,6 +140,25 @@ describe('validateCredentials', () => {
 });
 
 describe('checkRequiredScopes (helper, not in main path)', () => {
+  it('listGrantedTenantScopes maps scope.list grant_status fixture into granted names', async () => {
+    scopeListMock.mockResolvedValue({
+      code: 0,
+      data: {
+        scopes: [
+          { scope_name: 'im:message', grant_status: 2 },
+          { scope_name: 'im:message.group_msg', grant_status: 2 },
+          { scope_name: 'im:resource', grant_status: 1 },
+          { scope_name: 'contact:user.base:readonly', grant_status: 0 },
+        ],
+      },
+    });
+    const r = await listGrantedTenantScopes('cli_x', 'sec', 'feishu');
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.granted).toEqual(['im:message', 'im:message.group_msg']);
+    }
+  });
+
   it('lists granted scopes and computes missing critical/optional via grant_status===2', async () => {
     scopeListMock.mockResolvedValue({
       code: 0,

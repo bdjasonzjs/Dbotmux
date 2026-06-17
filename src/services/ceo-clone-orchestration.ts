@@ -105,6 +105,10 @@ export interface EnsureSpawnDeps {
    *  already in the chat, so groups-store treating already-in-chat as failure can't
    *  strand the flow at awaiting_clone_join (蔻黛 blocker). */
   isInChat: (chatId: string, appId: string) => Promise<boolean>;
+  /** Verify clone core scopes before the clone is treated as usable in the
+   *  subgroup. Must post a visible auth link / warning before throwing or
+   *  returning failure, because Feishu scope grant still needs a human click. */
+  ensureCloneScopesProvisioned: (bot: { chatId: string; appId: string; displayName?: string; role: SeatSpec['role'] }) => Promise<void>;
   /** Register the joined clone (with its role) into the subtask. Idempotent. */
   addBotToSubTask: (taskId: string, bot: { appId: string; displayName?: string; role: SeatSpec['role'] }) => Promise<void>;
   /** Targeted late kickoff — wakes ONLY this clone (by its summon name), not main. */
@@ -284,6 +288,21 @@ export async function ensureClonesAndSpawn(req: EnsureSpawnReq, deps: EnsureSpaw
   if (pc.phase === 'registered') {
     if (!deps.botOpenIdReady(pc.appId!)) {
       return { status: 'awaiting_openid', appId: pc.appId!, message: `分身 ${pc.appId} 已激活，等它在子群露面拿到 open_id 后我继续。` };
+    }
+    try {
+      await deps.ensureCloneScopesProvisioned({
+        chatId: state.subgroupChatId,
+        appId: pc.appId!,
+        displayName: pc.displayName,
+        role: pc.role,
+      });
+    } catch (err: any) {
+      return {
+        status: 'awaiting_clone_join',
+        taskId: state.taskId,
+        chatId: state.subgroupChatId,
+        message: `分身 ${pc.appId} 权限未就绪，已发授权链接并阻断入群/登记；授权后可重试（${err?.message ?? 'missing required scopes'}）。`,
+      };
     }
     // 守点4 + 重入: pull into the chat BEFORE any store change. If the clone is
     // ALREADY in the chat (re-entry after a crash, or a prior store/kickoff

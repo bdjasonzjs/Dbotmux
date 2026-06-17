@@ -12,6 +12,7 @@ import { join } from 'node:path';
 let tempDir: string;
 const mockAuthzCheck = vi.fn();
 const mockCreateGroup = vi.fn();
+const mockEnsureCloneScopesProvisioned = vi.fn();
 const idemCache = new Map<string, any>();
 const mockSessions = new Map<string, any>();
 
@@ -43,6 +44,9 @@ vi.mock('../src/core/main-bot-playbook.js', () => {
   return { HttpError, authzCheck: (...a: any[]) => mockAuthzCheck(...a), resolveBotIdent };
 });
 vi.mock('../src/services/group-creator.js', () => ({ createGroupWithBots: (...a: any[]) => mockCreateGroup(...a) }));
+vi.mock('../src/services/clone-scope-provisioning.js', () => ({
+  ensureCloneScopesProvisioned: (...a: any[]) => mockEnsureCloneScopesProvisioned(...a),
+}));
 vi.mock('../src/services/spawn-idempotency-store.js', () => ({
   getOrCompute: async (key: string, compute: () => Promise<any>) => {
     if (idemCache.has(key)) return { entry: idemCache.get(key), cacheHit: true };
@@ -105,6 +109,8 @@ beforeEach(() => {
   mockSessions.clear();
   mockAuthzCheck.mockResolvedValue({ callerChatId: 'oc_main', callerBotAppId: 'app_claude', rootMessageId: 'om_root' });
   mockCreateGroup.mockResolvedValue({ ok: true, chatId: 'oc_sub_new', creator: 'app_claude', invalidBotIds: [], invalidUserIds: [] });
+  mockEnsureCloneScopesProvisioned.mockReset();
+  mockEnsureCloneScopesProvisioned.mockResolvedValue(undefined);
 });
 
 // ─── create_subtask ──────────────────────────────────────────────────────────
@@ -153,6 +159,22 @@ describe('createSubtask', () => {
     expect(task.bots.find((b: any) => b.openId === 'ou_coco')).toMatchObject({
       name: '缇蕾', role: 'observer', larkAppId: 'app_coco',
     });
+  });
+
+  it('clone scope gate: 缺 required scope 时阻断建群, 不静默 createGroupWithBots', async () => {
+    mainSession();
+    mockEnsureCloneScopesProvisioned.mockRejectedValue(Object.assign(new Error('missing clone scope'), { status: 403 }));
+    await expect(createSubtask({ sessionId: 'sess_main', goal: 'clone scope gate', bots: ['claude-clone:main'] }))
+      .rejects.toMatchObject({ status: 403 });
+    expect(mockEnsureCloneScopesProvisioned).toHaveBeenCalledWith({
+      creatorLarkAppId: 'app_claude',
+      chatId: 'oc_main',
+      bots: [
+        { larkAppId: 'app_clone', name: 'claude-clone', role: 'main' },
+        { larkAppId: 'app_coco', name: '缇蕾', role: 'observer' },
+      ],
+    });
+    expect(mockCreateGroup).not.toHaveBeenCalled();
   });
 
   it('alias role/name 兼容: bots 用短码 c/k/t 与大写 CLAUDE → 保留 main/collab/observer 不降级', async () => {

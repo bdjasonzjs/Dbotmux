@@ -27,6 +27,7 @@ import { replyMessage, sendMessage, uploadImage } from '../im/lark/client.js';
 import { addBotToChat, isInChat } from './groups-store.js';
 import { cloneBotInChat, renderQrPng } from './bot-clone-chat.js';
 import { cloneGrantScopes, buildAuthUrl, type CloneScopeProfile } from './clone-auth-link.js';
+import { ensureCloneScopesProvisioned } from './clone-scope-provisioning.js';
 import { activateBot } from './bot-activate.js';
 import { createSubtask, slug, djb2 } from './subtask-orchestrator.js';
 import { addBotToSubTask, enqueueCommand } from './subtask-store.js';
@@ -232,6 +233,14 @@ export async function ceoSpawn(req: CeoSpawnReq): Promise<EnsureSpawnOutcome> {
       return r0?.ok ? { ok: true } : { ok: false, error: r0?.error ?? 'add_failed' };
     },
     isInChat: (chatId, appId) => isInChat(appId, chatId), // clone's own token checks its membership
+    ensureCloneScopesProvisioned: async ({ chatId, appId, displayName, role }) => {
+      await ensureCloneScopesProvisioned({
+        creatorLarkAppId: ceoAppId,
+        chatId,
+        bots: [{ larkAppId: appId, name: displayName, role }],
+        profile: req.cloneScopeProfile ?? 'core',
+      });
+    },
 
     addBotToSubTask: async (taskId, bot) => {
       await addBotToSubTask(taskId, {

@@ -6,8 +6,11 @@
  *   AppID/Secret 有效. 没拿到才会让 setup 失败 (拒绝写 bots.json).
  *
  * 仅作为可选 helper, **未启用于 setup / start 主链路**:
- * - {@link checkRequiredScopes} —— 调 `application.v6.scope.list` 比对 botmux
- *   需要的 scope. 待 spike 用真实/可复现 mock 证明 grant_status 闭环后再启用.
+ * - {@link listGrantedTenantScopes} —— 调 `application.v6.scope.list` 把
+ *   grant_status===2 归一为 granted scope name. clone provisioning 用它在
+ *   建群前 fail-closed；setup/start 主链路仍只提示, 不因此阻断启动.
+ * - {@link checkRequiredScopes} —— 基于 listGrantedTenantScopes 比对 botmux
+ *   需要的 scope. setup/start 主链路仍未启用阻断.
  * - {@link applyScopesUnverified} —— 调 `application.v6.scope.apply` 触发管理
  *   员审批. Lark 文档表明它只能提交"已声明但未授权"的 scope, 不能给 manifest
  *   加新 scope, 所以无法绕开"用户去开放平台勾"这步; 同样待 spike 后启用.
@@ -177,21 +180,23 @@ export type ScopeCheckResult =
     };
 
 /**
- * 列出应用的 scope grant 状态, 比对 BOTMUX_REQUIRED_SCOPES.
- *
- * **不在主路径使用** — 待 spike 用真实/可复现 mock 证明 grant_status 含义和
- * 状态闭环后再启用. 当前主路径只输出"剩余步骤 + 深链", 不做 grant_status 判定.
+ * 列出应用已生效的 tenant scopes.
  *
  * scope.list 返回 shape (SDK type):
  *   `{ data: { scopes: [{ scope_name, grant_status, scope_type }] } }`
- * grant_status 含义未在官方文档明确, 但社区 SDK / 实测一般约定:
- *   1 = 已申请未生效, 2 = 已生效. 启用前 spike 务必确认这个映射.
+ * grant_status 在本仓库统一按:
+ *   1 = 已申请未生效, 2 = 已生效.
+ * 该解释有可复现单测 fixture 锁定；调用方必须在不可检查时 fail closed
+ * 或降级为显眼提示, 不能把 unknown 当 granted.
  */
-export async function checkRequiredScopes(
+export async function listGrantedTenantScopes(
   appId: string,
   appSecret: string,
   brand: Brand = 'feishu',
-): Promise<ScopeCheckResult> {
+): Promise<
+  | { ok: true; granted: string[] }
+  | { ok: false; error: 'need_self_manage' | 'network' | 'unknown'; message: string }
+> {
   const domain = brand === 'lark' ? Lark.Domain.Lark : Lark.Domain.Feishu;
   const client = new Lark.Client({ appId, appSecret, domain, loggerLevel: Lark.LoggerLevel.error });
 
@@ -220,6 +225,23 @@ export async function checkRequiredScopes(
     .filter((s: any) => s?.grant_status === 2 && typeof s?.scope_name === 'string')
     .map((s: any) => s.scope_name);
 
+  return { ok: true, granted: grantedNames };
+}
+
+/**
+ * 列出应用的 scope grant 状态, 比对 BOTMUX_REQUIRED_SCOPES.
+ *
+ * setup/start 主路径仍不把该检查作为启动硬闸；clone subgroup provisioning
+ * 会用相同底层 helper 在建群前 fail-closed 并贴授权链接。
+ */
+export async function checkRequiredScopes(
+  appId: string,
+  appSecret: string,
+  brand: Brand = 'feishu',
+): Promise<ScopeCheckResult> {
+  const listed = await listGrantedTenantScopes(appId, appSecret, brand);
+  if (!listed.ok) return listed;
+  const grantedNames = listed.granted;
   const missingCritical = BOTMUX_REQUIRED_SCOPES.filter(s => s.critical && !grantedNames.includes(s.name));
   const missingOptional = BOTMUX_REQUIRED_SCOPES.filter(s => !s.critical && !grantedNames.includes(s.name));
 

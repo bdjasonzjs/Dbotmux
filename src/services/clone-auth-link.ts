@@ -83,6 +83,7 @@ export const CLONE_CORE_SCOPES: readonly string[] = [
   'cardkit:card:read',                             // interactive status cards
   'cardkit:card:write',
   'contact:user.base:readonly',                    // resolve member names
+  'application:application:self_manage',           // inspect grant status before subgroup use
 ];
 
 /**
