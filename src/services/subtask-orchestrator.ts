@@ -895,6 +895,25 @@ export async function listManagerInbox(req: ListInboxReq): Promise<{ entries: Ar
   return { entries: entries.map(e => ({ ...e, body: e.letterId ? (readLetter(e.letterId)?.payload ?? null) : null })) };
 }
 
+export interface ListManagersReq { sessionId: string; }
+
+/** 列调用者（CEO 主群）下当前活跃的**部门经理子群**——供"派活前先判归口"：
+ *  知道现在有哪些常驻经理、各管什么域，从而判断"交对口经理 own"还是"CEO 直建"。
+ *  只列 parentChatId == 调用者群 且 reportingMode=manager 且 ACTIVE 的子群。 */
+export async function listManagers(req: ListManagersReq): Promise<{ managers: Array<{ taskId: string; chatId: string; status: SubTaskStatus; goal: string }> }> {
+  const session = getSession(req.sessionId);
+  if (!session) throw new HttpError(403, `unknown session: ${req.sessionId}`);
+  const managers = listSubTasks({ statuses: ACTIVE_STATUSES })
+    .filter(t => isManager(t) && t.parentChatId === session.chatId)
+    .map(t => ({
+      taskId: t.taskId,
+      chatId: t.chatId,
+      status: t.status,
+      goal: (t.goal || '').replace(/\s+/g, ' ').trim().slice(0, 80),
+    }));
+  return { managers };
+}
+
 export interface MarkInboxReadReq { sessionId: string; ids: string[]; }
 
 /** 标自己收件箱里若干邮件已读（per-reader）。 */

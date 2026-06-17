@@ -1462,6 +1462,7 @@ const SUBTASK_ORCH_ROUTES: Array<[string, string]> = [
   ['/api/subtask-orch-request-report', 'requestReport'],   // CEO 主动 pull：命令经理立即汇报
   ['/api/subtask-orch-inbox-list', 'listManagerInbox'],    // CEO 列自己收件箱
   ['/api/subtask-orch-inbox-read', 'markInboxRead'],       // CEO 标已读
+  ['/api/subtask-orch-managers', 'listManagers'],          // CEO 派活前列当前活跃经理群（判归口）
 ];
 for (const [path, fnName] of SUBTASK_ORCH_ROUTES) {
   ipcRoute('POST', path, async (req, res) => {
