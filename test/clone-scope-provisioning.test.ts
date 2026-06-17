@@ -32,8 +32,9 @@ describe('ensureCloneScopesProvisioned', () => {
     expect(text).toContain('已阻断建群');
   });
 
-  it('缺 self_manage 时授权链接包含 self_manage, 重试有可完成补救路径', async () => {
-    const postMessage = vi.fn().mockResolvedValue('om_warn');
+  it('scope 自检失败 (check.ok=false, 如 need_self_manage) → fail-open 放行, 不阻断不发链接', async () => {
+    // 自检 API 失败 = 无法判定，不能当"全缺"。fail-open：放行 + 仅 logger 告警。
+    const postMessage = vi.fn();
     await expect(ensureCloneScopesProvisioned({
       creatorLarkAppId: 'cli_creator',
       chatId: 'oc_parent',
@@ -46,21 +47,52 @@ describe('ensureCloneScopesProvisioned', () => {
         message: 'missing application:application:self_manage; cannot inspect granted scopes',
       }),
       postMessage,
-    })).rejects.toMatchObject({ status: 403 });
-    const text = postMessage.mock.calls[0][2];
-    expect(text).toContain('application:application:self_manage');
-    const url = text.split('\n').find((line: string) => line.startsWith('https://'))!;
-    expect(new URL(url).searchParams.get('q')).toContain('application:application:self_manage');
+    })).resolves.toBeUndefined();
+    expect(postMessage).not.toHaveBeenCalled();
   });
 
-  it('授权链接投递失败时 403 错误带 auth URL, 不丢补救入口', async () => {
+  it('scope.list 返回空 (granted=[]) → fail-open 放行 (线上回归: API 不反映 clone 已授 scope)', async () => {
+    // 真实线上: application.v6.scope.list 对 clone 返回 granted=[] 即使权限都授了。
+    // 空列表 = 不可判定, 绝不能当"全缺"硬拦 (否则误杀所有 2-Codex 建群)。
+    const postMessage = vi.fn();
+    await expect(ensureCloneScopesProvisioned({
+      creatorLarkAppId: 'cli_creator',
+      chatId: 'oc_parent',
+      bots: [{ larkAppId: 'cli_clone', name: 'clone', role: 'collab' }],
+    }, {
+      readBotsJson: () => [cloneCfg],
+      checkGrantedScopes: vi.fn().mockResolvedValue({ ok: true, granted: [] }),
+      postMessage,
+    })).resolves.toBeUndefined();
+    expect(postMessage).not.toHaveBeenCalled();
+  });
+
+  it('clone 配置无 larkAppSecret → fail-open 放行, 不阻断', async () => {
+    const postMessage = vi.fn();
+    const checkGrantedScopes = vi.fn();
+    await expect(ensureCloneScopesProvisioned({
+      creatorLarkAppId: 'cli_creator',
+      chatId: 'oc_parent',
+      bots: [{ larkAppId: 'cli_clone', name: 'clone', role: 'main' }],
+    }, {
+      readBotsJson: () => [{ ...cloneCfg, larkAppSecret: undefined }],
+      checkGrantedScopes,
+      postMessage,
+    })).resolves.toBeUndefined();
+    expect(checkGrantedScopes).not.toHaveBeenCalled();
+    expect(postMessage).not.toHaveBeenCalled();
+  });
+
+  it('授权链接投递失败时 403 错误带 auth URL, 不丢补救入口 (真缺 scope 路径)', async () => {
+    // 仅在能读到非空 granted 且确缺时才进入阻断/投递路径。
+    const granted = CLONE_CORE_SCOPES.filter(s => s !== 'im:message.group_msg');
     await expect(ensureCloneScopesProvisioned({
       creatorLarkAppId: 'cli_creator',
       chatId: 'oc_parent',
       bots: [{ larkAppId: 'cli_clone', name: 'clone', role: 'main' }],
     }, {
       readBotsJson: () => [cloneCfg],
-      checkGrantedScopes: vi.fn().mockResolvedValue({ ok: true, granted: [] }),
+      checkGrantedScopes: vi.fn().mockResolvedValue({ ok: true, granted }),
       postMessage: vi.fn().mockRejectedValue(new Error('send failed')),
     })).rejects.toMatchObject({
       status: 403,

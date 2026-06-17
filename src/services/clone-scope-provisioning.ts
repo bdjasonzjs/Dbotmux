@@ -94,28 +94,42 @@ export async function ensureCloneScopesProvisioned(
     const scopes = cloneGrantScopes(req.profile ?? 'core');
     const authUrl = buildAuthUrl(bot.larkAppId, scopes);
     const secret = typeof cfg.larkAppSecret === 'string' ? cfg.larkAppSecret : '';
-    let missing = scopes;
-    let checkError: string | undefined;
 
-    if (secret) {
-      const check = await checkGrantedScopes(bot.larkAppId, secret);
-      if (check.ok) {
-        missing = missingCoreScopes(check.granted);
-        if (missing.length === 0) continue;
-      } else {
-        checkError = check.message;
-      }
-    } else {
-      checkError = 'clone config has no larkAppSecret; cannot inspect granted scopes';
+    // Three-state gate (fail-safe): only HARD-BLOCK when we positively read a
+    // non-empty granted-scope list AND a required scope is genuinely absent.
+    // Every "cannot verify" state is FAIL-OPEN (advisory warn, no block):
+    //   - no secret           → can't query
+    //   - check.ok === false  → API error / need_self_manage / network
+    //   - granted list empty  → application.v6.scope.list returns [] for clones
+    //                           even when scopes ARE granted (observed in prod);
+    //                           an empty list means "unverifiable", NOT "all missing".
+    // This stops the gate from falsely locking a functional clone out of every
+    // subgroup, while still catching a clone whose grants we CAN read and that
+    // really lacks a required scope.
+    if (!secret) {
+      logger.warn(`[clone-scope] ${bot.larkAppId}: clone config has no larkAppSecret; cannot inspect granted scopes — allowing (fail-open)`);
+      continue;
     }
+    const check = await checkGrantedScopes(bot.larkAppId, secret);
+    if (!check.ok) {
+      logger.warn(`[clone-scope] ${bot.larkAppId}: scope self-check failed (${check.error}: ${check.message}) — cannot verify, allowing (fail-open)`);
+      continue;
+    }
+    if (check.granted.length === 0) {
+      logger.warn(`[clone-scope] ${bot.larkAppId}: scope.list returned 0 granted scopes (API does not reflect this clone's grants); cannot verify — allowing (fail-open)`);
+      continue;
+    }
+    const missing = missingCoreScopes(check.granted);
+    if (missing.length === 0) continue;
 
-    const warning = renderScopeWarning(bot, missing, authUrl, checkError);
+    // Positively determined: granted list was readable and a required scope is absent → block.
+    const warning = renderScopeWarning(bot, missing, authUrl);
     try {
       await postMessage(req.creatorLarkAppId, req.chatId, warning);
     } catch (err: any) {
       logger.warn(`[clone-scope] failed to post auth link for ${bot.larkAppId}: ${err?.message ?? err}`);
       throw new HttpError(403, `clone ${bot.larkAppId} missing required scopes; auth link delivery failed, retry manually: ${authUrl}`);
     }
-    throw new HttpError(403, `clone ${bot.larkAppId} missing required scopes: ${missing.join(', ') || 'unknown'}`);
+    throw new HttpError(403, `clone ${bot.larkAppId} missing required scopes: ${missing.join(', ')}`);
   }
 }
