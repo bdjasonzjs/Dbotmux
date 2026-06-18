@@ -231,14 +231,14 @@ test('PM can create, edit, connect, save, and delete a workflow on the canvas', 
   await page.locator('#property-panel textarea[name="responsibility"]').fill('审查发布风险并给出结论');
   await page.locator('#property-panel button#apply-props').click();
 
-  await page.getByRole('button', { name: '添加人工任务' }).click();
+  await page.getByRole('button', { name: '添加 Bot 任务' }).click();
   await page.locator('#property-panel input[name="id"]').fill('develop');
   await page.locator('#property-panel input[name="label"]').fill('开发实现');
   await page.locator('#property-panel select[name="bot"]').selectOption('cli_app');
   await page.locator('#property-panel textarea[name="prompt"]').fill('完成发布前实现与自测');
   await page.locator('#property-panel button#apply-props').click();
 
-  await page.getByRole('button', { name: '添加流程关卡' }).click();
+  await page.getByRole('button', { name: '添加流程控制' }).click();
   await page.locator('#property-panel input[name="id"]').fill('review');
   await page.locator('#property-panel input[name="label"]').fill('Reviewer 判定');
   await page.locator('#property-panel select[name="semanticKind"]').selectOption('reviewDecision');

@@ -118,9 +118,15 @@ function newNode(id: string, label: string, type: NodeType, x: number, y: number
 }
 
 function nodeTypeLabel(type: NodeType): string {
-  if (type === 'subagent') return '人工任务';
-  if (type === 'hostExecutor') return '自动动作';
-  return '流程关卡';
+  if (type === 'subagent') return 'Bot 任务';
+  if (type === 'hostExecutor') return '自动脚本/动作';
+  return '流程控制';
+}
+
+function nodeTypeHelp(type: NodeType): string {
+  if (type === 'subagent') return '把这一步交给一个 Bot 处理，例如让寇黛克斯开发、让克劳德 review、让某个 bot 汇报。你只需要选择 Bot，并写清楚要它做什么。';
+  if (type === 'hostExecutor') return '让系统自动执行一个动作，例如跑脚本、发飞书消息、创建定时任务。涉及脚本或外部副作用时默认会先停住等人确认。';
+  return '不直接做具体工作，而是控制流程怎么走，例如提审、人工判定、汇报点、里程碑、失败兜底。';
 }
 
 function semanticKindLabel(kind: SemanticKind): string {
@@ -132,12 +138,29 @@ function semanticKindLabel(kind: SemanticKind): string {
   return '里程碑';
 }
 
+function semanticKindHelp(kind: SemanticKind): string {
+  if (kind === 'submitGate') return '表示前置工作已经完成，可以进入审查或下一阶段。';
+  if (kind === 'reviewDecision') return '让人或 Reviewer 给出通过/打回等判定，后续连线可以按判定结果分支。';
+  if (kind === 'report') return '流程收尾或阶段性汇报点，通常接在通过分支后。';
+  if (kind === 'observer') return '旁路观察节点，用来通知或记录，不改变主线职责。';
+  if (kind === 'fail') return '异常或轮数上限后的兜底出口。';
+  return '普通流程标记，用来表达一个阶段已经到达。';
+}
+
 function hostExecutorLabel(executor: string): string {
   if (executor === 'shell-command') return '执行脚本/命令';
   if (executor === 'botmux-schedule') return '创建定时任务';
   if (executor === 'feishu-send') return '发送飞书消息';
   if (executor === 'feishu-reply') return '回复飞书消息';
   return executor;
+}
+
+function hostExecutorHelp(executor: string): string {
+  if (executor === 'shell-command') return '在机器上执行一个命令或脚本。命令和参数分开填写，例如命令 node，参数两行填 -e 和 console.log("ok")。';
+  if (executor === 'botmux-schedule') return '创建一个 botmux 定时任务，让系统之后按计划触发。';
+  if (executor === 'feishu-send') return '由系统发送一条飞书消息。';
+  if (executor === 'feishu-reply') return '由系统回复一条已有飞书消息。';
+  return '调用一个已注册的系统执行器。';
 }
 
 function roleKindLabel(kind: string): string {
@@ -148,8 +171,30 @@ function roleKindLabel(kind: string): string {
   return '自定义';
 }
 
+function conditionKindLabel(kind: CanvasEdge['conditionKind']): string {
+  if (kind === 'always') return '完成后就走';
+  if (kind === 'approved') return '判定为通过时走';
+  if (kind === 'rejected') return '判定为打回时走';
+  return '按自定义输出走';
+}
+
+function conditionKindHelp(kind: CanvasEdge['conditionKind']): string {
+  if (kind === 'always') return '上一个节点完成后，自动进入下一个节点。';
+  if (kind === 'approved') return '通常接在“人工判定”后，Reviewer 选择通过时走这条线。';
+  if (kind === 'rejected') return '通常接在“人工判定”后，Reviewer 选择打回时走这条线；可设置循环上限。';
+  return '需要知道上一个节点会输出什么值时才使用。普通用户优先选前三种。';
+}
+
 function optionLabel(value: string, labels?: Record<string, string>): string {
   return labels?.[value] ?? value;
+}
+
+function helpBlock(text: string): string {
+  return `<p class="builder-help">${escapeHtml(text)}</p>`;
+}
+
+function labelWithHelp(label: string, help?: string): string {
+  return `${escapeHtml(label)}${help ? ` <span class="field-help" title="${escapeHtml(help)}" aria-label="${escapeHtml(help)}">?</span>` : ''}`;
 }
 
 function parseScriptArgs(raw: string | undefined): string[] {
@@ -417,7 +462,7 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
     <section class="builder-head">
       <div>
         <h2>Workflow 管理后台</h2>
-        <p class="muted">在画布上增删改查任意 workflow，保存后生成标准 definition；全程零 JSON。</p>
+        <p class="muted">在画布上增删改查任意 workflow；右侧属性面板会用人话解释每个选项，保存后生成标准 definition。</p>
       </div>
       <div class="builder-actions">
         <button id="builder-new" type="button">新建</button>
@@ -432,13 +477,13 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
       </aside>
       <section class="workflow-admin-canvas">
         <div class="canvas-toolbar">
-          <button id="add-role" type="button">添加角色</button>
-          <button id="add-subagent" type="button">添加人工任务</button>
-          <button id="add-semantic" type="button">添加流程关卡</button>
-          <button id="add-host" type="button">添加自动动作</button>
-          <button id="connect-mode" type="button">点击连线</button>
-          <button id="delete-selected" type="button">删除选中</button>
-          <button id="auto-layout" type="button">自动布局</button>
+          <button id="add-role" type="button" title="添加一个职责身份，例如开发者、Reviewer、汇报员">添加角色</button>
+          <button id="add-subagent" type="button" title="添加一步交给某个 Bot 处理的任务">添加 Bot 任务</button>
+          <button id="add-semantic" type="button" title="添加提审、判定、汇报、里程碑等流程控制点">添加流程控制</button>
+          <button id="add-host" type="button" title="添加系统自动执行的脚本、发消息或定时任务">添加自动动作</button>
+          <button id="connect-mode" type="button" title="先选一个起点节点，再点目标节点创建连线">点击连线</button>
+          <button id="delete-selected" type="button" title="删除当前选中的角色、节点或连线">删除选中</button>
+          <button id="auto-layout" type="button" title="按流程顺序重新排布节点，避免重叠">自动布局</button>
         </div>
         <svg id="workflow-canvas" class="workflow-canvas" width="980" height="560" role="img" aria-label="可编辑 workflow 画布"></svg>
         <div id="builder-status" class="muted"></div>
@@ -598,15 +643,17 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
   svg.addEventListener('pointerup', () => { drag = null; });
   svg.addEventListener('pointerleave', () => { drag = null; });
 
-  function field(label: string, name: string, value: string, options?: string[], labels?: Record<string, string>): string {
+  function field(label: string, name: string, value: string, options?: string[], labels?: Record<string, string>, help?: string, placeholder?: string): string {
+    const labelText = labelWithHelp(label, help);
     if (options) {
-      return `<label><span>${escapeHtml(label)}</span><select name="${escapeHtml(name)}">${options.map((o) => `<option value="${escapeHtml(o)}" ${o === value ? 'selected' : ''}>${escapeHtml(optionLabel(o, labels))}</option>`).join('')}</select></label>`;
+      return `<label><span>${labelText}</span><select name="${escapeHtml(name)}" ${help ? `title="${escapeHtml(help)}"` : ''}>${options.map((o) => `<option value="${escapeHtml(o)}" ${o === value ? 'selected' : ''}>${escapeHtml(optionLabel(o, labels))}</option>`).join('')}</select></label>`;
     }
-    return `<label><span>${escapeHtml(label)}</span><input name="${escapeHtml(name)}" value="${escapeHtml(value)}" /></label>`;
+    return `<label><span>${labelText}</span><input name="${escapeHtml(name)}" value="${escapeHtml(value)}" ${help ? `title="${escapeHtml(help)}"` : ''} ${placeholder ? `placeholder="${escapeHtml(placeholder)}"` : ''} /></label>`;
   }
 
   function botField(currentBot: string | undefined): string {
     const value = currentBot ?? '';
+    const help = '选择真正要处理这一步的 Bot。列表来自当前 botmux 配置，不需要手写 codex 之类的内部名字。';
     if (availableBots.length > 0) {
       const values = availableBots.map((bot) => bot.larkAppId);
       const options = value && !values.includes(value) ? [value, ...values] : values;
@@ -617,9 +664,9 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
           `${bot.botName ?? bot.larkAppId}${bot.online === false ? '（离线）' : ''} · ${bot.larkAppId}`,
         ]),
       ]);
-      return field('执行 Bot', 'bot', value || options[0] || '', options, labels);
+      return field('交给哪个 Bot', 'bot', value || options[0] || '', options, labels, help);
     }
-    return `${field('执行 Bot', 'bot', value)}<p class="muted">未能加载真实 Bot 列表；这里应填写 bots.json 里的 larkAppId。</p>`;
+    return `${field('交给哪个 Bot', 'bot', value, undefined, undefined, help, '例如 cli_a97448b83eb8dbd6')}<p class="builder-help">未能加载真实 Bot 列表；这里应填写 bots.json 里的 larkAppId。</p>`;
   }
 
   function svgPoint(ev: PointerEvent): { x: number; y: number } {
@@ -638,10 +685,11 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
       const role = canvas.roles.find((r) => r.id === current.id);
       if (!role) { selected = { kind: 'workflow' }; return renderPanel(); }
       panel.innerHTML = `<h3>角色属性</h3>
-        ${field('角色 ID', 'id', role.id)}
-        ${field('名称', 'label', role.label)}
-        ${field('类型', 'kind', role.kind, roleKindOptions)}
-        <label><span>职责</span><textarea name="responsibility" rows="4">${escapeHtml(role.responsibility ?? '')}</textarea></label>
+        ${helpBlock('角色是流程里的职责身份，例如开发者、Reviewer、汇报员。节点可以分配给角色，方便看懂谁负责哪一步。')}
+        ${field('角色 ID', 'id', role.id, undefined, undefined, '内部唯一标识，建议用英文或拼音，例如 developer、reviewer。')}
+        ${field('名称', 'label', role.label, undefined, undefined, '给人看的角色名，例如开发者、Reviewer、汇报员。')}
+        ${field('类型', 'kind', role.kind, roleKindOptions, Object.fromEntries(roleKindOptions.map((kind) => [kind, roleKindLabel(kind)])), '选择最接近的角色类型；没有合适的就选自定义。')}
+        <label><span>${labelWithHelp('职责', '一句话说明这个角色在流程里负责什么。')}</span><textarea name="responsibility" rows="4" placeholder="例如：完成开发并提交可审查产物">${escapeHtml(role.responsibility ?? '')}</textarea></label>
         <button id="apply-props" type="button">应用</button>`;
       panel.querySelector<HTMLButtonElement>('#apply-props')!.onclick = () => {
         const fd = panelForm();
@@ -660,27 +708,30 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
       const node = canvas.nodes.find((n) => n.id === current.id);
       if (!node) { selected = { kind: 'workflow' }; return renderPanel(); }
       panel.innerHTML = `<h3>节点属性</h3>
-        ${field('节点 ID', 'id', node.id)}
-        ${field('名称', 'label', node.label)}
-        ${field('节点类型', 'type', node.type, nodeTypeOptions, {
-          subagent: '人工任务',
-          hostExecutor: '自动动作',
-          semantic: '流程关卡',
-        })}
-        ${field('角色', 'roleId', node.roleId ?? '', ['', ...canvas.roles.map((r) => r.id)])}
-        ${node.type === 'semantic' ? field('关卡类型', 'semanticKind', node.semanticKind ?? 'milestone', semanticKindOptions, Object.fromEntries(semanticKindOptions.map((kind) => [kind, semanticKindLabel(kind)]))) : ''}
-        ${node.type === 'subagent' ? botField(node.bot) + '<label><span>任务说明</span><textarea name="prompt" rows="4">' + escapeHtml(node.prompt ?? '') + '</textarea></label>' : ''}
+        ${helpBlock(nodeTypeHelp(node.type))}
+        ${field('节点 ID', 'id', node.id, undefined, undefined, '内部唯一标识，连线和运行记录会用到；建议用英文或拼音。')}
+        ${field('节点名称', 'label', node.label, undefined, undefined, '画布上显示给人看的名字，例如 开发实现、Reviewer 判定、发布汇报。')}
+        ${field('这一步是什么', 'type', node.type, nodeTypeOptions, {
+          subagent: 'Bot 任务',
+          hostExecutor: '自动脚本/动作',
+          semantic: '流程控制',
+        }, 'Bot 任务=交给 Bot 做；自动脚本/动作=系统执行；流程控制=提审/判定/汇报等流程点。')}
+        ${field('由哪个角色负责', 'roleId', node.roleId ?? '', ['', ...canvas.roles.map((r) => r.id)], Object.fromEntries(canvas.roles.map((r) => [r.id, r.label])), '可选。用于说明这一步归哪个角色负责，不影响 Bot 下拉本身。')}
+        ${node.type === 'semantic' ? field('控制点类型', 'semanticKind', node.semanticKind ?? 'milestone', semanticKindOptions, Object.fromEntries(semanticKindOptions.map((kind) => [kind, semanticKindLabel(kind)])), semanticKindHelp(node.semanticKind ?? 'milestone')) + helpBlock(semanticKindHelp(node.semanticKind ?? 'milestone')) : ''}
+        ${node.type === 'subagent' ? botField(node.bot) + '<label><span>' + labelWithHelp('让 Bot 做什么', '写给 Bot 的任务说明。流程运行到这里时，会把这段话发给选中的 Bot。') + '</span><textarea name="prompt" rows="4" placeholder="例如：请完成这个需求的开发实现，完成后说明改了哪些文件、如何验证。">' + escapeHtml(node.prompt ?? '') + '</textarea></label>' : ''}
         ${node.type === 'hostExecutor' ? `
-          ${field('自动动作', 'executor', node.executor ?? 'shell-command', hostExecutorOptions, Object.fromEntries(hostExecutorOptions.map((executor) => [executor, hostExecutorLabel(executor)])))}
+          ${field('自动动作类型', 'executor', node.executor ?? 'shell-command', hostExecutorOptions, Object.fromEntries(hostExecutorOptions.map((executor) => [executor, hostExecutorLabel(executor)])), hostExecutorHelp(node.executor ?? 'shell-command'))}
+          ${helpBlock(hostExecutorHelp(node.executor ?? 'shell-command'))}
           ${(node.executor ?? 'shell-command') === 'shell-command' ? `
-            ${field('脚本/命令', 'scriptCommand', node.scriptCommand ?? '')}
-            <label><span>参数（每行一个）</span><textarea name="scriptArgs" rows="3">${escapeHtml(node.scriptArgs ?? '')}</textarea></label>
-            ${field('工作目录', 'scriptCwd', node.scriptCwd ?? '')}
-            ${field('超时毫秒', 'scriptTimeoutMs', String(node.scriptTimeoutMs ?? 120000))}
-            <p class="muted">例：命令填 <code>pnpm</code>，参数分两行填 <code>test</code> 和 <code>--runInBand</code>。执行时不走 shell 拼接，避免注入。</p>
-          ` : '<p class="muted">该自动动作使用内置执行器；详细输入暂由系统定义。</p>'}
+            ${field('要执行的命令', 'scriptCommand', node.scriptCommand ?? '', undefined, undefined, '只填命令本身，不要把参数拼在这里。', '例如 node / pnpm / bash')}
+            <label><span>${labelWithHelp('命令参数', '每行一个参数。这样保存后会按 argv 执行，避免 shell 注入。')}</span><textarea name="scriptArgs" rows="3" placeholder="-e&#10;console.log(&quot;ok&quot;)">${escapeHtml(node.scriptArgs ?? '')}</textarea></label>
+            ${field('在哪个目录执行', 'scriptCwd', node.scriptCwd ?? '', undefined, undefined, '可选。留空表示使用默认工作目录。', '例如 /data00/home/.../work/Dbotmux_wt/workflow-product-mvp')}
+            ${field('最长执行多久', 'scriptTimeoutMs', String(node.scriptTimeoutMs ?? 120000), undefined, undefined, '毫秒。超过这个时间会中断命令。', '120000')}
+            <p class="builder-help">例：命令填 <code>node</code>，参数两行填 <code>-e</code> 和 <code>console.log("ok")</code>。</p>
+          ` : '<p class="builder-help">该自动动作使用内置执行器；当前只展示类型选择，后续会按执行器补齐专用表单。</p>'}
         ` : ''}
-        <label class="builder-check"><input name="humanGate" type="checkbox" ${node.humanGate ? 'checked' : ''}/> <span>需要人工确认</span></label>
+        <label class="builder-check" title="勾上后，流程走到这里会先停住，等人确认后再继续。"><input name="humanGate" type="checkbox" ${node.humanGate ? 'checked' : ''}/> <span>${labelWithHelp('执行前暂停确认', '适合脚本、发消息、部署等危险动作；确认后才会真正执行。')}</span></label>
+        ${helpBlock(node.humanGate ? '当前会在执行前等待人工确认，适合防止误跑脚本或误发消息。' : '当前不会等待人工确认，流程到这里会直接继续。')}
         <button id="apply-props" type="button">应用</button>`;
       panel.querySelector<HTMLButtonElement>('#apply-props')!.onclick = () => {
         const fd = panelForm();
@@ -712,14 +763,21 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
       const edge = canvas.edges.find((e) => e.id === current.id);
       if (!edge) { selected = { kind: 'workflow' }; return renderPanel(); }
       panel.innerHTML = `<h3>连线属性</h3>
-        ${field('连线 ID', 'id', edge.id)}
-        ${field('名称', 'label', edge.label)}
-        ${field('从', 'from', edge.from, canvas.nodes.map((n) => n.id))}
-        ${field('到', 'to', edge.to, canvas.nodes.map((n) => n.id))}
-        ${field('条件', 'conditionKind', edge.conditionKind, ['always', 'approved', 'rejected', 'custom'])}
-        ${field('判定值', 'decisionValue', edge.decisionValue ?? '')}
-        ${field('循环上限', 'maxVisits', String(edge.maxVisits ?? ''))}
-        <p class="muted">${escapeHtml(conditionText(edge))}</p>
+        ${helpBlock('连线表示流程从一个节点走到另一个节点。条件决定“什么时候走这条线”。')}
+        ${field('连线 ID', 'id', edge.id, undefined, undefined, '内部唯一标识，建议用英文或拼音。')}
+        ${field('画布上显示的文字', 'label', edge.label, undefined, undefined, '显示在箭头上的短文字，例如 通过、打回、开始审查。')}
+        ${field('从哪一步出来', 'from', edge.from, canvas.nodes.map((n) => n.id), Object.fromEntries(canvas.nodes.map((n) => [n.id, n.label])), '选择起点节点。')}
+        ${field('流向哪一步', 'to', edge.to, canvas.nodes.map((n) => n.id), Object.fromEntries(canvas.nodes.map((n) => [n.id, n.label])), '选择目标节点。')}
+        ${field('什么时候走这条线', 'conditionKind', edge.conditionKind, ['always', 'approved', 'rejected', 'custom'], {
+          always: conditionKindLabel('always'),
+          approved: conditionKindLabel('approved'),
+          rejected: conditionKindLabel('rejected'),
+          custom: conditionKindLabel('custom'),
+        }, conditionKindHelp(edge.conditionKind))}
+        ${field('判定值', 'decisionValue', edge.decisionValue ?? '', undefined, undefined, '只有通过/打回/自定义分支需要。通常通过填 approved，打回填 rejected。', edge.conditionKind === 'approved' ? 'approved' : edge.conditionKind === 'rejected' ? 'rejected' : 'custom')}
+        ${field('最多循环几轮', 'maxVisits', String(edge.maxVisits ?? ''), undefined, undefined, '只在打回循环时需要。留空表示不限制。', '例如 2')}
+        ${helpBlock(conditionKindHelp(edge.conditionKind))}
+        <p class="builder-help">当前规则：${escapeHtml(conditionText(edge))}</p>
         <button id="apply-props" type="button">应用</button>`;
       panel.querySelector<HTMLButtonElement>('#apply-props')!.onclick = () => {
         const fd = panelForm();
@@ -737,9 +795,10 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
       return;
     }
     panel.innerHTML = `<h3>Workflow 属性</h3>
-      ${field('Workflow ID', 'workflowId', canvas.workflowId)}
-      ${field('标题', 'title', canvas.title)}
-      ${field('版本', 'version', String(canvas.version))}
+      ${helpBlock('Workflow 是一整套流程配置。你在画布上改节点和连线，保存后就是运行时唯一读取的流程定义。')}
+      ${field('Workflow ID', 'workflowId', canvas.workflowId, undefined, undefined, '内部唯一标识，建议用英文或拼音，例如 development-review-flow。')}
+      ${field('标题', 'title', canvas.title, undefined, undefined, '给人看的流程名称。')}
+      ${field('版本', 'version', String(canvas.version), undefined, undefined, '流程版本号，通常从 1 开始。')}
       <h4>角色</h4>
       <div class="role-list">${canvas.roles.map((role) => `<button type="button" data-role="${escapeHtml(role.id)}">${escapeHtml(role.label)}<small>${escapeHtml(roleKindLabel(role.kind))}</small></button>`).join('')}</div>
       <button id="apply-props" type="button">应用</button>`;
@@ -785,7 +844,7 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
     const index = canvas.nodes.length;
     canvas.nodes.push(newNode(
       id,
-      type === 'semantic' ? '流程关卡' : type === 'hostExecutor' ? '自动动作' : '人工任务',
+      type === 'semantic' ? '流程控制' : type === 'hostExecutor' ? '自动动作' : 'Bot 任务',
       type,
       90 + index * 230,
       150 + (index % 2) * 70,
