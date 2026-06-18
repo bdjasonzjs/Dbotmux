@@ -27,6 +27,7 @@ const VERB_ROUTE: Record<string, string> = {
   'request-report': '/api/subtask-orch-request-report',
   'inbox-list': '/api/subtask-orch-inbox-list',
   'inbox-read': '/api/subtask-orch-inbox-read',
+  managers: '/api/subtask-orch-managers',
 };
 const NUM_FLAGS = new Set(['expectedVersion', 'limit']);
 const LIST_FLAGS = new Set(['bots', 'sourceMessageIds', 'relatedRefs', 'ids']);

@@ -3257,7 +3257,8 @@ switch (command) {
   case 'subtask-manager-report':
   case 'subtask-request-report':
   case 'subtask-inbox-list':
-  case 'subtask-inbox-read': {
+  case 'subtask-inbox-read':
+  case 'subtask-managers': {
     const { cmdSubtaskOrch } = await import('./cli/subtask-orch.js');
     await cmdSubtaskOrch(command.replace('subtask-', ''), process.argv.slice(3));
     break;
