@@ -32,6 +32,7 @@ import {
 } from './definition.js';
 import type { ErrorClass, OutputRef } from './events/payloads.js';
 import type { Snapshot } from './events/replay.js';
+import { decideStateFlowNextActions } from './stateflow.js';
 
 // ─── Activity ID helpers ──────────────────────────────────────────────────
 
@@ -157,6 +158,10 @@ export function decideNextActions(
   // activityCanceled → nodeCanceled → runCanceled.
   if (snapshot.cancelledRunIntent) {
     return [];
+  }
+
+  if (def.flow) {
+    return decideStateFlowNextActions(snapshot, def);
   }
 
   const actions: OrchestratorAction[] = [];

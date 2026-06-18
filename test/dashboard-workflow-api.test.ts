@@ -420,6 +420,22 @@ describe('dashboard workflow API routes', () => {
     expect(await res.json()).toEqual({ error: 'bad_id' });
   });
 
+  it('rejects unsafe workflowId when saving a definition', async () => {
+    const res = await fetch(`${baseUrl}/api/workflows/definitions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        definition: {
+          workflowId: '../escape',
+          version: 1,
+          nodes: { a: { type: 'semantic', kind: 'milestone' } },
+        },
+      }),
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ ok: false, error: 'bad_id' });
+  });
+
   it('returns unknown_workflow when catalog returns undefined', async () => {
     const res = await fetch(`${baseUrl}/api/workflows/definitions/missing`);
     expect(res.status).toBe(404);

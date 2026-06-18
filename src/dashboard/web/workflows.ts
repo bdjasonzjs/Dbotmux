@@ -4,6 +4,7 @@
 // #/workflows/<runId> — the Run Detail page (B path) hooks into the
 // same hash route.
 import { t } from './ui.js';
+import { humanWorkflowStatus } from './workflow-product-builder.js';
 
 type RunRow = {
   runId: string;
@@ -183,8 +184,9 @@ function pageHtml(): string {
   ];
   return `
 <nav class="wf-subnav">
-  <a href="#/workflows" class="active" data-i18n="workflow.subnav.runs">${escapeHtml(t('workflow.subnav.runs'))}</a>
-  <a href="#/workflows/catalog" data-i18n="workflow.subnav.catalog">${escapeHtml(t('workflow.subnav.catalog'))}</a>
+	  <a href="#/workflows" class="active" data-i18n="workflow.subnav.runs">${escapeHtml(t('workflow.subnav.runs'))}</a>
+	  <a href="#/workflows/catalog" data-i18n="workflow.subnav.catalog">${escapeHtml(t('workflow.subnav.catalog'))}</a>
+	  <a href="#/workflows/builder">${escapeHtml(t('builder.subnav'))}</a>
 </nav>
 <form id="wf-filters" class="filters">
   <input type="search" name="q" placeholder="${escapeHtml(t('workflow.searchPlaceholder'))}" />
@@ -195,8 +197,8 @@ function pageHtml(): string {
 </form>
 <table>
   <thead><tr>
-    <th>${escapeHtml(t('workflow.table.run'))}</th><th>${escapeHtml(t('workflow.table.workflow'))}</th><th>${escapeHtml(t('workflow.table.status'))}</th>
-    <th>${escapeHtml(t('workflow.table.lastSeq'))}</th><th>${escapeHtml(t('workflow.table.dangling'))}</th><th>${escapeHtml(t('workflow.table.updated'))}</th>
+    <th>${escapeHtml(t('workflow.table.run'))}</th><th>${escapeHtml(t('workflow.table.workflow'))}</th><th>${escapeHtml(t('workflow.table.progress'))}</th>
+    <th>${escapeHtml(t('workflow.table.updated'))}</th>
     <th>${escapeHtml(t('workflow.table.chatApp'))}</th>
   </tr></thead>
   <tbody id="wf-tbody"></tbody>
@@ -273,7 +275,7 @@ function renderWorkflowListPage(root: HTMLElement): () => void {
   function rerender(): void {
     const rows = applyFilters(cache);
     if (rows.length === 0) {
-      tbody.innerHTML = `<tr><td colspan="7" class="empty">${
+      tbody.innerHTML = `<tr><td colspan="5" class="empty">${
         lastErr
           ? escapeHtml(t('workflow.list.failedLoad', { error: lastErr }))
           : cache.length === 0
@@ -284,21 +286,24 @@ function renderWorkflowListPage(root: HTMLElement): () => void {
     }
     tbody.innerHTML = rows
       .map((r) => {
-        const dangling = `${r.dEf}/${r.dAct}/${r.dWait}`;
-        const danglingCls = r.dEf + r.dAct + r.dWait > 0 ? 'wf-dangling has' : 'wf-dangling none';
         const chatBits: string[] = [];
         if (r.chatId) chatBits.push(escapeHtml(r.chatId));
         if (r.larkAppId) chatBits.push(`<span class="muted">${escapeHtml(r.larkAppId)}</span>`);
         const chatCell = chatBits.length > 0 ? chatBits.join('<br/>') : '—';
         const errorSummary = renderRunErrorSummary(r);
+        const progress = humanWorkflowStatus({
+          status: r.status,
+          workflowId: r.workflowId,
+          failedNodeId: r.failedNodeId,
+          nodes: [],
+          activities: [],
+        });
         return `<tr data-runid="${escapeHtml(r.runId)}">
           <td><a href="#/workflows/${encodeURIComponent(r.runId)}"><code>${escapeHtml(r.runId)}</code></a></td>
           <td>${escapeHtml(r.workflowId)}</td>
           <td>${statusBadge(r.status)}${
             r.failedNodeId ? ` <span class="muted">(${escapeHtml(r.failedNodeId)})</span>` : ''
-          }${errorSummary}</td>
-          <td>${r.lastSeq}</td>
-          <td class="${danglingCls}">${dangling}</td>
+          } <span>${escapeHtml(progress)}</span>${errorSummary}</td>
           <td title="${escapeHtml(new Date(r.updatedAt).toISOString())}">${fmtUpdated(r.updatedAt)}</td>
           <td>${chatCell}</td>
         </tr>`;
@@ -785,7 +790,13 @@ function renderWorkflowDetailPage(
     timelineScrollTop = timelineScroll.scrollTop;
     const run = snapshot.run;
     if (TERMINAL.has(run.status)) setCancelStatus(null);
-    subtitle.innerHTML = `${escapeHtml(run.workflowId ?? '?')} · ${statusBadge(run.status)} · lastSeq ${snapshot.lastSeq}`;
+    subtitle.innerHTML = `${escapeHtml(run.workflowId ?? '?')} · ${statusBadge(run.status)} · ${escapeHtml(humanWorkflowStatus({
+      status: run.status,
+      workflowId: run.workflowId,
+      failedNodeId: run.failedNodeId,
+      nodes: snapshot.nodes,
+      activities: snapshot.activities,
+    }))}`;
     refresh.textContent = t('workflow.detail.refreshed', { time: new Date().toLocaleTimeString() });
     cancelBtn.hidden = TERMINAL.has(run.status);
     cancelBtn.disabled = canceling || !snapshot.chatBinding?.larkAppId;
@@ -872,7 +883,13 @@ function renderSummary(el: HTMLElement, snap: RunSnapshot): void {
   const items: Array<[string, string]> = [
     [t('workflow.summary.workflow'), escapeHtml(r.workflowId ?? '?')],
     [t('workflow.summary.status'), statusBadge(r.status)],
-    [t('workflow.summary.lastSeq'), String(snap.lastSeq)],
+    [t('workflow.summary.progress'), escapeHtml(humanWorkflowStatus({
+      status: r.status,
+      workflowId: r.workflowId,
+      failedNodeId: r.failedNodeId,
+      nodes: snap.nodes,
+      activities: snap.activities,
+    }))],
     [t('workflow.summary.updated'), escapeHtml(new Date(snap.updatedAt).toLocaleString())],
     [t('workflow.summary.revision'), escapeHtml(short(r.revisionId))],
     [t('workflow.summary.initiator'), escapeHtml(r.initiator ?? '-')],
@@ -929,10 +946,10 @@ function renderDangling(el: HTMLElement, snap: RunSnapshot): void {
   const total = new Set(groups.flatMap(([, xs]) => xs)).size;
   el.className = total > 0 ? 'wf-panel wf-dangling-panel has' : 'wf-panel wf-dangling-panel';
   if (total === 0) {
-    el.innerHTML = `<div class="wf-panel-title"><h3>${escapeHtml(t('workflow.detail.dangling'))}</h3></div><div class="muted">${escapeHtml(t('workflow.detail.noDangling'))}</div>`;
+    el.innerHTML = `<div class="wf-panel-title"><h3>${escapeHtml(t('workflow.detail.recovery'))}</h3></div><div class="muted">${escapeHtml(t('workflow.detail.noDangling'))}</div>`;
     return;
   }
-  el.innerHTML = `<div class="wf-panel-title"><h3>${escapeHtml(t('workflow.detail.dangling'))}</h3><span class="wf-dangling has">${total}</span></div>
+  el.innerHTML = `<div class="wf-panel-title"><h3>${escapeHtml(t('workflow.detail.recovery'))}</h3><span class="wf-dangling has">${total}</span></div>
     <div class="wf-dangling-grid">
       ${groups
         .map(

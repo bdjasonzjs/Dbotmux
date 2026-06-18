@@ -1,4 +1,6 @@
 import { createReadStream, promises as fs } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
 import {
@@ -8,6 +10,7 @@ import {
   type CatalogDefinition,
   type CatalogEntry,
 } from '../workflows/catalog.js';
+import { parseWorkflowDefinition } from '../workflows/definition.js';
 import {
   listRuns,
   readRunSnapshot,
@@ -87,6 +90,46 @@ export async function handleWorkflowApi(
     } catch (e: any) {
       jsonRes(res, 500, {
         error: 'list_definitions_failed',
+        message: e?.message ?? String(e),
+      });
+    }
+    return true;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/workflows/definitions') {
+    let body: { definition?: unknown };
+    try {
+      body = await readJsonBody<{ definition?: unknown }>(req);
+    } catch {
+      jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      return true;
+    }
+    let def;
+    try {
+      def = parseWorkflowDefinition(body.definition);
+    } catch (e: any) {
+      jsonRes(res, 400, {
+        ok: false,
+        error: 'invalid_workflow',
+        message: e?.message ?? String(e),
+        issues: e?.issues,
+      });
+      return true;
+    }
+    if (!isValidWorkflowId(def.workflowId)) {
+      jsonRes(res, 400, { ok: false, error: 'bad_id' });
+      return true;
+    }
+    const dir = join(homedir(), '.botmux', 'workflows');
+    const path = join(dir, `${def.workflowId}.workflow.json`);
+    try {
+      await fs.mkdir(dir, { recursive: true });
+      await fs.writeFile(path, JSON.stringify(def, null, 2) + '\n', 'utf-8');
+      jsonRes(res, 200, { ok: true, workflowId: def.workflowId, path });
+    } catch (e: any) {
+      jsonRes(res, 500, {
+        ok: false,
+        error: 'save_definition_failed',
         message: e?.message ?? String(e),
       });
     }

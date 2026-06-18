@@ -75,6 +75,7 @@ function renderCatalogListPage(root: HTMLElement): () => void {
     <nav class="wf-subnav">
       <a href="#/workflows" data-i18n="workflow.subnav.runs">${escapeHtml(t('workflow.subnav.runs'))}</a>
       <a href="#/workflows/catalog" class="active" data-i18n="workflow.subnav.catalog">${escapeHtml(t('workflow.subnav.catalog'))}</a>
+      <a href="#/workflows/builder">${escapeHtml(t('builder.subnav'))}</a>
     </nav>
     <section class="catalog-head">
       <div>
