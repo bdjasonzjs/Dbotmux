@@ -1012,6 +1012,28 @@ input.row-select,
   cursor: help;
   background: var(--surface);
 }
+.choice-field { display: grid; gap: 0.4rem; }
+.choice-label { color: var(--muted); font-size: 12px; }
+.choice-list { display: grid; gap: 0.4rem; }
+.choice-card {
+  width: 100%;
+  min-height: 58px;
+  padding: 0.55rem 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-muted);
+  color: var(--fg);
+  text-align: left;
+  display: grid;
+  gap: 0.2rem;
+}
+.choice-card:hover { border-color: var(--accent); background: var(--accent-soft); }
+.choice-card.active { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); background: var(--surface); }
+.choice-card strong { font-size: 13px; line-height: 1.25; }
+.choice-card span { color: var(--muted); font-size: 12px; line-height: 1.35; }
+.advanced-props { border: 1px dashed var(--border); border-radius: 8px; padding: 0.55rem 0.65rem; background: var(--surface-muted); }
+.advanced-props summary { cursor: pointer; color: var(--muted); font-size: 12px; font-weight: 700; }
+.advanced-props label { margin-top: 0.55rem; }
 .builder-canvas { border: 1px solid var(--border); border-radius: 8px; padding: 0.9rem; margin-bottom: 0.75rem; background: var(--surface-muted); display: grid; gap: 0.85rem; overflow-x: auto; }
 .builder-flowchart { min-width: 0; display: grid; gap: 0.85rem; }
 .builder-mainline { display: flex; align-items: stretch; gap: 0.3rem; }

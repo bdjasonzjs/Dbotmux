@@ -83,6 +83,37 @@ function safeId(input: string, fallback: string): string {
   return id || fallback;
 }
 
+function labelToId(label: string, fallback: string): string {
+  const lower = label.trim().toLowerCase();
+  const keywordMap: Array<[RegExp, string]> = [
+    [/开发|develop/, 'develop'],
+    [/提审|提交|submit/, 'submit'],
+    [/审查|评审|reviewer|review|判定/, 'review'],
+    [/汇报|报告|report/, 'report'],
+    [/通知|消息|notify|message/, 'notify'],
+    [/发布|release/, 'release'],
+    [/部署|deploy/, 'deploy'],
+    [/测试|test|qa/, 'test'],
+    [/打回|返工|rework/, 'rework'],
+    [/观察|observer|observe/, 'observe'],
+    [/失败|fail|兜底/, 'fail'],
+  ];
+  for (const [pattern, word] of keywordMap) {
+    if (pattern.test(lower)) return word;
+  }
+  const ascii = lower.replace(/[^a-z0-9_.-]+/g, '-').replace(/^-+|-+$/g, '');
+  return safeId(ascii, fallback);
+}
+
+function nextIdFromLabel(label: string, fallback: string, used: Set<string>): string {
+  return uniqueId(labelToId(label, fallback), used);
+}
+
+function nextRoleIdFromLabel(label: string, kind: string, used: Set<string>): string {
+  const ascii = label.trim().toLowerCase().replace(/[^a-z0-9_.-]+/g, '-').replace(/^-+|-+$/g, '');
+  return uniqueId(safeId(ascii, kind || 'role'), used);
+}
+
 function uniqueId(base: string, used: Set<string>): string {
   const root = safeId(base, 'item');
   if (!used.has(root)) return root;
@@ -195,6 +226,13 @@ function helpBlock(text: string): string {
 
 function labelWithHelp(label: string, help?: string): string {
   return `${escapeHtml(label)}${help ? ` <span class="field-help" title="${escapeHtml(help)}" aria-label="${escapeHtml(help)}">?</span>` : ''}`;
+}
+
+function apiPath(path: string): string {
+  const token = new URLSearchParams(window.location.search).get('t');
+  if (!token) return path;
+  const sep = path.includes('?') ? '&' : '?';
+  return `${path}${sep}t=${encodeURIComponent(token)}`;
 }
 
 function parseScriptArgs(raw: string | undefined): string[] {
@@ -505,6 +543,20 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
   let connectFrom: string | null = null;
   let drag: { id: string; dx: number; dy: number } | null = null;
 
+  panel.addEventListener('click', (ev) => {
+    const card = (ev.target as HTMLElement).closest<HTMLButtonElement>('.choice-card');
+    if (!card) return;
+    const name = card.dataset.choiceName;
+    const value = card.dataset.choiceValue;
+    if (!name || value === undefined) return;
+    const input = panel.querySelector<HTMLInputElement>(`input[type="hidden"][name="${CSS.escape(name)}"]`);
+    if (!input) return;
+    input.value = value;
+    panel.querySelectorAll<HTMLButtonElement>(`.choice-card[data-choice-name="${CSS.escape(name)}"]`).forEach((btn) => {
+      btn.classList.toggle('active', btn === card);
+    });
+  });
+
   function setStatus(text: string): void { status.textContent = text; }
 
   async function loadCatalog(): Promise<void> {
@@ -520,7 +572,8 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
 
   async function loadBots(): Promise<void> {
     try {
-      const res = await fetch('/api/bots');
+      const res = await fetch(apiPath('/api/bots'));
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const body = await res.json();
       availableBots = Array.isArray(body.bots)
         ? body.bots
@@ -651,6 +704,28 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
     return `<label><span>${labelText}</span><input name="${escapeHtml(name)}" value="${escapeHtml(value)}" ${help ? `title="${escapeHtml(help)}"` : ''} ${placeholder ? `placeholder="${escapeHtml(placeholder)}"` : ''} /></label>`;
   }
 
+  function choiceField(
+    label: string,
+    name: string,
+    value: string,
+    options: string[],
+    labels: Record<string, string>,
+    descriptions: Record<string, string>,
+    help?: string,
+  ): string {
+    const cards = options.map((option) => `
+      <button type="button" class="choice-card ${option === value ? 'active' : ''}" data-choice-name="${escapeHtml(name)}" data-choice-value="${escapeHtml(option)}">
+        <strong>${escapeHtml(labels[option] ?? option)}</strong>
+        <span>${escapeHtml(descriptions[option] ?? '')}</span>
+      </button>
+    `).join('');
+    return `<div class="choice-field">
+      <span class="choice-label">${labelWithHelp(label, help)}</span>
+      <input type="hidden" name="${escapeHtml(name)}" value="${escapeHtml(value)}" />
+      <div class="choice-list">${cards}</div>
+    </div>`;
+  }
+
   function botField(currentBot: string | undefined): string {
     const value = currentBot ?? '';
     const help = '选择真正要处理这一步的 Bot。列表来自当前 botmux 配置，不需要手写 codex 之类的内部名字。';
@@ -664,9 +739,20 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
           `${bot.botName ?? bot.larkAppId}${bot.online === false ? '（离线）' : ''} · ${bot.larkAppId}`,
         ]),
       ]);
-      return field('交给哪个 Bot', 'bot', value || options[0] || '', options, labels, help);
+      const descriptions = Object.fromEntries([
+        ...(value && !values.includes(value) ? [[value, value.includes('PLACEHOLDER') ? '这是示例 workflow 里的占位值。请选择真实 Bot 后再保存。' : '当前 definition 里的值，不在在线 Bot 列表中。']] : []),
+        ...availableBots.map((bot) => [
+          bot.larkAppId,
+          bot.online === false ? '当前离线，不建议用于新流程。' : '真实在线 Bot，可接收这个节点的任务。',
+        ]),
+      ]);
+      return choiceField('交给哪个 Bot', 'bot', value || options[0] || '', options, labels, descriptions, help);
     }
-    return `${field('交给哪个 Bot', 'bot', value, undefined, undefined, help, '例如 cli_a97448b83eb8dbd6')}<p class="builder-help">未能加载真实 Bot 列表；这里应填写 bots.json 里的 larkAppId。</p>`;
+    return `<div class="choice-field">
+      <span class="choice-label">${labelWithHelp('交给哪个 Bot', help)}</span>
+      <input type="hidden" name="bot" value="${escapeHtml(value)}" />
+      <div class="builder-help">${value && value.includes('PLACEHOLDER') ? `当前是示例占位值 <code>${escapeHtml(value)}</code>，不是可运行 Bot。` : '还没有加载到真实 Bot 列表。'}请刷新页面或确认 dashboard 登录态后重试。</div>
+    </div>`;
   }
 
   function svgPoint(ev: PointerEvent): { x: number; y: number } {
@@ -686,17 +772,32 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
       if (!role) { selected = { kind: 'workflow' }; return renderPanel(); }
       panel.innerHTML = `<h3>角色属性</h3>
         ${helpBlock('角色是流程里的职责身份，例如开发者、Reviewer、汇报员。节点可以分配给角色，方便看懂谁负责哪一步。')}
-        ${field('角色 ID', 'id', role.id, undefined, undefined, '内部唯一标识，建议用英文或拼音，例如 developer、reviewer。')}
         ${field('名称', 'label', role.label, undefined, undefined, '给人看的角色名，例如开发者、Reviewer、汇报员。')}
-        ${field('类型', 'kind', role.kind, roleKindOptions, Object.fromEntries(roleKindOptions.map((kind) => [kind, roleKindLabel(kind)])), '选择最接近的角色类型；没有合适的就选自定义。')}
+        ${choiceField('类型', 'kind', role.kind, roleKindOptions, Object.fromEntries(roleKindOptions.map((kind) => [kind, roleKindLabel(kind)])), {
+          developer: '负责开发实现、修复问题、产出代码。',
+          reviewer: '负责审查、判定通过或打回。',
+          reporter: '负责汇总进展、验证结论和风险。',
+          observer: '只观察或接收通知，不负责主流程动作。',
+          custom: '其他自定义角色。',
+        }, '选择最接近的角色类型；没有合适的就选自定义。')}
         <label><span>${labelWithHelp('职责', '一句话说明这个角色在流程里负责什么。')}</span><textarea name="responsibility" rows="4" placeholder="例如：完成开发并提交可审查产物">${escapeHtml(role.responsibility ?? '')}</textarea></label>
+        <details class="advanced-props"><summary>高级设置</summary>
+          ${field('角色 ID', 'id', role.id, undefined, undefined, '内部唯一标识，建议用英文或拼音，例如 developer、reviewer。')}
+        </details>
         <button id="apply-props" type="button">应用</button>`;
       panel.querySelector<HTMLButtonElement>('#apply-props')!.onclick = () => {
         const fd = panelForm();
         const old = role.id;
-        role.id = uniqueId(String(fd.get('id') ?? role.id), new Set(canvas.roles.filter((r) => r !== role).map((r) => r.id)));
-        role.label = String(fd.get('label') ?? role.label);
-        role.kind = String(fd.get('kind') ?? role.kind) as RoleKind;
+        const oldLabel = role.label;
+        const nextLabel = String(fd.get('label') ?? role.label);
+        const idInput = String(fd.get('id') ?? role.id);
+        const used = new Set(canvas.roles.filter((r) => r !== role).map((r) => r.id));
+        const nextKind = String(fd.get('kind') ?? role.kind) as RoleKind;
+        role.id = idInput === old && nextLabel !== oldLabel
+          ? nextRoleIdFromLabel(nextLabel, nextKind, used)
+          : uniqueId(idInput, used);
+        role.label = nextLabel;
+        role.kind = nextKind;
         role.responsibility = String(fd.get('responsibility') ?? '');
         canvas.nodes.forEach((n) => { if (n.roleId === old) n.roleId = role.id; });
         selected = { kind: 'role', id: role.id };
@@ -709,18 +810,21 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
       if (!node) { selected = { kind: 'workflow' }; return renderPanel(); }
       panel.innerHTML = `<h3>节点属性</h3>
         ${helpBlock(nodeTypeHelp(node.type))}
-        ${field('节点 ID', 'id', node.id, undefined, undefined, '内部唯一标识，连线和运行记录会用到；建议用英文或拼音。')}
         ${field('节点名称', 'label', node.label, undefined, undefined, '画布上显示给人看的名字，例如 开发实现、Reviewer 判定、发布汇报。')}
-        ${field('这一步是什么', 'type', node.type, nodeTypeOptions, {
+        ${choiceField('这一步是什么', 'type', node.type, nodeTypeOptions, {
           subagent: 'Bot 任务',
           hostExecutor: '自动脚本/动作',
           semantic: '流程控制',
+        }, {
+          subagent: '把任务交给一个真实 Bot 处理，比如开发、review、写汇报。',
+          hostExecutor: '由系统执行命令、脚本、发消息或创建定时任务。',
+          semantic: '不做具体任务，只控制流程：提审、判定、汇报、里程碑等。',
         }, 'Bot 任务=交给 Bot 做；自动脚本/动作=系统执行；流程控制=提审/判定/汇报等流程点。')}
-        ${field('由哪个角色负责', 'roleId', node.roleId ?? '', ['', ...canvas.roles.map((r) => r.id)], Object.fromEntries(canvas.roles.map((r) => [r.id, r.label])), '可选。用于说明这一步归哪个角色负责，不影响 Bot 下拉本身。')}
-        ${node.type === 'semantic' ? field('控制点类型', 'semanticKind', node.semanticKind ?? 'milestone', semanticKindOptions, Object.fromEntries(semanticKindOptions.map((kind) => [kind, semanticKindLabel(kind)])), semanticKindHelp(node.semanticKind ?? 'milestone')) + helpBlock(semanticKindHelp(node.semanticKind ?? 'milestone')) : ''}
+        ${choiceField('由哪个角色负责', 'roleId', node.roleId ?? '', ['', ...canvas.roles.map((r) => r.id)], { '': '暂不指定角色', ...Object.fromEntries(canvas.roles.map((r) => [r.id, r.label])) }, { '': '可先不指定；之后也能补。', ...Object.fromEntries(canvas.roles.map((r) => [r.id, r.responsibility ?? `${r.label} 负责这一步`])) }, '可选。用于说明这一步归哪个角色负责，不影响 Bot 下拉本身。')}
+        ${node.type === 'semantic' ? choiceField('控制点类型', 'semanticKind', node.semanticKind ?? 'milestone', semanticKindOptions, Object.fromEntries(semanticKindOptions.map((kind) => [kind, semanticKindLabel(kind)])), Object.fromEntries(semanticKindOptions.map((kind) => [kind, semanticKindHelp(kind)])), semanticKindHelp(node.semanticKind ?? 'milestone')) + helpBlock(semanticKindHelp(node.semanticKind ?? 'milestone')) : ''}
         ${node.type === 'subagent' ? botField(node.bot) + '<label><span>' + labelWithHelp('让 Bot 做什么', '写给 Bot 的任务说明。流程运行到这里时，会把这段话发给选中的 Bot。') + '</span><textarea name="prompt" rows="4" placeholder="例如：请完成这个需求的开发实现，完成后说明改了哪些文件、如何验证。">' + escapeHtml(node.prompt ?? '') + '</textarea></label>' : ''}
         ${node.type === 'hostExecutor' ? `
-          ${field('自动动作类型', 'executor', node.executor ?? 'shell-command', hostExecutorOptions, Object.fromEntries(hostExecutorOptions.map((executor) => [executor, hostExecutorLabel(executor)])), hostExecutorHelp(node.executor ?? 'shell-command'))}
+          ${choiceField('自动动作类型', 'executor', node.executor ?? 'shell-command', hostExecutorOptions, Object.fromEntries(hostExecutorOptions.map((executor) => [executor, hostExecutorLabel(executor)])), Object.fromEntries(hostExecutorOptions.map((executor) => [executor, hostExecutorHelp(executor)])), hostExecutorHelp(node.executor ?? 'shell-command'))}
           ${helpBlock(hostExecutorHelp(node.executor ?? 'shell-command'))}
           ${(node.executor ?? 'shell-command') === 'shell-command' ? `
             ${field('要执行的命令', 'scriptCommand', node.scriptCommand ?? '', undefined, undefined, '只填命令本身，不要把参数拼在这里。', '例如 node / pnpm / bash')}
@@ -732,13 +836,23 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
         ` : ''}
         <label class="builder-check" title="勾上后，流程走到这里会先停住，等人确认后再继续。"><input name="humanGate" type="checkbox" ${node.humanGate ? 'checked' : ''}/> <span>${labelWithHelp('执行前暂停确认', '适合脚本、发消息、部署等危险动作；确认后才会真正执行。')}</span></label>
         ${helpBlock(node.humanGate ? '当前会在执行前等待人工确认，适合防止误跑脚本或误发消息。' : '当前不会等待人工确认，流程到这里会直接继续。')}
+        <details class="advanced-props"><summary>高级设置</summary>
+          ${field('节点 ID', 'id', node.id, undefined, undefined, '会根据节点名称自动生成；不喜欢可以在这里手动改。', nextIdFromLabel(node.label, node.type === 'semantic' ? 'semantic' : node.type === 'hostExecutor' ? 'executor' : 'task', new Set(canvas.nodes.filter((n) => n !== node).map((n) => n.id))))}
+        </details>
         <button id="apply-props" type="button">应用</button>`;
       panel.querySelector<HTMLButtonElement>('#apply-props')!.onclick = () => {
         const fd = panelForm();
         const old = node.id;
-        node.id = uniqueId(String(fd.get('id') ?? node.id), new Set(canvas.nodes.filter((n) => n !== node).map((n) => n.id)));
-        node.label = String(fd.get('label') ?? node.label);
+        const oldLabel = node.label;
+        const nextLabel = String(fd.get('label') ?? node.label);
         node.type = String(fd.get('type') ?? node.type) as NodeType;
+        const idInput = String(fd.get('id') ?? node.id);
+        const idFallback = node.type === 'semantic' ? 'semantic' : node.type === 'hostExecutor' ? 'executor' : 'task';
+        const used = new Set(canvas.nodes.filter((n) => n !== node).map((n) => n.id));
+        node.id = idInput === old && nextLabel !== oldLabel
+          ? nextIdFromLabel(nextLabel, idFallback, used)
+          : uniqueId(idInput, used);
+        node.label = nextLabel;
         node.roleId = String(fd.get('roleId') ?? '') || undefined;
         node.semanticKind = String(fd.get('semanticKind') ?? node.semanticKind ?? 'milestone') as SemanticKind;
         node.bot = String(fd.get('bot') ?? node.bot ?? availableBots[0]?.larkAppId ?? 'codex');
@@ -764,20 +878,27 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
       if (!edge) { selected = { kind: 'workflow' }; return renderPanel(); }
       panel.innerHTML = `<h3>连线属性</h3>
         ${helpBlock('连线表示流程从一个节点走到另一个节点。条件决定“什么时候走这条线”。')}
-        ${field('连线 ID', 'id', edge.id, undefined, undefined, '内部唯一标识，建议用英文或拼音。')}
         ${field('画布上显示的文字', 'label', edge.label, undefined, undefined, '显示在箭头上的短文字，例如 通过、打回、开始审查。')}
-        ${field('从哪一步出来', 'from', edge.from, canvas.nodes.map((n) => n.id), Object.fromEntries(canvas.nodes.map((n) => [n.id, n.label])), '选择起点节点。')}
-        ${field('流向哪一步', 'to', edge.to, canvas.nodes.map((n) => n.id), Object.fromEntries(canvas.nodes.map((n) => [n.id, n.label])), '选择目标节点。')}
-        ${field('什么时候走这条线', 'conditionKind', edge.conditionKind, ['always', 'approved', 'rejected', 'custom'], {
+        ${choiceField('从哪一步出来', 'from', edge.from, canvas.nodes.map((n) => n.id), Object.fromEntries(canvas.nodes.map((n) => [n.id, n.label])), Object.fromEntries(canvas.nodes.map((n) => [n.id, `${nodeTypeLabel(n.type)}：${n.label}`])), '选择起点节点。')}
+        ${choiceField('流向哪一步', 'to', edge.to, canvas.nodes.map((n) => n.id), Object.fromEntries(canvas.nodes.map((n) => [n.id, n.label])), Object.fromEntries(canvas.nodes.map((n) => [n.id, `${nodeTypeLabel(n.type)}：${n.label}`])), '选择目标节点。')}
+        ${choiceField('什么时候走这条线', 'conditionKind', edge.conditionKind, ['always', 'approved', 'rejected', 'custom'], {
           always: conditionKindLabel('always'),
           approved: conditionKindLabel('approved'),
           rejected: conditionKindLabel('rejected'),
           custom: conditionKindLabel('custom'),
+        }, {
+          always: conditionKindHelp('always'),
+          approved: conditionKindHelp('approved'),
+          rejected: conditionKindHelp('rejected'),
+          custom: conditionKindHelp('custom'),
         }, conditionKindHelp(edge.conditionKind))}
         ${field('判定值', 'decisionValue', edge.decisionValue ?? '', undefined, undefined, '只有通过/打回/自定义分支需要。通常通过填 approved，打回填 rejected。', edge.conditionKind === 'approved' ? 'approved' : edge.conditionKind === 'rejected' ? 'rejected' : 'custom')}
         ${field('最多循环几轮', 'maxVisits', String(edge.maxVisits ?? ''), undefined, undefined, '只在打回循环时需要。留空表示不限制。', '例如 2')}
         ${helpBlock(conditionKindHelp(edge.conditionKind))}
         <p class="builder-help">当前规则：${escapeHtml(conditionText(edge))}</p>
+        <details class="advanced-props"><summary>高级设置</summary>
+          ${field('连线 ID', 'id', edge.id, undefined, undefined, '内部唯一标识，建议用英文或拼音。')}
+        </details>
         <button id="apply-props" type="button">应用</button>`;
       panel.querySelector<HTMLButtonElement>('#apply-props')!.onclick = () => {
         const fd = panelForm();

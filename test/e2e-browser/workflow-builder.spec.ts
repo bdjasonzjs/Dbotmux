@@ -225,31 +225,27 @@ test('PM can create, edit, connect, save, and delete a workflow on the canvas', 
   await page.locator('#property-panel button#apply-props').click();
 
   await page.getByRole('button', { name: '添加角色' }).click();
-  await page.locator('#property-panel input[name="id"]').fill('reviewer');
   await page.locator('#property-panel input[name="label"]').fill('Reviewer');
-  await page.locator('#property-panel select[name="kind"]').selectOption('reviewer');
+  await page.locator('#property-panel .choice-card[data-choice-name="kind"][data-choice-value="reviewer"]').click();
   await page.locator('#property-panel textarea[name="responsibility"]').fill('审查发布风险并给出结论');
   await page.locator('#property-panel button#apply-props').click();
 
   await page.getByRole('button', { name: '添加 Bot 任务' }).click();
-  await page.locator('#property-panel input[name="id"]').fill('develop');
   await page.locator('#property-panel input[name="label"]').fill('开发实现');
-  await page.locator('#property-panel select[name="bot"]').selectOption('cli_app');
+  await page.locator('#property-panel .choice-card[data-choice-name="bot"][data-choice-value="cli_app"]').click();
   await page.locator('#property-panel textarea[name="prompt"]').fill('完成发布前实现与自测');
   await page.locator('#property-panel button#apply-props').click();
 
   await page.getByRole('button', { name: '添加流程控制' }).click();
-  await page.locator('#property-panel input[name="id"]').fill('review');
   await page.locator('#property-panel input[name="label"]').fill('Reviewer 判定');
-  await page.locator('#property-panel select[name="semanticKind"]').selectOption('reviewDecision');
-  await page.locator('#property-panel select[name="roleId"]').selectOption('reviewer');
+  await page.locator('#property-panel .choice-card[data-choice-name="semanticKind"][data-choice-value="reviewDecision"]').click();
+  await page.locator('#property-panel .choice-card[data-choice-name="roleId"][data-choice-value="reviewer"]').click();
   await page.locator('#property-panel input[name="humanGate"]').check();
   await page.locator('#property-panel button#apply-props').click();
 
   await page.getByRole('button', { name: '添加自动动作' }).click();
-  await page.locator('#property-panel input[name="id"]').fill('notify');
   await page.locator('#property-panel input[name="label"]').fill('发布通知');
-  await page.locator('#property-panel select[name="executor"]').selectOption('shell-command');
+  await page.locator('#property-panel .choice-card[data-choice-name="executor"][data-choice-value="shell-command"]').click();
   await page.locator('#property-panel input[name="scriptCommand"]').fill('node');
   await page.locator('#property-panel textarea[name="scriptArgs"]').fill('-e\nconsole.log("ok")');
   await page.locator('#property-panel button#apply-props').click();
@@ -262,7 +258,7 @@ test('PM can create, edit, connect, save, and delete a workflow on the canvas', 
   await page.locator('#property-panel button#apply-props').click();
   await connectNodes(page, 'review', 'notify');
   await page.locator('.wf-edge[data-edge="review-notify"] rect').click();
-  await page.locator('#property-panel select[name="conditionKind"]').selectOption('approved');
+  await page.locator('#property-panel .choice-card[data-choice-name="conditionKind"][data-choice-value="approved"]').click();
   await page.locator('#property-panel input[name="decisionValue"]').fill('approved');
   await page.locator('#property-panel button#apply-props').click();
 
@@ -285,7 +281,7 @@ test('PM can create, edit, connect, save, and delete a workflow on the canvas', 
   await page.locator('#property-panel input[name="label"]').fill('开发实现与自测');
   await page.locator('#property-panel button#apply-props').click();
   await page.getByRole('button', { name: '保存' }).click();
-  await expect.poll(() => updatedDefinition?.nodes?.develop?.description).toBe('开发实现与自测');
+  await expect.poll(() => Object.values(updatedDefinition?.nodes ?? {}).some((node: any) => node.description === '开发实现与自测')).toBe(true);
 
   await page.getByRole('button', { name: '删除 workflow' }).click();
   await expect.poll(() => deletedWorkflowId).toBe('qa-release-flow');
