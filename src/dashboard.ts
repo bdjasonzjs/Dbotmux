@@ -674,12 +674,17 @@ const server = createServer(async (req, res) => {
       const root = await import('./services/root-inbox-store.js');
       const existing = root.lookup(id);
       if (!existing) return jsonRes(res, 404, { ok: false, error: 'item_not_found' });
-      // P2-rev1 #3: close + update Lark card to grayed state. Resolve
-      // Claude bot's app id for the card update sender.
+      // P2-rev1 #3: close + update Lark card to grayed state. Resolve the
+      // owning Company CEO app for multi-company roots; fall back to the
+      // legacy main-topic bot only for pre-company data.
       try {
         const { resolveBotIdent } = await import('./core/main-bot-playbook.js');
+        const { getByChatId } = await import('./services/subtask-store.js');
+        const { getCompanyByRootChatId, getMainTopicBotRef } = await import('./services/main-topic-config.js');
         const { closeAndRenderClosed } = await import('./services/root-inbox-card-renderer.js');
-        const larkAppId = resolveBotIdent('claude').larkAppId;
+        const task = existing.subChatId ? getByChatId(existing.subChatId) : null;
+        const company = getCompanyByRootChatId(task?.rootChatId ?? task?.parentChatId);
+        const larkAppId = company?.ceoLarkAppId ?? resolveBotIdent(getMainTopicBotRef(company?.rootChatId)).larkAppId;
         await closeAndRenderClosed(id, larkAppId);
       } catch {
         // Fall back to store-only close so dashboard still works without

@@ -10,6 +10,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 const REGISTRY_DIR = join(homedir(), '.botmux', 'data', 'dashboard-daemons');
+const DATA_DIR = join(homedir(), '.botmux', 'data');
 const CLAUDE_BOT_NAME_ZH = '克劳德';
 
 interface DaemonInfoFile {
@@ -53,20 +54,44 @@ function parseArgs(argv: string[]): Args | { error: string } {
   return a as Args;
 }
 
-function findMainBotDaemonPort(): number | null {
+function findSessionLarkAppId(sessionId: string): string | null {
+  let files: string[];
+  try { files = readdirSync(DATA_DIR).filter(f => f.startsWith('sessions-') && f.endsWith('.json')); }
+  catch { return null; }
+  for (const f of files) {
+    try {
+      const sessions = JSON.parse(readFileSync(join(DATA_DIR, f), 'utf-8')) as Record<string, { larkAppId?: string }>;
+      const appId = sessions?.[sessionId]?.larkAppId;
+      if (appId) return appId;
+    } catch { /* skip */ }
+  }
+  return null;
+}
+
+function findMainBotDaemonPort(sessionId: string): number | null {
   let files: string[];
   try { files = readdirSync(REGISTRY_DIR).filter(f => f.endsWith('.json')); }
   catch { return null; }
   const now = Date.now(); const STALE = 90_000;
+  const fresh: DaemonInfoFile[] = [];
   for (const f of files) {
     try {
       const d = JSON.parse(readFileSync(join(REGISTRY_DIR, f), 'utf-8')) as DaemonInfoFile;
-      if (d.botName !== CLAUDE_BOT_NAME_ZH) continue;
       if (now - d.lastHeartbeat > STALE) continue;
-      return d.ipcPort;
+      fresh.push(d);
     } catch { /* skip */ }
   }
-  return null;
+  const envAppId = process.env.LARK_APP_ID;
+  if (envAppId) {
+    const own = fresh.find(d => d.larkAppId === envAppId);
+    if (own) return own.ipcPort;
+  }
+  const sessionAppId = findSessionLarkAppId(sessionId);
+  if (sessionAppId) {
+    const own = fresh.find(d => d.larkAppId === sessionAppId);
+    if (own) return own.ipcPort;
+  }
+  return fresh.find(d => d.botName === CLAUDE_BOT_NAME_ZH)?.ipcPort ?? null;
 }
 
 export async function cmdProgressReport(argv: string[]): Promise<void> {
@@ -88,8 +113,8 @@ dedup: 同 kind+sub-chat+slug 第二次调用 → 编辑同张主话题卡（不
   const parsed = parseArgs(argv);
   if ('error' in parsed) { console.error(`❌ ${parsed.error}`); process.exit(2); }
 
-  const port = findMainBotDaemonPort();
-  if (!port) { console.error(`❌ 找不到 Claude daemon（${REGISTRY_DIR} 里没新鲜注册）`); process.exit(1); }
+  const port = findMainBotDaemonPort(parsed.sessionId);
+  if (!port) { console.error(`❌ 找不到当前 session 所属 daemon（${REGISTRY_DIR} 里没新鲜注册）`); process.exit(1); }
 
   let res: Response;
   try {

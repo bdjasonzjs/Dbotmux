@@ -16,7 +16,7 @@ import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { getBot, getAllBots } from '../bot-registry.js';
-import { getMainTopicChatId, isTillyMainTopicConversationDenied } from '../services/main-topic-config.js';
+import { getCompanyByRootChatId, getMainTopicBotRef, getMainTopicChatId, isTillyMainTopicConversationDenied } from '../services/main-topic-config.js';
 import { getChatMode } from '../services/chat-mode-store.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { validateAdoptTarget } from './session-discovery.js';
@@ -216,21 +216,53 @@ export function formatAttachmentsHint(attachments?: LarkAttachment[], locale?: L
  * Returns empty string when conditions don't match — block is omitted
  * from the prompt.
  */
+function identitySourceForCli(cliId: string): string {
+  switch (cliId) {
+    case 'claude-code': return '~/.claude/CLAUDE.md';
+    case 'codex': return '~/.codex/AGENTS.override.md if present, otherwise ~/.codex/AGENTS.md';
+    case 'coco': return '~/.coco/AGENTS.md';
+    default: return 'this bot engine\'s own configured identity/home files';
+  }
+}
+
+function isConfiguredMainBot(larkAppId: string, chatId?: string): boolean {
+  let bot;
+  try {
+    bot = getBot(larkAppId);
+  } catch { return false; }
+  const company = getCompanyByRootChatId(chatId);
+  if (company?.ceoLarkAppId && company.ceoLarkAppId === larkAppId) return true;
+  const ref = getMainTopicBotRef(chatId).toLowerCase();
+  const cliId = bot.config.cliId;
+  const botName = bot.botName?.toLowerCase();
+  const aliases: Record<string, string[]> = {
+    claude: ['claude', 'c', 'claude-code', '克劳德'],
+    codex: ['codex', 'k', '蔻黛克斯', '寇黛克斯'],
+    tilly: ['tilly', 't', 'coco', '缇蕾', '小宝'],
+  };
+  if (bot.config.larkAppId && ref === bot.config.larkAppId.toLowerCase()) return true;
+  if (ref === cliId.toLowerCase()) return true;
+  if (botName && ref === botName) return true;
+  if (aliases.claude.includes(ref)) return cliId === 'claude-code';
+  if (aliases.codex.includes(ref)) return cliId === 'codex';
+  if (aliases.tilly.includes(ref)) return cliId === 'coco';
+  return false;
+}
+
 export function buildMainBotPromptBlock(chatId: string | undefined, larkAppId: string | undefined): string {
   if (!chatId || !larkAppId) return '';
   const mainTopic = getMainTopicChatId();
-  if (!mainTopic || chatId !== mainTopic) return '';
-  // Verify bot is Claude (cliId='claude-code') via bot-registry.
-  let isMainBot = false;
-  try {
-    const bot = getBot(larkAppId);
-    isMainBot = bot.config.cliId === 'claude-code';
-  } catch { return ''; }
-  if (!isMainBot) return '';
+  const company = getCompanyByRootChatId(chatId);
+  if (!company && (!mainTopic || chatId !== mainTopic)) return '';
+  if (!isConfiguredMainBot(larkAppId, chatId)) return '';
+  const bot = getBot(larkAppId);
+  const companyName = company?.name ?? 'legacy-main-topic';
+  const identityLine = `你是 bot「${bot.botName ?? bot.config.larkAppId}」担任 Company「${companyName}」的 CEO / main-bot。启动前必须读取并遵守自己的身份来源：${identitySourceForCli(bot.config.cliId)}；不要继承其他 bot 的身份文件或私密记忆。`;
+  const commandLine = '复杂任务优先用 `botmux subtask-start` 或 `botmux bot ceo-spawn` 编排；需要审查的工程产出先写飞书 docx/绝对路径，再 request-review；未经授权不 commit/push/deploy。';
   return `<main_bot_routing>
-你在 Flumy 主话题工作（mainTopicChatId）。
+你在 Company「${companyName}」的 CEO 主话题工作（rootChatId=${chatId}）。
 
-**定位：你是 CEO** —— 以**决策和分派**为主。能交给子群解决的问题就**尽量分派出去**，自己不必亲自下场干每件细活。邹劲松是**董事长**：只有**真正重要的问题**（重大方向 / 高风险 / 不可逆决策）才找他拍板；其余不是非常重要的事，你**自行决断、自主推进**，别事事等他。
+**定位：你是 CEO** —— ${identityLine} 以**决策和分派**为主。能交给子群解决的问题就**尽量分派出去**，自己不必亲自下场干每件细活。邹劲松是**董事长**：只有**真正重要的问题**（重大方向 / 高风险 / 不可逆决策）才找他拍板；其余不是非常重要的事，你**自行决断、自主推进**，别事事等他。
 
 **任务分派（先判归口，再动手）**：
 - 复杂 / 多轮任务（PRD / bug 清单 / 跨群 / 多 bot / 预期多轮）**先判归口**——先了解当前有哪些常驻 domain 经理群、各管什么域（\`botmux subtask-managers\` 列活跃经理群；该命令没有时退而从 CEO 收件箱近期 digest 反推，别凭记忆）：
@@ -239,6 +271,7 @@ export function buildMainBotPromptBlock(chatId: string | undefined, larkAppId: s
   → 同一任务**只走一条路**，别既交经理又自己建（双重派发）。
 - 经理 session 老化 / 不响应 → 先**重启经理**让它能干，**别 CEO 绕过自建**。
 - 只有一句话能搞定的即时答疑 / 闲聊才自己直接答。
+- ${commandLine}
 
 **决策与上报**：
 - 不是非常重要的问题 → **自行决断、自主推进**，不必上报

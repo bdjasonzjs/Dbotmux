@@ -10,9 +10,10 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 const REGISTRY_DIR = join(homedir(), '.botmux', 'data', 'dashboard-daemons');
+const DATA_DIR = join(homedir(), '.botmux', 'data');
 const CLAUDE_BOT_NAME_ZH = '克劳德';
 
-interface DaemonInfoFile { botName: string; ipcPort: number; lastHeartbeat: number; }
+interface DaemonInfoFile { larkAppId?: string; botName: string; ipcPort: number; lastHeartbeat: number; }
 
 const VERB_ROUTE: Record<string, string> = {
   start: '/api/subtask-orch-create',
@@ -40,20 +41,44 @@ function kebabToCamel(s: string): string {
   return s.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
 }
 
-export function findClaudeDaemonPort(): number | null {
+function findSessionLarkAppId(sessionId: string): string | null {
+  let files: string[];
+  try { files = readdirSync(DATA_DIR).filter(f => f.startsWith('sessions-') && f.endsWith('.json')); }
+  catch { return null; }
+  for (const f of files) {
+    try {
+      const sessions = JSON.parse(readFileSync(join(DATA_DIR, f), 'utf-8')) as Record<string, { larkAppId?: string }>;
+      const appId = sessions?.[sessionId]?.larkAppId;
+      if (appId) return appId;
+    } catch { /* skip corrupt */ }
+  }
+  return null;
+}
+
+export function findClaudeDaemonPort(sessionId?: string): number | null {
   let files: string[];
   try { files = readdirSync(REGISTRY_DIR).filter(f => f.endsWith('.json')); }
   catch { return null; }
   const now = Date.now(); const STALE = 90_000;
+  const fresh: DaemonInfoFile[] = [];
   for (const f of files) {
     try {
       const d = JSON.parse(readFileSync(join(REGISTRY_DIR, f), 'utf-8')) as DaemonInfoFile;
-      if (d.botName !== CLAUDE_BOT_NAME_ZH) continue;
       if (now - d.lastHeartbeat > STALE) continue;
-      return d.ipcPort;
+      fresh.push(d);
     } catch { /* skip corrupt */ }
   }
-  return null;
+  const envAppId = process.env.LARK_APP_ID;
+  if (envAppId) {
+    const own = fresh.find(d => d.larkAppId === envAppId);
+    if (own) return own.ipcPort;
+  }
+  const sessionAppId = sessionId ? findSessionLarkAppId(sessionId) : null;
+  if (sessionAppId) {
+    const own = fresh.find(d => d.larkAppId === sessionAppId);
+    if (own) return own.ipcPort;
+  }
+  return fresh.find(d => d.botName === CLAUDE_BOT_NAME_ZH)?.ipcPort ?? null;
 }
 
 function parseBody(argv: string[]): { body: Record<string, unknown> } | { error: string } {
@@ -124,8 +149,8 @@ export async function cmdSubtaskOrch(verb: string, argv: string[]): Promise<void
   const parsed = parseBody(argv);
   if ('error' in parsed) { console.error(`❌ ${parsed.error}`); process.exit(2); }
 
-  const port = findClaudeDaemonPort();
-  if (!port) { console.error(`❌ 找不到 Claude daemon（${REGISTRY_DIR} 无新鲜注册）`); process.exit(1); }
+  const port = findClaudeDaemonPort(String(parsed.body.sessionId ?? ''));
+  if (!port) { console.error(`❌ 找不到当前 session 所属 daemon（${REGISTRY_DIR} 无新鲜注册）`); process.exit(1); }
 
   let res: Response;
   try {

@@ -22,6 +22,7 @@ beforeAll(() => {
     { larkAppId: 'cli_main', botName: '克劳德', cliId: 'claude-code', botOpenId: 'ou_main' },
     { larkAppId: 'cli_codex', botName: '蔻黛克斯', cliId: 'codex', botOpenId: 'ou_codex' },
     { larkAppId: 'cli_coco', botName: '缇蕾', cliId: 'coco', botOpenId: 'ou_coco' },
+    { larkAppId: 'cli_newbot', botName: 'NewBot', cliId: 'new-engine', botOpenId: 'ou_newbot' },
   ]));
 });
 
@@ -50,6 +51,13 @@ describe('resolveBotIdent — N-bot generalization', () => {
 
   it('resolved name comes from the registry botName', () => {
     expect(resolveBotIdent('claude').name).toBe('克劳德');
+  });
+
+  it('generic cliId ref resolves to its canonical bot for future Company CEOs', () => {
+    const byCliId = resolveBotIdent('new-engine');
+    expect(byCliId.larkAppId).toBe('cli_newbot');
+    expect(byCliId.openId).toBe('ou_newbot');
+    expect(byCliId.name).toBe('NewBot');
   });
 
   it('unknown ref throws (→ caller maps to 400)', () => {

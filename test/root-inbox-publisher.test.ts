@@ -20,9 +20,15 @@ vi.mock('../src/im/lark/client.js', () => ({
   updateMessage: updateMessageSpy,
 }));
 let fakeMainTopic: string | undefined;
+let fakeCompany: { rootChatId: string; ceoLarkAppId: string } | null;
+const fakeTaskByChat = new Map<string, { rootChatId?: string; parentChatId?: string }>();
 vi.mock('../src/services/main-topic-config.js', () => ({
   getMainTopicChatId: () => fakeMainTopic,
+  getCompanyByRootChatId: (rootChatId?: string) => fakeCompany && rootChatId === fakeCompany.rootChatId ? fakeCompany : null,
   isTillyMainTopicConversationDenied: () => false,
+}));
+vi.mock('../src/services/subtask-store.js', () => ({
+  getByChatId: (chatId: string) => fakeTaskByChat.get(chatId),
 }));
 vi.mock('../src/utils/logger.js', () => ({
   logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
@@ -42,6 +48,8 @@ beforeEach(() => {
   updateMessageSpy.mockReset();
   sendMessageSpy.mockResolvedValue('msg_id');
   fakeMainTopic = undefined;
+  fakeCompany = null;
+  fakeTaskByChat.clear();
 });
 afterEach(() => {
   rmSync(tempDir, { recursive: true, force: true });
@@ -77,6 +85,24 @@ describe('root-inbox-publisher (P2 commit #5)', () => {
       expect(chatId).toBe('oc_flumy');
       expect(msgType).toBe('interactive');
       expect(root.lookup('progress:oc_sub_a:m1')?.rootCardMessageId).toBe('msg_card_1');
+    });
+
+    it('Company subtask 上报 → 发到对应 company root，并用 CEO app 发送', async () => {
+      fakeMainTopic = 'oc_legacy';
+      fakeCompany = { rootChatId: 'oc_company_root', ceoLarkAppId: 'app_codex' };
+      fakeTaskByChat.set('oc_company_sub', { rootChatId: 'oc_company_root' });
+      sendMessageSpy.mockResolvedValueOnce('msg_company_card');
+      const { pub, root } = await freshImports();
+      const r = await pub.publishProgress({
+        subChatId: 'oc_company_sub', slug: 'm1', summary: 'company milestone', larkAppId: 'app_worker',
+      });
+      expect(r.mainTopicConfigured).toBe(true);
+      expect(r.rootCardMessageId).toBe('msg_company_card');
+      const [appId, chatId, _content, msgType] = sendMessageSpy.mock.calls[0];
+      expect(appId).toBe('app_codex');
+      expect(chatId).toBe('oc_company_root');
+      expect(msgType).toBe('interactive');
+      expect(root.lookup('progress:oc_company_sub:m1')?.rootCardMessageId).toBe('msg_company_card');
     });
 
     it('mainTopic 配了 + 同 slug 第二次 → updateMessage 编辑原卡', async () => {

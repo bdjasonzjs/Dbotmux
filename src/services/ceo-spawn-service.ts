@@ -99,7 +99,6 @@ export async function ceoSpawn(req: CeoSpawnReq): Promise<EnsureSpawnOutcome> {
   const owner = resolveCeoOwner(getOwnerOpenId(ceoAppId), session.ownerOpenId);
   // Triggering human — NO fallback to ownerOpenId (蔻黛 blocker 2, owner-fix).
   const sender = session.lastCallerOpenId ?? '';
-  const claudeAppId = resolveBotIdent('claude').larkAppId;
 
   let seats;
   try {
@@ -217,7 +216,7 @@ export async function ceoSpawn(req: CeoSpawnReq): Promise<EnsureSpawnOutcome> {
     },
     activationApproved: (appId) => activationApproved({
       approvedAppId: req.activationApprovedAppId, senderOpenId: sender, ownerOpenId: owner,
-      callerAppId: ceoAppId, claudeAppId, pendingAppId: appId, pendingIsClone: isClone(appId),
+      callerAppId: ceoAppId, claudeAppId: ceoAppId, pendingAppId: appId, pendingIsClone: isClone(appId),
     }),
     activate: async (appId) => {
       const r = await activateBot(appId, { ecosystem: paths.ecosystem, pm2Home: paths.pm2Home, botsJsonPath });

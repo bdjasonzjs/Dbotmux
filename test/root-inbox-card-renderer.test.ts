@@ -189,13 +189,16 @@ describe('root-inbox-card-renderer (P2-rev1 #3)', () => {
       expect(updateMessageSpy).not.toHaveBeenCalled();
       expect(sendMessageSpy).not.toHaveBeenCalled();
     });
-    it('mainTopic not configured → store-only close, no Lark call', async () => {
+    it('mainTopic not configured but card exists → still updates closed-state card', async () => {
       const { renderer, root } = await freshImports();
       fakeMainTopic = undefined;
-      root.upsertOpen({ id: 'R5:oc_e', kind: 'escalation', subChatId: 'oc_e', subChatName: 'E', ruleId: 'R5', summary: 's' });
+      const { item } = root.upsertOpen({ id: 'R5:oc_e', kind: 'escalation', subChatId: 'oc_e', subChatName: 'E', ruleId: 'R5', summary: 's' });
+      root.setRootCardMessageId(item.id, 'msg_e');
+      updateMessageSpy.mockResolvedValue(undefined);
       await renderer.closeAndRenderClosed('R5:oc_e', 'app_x');
       expect(root.lookup('R5:oc_e')?.status).toBe('closed');
-      expect(updateMessageSpy).not.toHaveBeenCalled();
+      expect(updateMessageSpy).toHaveBeenCalledTimes(1);
+      expect(updateMessageSpy.mock.calls[0][1]).toBe('msg_e');
     });
     it('no rootCardMessageId (sink failed earlier) → store-only close', async () => {
       const { renderer, root } = await freshImports();

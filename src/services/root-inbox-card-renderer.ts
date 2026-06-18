@@ -12,7 +12,7 @@
  * 都用同一 send-or-update fallback chain — DRY avoids future drift.
  */
 import { sendMessage, updateMessage } from '../im/lark/client.js';
-import { getMainTopicChatId } from './main-topic-config.js';
+import { getCompanyByRootChatId, getMainTopicChatId, getMainTopicBotRef } from './main-topic-config.js';
 import * as rootInbox from './root-inbox-store.js';
 import { logger } from '../utils/logger.js';
 
@@ -160,14 +160,13 @@ export async function sendOrUpdateCard(
  *
  * Best-effort on Lark side — failure is logged, store state is still closed.
  *
- * `larkAppId` is the bot to send-as. mainTopic must be configured or
- * card update is skipped (store close still happens).
+ * `larkAppId` is the bot to send-as. Updating an existing card only needs
+ * rootCardMessageId, so Company-only deployments do not require legacy
+ * mainTopicChatId to be configured.
  */
 export async function closeAndRenderClosed(id: string, larkAppId: string): Promise<void> {
   const closed = rootInbox.close(id);
   if (!closed) return;   // unknown id
-  const mainTopic = getMainTopicChatId();
-  if (!mainTopic) return;   // store-only close, no card to update
   if (!closed.rootCardMessageId) return;   // never sent a card (sink failed earlier)
   try {
     const cardJson = renderRootInboxCard(closed);
@@ -192,13 +191,16 @@ export async function closeAllForSubChatWithCards(subChatId: string): Promise<nu
   // each via closeAndRenderClosed so card updates fire too.
   const open = rootInbox.listOpen().filter(it => it.subChatId === subChatId);
   if (open.length === 0) return 0;
-  // Resolve Claude bot's app id for card update sender.
+  // Resolve the owning company CEO bot's app id for card update sender.
   let larkAppId: string | undefined;
   try {
     const { resolveBotIdent } = await import('../core/main-bot-playbook.js');
-    larkAppId = resolveBotIdent('claude').larkAppId;
+    const { getByChatId } = await import('./subtask-store.js');
+    const task = getByChatId(subChatId);
+    const company = getCompanyByRootChatId(task?.rootChatId ?? task?.parentChatId);
+    larkAppId = company?.ceoLarkAppId ?? resolveBotIdent(getMainTopicBotRef(company?.rootChatId)).larkAppId;
   } catch (err) {
-    logger.warn(`[root-inbox-card-renderer] closeAllForSubChatWithCards: can't resolve Claude appId, falling back to store-only close: ${err}`);
+    logger.warn(`[root-inbox-card-renderer] closeAllForSubChatWithCards: can't resolve CEO appId, falling back to store-only close: ${err}`);
     // Fall back to store-only close
     return rootInbox.closeAllForSubChat(subChatId);
   }

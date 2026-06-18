@@ -83,6 +83,7 @@ export interface CreateGroupResult {
   notifyMessageId: string | null;
   notifyError: string | null;
   oncallBindings: { larkAppId: string; ok: boolean; created?: boolean; error?: string }[];
+  chatContextError: string | null;
 }
 
 export async function createGroupWithBots(opts: CreateGroupOpts): Promise<CreateGroupResult> {
@@ -169,6 +170,7 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
   // this group — chat-context-store.create is idempotent, so if the event
   // also fires later it's a no-op. Best-effort: failures are logged but
   // never block group creation (which already succeeded at this point).
+  let chatContextError: string | null = null;
   try {
     await dispatchChatCreated({
       chatId: r.chatId,
@@ -187,7 +189,8 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
       parentDigest: opts.chatContext?.parentDigest,
       taskType: opts.chatContext?.taskType,
     });
-  } catch (err) {
+  } catch (err: any) {
+    chatContextError = err?.message ?? String(err);
     logger.error(`[group-creator] main-bot dispatchChatCreated failed for chat ${r.chatId}: ${err}`);
   }
 
@@ -202,5 +205,6 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     notifyMessageId,
     notifyError,
     oncallBindings,
+    chatContextError,
   };
 }

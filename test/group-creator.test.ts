@@ -85,6 +85,7 @@ describe('createGroupWithBots', () => {
       notifyMessageId: 'om_notify_1',
       notifyError: null,
       oncallBindings: [],
+      chatContextError: null,
     });
   });
 
