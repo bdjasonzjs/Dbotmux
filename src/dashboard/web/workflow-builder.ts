@@ -225,7 +225,9 @@ function helpBlock(text: string): string {
 }
 
 function labelWithHelp(label: string, help?: string): string {
-  return `${escapeHtml(label)}${help ? ` <span class="field-help" title="${escapeHtml(help)}" aria-label="${escapeHtml(help)}">?</span>` : ''}`;
+  return help
+    ? `<span class="field-label-with-help" title="${escapeHtml(help)}">${escapeHtml(label)}</span>`
+    : escapeHtml(label);
 }
 
 function apiPath(path: string): string {
@@ -555,6 +557,14 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
     panel.querySelectorAll<HTMLButtonElement>(`.choice-card[data-choice-name="${CSS.escape(name)}"]`).forEach((btn) => {
       btn.classList.toggle('active', btn === card);
     });
+    const menu = card.closest<HTMLDetailsElement>('.choice-menu');
+    const summary = menu?.querySelector<HTMLElement>('.choice-summary');
+    const selectedLabel = card.dataset.choiceLabel;
+    const selectedDescription = card.dataset.choiceDescription;
+    if (summary && selectedLabel !== undefined) {
+      summary.innerHTML = `<strong>${escapeHtml(selectedLabel)}</strong><span>${escapeHtml(selectedDescription ?? '')}</span>`;
+    }
+    if (menu) menu.open = false;
   });
 
   function setStatus(text: string): void { status.textContent = text; }
@@ -713,8 +723,10 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
     descriptions: Record<string, string>,
     help?: string,
   ): string {
+    const selectedLabel = labels[value] ?? value;
+    const selectedDescription = descriptions[value] ?? '';
     const cards = options.map((option) => `
-      <button type="button" class="choice-card ${option === value ? 'active' : ''}" data-choice-name="${escapeHtml(name)}" data-choice-value="${escapeHtml(option)}">
+      <button type="button" class="choice-card ${option === value ? 'active' : ''}" data-choice-name="${escapeHtml(name)}" data-choice-value="${escapeHtml(option)}" data-choice-label="${escapeHtml(labels[option] ?? option)}" data-choice-description="${escapeHtml(descriptions[option] ?? '')}">
         <strong>${escapeHtml(labels[option] ?? option)}</strong>
         <span>${escapeHtml(descriptions[option] ?? '')}</span>
       </button>
@@ -722,7 +734,10 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
     return `<div class="choice-field">
       <span class="choice-label">${labelWithHelp(label, help)}</span>
       <input type="hidden" name="${escapeHtml(name)}" value="${escapeHtml(value)}" />
-      <div class="choice-list">${cards}</div>
+      <details class="choice-menu">
+        <summary class="choice-summary"><strong>${escapeHtml(selectedLabel)}</strong><span>${escapeHtml(selectedDescription)}</span></summary>
+        <div class="choice-list">${cards}</div>
+      </details>
     </div>`;
   }
 

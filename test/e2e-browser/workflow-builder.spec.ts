@@ -226,26 +226,26 @@ test('PM can create, edit, connect, save, and delete a workflow on the canvas', 
 
   await page.getByRole('button', { name: '添加角色' }).click();
   await page.locator('#property-panel input[name="label"]').fill('Reviewer');
-  await page.locator('#property-panel .choice-card[data-choice-name="kind"][data-choice-value="reviewer"]').click();
+  await selectChoice(page, 'kind', 'reviewer');
   await page.locator('#property-panel textarea[name="responsibility"]').fill('审查发布风险并给出结论');
   await page.locator('#property-panel button#apply-props').click();
 
   await page.getByRole('button', { name: '添加 Bot 任务' }).click();
   await page.locator('#property-panel input[name="label"]').fill('开发实现');
-  await page.locator('#property-panel .choice-card[data-choice-name="bot"][data-choice-value="cli_app"]').click();
+  await selectChoice(page, 'bot', 'cli_app');
   await page.locator('#property-panel textarea[name="prompt"]').fill('完成发布前实现与自测');
   await page.locator('#property-panel button#apply-props').click();
 
   await page.getByRole('button', { name: '添加流程控制' }).click();
   await page.locator('#property-panel input[name="label"]').fill('Reviewer 判定');
-  await page.locator('#property-panel .choice-card[data-choice-name="semanticKind"][data-choice-value="reviewDecision"]').click();
-  await page.locator('#property-panel .choice-card[data-choice-name="roleId"][data-choice-value="reviewer"]').click();
+  await selectChoice(page, 'semanticKind', 'reviewDecision');
+  await selectChoice(page, 'roleId', 'reviewer');
   await page.locator('#property-panel input[name="humanGate"]').check();
   await page.locator('#property-panel button#apply-props').click();
 
   await page.getByRole('button', { name: '添加自动动作' }).click();
   await page.locator('#property-panel input[name="label"]').fill('发布通知');
-  await page.locator('#property-panel .choice-card[data-choice-name="executor"][data-choice-value="shell-command"]').click();
+  await selectChoice(page, 'executor', 'shell-command');
   await page.locator('#property-panel input[name="scriptCommand"]').fill('node');
   await page.locator('#property-panel textarea[name="scriptArgs"]').fill('-e\nconsole.log("ok")');
   await page.locator('#property-panel button#apply-props').click();
@@ -258,7 +258,7 @@ test('PM can create, edit, connect, save, and delete a workflow on the canvas', 
   await page.locator('#property-panel button#apply-props').click();
   await connectNodes(page, 'review', 'notify');
   await page.locator('.wf-edge[data-edge="review-notify"] rect').click();
-  await page.locator('#property-panel .choice-card[data-choice-name="conditionKind"][data-choice-value="approved"]').click();
+  await selectChoice(page, 'conditionKind', 'approved');
   await page.locator('#property-panel input[name="decisionValue"]').fill('approved');
   await page.locator('#property-panel button#apply-props').click();
 
@@ -352,6 +352,15 @@ async function connectNodes(page: Page, from: string, to: string): Promise<void>
   await page.locator(`.wf-node[data-node="${from}"]`).click();
   await page.getByRole('button', { name: '点击连线' }).click();
   await page.locator(`.wf-node[data-node="${to}"]`).click();
+}
+
+async function selectChoice(page: Page, name: string, value: string): Promise<void> {
+  const card = page.locator(`#property-panel .choice-card[data-choice-name="${name}"][data-choice-value="${value}"]`);
+  await card.evaluate((el) => {
+    const menu = el.closest('details');
+    if (menu) menu.open = true;
+  });
+  await card.click();
 }
 
 function contentType(path: string): string {
