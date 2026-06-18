@@ -110,7 +110,7 @@ import {
   isTerminalRunStatus,
 } from './workflows/cancel-run.js';
 import { requestCancel } from './workflows/cancel.js';
-import { resolveWait } from './workflows/wait.js';
+import { resolveReviewDecision, resolveWait } from './workflows/wait.js';
 import { replay } from './workflows/events/replay.js';
 import { isValidRunId, readRunSnapshot } from './workflows/ops-projection.js';
 import { AttemptResumeManager } from './workflows/attempt-resume.js';
@@ -986,13 +986,24 @@ async function resolveDashboardWait(
   }
 
   try {
-    const resolved = await resolveWait(entry.ctx.log, {
-      activityId: target.activityId,
-      attemptId: target.attemptId,
-      resolution,
-      by: 'dashboard',
-      comment,
-    });
+    const activity = snapshot.activities.get(target.activityId);
+    const ownerNodeId = activity?.ownerNodeId;
+    const ownerNode = ownerNodeId ? entry.ctx.def.nodes[ownerNodeId] : undefined;
+    const resolved = ownerNode?.type === 'semantic' && ownerNode.kind === 'reviewDecision'
+      ? await resolveReviewDecision(entry.ctx.log, {
+          activityId: target.activityId,
+          attemptId: target.attemptId,
+          resolution,
+          by: 'dashboard',
+          comment,
+        })
+      : await resolveWait(entry.ctx.log, {
+          activityId: target.activityId,
+          attemptId: target.attemptId,
+          resolution,
+          by: 'dashboard',
+          comment,
+        });
     const after = replay(await entry.ctx.log.readAll());
     // Fire-and-forget re-drive — same pattern as Lark card path
     // (workflowApprovalResolved hook).  Don't await; the dashboard caller

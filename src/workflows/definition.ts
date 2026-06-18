@@ -95,6 +95,7 @@ export const OutputSchemaSchema = z.record(z.unknown());
 
 const NodeBaseShape = {
   description: z.string().optional(),
+  roleId: z.string().optional(),
   depends: z.array(z.string()).optional(),
   humanGate: HumanGateSchema.optional(),
   retryPolicy: RetryPolicySchema.optional(),
@@ -144,6 +145,15 @@ export const HostExecutorNodeSchema = z.object({
 });
 export type HostExecutorNode = z.infer<typeof HostExecutorNodeSchema>;
 
+export const SemanticNodeSchema = z.object({
+  ...NodeBaseShape,
+  type: z.literal('semantic'),
+  kind: z.enum(['submitGate', 'reviewDecision', 'report', 'observer', 'milestone', 'fail']),
+  input: BoundJsonValueSchema.optional(),
+  output: BoundJsonValueSchema.optional(),
+});
+export type SemanticNode = z.infer<typeof SemanticNodeSchema>;
+
 /**
  * Executors that produce externally-visible side effects: sending a Feishu
  * message, scheduling a botmux cron task, etc.  Validator requires a
@@ -168,8 +178,69 @@ export function isSideEffectExecutor(executor: string): boolean {
 export const WorkflowNodeSchema = z.discriminatedUnion('type', [
   SubagentNodeSchema,
   HostExecutorNodeSchema,
+  SemanticNodeSchema,
 ]);
 export type WorkflowNode = z.infer<typeof WorkflowNodeSchema>;
+
+export const WorkflowRoleSchema = z.object({
+  id: z.string().min(1),
+  kind: z.enum(['developer', 'reviewer', 'reporter', 'observer', 'custom']),
+  label: z.string().min(1),
+  bot: z.string().optional(),
+  responsibility: z.string().optional(),
+  icon: z.string().optional(),
+});
+export type WorkflowRole = z.infer<typeof WorkflowRoleSchema>;
+
+export const WorkflowTransitionConditionSchema: z.ZodType<any> = z.lazy(() => z.discriminatedUnion('type', [
+  z.object({ type: z.literal('always') }),
+  z.object({
+    type: z.literal('visitCountLessThan'),
+    nodeId: z.string().optional(),
+    count: z.number().int().nonnegative(),
+  }),
+  z.object({
+    type: z.literal('visitCountAtLeast'),
+    nodeId: z.string().optional(),
+    count: z.number().int().nonnegative(),
+  }),
+  z.object({
+    type: z.literal('outputEquals'),
+    nodeId: z.string().optional(),
+    path: z.string().min(1),
+    value: z.unknown(),
+  }),
+  z.object({
+    type: z.literal('outputIn'),
+    nodeId: z.string().optional(),
+    path: z.string().min(1),
+    values: z.array(z.unknown()),
+  }),
+  z.object({
+    type: z.literal('all'),
+    conditions: z.array(WorkflowTransitionConditionSchema).min(1),
+  }),
+  z.object({
+    type: z.literal('any'),
+    conditions: z.array(WorkflowTransitionConditionSchema).min(1),
+  }),
+]));
+export type WorkflowTransitionCondition = z.infer<typeof WorkflowTransitionConditionSchema>;
+
+export const WorkflowTransitionSchema = z.object({
+  id: z.string().min(1).optional(),
+  from: z.string().min(1),
+  to: z.string().min(1),
+  label: z.string().optional(),
+  when: WorkflowTransitionConditionSchema.default({ type: 'always' }),
+});
+export type WorkflowTransition = z.infer<typeof WorkflowTransitionSchema>;
+
+export const WorkflowFlowSchema = z.object({
+  start: z.string().min(1),
+  transitions: z.array(WorkflowTransitionSchema).default([]),
+});
+export type WorkflowFlow = z.infer<typeof WorkflowFlowSchema>;
 
 /**
  * Node id constraint: safe path segment for use in activityId and the
@@ -206,6 +277,8 @@ export const WorkflowDefinitionSchema = z.object({
     })
     .optional(),
   nodes: z.record(NodeIdSchema, WorkflowNodeSchema),
+  roles: z.record(WorkflowRoleSchema).optional(),
+  flow: WorkflowFlowSchema.optional(),
 });
 export type WorkflowDefinition = z.infer<typeof WorkflowDefinitionSchema>;
 
@@ -281,6 +354,9 @@ function validateGraph(def: WorkflowDefinition): void {
     }
   }
   for (const [nodeId, node] of Object.entries(def.nodes)) {
+    if (node.roleId && !def.roles?.[node.roleId]) {
+      throw new Error(`Node '${nodeId}' references unknown role '${node.roleId}'`);
+    }
     for (const dep of node.depends ?? []) {
       if (!def.nodes[dep]) {
         throw new Error(`Node '${nodeId}' depends on unknown node '${dep}'`);
@@ -306,10 +382,35 @@ function validateGraph(def: WorkflowDefinition): void {
       );
     }
   }
-  detectCycle(def);
-  const hasRoot = ids.some((id) => (def.nodes[id]!.depends ?? []).length === 0);
-  if (!hasRoot) {
-    throw new Error('Workflow has no root node (every node has dependencies)');
+  if (def.flow) {
+    validateFlow(def);
+  } else {
+    detectCycle(def);
+    const hasRoot = ids.some((id) => (def.nodes[id]!.depends ?? []).length === 0);
+    if (!hasRoot) {
+      throw new Error('Workflow has no root node (every node has dependencies)');
+    }
+  }
+}
+
+function validateFlow(def: WorkflowDefinition): void {
+  if (!def.nodes[def.flow!.start]) {
+    throw new Error(`Workflow flow.start references unknown node '${def.flow!.start}'`);
+  }
+  const transitionIds = new Set<string>();
+  for (const [idx, transition] of def.flow!.transitions.entries()) {
+    if (!def.nodes[transition.from]) {
+      throw new Error(`Workflow transition[${idx}].from references unknown node '${transition.from}'`);
+    }
+    if (!def.nodes[transition.to]) {
+      throw new Error(`Workflow transition[${idx}].to references unknown node '${transition.to}'`);
+    }
+    if (transition.id) {
+      if (transitionIds.has(transition.id)) {
+        throw new Error(`Workflow transition id '${transition.id}' is duplicated`);
+      }
+      transitionIds.add(transition.id);
+    }
   }
 }
 

@@ -7,6 +7,7 @@ import { renderGroupsPage } from './groups.js';
 import { renderBotDefaultsPage } from './bot-defaults.js';
 import { renderWorkflowsPage } from './workflows.js';
 import { renderWorkflowCatalogPage } from './workflow-catalog.js';
+import { renderWorkflowBuilderPage } from './workflow-builder.js';
 import { renderTopologyPage } from './topology.js';
 import { wireBotOnboardingButton } from './bot-onboarding.js';
 import { t, ui } from './ui.js';
@@ -27,6 +28,10 @@ function route() {
   // `#/workflows-catalog[*]` URLs are kept working for any external links
   // that may have been pasted before the move.
   if (
+    hash.startsWith('#/workflows/builder')
+  ) {
+    pageDispose = renderWorkflowBuilderPage(root);
+  } else if (
     hash.startsWith('#/workflows/catalog') ||
     hash.startsWith('#/workflows-catalog')
   ) {

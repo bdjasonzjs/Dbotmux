@@ -5,7 +5,9 @@ import { replay } from '../../workflows/events/replay.js';
 import type { WorkflowEvent } from '../../workflows/events/schema.js';
 import type { WaitCreatedEvent } from '../../workflows/events/types.js';
 import { getRunsDir } from '../../workflows/runs-dir.js';
+import { parseWorkflowDefinition } from '../../workflows/definition.js';
 import {
+  resolveReviewDecision,
   resolveWait,
   type ResolveWaitInput,
   type ResolveWaitResult,
@@ -24,6 +26,8 @@ import {
   WORKFLOW_REJECT_ACTION,
   type WorkflowApprovalResolutionKind,
 } from './workflow-cards.js';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 export type WorkflowCardActionData = {
   operator?: { open_id?: string };
@@ -123,12 +127,15 @@ export async function handleWorkflowApprovalAction(
           },
           'human',
         )
-      : await (deps.resolveWaitFn ?? resolveWait)(log, {
+      : await resolveWorkflowApproval(log, {
           activityId,
           attemptId,
           resolution: action === WORKFLOW_APPROVE_ACTION ? 'approved' : 'rejected',
           by,
           comment,
+          resolveWaitFn: deps.resolveWaitFn,
+          runDir: join(runsDir, runId),
+          events: eventsBefore,
         });
 
   const resolutionKind: WorkflowApprovalResolutionKind =
@@ -164,6 +171,48 @@ export async function handleWorkflowApprovalAction(
   });
 
   return { ok: true, duplicate: false, cardNonce, result, resolvedCardJson };
+}
+
+async function resolveWorkflowApproval(
+  log: EventLog,
+  input: ResolveWaitInput & {
+    resolveWaitFn?: (log: EventLog, input: ResolveWaitInput) => Promise<ResolveWaitResult>;
+    runDir: string;
+    events: WorkflowEvent[];
+  },
+): Promise<ResolveWaitResult> {
+  if (
+    isReviewDecisionActivity(input.runDir, input.events, input.activityId)
+    && (input.resolution === 'approved' || input.resolution === 'rejected')
+  ) {
+    return resolveReviewDecision(log, {
+      activityId: input.activityId,
+      attemptId: input.attemptId,
+      resolution: input.resolution,
+      by: input.by,
+      comment: input.comment,
+    });
+  }
+  return (input.resolveWaitFn ?? resolveWait)(log, input);
+}
+
+function isReviewDecisionActivity(
+  runDir: string,
+  events: WorkflowEvent[],
+  activityId: string,
+): boolean {
+  if (events.length === 0) return false;
+  const snapshot = replay(events);
+  const nodeId = snapshot.activities.get(activityId)?.ownerNodeId;
+  if (!nodeId) return false;
+  try {
+    const raw = readFileSync(join(runDir, 'workflow.json'), 'utf-8');
+    const def = parseWorkflowDefinition(JSON.parse(raw));
+    const node = def.nodes[nodeId];
+    return node?.type === 'semantic' && node.kind === 'reviewDecision';
+  } catch {
+    return false;
+  }
 }
 
 function buildResolvedCardJson(

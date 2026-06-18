@@ -3,7 +3,7 @@ import {
   mkdtempSync,
   rmSync,
 } from 'node:fs';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -418,6 +418,72 @@ describe('dashboard workflow API routes', () => {
     const res = await fetch(`${baseUrl}/api/workflows/definitions/${encodeURIComponent('../escape')}`);
     expect(res.status).toBe(400);
     expect(await res.json()).toEqual({ error: 'bad_id' });
+  });
+
+  it('rejects unsafe workflowId when saving a definition', async () => {
+    const res = await fetch(`${baseUrl}/api/workflows/definitions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        definition: {
+          workflowId: '../escape',
+          version: 1,
+          nodes: { a: { type: 'semantic', kind: 'milestone' } },
+        },
+      }),
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ ok: false, error: 'bad_id' });
+  });
+
+  it('validates, updates, and soft-deletes workflow definitions', async () => {
+    const path = join(tempDir, 'editable.workflow.json');
+    const def = parseWorkflowDefinition({
+      workflowId: 'editable',
+      version: 1,
+      roles: { owner: { id: 'owner', kind: 'custom', label: 'Owner' } },
+      flow: { start: 'a', transitions: [{ id: 'a-b', from: 'a', to: 'b', label: 'next' }] },
+      nodes: {
+        a: { type: 'subagent', bot: 'codex', prompt: 'A', roleId: 'owner' },
+        b: { type: 'semantic', kind: 'report', roleId: 'owner', output: { ok: true } },
+      },
+    });
+    catalogDefs.set('editable', {
+      definition: def,
+      revisionId: computeRevisionId(def),
+      path,
+    });
+
+    const validate = await fetch(`${baseUrl}/api/workflows/definitions/validate`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ definition: def }),
+    });
+    expect(validate.status).toBe(200);
+    expect(await validate.json()).toMatchObject({ ok: true, workflowId: 'editable', nodeCount: 2, transitionCount: 1 });
+
+    const updated = parseWorkflowDefinition({
+      ...def,
+      nodes: {
+        ...def.nodes,
+        b: { type: 'semantic', kind: 'report', roleId: 'owner', description: 'Updated report', output: { ok: true } },
+      },
+    });
+    const put = await fetch(`${baseUrl}/api/workflows/definitions/editable`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ definition: updated }),
+    });
+    expect(put.status).toBe(200);
+    expect(await put.json()).toMatchObject({ ok: true, workflowId: 'editable', path });
+    expect(await readFile(path, 'utf-8')).toContain('Updated report');
+
+    const del = await fetch(`${baseUrl}/api/workflows/definitions/editable`, { method: 'DELETE' });
+    expect(del.status).toBe(200);
+    const delBody = await del.json() as { ok: boolean; deletedPath: string };
+    expect(delBody.ok).toBe(true);
+    await expect(stat(delBody.deletedPath)).resolves.toBeTruthy();
+    await expect(stat(path)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('returns unknown_workflow when catalog returns undefined', async () => {
