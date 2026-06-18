@@ -17,7 +17,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import { HttpError, resolveBotIdent } from '../core/main-bot-playbook.js';
-import { getMainTopicChatId } from './main-topic-config.js';
+import { getCompanyByRootChatId, getMainTopicBotRef, getMainTopicChatId, type CompanyConfig } from './main-topic-config.js';
 import { getOrCompute, type IdempotencyEntry } from './spawn-idempotency-store.js';
 import { createGroupWithBots } from './group-creator.js';
 import { getSession } from './session-store.js';
@@ -80,15 +80,26 @@ export function djb2(s: string): string {
 /** session.larkAppId 反查到对应 bot 的 openId (report 鉴权: 发起 bot ∈ task.bots)。 */
 function sessionBotOpenId(larkAppId?: string): string | null {
   if (!larkAppId) return null;
-  for (const k of ['claude', 'codex', 'tilly'] as const) {
-    if (resolveBotIdent(k).larkAppId === larkAppId) return resolveBotIdent(k).openId;
-  }
-  return null;
+  try { return resolveBotIdent(larkAppId).openId; }
+  catch { return null; }
+}
+
+/** Match a task participant from the current session. Prefer larkAppId because
+ *  Lark open_id is app-scoped; older tasks without larkAppId still fall back to
+ *  the historical openId check. */
+function sessionTaskBot(task: SubTask, larkAppId?: string): SubTaskBot | undefined {
+  if (!larkAppId) return undefined;
+  const byAppId = task.bots.find(b => b.larkAppId === larkAppId);
+  if (byAppId) return byAppId;
+  const botOpenId = sessionBotOpenId(larkAppId);
+  return botOpenId ? task.bots.find(b => b.openId === botOpenId) : undefined;
 }
 
 /** session.larkAppId 反查 bot key（createdBy 记真实创建者用）。 */
-function sessionBotKey(larkAppId?: string): 'claude' | 'codex' | 'tilly' | null {
+function sessionBotKey(larkAppId?: string): string | null {
   if (!larkAppId) return null;
+  try { return resolveBotIdent(larkAppId).name; }
+  catch { /* fallback to legacy aliases below */ }
   for (const k of ['claude', 'codex', 'tilly'] as const) {
     if (resolveBotIdent(k).larkAppId === larkAppId) return k;
   }
@@ -135,16 +146,18 @@ interface SpawnCtx {
  */
 async function authzSpawn(sessionId: string): Promise<SpawnCtx> {
   if (!sessionId) throw new HttpError(400, 'missing sessionId');
-  const mainTopic = getMainTopicChatId();
-  if (!mainTopic) throw new HttpError(500, 'mainTopicChatId not configured — run `botmux config set-main-topic <chatId>`');
+  const legacyMainTopic = getMainTopicChatId();
   const session = getSession(sessionId);
   if (!session) throw new HttpError(403, `unknown session: ${sessionId}`);
+  const rootCompany = getCompanyByRootChatId(session.chatId);
+  const mainTopic = rootCompany?.rootChatId ?? legacyMainTopic;
+  if (!mainTopic) throw new HttpError(500, 'mainTopicChatId/company root not configured — run `botmux create-company --ceo <bot>` or `botmux config set-main-topic <chatId>`');
 
   if (session.chatId === mainTopic) {
     // —— 主话题分支：与 authzCheck (main-bot-playbook.ts) 行为 100% 一致 ——
-    const claudeApp = resolveBotIdent('claude').larkAppId;
-    if (session.larkAppId !== claudeApp) {
-      throw new HttpError(403, `only main bot can spawn subtasks (session.larkAppId=${session.larkAppId}, expected=${claudeApp})`);
+    const mainBotApp = rootCompany?.ceoLarkAppId ?? resolveBotIdent(getMainTopicBotRef(mainTopic)).larkAppId;
+    if (session.larkAppId !== mainBotApp) {
+      throw new HttpError(403, `only main bot can spawn subtasks (session.larkAppId=${session.larkAppId}, expected=${mainBotApp})`);
     }
     return {
       callerChatId: session.chatId, callerBotAppId: session.larkAppId,
@@ -170,19 +183,19 @@ async function authzSpawn(sessionId: string): Promise<SpawnCtx> {
   if (task.spawnable !== true) {
     throw new HttpError(403, `task ${task.taskId} is not spawnable (create 时未授权 --spawnable)`);
   }
-  const botOpenId = sessionBotOpenId(session.larkAppId);
-  const mainBot = task.bots.find(b => b.role === 'main');
-  if (!botOpenId || botOpenId !== mainBot?.openId) {
+  const callerBot = sessionTaskBot(task, session.larkAppId);
+  if (callerBot?.role !== 'main') {
     throw new HttpError(403, `only this chat's registered executor (main bot) can spawn (caller larkAppId=${session.larkAppId})`);
   }
   // owner 链 + 跨 app scope 防护 (蔻黛克斯 review blocker)：open_id 是 app-scoped，而 createSubtask
-  // 固定以 Claude app 建群 (group-creator 合同: userOpenIds 必须 creator scope)。非 Claude 执行者
+  // 固定以配置的 main-bot app 建群 (group-creator 合同: userOpenIds 必须 creator scope)。非 main-bot 执行者
   // 会话里的 ownerOpenId 是它自己 app 视角的 id，直接用会让 owner 邀请失败 → base relay 投不进新群。
-  // 所以只有 Claude 会话的 ownerOpenId 可直接用；其余回退父任务 requester —— 整条建树链的 requester
-  // 都由 Claude 链路写入，恒为 Claude scope。'owner' 是历史占位符，视为无效。
-  const claudeApp = resolveBotIdent('claude').larkAppId;
+  // 所以只有 main-bot 会话的 ownerOpenId 可直接用；其余回退父任务 requester —— 整条建树链的 requester
+  // 都由 main-bot 链路写入，恒为 main-bot scope。'owner' 是历史占位符，视为无效。
+  const taskCompany = getCompanyByRootChatId(task.rootChatId ?? rootOf(task, getMainTopicChatId()));
+  const mainBotApp = taskCompany?.ceoLarkAppId ?? resolveBotIdent(getMainTopicBotRef(taskCompany?.rootChatId)).larkAppId;
   const inheritedRequester = task.requester && task.requester !== 'owner' ? task.requester : undefined;
-  const ownerOpenId = (session.larkAppId === claudeApp ? session.ownerOpenId : undefined) ?? inheritedRequester;
+  const ownerOpenId = (session.larkAppId === mainBotApp ? session.ownerOpenId : undefined) ?? inheritedRequester;
   return {
     callerChatId: session.chatId, callerBotAppId: session.larkAppId,
     rootMessageId: session.rootMessageId,
@@ -205,10 +218,18 @@ function assertNoCycle(startChatId: string, mainTopic: string): void {
   }
 }
 
-/** 父群 orchestrator bot 解析：父群是任务群 → 它登记的 main bot；父=主话题 → 克劳德。 */
+/** 父群 orchestrator bot 解析：父群是任务群 → 它登记的 main bot；父=主话题 → 配置的 main bot。 */
+function resolveCompanyCeoOpenId(company: CompanyConfig | null): string {
+  if (company?.ceoOpenId) return company.ceoOpenId;
+  if (company?.ceoLarkAppId) return resolveBotIdent(company.ceoLarkAppId).openId;
+  return resolveBotIdent(getMainTopicBotRef(company?.rootChatId)).openId;
+}
+
 function parentOrchestratorOpenId(task: SubTask): string {
   const parentTask = getByChatId(task.parentChatId);
-  return parentTask?.bots.find(b => b.role === 'main')?.openId ?? resolveBotIdent('claude').openId;
+  const company = getCompanyByRootChatId(task.rootChatId ?? task.parentChatId);
+  return parentTask?.bots.find(b => b.role === 'main')?.openId
+    ?? resolveCompanyCeoOpenId(company);
 }
 
 /** 父群主 bot 鉴权：session 合法 + 是该 task 父群的 orchestrator bot（父=主话题→克劳德）+
@@ -337,12 +358,13 @@ export async function createSubtask(req: CreateSubtaskReq): Promise<{ taskId: st
   if (isExecutorGroup && req.noObserver !== true && !resolved.some(r => r.ident.larkAppId === tillyApp)) {
     resolved.push(resolveBotEntry('tilly:observer'));
   }
-  const claudeApp = resolveBotIdent('claude').larkAppId;
+  const company = getCompanyByRootChatId(ctx.rootChatId);
+  const creatorApp = company?.ceoLarkAppId ?? resolveBotIdent(getMainTopicBotRef(ctx.rootChatId)).larkAppId;
   const larkAppIds = resolved.map(r => r.ident.larkAppId);
   const subtaskBots: SubTaskBot[] = resolved.map(r => ({ openId: r.ident.openId, name: r.name, role: r.role, larkAppId: r.ident.larkAppId }));
 
   await ensureCloneScopesProvisioned({
-    creatorLarkAppId: claudeApp,
+    creatorLarkAppId: creatorApp,
     chatId: ctx.callerChatId,
     bots: resolved.map(r => ({ larkAppId: r.ident.larkAppId, name: r.name, role: r.role })),
   });
@@ -356,7 +378,7 @@ export async function createSubtask(req: CreateSubtaskReq): Promise<{ taskId: st
 
   const { entry, cacheHit } = await getOrCompute(idempotencyKey, async (): Promise<IdempotencyEntry> => {
     const result = await createGroupWithBots({
-      creatorLarkAppId: claudeApp,
+      creatorLarkAppId: creatorApp,
       larkAppIds,
       // base relay 以 owner 身份写「接收群组」字段；owner 不在目标群时，
       // Base 会把该 oc_id 判为 800030410/not_found，kickoff/supplement 永远投不出。
@@ -422,8 +444,8 @@ export async function reportProgress(req: ReportProgressReq): Promise<{ cmdId?: 
   if (session.chatId !== task.chatId) {
     throw new HttpError(403, `report_progress must come from the subtask chat (session.chatId=${session.chatId}, task.chatId=${task.chatId})`);
   }
-  const botOpenId = sessionBotOpenId(session.larkAppId);
-  if (!botOpenId || !task.bots.some(b => b.openId === botOpenId)) {
+  const callerBot = sessionTaskBot(task, session.larkAppId);
+  if (!callerBot) {
     throw new HttpError(403, `reporting bot (larkAppId=${session.larkAppId}) is not a participant of this subtask`);
   }
   if (!req.summary?.trim()) throw new HttpError(400, 'missing summary');
@@ -537,8 +559,7 @@ export async function requestReview(req: RequestReviewReq): Promise<{ cmdId: str
     throw new HttpError(403, `request_review must come from the subtask chat (session.chatId=${session.chatId}, task.chatId=${task.chatId})`);
   }
   // 发起方必须是本任务的 main(执行者)
-  const botOpenId = sessionBotOpenId(session.larkAppId);
-  const me = botOpenId ? task.bots.find(b => b.openId === botOpenId) : undefined;
+  const me = sessionTaskBot(task, session.larkAppId);
   if (!me) throw new HttpError(403, `requesting bot (larkAppId=${session.larkAppId}) is not a participant of this subtask`);
   if (me.role !== 'main') throw new HttpError(403, `only the executor(main) bot can request review (caller role=${me.role})`);
   // 必须有 reviewer 可唤 (蔻黛克斯 #1-blocker3：空集合不发空名单)
@@ -839,8 +860,7 @@ export async function managerReport(req: ManagerReportReq): Promise<{ taskId: st
   if (!task) throw new HttpError(404, `subtask not found: ${req.taskId}`);
   if (!isManager(task)) throw new HttpError(400, `manager-report 仅 manager 子群适用（task ${req.taskId} 是 executor）`);
   if (session.chatId !== task.chatId) throw new HttpError(403, `manager-report must come from the manager subtask chat`);
-  const botOpenId = sessionBotOpenId(session.larkAppId);
-  const me = botOpenId ? task.bots.find(b => b.openId === botOpenId) : undefined;
+  const me = sessionTaskBot(task, session.larkAppId);
   if (!me || me.role !== 'main') throw new HttpError(403, `only the manager's executor(main) bot can manager-report`);
   if (!req.summary?.trim()) throw new HttpError(400, 'missing summary');
   // 蔻黛 M1：运行时枚举校验（TS 类型挡不住 IPC/CLI 输入）。非法 urgency 会绕过 reason 门控、写脏 store。

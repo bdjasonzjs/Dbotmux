@@ -28,8 +28,13 @@ vi.mock('../src/core/main-bot-playbook.js', () => {
     claude: { larkAppId: 'app_claude', openId: 'ou_claude', name: '克劳德' },
     codex: { larkAppId: 'app_codex', openId: 'ou_codex', name: '蔻黛克斯' },
     tilly: { larkAppId: 'app_coco', openId: 'ou_coco', name: '缇蕾' },
+    app_claude: { larkAppId: 'app_claude', openId: 'ou_claude', name: '克劳德' },
+    app_codex: { larkAppId: 'app_codex', openId: 'ou_codex', name: '蔻黛克斯' },
+    app_coco: { larkAppId: 'app_coco', openId: 'ou_coco', name: '缇蕾' },
     // a registered clone referenced by name/appId (N-bot)
     'claude-clone': { larkAppId: 'app_clone', openId: 'ou_clone', name: 'claude-clone' },
+    'app_new': { larkAppId: 'app_new', openId: 'ou_new', name: 'NewBot' },
+    'new-engine': { larkAppId: 'app_new', openId: 'ou_new', name: 'NewBot' },
   };
   // Mirror real resolveBotIdent: built-in aliases (c/k/t + full names, any case)
   // canonicalize first; unknown ref throws (→ orchestrator maps to 400).
@@ -57,7 +62,11 @@ vi.mock('../src/services/spawn-idempotency-store.js', () => ({
 }));
 vi.mock('../src/services/session-store.js', () => ({ getSession: (id: string) => mockSessions.get(id) }));
 // 嵌套改造后 createSubtask 走内部 authzSpawn（authzCheck 不再被 v2 调用）：主话题判定靠 main-topic-config。
-vi.mock('../src/services/main-topic-config.js', () => ({ getMainTopicChatId: () => 'oc_main' }));
+vi.mock('../src/services/main-topic-config.js', () => ({
+  getMainTopicChatId: () => 'oc_main',
+  getMainTopicBotRef: () => 'claude',
+  getCompanyByRootChatId: () => null,
+}));
 
 import {
   createSubtask, reportProgress, querySubtask, finishSubtask, supplementSubtask, requestReview, V2_MARKER,
@@ -422,6 +431,32 @@ describe('reportProgress', () => {
     await expect(reportProgress({ sessionId: 'sess_codex', taskId: t.taskId, type: 'need_help', summary: 'x' }))
       .rejects.toMatchObject({ status: 403 });
   });
+
+  it('generic bot appId participant can report; sessionBotOpenId is not limited to claude/codex/tilly', async () => {
+    const t = await createSubTask({
+      taskId: 'st_newbot', chatId: 'oc_new_sub', parentChatId: 'oc_main', parentMessageId: 'om_root',
+      goal: 'future bot task', acceptance: null,
+      bots: [{ openId: 'ou_new', name: 'NewBot', role: 'main', larkAppId: 'app_new' }],
+      requester: 'ou_jason', createdBy: 'NewBot', idempotencyKey: 'k_newbot',
+    });
+    await transitionStatus(t.taskId, 'observing');
+    subSession('sess_newbot', 'oc_new_sub', 'app_new');
+    const r = await reportProgress({ sessionId: 'sess_newbot', taskId: t.taskId, type: 'progress', slug: 'm1', summary: 'done' });
+    expect(r.taskId).toBe(t.taskId);
+  });
+
+  it('app-scoped open_id mismatch: larkAppId participant can report even when stored openId differs', async () => {
+    const t = await createSubTask({
+      taskId: 'st_app_scope_report', chatId: 'oc_app_scope_sub', parentChatId: 'oc_main', parentMessageId: 'om_root',
+      goal: 'app scope task', acceptance: null,
+      bots: [{ openId: 'ou_claude_from_other_app', name: '克劳德', role: 'main', larkAppId: 'app_claude' }],
+      requester: 'ou_jason', createdBy: 'claude', idempotencyKey: 'k_app_scope_report',
+    });
+    await transitionStatus(t.taskId, 'observing');
+    subSession('sess_app_scope_report', 'oc_app_scope_sub', 'app_claude');
+    const r = await reportProgress({ sessionId: 'sess_app_scope_report', taskId: t.taskId, type: 'done', summary: '完成' });
+    expect(r.taskId).toBe(t.taskId);
+  });
 });
 
 // ─── query_subtask (边界6) ────────────────────────────────────────────────────
@@ -615,6 +650,22 @@ describe('requestReview', () => {
     expect(cmd.direction).toBe('parent_to_child');
     expect(cmd.targetChatId).toBe('oc_sub');
     expect(cmd.payload.targetRole).toBe('collab');
+  });
+
+  it('app-scoped open_id mismatch: request_review 按 larkAppId 识别 main 执行者', async () => {
+    const t = await createSubTask({
+      chatId: 'oc_sub', parentChatId: 'oc_main', parentMessageId: 'om_root',
+      goal: '修 bug', acceptance: null,
+      bots: [
+        { openId: 'ou_claude_from_other_app', name: '克劳德', role: 'main', larkAppId: 'app_claude' },
+        { openId: 'ou_codex_from_other_app', name: '蔻黛克斯', role: 'collab', larkAppId: 'app_codex' },
+      ],
+      requester: 'ou_jason', createdBy: 'claude', idempotencyKey: 'kr_app_scope',
+    });
+    await transitionStatus(t.taskId, 'observing');
+    subSession('sess_sub', 'oc_sub', 'app_claude');
+    const res = await requestReview({ sessionId: 'sess_sub', taskId: t.taskId, summary: 'https://x/doc' });
+    expect(getCommand(res.cmdId)!.commandType).toBe('request_review');
   });
 
   it('summary 无可打开链接/绝对路径 → 400', async () => {

@@ -55,15 +55,20 @@ function findMainBotDaemonPort(): number | null {
   }
   const STALE_MS = 90_000;
   const now = Date.now();
+  const fresh: DaemonInfoFile[] = [];
   for (const f of files) {
     try {
       const d = JSON.parse(readFileSync(join(REGISTRY_DIR, f), 'utf-8')) as DaemonInfoFile;
-      if (d.botName !== CLAUDE_BOT_NAME_ZH) continue;
       if (now - d.lastHeartbeat > STALE_MS) continue;
-      return d.ipcPort;
+      fresh.push(d);
     } catch { /* skip corrupt file */ }
   }
-  return null;
+  const envAppId = process.env.LARK_APP_ID;
+  if (envAppId) {
+    const own = fresh.find(d => d.larkAppId === envAppId);
+    if (own) return own.ipcPort;
+  }
+  return fresh.find(d => d.botName === CLAUDE_BOT_NAME_ZH)?.ipcPort ?? null;
 }
 
 function parseArgs(argv: string[]): SubtaskCreateArgs | { error: string } {

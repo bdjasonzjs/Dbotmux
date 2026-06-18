@@ -54,6 +54,8 @@ vi.mock('../src/services/session-store.js', () => ({
 let fakeMainTopic: string | undefined;
 vi.mock('../src/services/main-topic-config.js', () => ({
   getMainTopicChatId: () => fakeMainTopic,
+  getMainTopicBotRef: () => 'claude',
+  getCompanyByRootChatId: () => null,
   isTillyMainTopicConversationDenied: () => false,
 }));
 
@@ -152,7 +154,7 @@ describe('MainBotPlaybook.spawnSubTask (P1 commit #6)', () => {
         ownerOpenId: 'ou_jason',
       });
       await expect(pb.spawnSubTask({ sessionId: 's4', purpose: 'x', taskType: 'misc' }))
-        .rejects.toThrow(/only allowed from main topic chat/);
+        .rejects.toThrow(/only allowed from a company\/root main topic chat/);
     });
   });
 

@@ -98,6 +98,7 @@ describe('createGroupWithBots — P0/4 main-bot dispatch', () => {
 
     expect(result.ok).toBe(true);
     expect(result.chatId).toBe('oc_new_chat');
+    expect(result.chatContextError).toContain('disk full');
   });
 
   it('does not call dispatchChatCreated when createChat throws (chat never created)', async () => {

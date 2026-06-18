@@ -1384,16 +1384,19 @@ ipcRoute('POST', '/api/progress-report', async (req, res) => {
     if (!body.sessionId || !body.summary || !body.slug) {
       return jsonRes(res, 400, { ok: false, error: 'missing sessionId/summary/slug' });
     }
-    // authzCheck: verify session exists + is main bot (Claude). Unlike
-    // spawnSubTask, progress reports can come from ANY chat (sub-chat
-    // included), so we don't enforce mainTopic.
+    // authzCheck: verify session exists + is that Company's CEO/main bot.
+    // Unlike spawnSubTask, progress reports can come from ANY chat (sub-chat
+    // included), so derive the Company from the subtask tree when available.
     const session = (await import('./services/session-store.js')).getSession(body.sessionId);
     if (!session) return jsonRes(res, 403, { ok: false, error: `unknown session: ${body.sessionId}` });
-    // Resolve Claude's app id once via Playbook helper
     const { resolveBotIdent } = await import('./core/main-bot-playbook.js');
-    const claudeApp = resolveBotIdent('claude').larkAppId;
-    if (session.larkAppId !== claudeApp) {
-      return jsonRes(res, 403, { ok: false, error: 'only main bot can publish progress reports' });
+    const { getCompanyByRootChatId, getMainTopicBotRef } = await import('./services/main-topic-config.js');
+    const { getByChatId } = await import('./services/subtask-store.js');
+    const task = getByChatId(session.chatId);
+    const company = getCompanyByRootChatId(task?.rootChatId ?? task?.parentChatId ?? session.chatId);
+    const expectedMainApp = company?.ceoLarkAppId ?? resolveBotIdent(getMainTopicBotRef(company?.rootChatId)).larkAppId;
+    if (session.larkAppId !== expectedMainApp) {
+      return jsonRes(res, 403, { ok: false, error: 'only this Company main bot can publish progress reports' });
     }
     // P2-rev1 #4 (妹妹 review): subChatId is ALWAYS session.chatId, never
     // accepted from caller body — CLI shouldn't be able to ghost-report

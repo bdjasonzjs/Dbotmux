@@ -31,8 +31,23 @@ function configFilePath(): string {
 
 interface BotmuxConfigFile {
   mainTopicChatId?: string;
+  /** Bot ref that is authorized to act as the main/CEO bot in mainTopicChatId.
+   *  Accepts the same refs as resolveBotIdent: claude|codex|tilly, botName,
+   *  or larkAppId. Defaults to "claude" for backward compatibility. */
+  mainTopicBotRef?: string;
+  companies?: CompanyConfig[];
   // ... future fields go here; readers must tolerate unknown keys
   [k: string]: unknown;
+}
+
+export interface CompanyConfig {
+  id: string;
+  name: string;
+  rootChatId: string;
+  ceoBotRef: string;
+  ceoLarkAppId?: string;
+  ceoOpenId?: string;
+  createdAt: string;
 }
 
 function readConfigFile(): BotmuxConfigFile {
@@ -72,6 +87,52 @@ export function getMainTopicChatId(): string | undefined {
   return undefined;
 }
 
+export function listCompanies(): CompanyConfig[] {
+  const companies = readConfigFile().companies;
+  return Array.isArray(companies) ? companies.filter(c => !!c?.rootChatId && !!c?.ceoBotRef) : [];
+}
+
+export function getCompanyByRootChatId(rootChatId: string | undefined | null): CompanyConfig | null {
+  if (!rootChatId) return null;
+  return listCompanies().find(c => c.rootChatId === rootChatId) ?? null;
+}
+
+export function getMainTopicBotRef(rootChatId?: string): string {
+  const company = getCompanyByRootChatId(rootChatId);
+  if (company) return company.ceoBotRef;
+  const fromFile = readConfigFile().mainTopicBotRef;
+  if (typeof fromFile === 'string' && fromFile.trim()) return fromFile.trim();
+  return 'claude';
+}
+
+export function upsertCompany(company: Omit<CompanyConfig, 'createdAt'> & { createdAt?: string }): CompanyConfig {
+  const current = readConfigFile();
+  const companies = Array.isArray(current.companies) ? [...current.companies] : [];
+  const nextCompany: CompanyConfig = {
+    ...company,
+    createdAt: company.createdAt ?? new Date().toISOString(),
+  };
+  const idx = companies.findIndex(c => c.id === nextCompany.id || c.rootChatId === nextCompany.rootChatId);
+  if (idx >= 0) companies[idx] = { ...companies[idx], ...nextCompany };
+  else companies.push(nextCompany);
+  writeConfigFile({ ...current, companies });
+  try {
+    setRootChatId(nextCompany.rootChatId);
+  } catch (err) {
+    logger.warn(`[main-topic-config] failed to sync company rootChatId: ${err}`);
+  }
+  return nextCompany;
+}
+
+export function removeCompany(idOrRootChatId: string): boolean {
+  const current = readConfigFile();
+  const companies = Array.isArray(current.companies) ? current.companies : [];
+  const nextCompanies = companies.filter(c => c.id !== idOrRootChatId && c.rootChatId !== idOrRootChatId);
+  if (nextCompanies.length === companies.length) return false;
+  writeConfigFile({ ...current, companies: nextCompanies });
+  return true;
+}
+
 /**
  * Persist `mainTopicChatId` to ~/.botmux/config.json and sync the same
  * value into ChatTopology.rootChatId so they don't drift.
@@ -97,6 +158,18 @@ export function setMainTopicChatId(chatId: string | null): void {
   } catch (err) {
     logger.warn(`[main-topic-config] failed to sync ChatTopology.rootChatId: ${err}`);
   }
+}
+
+export function setMainTopicBotRef(botRef: string | null): void {
+  const current = readConfigFile();
+  const next: BotmuxConfigFile = { ...current };
+  if (botRef === null || !botRef.trim() || botRef.trim() === 'claude') {
+    delete next.mainTopicBotRef;
+  } else {
+    next.mainTopicBotRef = botRef.trim();
+  }
+  writeConfigFile(next);
+  logger.info(`[main-topic-config] mainTopicBotRef set to ${next.mainTopicBotRef ?? 'claude'}`);
 }
 
 /**

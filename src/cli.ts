@@ -1983,6 +1983,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
 新建飞书群:
   create-group --bot <name> [--bot ...] [--name "群名"]
                                        用指定 bot 起新群；详见 \`botmux create-group --help\`
+  create-company --ceo <bot> [--name "Company"]
+                                       创建/注册独立 CEO Company；详见 \`botmux create-company --help\`
 
 配置目录: ~/.botmux/
 文档: https://github.com/deepcoldy/botmux
@@ -3019,6 +3021,165 @@ botmux create-group — 用一组机器人新建飞书群
   }
 }
 
+// ─── Create-company subcommand ───────────────────────────────────────────────
+
+async function cmdCreateCompany(rest: string[]): Promise<void> {
+  if (rest.includes('--help') || rest.includes('-h')) {
+    console.log(`
+botmux create-company — 一键创建一套独立 CEO Company
+
+用法:
+  botmux create-company --ceo <botName|larkAppId|cliId> [--name "Company 名"]
+                        [--working-dir <path>] [--chat-id oc_xxx]
+                        [--owner-open-id ou_xxx]
+
+行为:
+  - 不传 --chat-id：用 --ceo 指定的 bot 作为 creator 新建 CEO 主话题群。
+  - 传 --chat-id：不建群，只把这个既有群注册为该 CEO bot 的 company root。
+  - 新建 root 时必须能从 CEO bot allowedUsers 解析 owner，或显式传 --owner-open-id。
+  - 写入 ~/.botmux/config.json companies[]，每家公司有独立 rootChatId + ceoBotRef。
+  - 同步 ChatTopology.rootChatId，便于 dashboard 立即看到 root。
+
+输出: stdout JSON（company + chatId），stderr 打人类提示。
+`);
+    return;
+  }
+  process.env.SESSION_DATA_DIR ??= resolveDataDir();
+  const ceoRef = argValue(rest, '--ceo');
+  if (!ceoRef?.trim()) {
+    console.error('用法: botmux create-company --ceo <botName|larkAppId|cliId> [--name "Company 名"] [--chat-id oc_xxx]');
+    process.exit(2);
+  }
+  const name = argValue(rest, '--name')?.trim() || `${ceoRef.trim()} Company`;
+  const existingChatId = argValue(rest, '--chat-id')?.trim();
+  const explicitOwnerOpenId = argValue(rest, '--owner-open-id', '--owner')?.trim();
+  const workingDirArg = argValue(rest, '--working-dir', '--cwd', '--dir');
+  let bindWorkingDir: string | undefined;
+  if (workingDirArg !== undefined) {
+    const validation = validateWorkingDir(workingDirArg);
+    if (!validation.ok) {
+      console.error(`--working-dir ${validation.error}`);
+      process.exit(1);
+    }
+    bindWorkingDir = workingDirArg;
+  }
+
+  const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
+  const fullConfigs = loadBotConfigs();
+  const botConfigs = fullConfigs.map(c => ({ larkAppId: c.larkAppId, cliId: c.cliId }));
+  const dataDir = resolveDataDir();
+  const botInfoPath = join(dataDir, 'bots-info.json');
+  type BotInfoEntry = { larkAppId: string; botOpenId: string | null; botName: string | null; cliId: string };
+  let botInfoEntries: BotInfoEntry[] = [];
+  try { if (existsSync(botInfoPath)) botInfoEntries = JSON.parse(readFileSync(botInfoPath, 'utf-8')); } catch { /* */ }
+
+  const { resolveBotRefs } = await import('./cli/create-group-resolver.js');
+  const resolved = resolveBotRefs([ceoRef], botConfigs, botInfoEntries.map(b => ({ larkAppId: b.larkAppId, botName: b.botName })));
+  for (const w of resolved.ambiguousWarnings) console.error(`⚠️  ${w}`);
+  if (resolved.invalid.length > 0 || resolved.larkAppIds.length !== 1) {
+    console.error(`无法解析 --ceo: ${ceoRef}`);
+    process.exit(1);
+  }
+  const ceoLarkAppId = resolved.larkAppIds[0];
+  const ceoCfg = fullConfigs.find(c => c.larkAppId === ceoLarkAppId);
+  if (!ceoCfg) {
+    console.error(`CEO bot config not found: ${ceoLarkAppId}`);
+    process.exit(1);
+  }
+  registerBot(ceoCfg);
+
+  const ceoInfo = botInfoEntries.find(b => b.larkAppId === ceoLarkAppId);
+  const { resolveAllowedUsers } = await import('./im/lark/client.js');
+  let ownerOpenIds: string[] = [];
+  try {
+    ownerOpenIds = await resolveAllowedUsers(ceoLarkAppId, ceoCfg.allowedUsers ?? []);
+  } catch (err: any) {
+    console.error(`⚠️  解析 CEO allowedUsers 失败: ${err?.message ?? err}（继续）`);
+  }
+
+  let rootChatId = existingChatId;
+  if (!rootChatId) {
+    const { createGroupWithBots } = await import('./services/group-creator.js');
+    const ownerOpenId = explicitOwnerOpenId || ownerOpenIds[0];
+    if (!ownerOpenId) {
+      console.error('CEO root 创建失败：无法从 CEO bot allowedUsers 解析 owner。请给该 bot 配 allowedUsers，或显式传 --owner-open-id <该 CEO app 视角下的用户 open_id>。');
+      process.exit(1);
+    }
+    try {
+      const result = await createGroupWithBots({
+        creatorLarkAppId: ceoLarkAppId,
+        larkAppIds: [ceoLarkAppId],
+        name,
+        userOpenIds: ownerOpenId ? [ownerOpenId] : [],
+        transferOwnerTo: ownerOpenId,
+        notifyOwnerOpenId: ownerOpenId,
+        bindWorkingDir,
+        sourceChatId: null,
+        purpose: `Company root: ${name}`,
+      });
+      if (bindWorkingDir) {
+        const ceoOncall = result.oncallBindings.find(b => b.larkAppId === ceoLarkAppId);
+        if (!ceoOncall?.ok) {
+          console.error(`CEO root oncall 绑定失败: ${ceoOncall?.error ?? 'missing_binding_result'}`);
+          process.exit(1);
+        }
+      }
+      if (result.chatContextError) {
+        console.error(`CEO root ChatContext 初始化失败: ${result.chatContextError}`);
+        process.exit(1);
+      }
+      rootChatId = result.chatId;
+    } catch (err: any) {
+      console.error(`创建 CEO 主话题群失败: ${err?.message ?? err}`);
+      process.exit(1);
+    }
+  } else {
+    const { isInChat } = await import('./services/groups-store.js');
+    const ceoInChat = await isInChat(ceoLarkAppId, rootChatId);
+    if (!ceoInChat) {
+      console.error(`既有群 ${rootChatId} 不能升级为 Company：CEO bot ${ceoInfo?.botName ?? ceoRef} (${ceoLarkAppId}) 不在群内。请先把该 bot 加入群，或不传 --chat-id 让 create-company 自动建群。`);
+      process.exit(1);
+    }
+    if (bindWorkingDir) {
+      const { bindOncall } = await import('./services/oncall-store.js');
+      const br = await bindOncall(ceoLarkAppId, rootChatId, bindWorkingDir);
+      if (!br.ok) {
+        console.error(`oncall 绑定失败: ${br.reason}`);
+        process.exit(1);
+      }
+    }
+    try {
+      const { dispatchChatCreated } = await import('./im/lark/chat-created-handler.js');
+      await dispatchChatCreated({
+        chatId: rootChatId,
+        larkAppId: ceoLarkAppId,
+        originType: 'bot_spawned',
+        parentChatId: null,
+        purpose: `Company root: ${name}`,
+      });
+    } catch (err: any) {
+      console.error(`既有群 ChatContext 初始化失败: ${err?.message ?? err}`);
+      process.exit(1);
+    }
+  }
+
+  const { upsertCompany } = await import('./services/main-topic-config.js');
+  const company = upsertCompany({
+    id: `company-${rootChatId}`,
+    name,
+    rootChatId,
+    ceoBotRef: ceoRef.trim(),
+    ceoLarkAppId,
+    ceoOpenId: ceoInfo?.botOpenId ?? undefined,
+  });
+
+  const link = `https://applink.feishu.cn/client/chat/open?openChatId=${encodeURIComponent(rootChatId)}`;
+  console.error(`✅ Company 已创建/注册：${name}`);
+  console.error(`CEO: ${ceoInfo?.botName ?? ceoRef} (${ceoLarkAppId})`);
+  console.error(`Root: ${link}`);
+  process.stdout.write(`${JSON.stringify({ ok: true, company, chatId: rootChatId })}\n`);
+}
+
 // ─── Bots subcommand ─────────────────────────────────────────────────────────
 
 async function cmdBots(sub: string, rest: string[]): Promise<void> {
@@ -3236,6 +3397,7 @@ switch (command) {
   }
   case 'send':     await cmdSend(process.argv.slice(3)); break;
   case 'create-group': await cmdCreateGroup(process.argv.slice(3)); break;
+  case 'create-company': await cmdCreateCompany(process.argv.slice(3)); break;
   case 'chat-mode': await cmdChatMode(process.argv.slice(3)); break;
   case 'subtask-create': {
     const { cmdSubtaskCreate } = await import('./cli/subtask-create.js');

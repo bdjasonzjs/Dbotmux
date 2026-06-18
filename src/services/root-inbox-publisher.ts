@@ -14,10 +14,11 @@
  *
  * 卡片格式独立 — progress 用 ✅ emoji，request_decision 用 ❓。
  */
-import { getMainTopicChatId } from './main-topic-config.js';
+import { getCompanyByRootChatId, getMainTopicChatId } from './main-topic-config.js';
 import * as rootInbox from './root-inbox-store.js';
 import { sendOrUpdateCard } from './root-inbox-card-renderer.js';
 import { logger } from './../utils/logger.js';
+import { getByChatId } from './subtask-store.js';
 
 export interface PublishOpts {
   /** Caller's session id (for audit + future authz; not stored). */
@@ -74,12 +75,15 @@ async function publishGeneric(
     summary: opts.summary,
   });
 
-  const mainTopic = getMainTopicChatId();
+  const task = getByChatId(opts.subChatId);
+  const company = getCompanyByRootChatId(task?.rootChatId ?? task?.parentChatId);
+  const mainTopic = company?.rootChatId ?? getMainTopicChatId();
   if (!mainTopic) {
     logger.debug('[root-inbox-publisher] mainTopic not configured — RootInbox written but card not sent');
     return { mainTopicConfigured: false, itemId: item.id, inserted, rootCardMessageId: item.rootCardMessageId };
   }
 
-  const messageId = await sendOrUpdateCard(opts.larkAppId, mainTopic, item);
+  const senderAppId = company?.ceoLarkAppId ?? opts.larkAppId;
+  const messageId = await sendOrUpdateCard(senderAppId, mainTopic, item);
   return { mainTopicConfigured: true, itemId: item.id, inserted, rootCardMessageId: messageId };
 }

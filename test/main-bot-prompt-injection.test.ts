@@ -8,10 +8,13 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 let fakeMainTopic: string | undefined;
+let fakeCompany: { rootChatId: string; name: string; ceoBotRef: string; ceoLarkAppId?: string } | null;
 const fakeBotsByAppId = new Map<string, { config: { cliId: string } }>();
 
 vi.mock('../src/services/main-topic-config.js', () => ({
   getMainTopicChatId: () => fakeMainTopic,
+  getMainTopicBotRef: (rootChatId?: string) => fakeCompany && fakeCompany.rootChatId === rootChatId ? fakeCompany.ceoBotRef : 'claude',
+  getCompanyByRootChatId: (rootChatId?: string) => fakeCompany && fakeCompany.rootChatId === rootChatId ? fakeCompany : null,
   isTillyMainTopicConversationDenied: () => false,
 }));
 
@@ -35,9 +38,10 @@ async function freshImport() {
 
 beforeEach(() => {
   fakeMainTopic = undefined;
+  fakeCompany = null;
   fakeBotsByAppId.clear();
-  fakeBotsByAppId.set('cli_claude', { config: { cliId: 'claude-code' } });
-  fakeBotsByAppId.set('cli_codex',  { config: { cliId: 'codex' } });
+  fakeBotsByAppId.set('cli_claude', { config: { cliId: 'claude-code', larkAppId: 'cli_claude' } } as any);
+  fakeBotsByAppId.set('cli_codex',  { config: { cliId: 'codex', larkAppId: 'cli_codex' } } as any);
 });
 
 describe('buildMainBotPromptBlock (P1 commit #8)', () => {
@@ -47,8 +51,31 @@ describe('buildMainBotPromptBlock (P1 commit #8)', () => {
       const { buildMainBotPromptBlock } = await freshImport();
       const block = buildMainBotPromptBlock('oc_flumy', 'cli_claude');
       expect(block).toContain('<main_bot_routing>');
-      expect(block).toContain('Flumy 主话题');
+      expect(block).toContain('CEO 主话题');
       expect(block).toContain('botmux subtask-start');
+    });
+  });
+
+  describe('Company mode — configured CEO bot gets its own identity prompt', () => {
+    it('renders Codex CEO prompt for a Codex company root without setting legacy mainTopicChatId', async () => {
+      fakeMainTopic = undefined;
+      fakeCompany = { rootChatId: 'oc_codex_company', name: 'Codex Company', ceoBotRef: 'codex', ceoLarkAppId: 'cli_codex' };
+      const { buildMainBotPromptBlock } = await freshImport();
+      const block = buildMainBotPromptBlock('oc_codex_company', 'cli_codex');
+      expect(block).toContain('<main_bot_routing>');
+      expect(block).toContain('Codex Company');
+      expect(block).toContain('~/.codex/AGENTS.override.md');
+      expect(block).not.toContain('~/.claude/CLAUDE.md');
+    });
+
+    it('accepts a generic company CEO by exact larkAppId without alias knowledge', async () => {
+      fakeMainTopic = undefined;
+      fakeBotsByAppId.set('cli_newbot', { config: { cliId: 'new-engine', larkAppId: 'cli_newbot' } } as any);
+      fakeCompany = { rootChatId: 'oc_new_company', name: 'NewBot Company', ceoBotRef: 'new-engine', ceoLarkAppId: 'cli_newbot' };
+      const { buildMainBotPromptBlock } = await freshImport();
+      const block = buildMainBotPromptBlock('oc_new_company', 'cli_newbot');
+      expect(block).toContain('NewBot Company');
+      expect(block).toContain('this bot engine');
     });
   });
 

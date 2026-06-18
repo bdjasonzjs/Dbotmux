@@ -19,7 +19,7 @@ import { join } from 'node:path';
 import { config } from '../config.js';
 import { createGroupWithBots, type CreateGroupOpts } from '../services/group-creator.js';
 import { getOrCompute, type IdempotencyEntry } from '../services/spawn-idempotency-store.js';
-import { getMainTopicChatId } from '../services/main-topic-config.js';
+import { getCompanyByRootChatId, getMainTopicBotRef, getMainTopicChatId } from '../services/main-topic-config.js';
 import * as sessionStore from '../services/session-store.js';
 import { SUBTASK_COLLAB_NORMS } from '../services/subtask-norms.js';
 import { logger } from '../utils/logger.js';
@@ -149,9 +149,10 @@ export function resolveBotIdent(ref: string): BotIdent {
   const bot = aliasCliId
     ? pickCanonicalByCliId(bots, aliasCliId)
     : (bots.find(b => b.larkAppId === ref)
-       ?? bots.find(b => b.botName && b.botName.toLowerCase() === ref.toLowerCase()));
+       ?? bots.find(b => b.botName && b.botName.toLowerCase() === ref.toLowerCase())
+       ?? pickCanonicalByCliId(bots, ref));
   if (!bot) {
-    throw new HttpError(500, `bot ref "${ref}" not found in bots-info.json (by alias/appId/name)`);
+    throw new HttpError(500, `bot ref "${ref}" not found in bots-info.json (by alias/appId/name/cliId)`);
   }
   // 2. Resolve open_id in **this daemon's app scope** via cross-ref file.
   //    This daemon's app id = process.env.LARK_APP_ID (set by daemon main)
@@ -241,18 +242,19 @@ function slug(s: string): string {
  *  unknown session, mainTopic not configured). */
 export async function authzCheck(sessionId: string): Promise<InternalSpawnContext> {
   if (!sessionId) throw new HttpError(400, 'missing sessionId');
-  const mainTopic = getMainTopicChatId();
-  if (!mainTopic) throw new HttpError(500, 'mainTopicChatId not configured — run `botmux config set-main-topic <chatId>`');
+  const legacyMainTopic = getMainTopicChatId();
 
   const session = sessionStore.getSession(sessionId);
   if (!session) throw new HttpError(403, `unknown session: ${sessionId}`);
+  const company = getCompanyByRootChatId(session.chatId);
+  const mainTopic = company?.rootChatId ?? legacyMainTopic;
+  if (!mainTopic) throw new HttpError(500, 'mainTopicChatId/company root not configured — run `botmux create-company --ceo <bot>` or `botmux config set-main-topic <chatId>`');
   if (session.chatId !== mainTopic) {
-    throw new HttpError(403, `spawnSubTask only allowed from main topic chat (session.chatId=${session.chatId}, mainTopic=${mainTopic})`);
+    throw new HttpError(403, `spawnSubTask only allowed from a company/root main topic chat (session.chatId=${session.chatId}, mainTopic=${mainTopic})`);
   }
-  // Only Claude bot (cliId='claude-code') is the main bot in P1.
-  const claudeApp = resolveBotIdent('claude').larkAppId;
-  if (session.larkAppId !== claudeApp) {
-    throw new HttpError(403, `only main bot can spawn subtasks (session.larkAppId=${session.larkAppId}, expected=${claudeApp})`);
+  const mainBotApp = company?.ceoLarkAppId ?? resolveBotIdent(getMainTopicBotRef(mainTopic)).larkAppId;
+  if (session.larkAppId !== mainBotApp) {
+    throw new HttpError(403, `only main bot can spawn subtasks (session.larkAppId=${session.larkAppId}, expected=${mainBotApp})`);
   }
   return {
     callerChatId: session.chatId,
@@ -271,7 +273,8 @@ export async function spawnSubTask(
 
   const botKeys = request.bots ?? ['claude', 'codex', 'tilly'];
   const resolvedBots = botKeys.map(key => ({ key, ident: resolveBotIdent(key) }));
-  const creatorApp = resolveBotIdent('claude').larkAppId;
+  const company = getCompanyByRootChatId(ctx.callerChatId);
+  const creatorApp = company?.ceoLarkAppId ?? resolveBotIdent(getMainTopicBotRef(ctx.callerChatId)).larkAppId;
   const allLarkAppIds = resolvedBots.map(b => b.ident.larkAppId);
 
   const chatContext = buildChatContext(request, ctx, resolvedBots);
