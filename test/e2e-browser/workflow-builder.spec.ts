@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect, type Page } from '@playwright/test';
 import { createReadStream } from 'node:fs';
 import { mkdtemp, rm, stat } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
@@ -17,9 +17,12 @@ const root = join(process.cwd(), 'dist', 'dashboard-web');
 let server: Server;
 let baseUrl: string;
 let savedDefinition: any;
+let updatedDefinition: any;
+let deletedWorkflowId: string | undefined;
 let currentRunRow: any;
 let currentSnapshot: any;
 let currentEvents: any[] = [];
+let workflowStore = new Map<string, WorkflowDefinition>();
 
 test.use({
   launchOptions: {
@@ -101,6 +104,59 @@ test.beforeAll(async () => {
         hasNewer: false,
       });
     }
+    if (url.pathname === '/api/workflows/definitions' && req.method === 'GET') {
+      return json(res, {
+        definitions: Array.from(workflowStore.values()).map((definition) => ({
+          workflowId: definition.workflowId,
+          version: definition.version,
+          path: `/tmp/${definition.workflowId}.workflow.json`,
+          revisionId: `test:${definition.workflowId}`,
+          nodeCount: Object.keys(definition.nodes).length,
+        })),
+      });
+    }
+    if (url.pathname === '/api/workflows/definitions/validate' && req.method === 'POST') {
+      const body = await readBody(req);
+      try {
+        const definition = parseWorkflowDefinition(body.definition);
+        return json(res, {
+          ok: true,
+          workflowId: definition.workflowId,
+          nodeCount: Object.keys(definition.nodes).length,
+          transitionCount: definition.flow?.transitions.length ?? 0,
+        });
+      } catch (err: any) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        return res.end(JSON.stringify({ ok: false, error: 'invalid_workflow', message: err?.message ?? String(err) }));
+      }
+    }
+    const defMatch = url.pathname.match(/^\/api\/workflows\/definitions\/([^/]+)$/);
+    if (defMatch && req.method === 'GET') {
+      const workflowId = decodeURIComponent(defMatch[1]);
+      const definition = workflowStore.get(workflowId);
+      if (!definition) {
+        res.writeHead(404, { 'content-type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'unknown_workflow' }));
+      }
+      return json(res, {
+        definition,
+        revisionId: `test:${workflowId}`,
+        path: `/tmp/${workflowId}.workflow.json`,
+      });
+    }
+    if (defMatch && req.method === 'PUT') {
+      const body = await readBody(req);
+      const definition = parseWorkflowDefinition(body.definition);
+      updatedDefinition = definition;
+      workflowStore.set(definition.workflowId, definition);
+      return json(res, { ok: true, workflowId: definition.workflowId, path: `/tmp/${definition.workflowId}.workflow.json` });
+    }
+    if (defMatch && req.method === 'DELETE') {
+      const workflowId = decodeURIComponent(defMatch[1]);
+      deletedWorkflowId = workflowId;
+      workflowStore.delete(workflowId);
+      return json(res, { ok: true, workflowId, deletedPath: `/tmp/${workflowId}.workflow.json.deleted` });
+    }
     if (url.pathname === '/events') {
       res.writeHead(200, {
         'content-type': 'text/event-stream',
@@ -111,9 +167,9 @@ test.beforeAll(async () => {
       return;
     }
     if (url.pathname === '/api/workflows/definitions' && req.method === 'POST') {
-      const chunks: Buffer[] = [];
-      for await (const chunk of req) chunks.push(chunk as Buffer);
-      savedDefinition = JSON.parse(Buffer.concat(chunks).toString('utf-8')).definition;
+      const body = await readBody(req);
+      savedDefinition = parseWorkflowDefinition(body.definition);
+      workflowStore.set(savedDefinition.workflowId, savedDefinition);
       return json(res, {
         ok: true,
         workflowId: savedDefinition.workflowId,
@@ -145,47 +201,84 @@ test.afterAll(async () => {
   await new Promise<void>((resolve, reject) => server.close((err) => err ? reject(err) : resolve()));
 });
 
-test('PM can configure and save the review loop without editing JSON', async ({ page }) => {
+test('PM can create, edit, connect, save, and delete a workflow on the canvas', async ({ page }) => {
   const pageErrors: string[] = [];
   page.on('pageerror', (err) => pageErrors.push(err.message));
   await page.goto(`${baseUrl}/#/workflows/builder`);
   await page.waitForTimeout(250);
   expect(pageErrors).toEqual([]);
-  await expect(page.getByRole('heading', { name: /可视化工作流编排器|Visual Workflow Builder/ })).toBeVisible();
-  await expect(page.getByLabel(/可视化工作流画布|Visual workflow canvas/i)).toBeVisible();
-  await expect(page.locator('.builder-flowchart')).toContainText('①');
-  await expect(page.locator('.builder-flowchart')).toContainText('②');
-  await expect(page.locator('.builder-flowchart')).toContainText('③');
-  await expect(page.locator('.builder-flowchart')).toContainText('④');
-  await expect(page.locator('.builder-arrow-main')).toHaveCount(3);
-  await page.locator('.builder-branch[data-transition="review-reject"]').click();
-  await expect(page.locator('#builder-edge-editor')).toContainText(/Reviewer.*打回|打回.*Reviewer/);
-  await expect(page.locator('#builder-edge-editor')).toContainText(/回到开发者返工/);
+  await expect(page.getByRole('heading', { name: 'Workflow 管理后台' })).toBeVisible();
+  await expect(page.getByLabel('可编辑 workflow 画布')).toBeVisible();
   await expect(page.locator('main')).not.toContainText(/outputEquals|nodeId|value\.decision|visitCountLessThan|visitCountAtLeast/i);
-  await page.locator('.builder-step[data-node="develop"]').dragTo(page.locator('.builder-step[data-node="review"]'));
-  await page.getByLabel(/审查轮数|Review rounds/).fill('3');
-  await page.getByLabel(/添加 Observer|Add Observer/).check();
-  await expect(page.locator('.builder-flowchart')).toContainText('⓪');
-  await expect(page.locator('.builder-branch-map')).toContainText('打回循环');
-  await page.locator('.builder-branch[data-transition="review-pass"]').click();
-  await expect(page.locator('#builder-edge-editor')).toContainText(/进入汇报员总结/);
-  await page.locator('.builder-branch[data-transition="review-reject-limit"]').click();
-  await expect(page.locator('#builder-edge-editor')).toContainText(/人工兜底/);
-  await page.getByRole('button', { name: /保存工作流|Save workflow/ }).click();
+
+  await page.getByRole('button', { name: '新建' }).click();
+  await page.locator('#property-panel input[name="workflowId"]').fill('qa-release-flow');
+  await page.locator('#property-panel input[name="title"]').fill('QA 发布流程');
+  await page.locator('#property-panel button#apply-props').click();
+
+  await page.getByRole('button', { name: '添加角色' }).click();
+  await page.locator('#property-panel input[name="id"]').fill('reviewer');
+  await page.locator('#property-panel input[name="label"]').fill('Reviewer');
+  await page.locator('#property-panel select[name="kind"]').selectOption('reviewer');
+  await page.locator('#property-panel textarea[name="responsibility"]').fill('审查发布风险并给出结论');
+  await page.locator('#property-panel button#apply-props').click();
+
+  await page.getByRole('button', { name: '添加任务节点' }).click();
+  await page.locator('#property-panel input[name="id"]').fill('develop');
+  await page.locator('#property-panel input[name="label"]').fill('开发实现');
+  await page.locator('#property-panel textarea[name="prompt"]').fill('完成发布前实现与自测');
+  await page.locator('#property-panel button#apply-props').click();
+
+  await page.getByRole('button', { name: '添加语义节点' }).click();
+  await page.locator('#property-panel input[name="id"]').fill('review');
+  await page.locator('#property-panel input[name="label"]').fill('Reviewer 判定');
+  await page.locator('#property-panel select[name="semanticKind"]').selectOption('reviewDecision');
+  await page.locator('#property-panel select[name="roleId"]').selectOption('reviewer');
+  await page.locator('#property-panel input[name="humanGate"]').check();
+  await page.locator('#property-panel button#apply-props').click();
+
+  await page.getByRole('button', { name: '添加执行器节点' }).click();
+  await page.locator('#property-panel input[name="id"]').fill('notify');
+  await page.locator('#property-panel input[name="label"]').fill('发布通知');
+  await page.locator('#property-panel input[name="executor"]').fill('noop');
+  await page.locator('#property-panel button#apply-props').click();
+
+  await expect(page.locator('.wf-node')).toHaveCount(3);
+  await dragNode(page, 'develop', 40, 50);
+  await connectNodes(page, 'develop', 'review');
+  await page.locator('.wf-edge[data-edge="develop-review"] rect').click();
+  await page.locator('#property-panel input[name="label"]').fill('提交审查');
+  await page.locator('#property-panel button#apply-props').click();
+  await connectNodes(page, 'review', 'notify');
+  await page.locator('.wf-edge[data-edge="review-notify"] rect').click();
+  await page.locator('#property-panel select[name="conditionKind"]').selectOption('approved');
+  await page.locator('#property-panel input[name="decisionValue"]').fill('approved');
+  await page.locator('#property-panel button#apply-props').click();
+
+  await page.getByRole('button', { name: '保存' }).click();
   await expect.poll(() => savedDefinition?.flow?.transitions?.length).toBeGreaterThan(0);
+  expect(savedDefinition.workflowId).toBe('qa-release-flow');
+  expect(savedDefinition.nodes.develop.type).toBe('subagent');
+  expect(savedDefinition.nodes.review.type).toBe('semantic');
+  expect(savedDefinition.nodes.review.kind).toBe('reviewDecision');
+  expect(savedDefinition.nodes.review.humanGate).toBeTruthy();
+  expect(savedDefinition.nodes.notify.type).toBe('hostExecutor');
   expect(JSON.stringify(savedDefinition)).toContain('outputEquals');
-  expect(JSON.stringify(savedDefinition)).toContain('value.decision');
-  expect(JSON.stringify(savedDefinition)).toContain('visitCountLessThan');
-  expect(JSON.stringify(savedDefinition)).toContain('visitCountAtLeast');
-  expect(JSON.stringify(savedDefinition.nodes.review)).toContain('humanGate');
-  expect(JSON.stringify(savedDefinition.nodes.review)).not.toContain('"decision":"approved"');
-  expect(JSON.stringify(savedDefinition)).not.toContain('lastSeq');
+
+  await page.getByRole('button', { name: /qa-release-flow/ }).click();
+  await page.locator('.wf-node[data-node="develop"]').click();
+  await page.locator('#property-panel input[name="label"]').fill('开发实现与自测');
+  await page.locator('#property-panel button#apply-props').click();
+  await page.getByRole('button', { name: '保存' }).click();
+  await expect.poll(() => updatedDefinition?.nodes?.develop?.description).toBe('开发实现与自测');
+
+  await page.getByRole('button', { name: '删除 workflow' }).click();
+  await expect.poll(() => deletedWorkflowId).toBe('qa-release-flow');
 });
 
 test('full review workflow runs rework loop then approval report from builder config', async ({ page }) => {
   await page.goto(`${baseUrl}/#/workflows/builder`);
-  await page.getByLabel(/审查轮数|Review rounds/).fill('2');
-  await page.getByRole('button', { name: /保存工作流|Save workflow/ }).click();
+  await page.getByRole('button', { name: '保存' }).click();
   await expect.poll(() => savedDefinition?.workflowId).toBe('development-review-flow');
 
   const def = parseWorkflowDefinition(savedDefinition);
@@ -213,32 +306,6 @@ test('full review workflow runs rework loop then approval report from builder co
   }
 });
 
-test('changing only workflow config changes rejected path to failed review limit', async ({ page }) => {
-  await page.goto(`${baseUrl}/#/workflows/builder`);
-  await page.getByLabel(/审查轮数|Review rounds/).fill('1');
-  await page.getByRole('button', { name: /保存工作流|Save workflow/ }).click();
-  await expect.poll(() => savedDefinition?.flow?.transitions?.length).toBeGreaterThan(0);
-
-  const oneRound = parseWorkflowDefinition(savedDefinition);
-  const tempDir = await mkdtemp(join(tmpdir(), 'wf-config-source-e2e-'));
-  try {
-    const { finalSnapshot } = await runSingleReject(oneRound, tempDir);
-    expect(finalSnapshot.run.status).toBe('failed');
-    expect(finalSnapshot.run.failedNodeId).toBe('review_failed');
-    expect(finalSnapshot.outputs.has(flowWorkActivityId(finalSnapshot.run.runId, 'develop', 2))).toBe(false);
-    expect(JSON.stringify(oneRound.flow?.transitions)).toContain('"count":1');
-
-    await page.goto(`${baseUrl}/#/workflows/builder`);
-    await page.getByLabel(/审查轮数|Review rounds/).fill('2');
-    await page.getByRole('button', { name: /保存工作流|Save workflow/ }).click();
-    await expect.poll(() => JSON.stringify(savedDefinition?.flow?.transitions ?? [])).toContain('"count":2');
-    expect(JSON.stringify(savedDefinition.flow.transitions)).toContain('visitCountLessThan');
-    expect(JSON.stringify(savedDefinition.flow.transitions)).toContain('visitCountAtLeast');
-  } finally {
-    await rm(tempDir, { recursive: true, force: true });
-  }
-});
-
 test('run board presents workflow status without internal recovery jargon', async ({ page }) => {
   resetMockWorkflowState();
   await page.goto(`${baseUrl}/#/workflows`);
@@ -253,6 +320,27 @@ test('run board presents workflow status without internal recovery jargon', asyn
 function json(res: any, body: unknown): void {
   res.writeHead(200, { 'content-type': 'application/json' });
   res.end(JSON.stringify(body));
+}
+
+async function readBody(req: AsyncIterable<Buffer>): Promise<any> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) chunks.push(chunk);
+  return chunks.length > 0 ? JSON.parse(Buffer.concat(chunks).toString('utf-8')) : {};
+}
+
+async function dragNode(page: Page, nodeId: string, dx: number, dy: number): Promise<void> {
+  const box = await page.locator(`.wf-node[data-node="${nodeId}"]`).boundingBox();
+  if (!box) throw new Error(`node ${nodeId} is not visible`);
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.width / 2 + dx, box.y + box.height / 2 + dy, { steps: 8 });
+  await page.mouse.up();
+}
+
+async function connectNodes(page: Page, from: string, to: string): Promise<void> {
+  await page.locator(`.wf-node[data-node="${from}"]`).click();
+  await page.getByRole('button', { name: '点击连线' }).click();
+  await page.locator(`.wf-node[data-node="${to}"]`).click();
 }
 
 function contentType(path: string): string {

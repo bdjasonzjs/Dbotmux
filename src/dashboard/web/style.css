@@ -1029,6 +1029,53 @@ input.row-select,
 .builder-readable-summary strong { display: block; margin-bottom: 0.35rem; }
 .builder-readable-summary ol { margin: 0; padding-left: 1.1rem; color: var(--muted); }
 .builder-readable-summary li { margin: 0.25rem 0; }
+.builder-actions { display: flex; align-items: center; gap: 0.55rem; flex-wrap: wrap; }
+.builder-actions .danger,
+.canvas-toolbar .danger { border-color: color-mix(in srgb, var(--danger) 42%, var(--border)); color: var(--danger); }
+.workflow-admin { display: grid; grid-template-columns: 210px minmax(0, 1fr) 260px; gap: 1rem; align-items: start; }
+.workflow-admin-list,
+.workflow-admin-canvas,
+.property-panel { border: 1px solid var(--border); border-radius: 8px; background: var(--surface); padding: 0.85rem; min-width: 0; }
+.workflow-admin-list h3,
+.property-panel h3 { margin: 0 0 0.7rem; font-size: 15px; }
+.workflow-list { display: grid; gap: 0.45rem; }
+.workflow-list button,
+.role-list button { width: 100%; text-align: left; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-muted); color: var(--fg); padding: 0.55rem 0.65rem; display: grid; gap: 0.2rem; }
+.workflow-list button:hover,
+.role-list button:hover { border-color: var(--accent); background: var(--accent-soft); }
+.workflow-list small,
+.role-list small { color: var(--muted); font-size: 11px; }
+.workflow-admin-canvas { display: grid; gap: 0.7rem; overflow: auto; }
+.canvas-toolbar { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+.canvas-toolbar button { min-height: 32px; }
+.workflow-canvas { width: 100%; min-width: 0; height: 560px; border: 1px solid var(--border); border-radius: 8px; background:
+  linear-gradient(var(--border-soft) 1px, transparent 1px),
+  linear-gradient(90deg, var(--border-soft) 1px, transparent 1px),
+  var(--surface-muted);
+  background-size: 24px 24px;
+}
+.wf-node rect { fill: var(--surface); stroke: var(--border); stroke-width: 1.5; filter: drop-shadow(0 8px 16px rgba(15, 23, 42, 0.08)); }
+.wf-node { cursor: grab; }
+.wf-node:active { cursor: grabbing; }
+.wf-node.active rect { stroke: var(--accent); stroke-width: 2.5; fill: var(--accent-soft); }
+.wf-node text { fill: var(--muted); font-size: 11px; pointer-events: none; }
+.wf-node .wf-node-title { fill: var(--fg); font-size: 13px; font-weight: 700; }
+.wf-edge path { fill: none; stroke: var(--border-strong); stroke-width: 2.4; }
+.wf-edge rect { fill: var(--surface); stroke: var(--border); stroke-width: 1; }
+.wf-edge text { fill: var(--fg); font-size: 11px; font-weight: 700; pointer-events: none; }
+.wf-edge marker path,
+.workflow-canvas marker path { fill: var(--border-strong); }
+.wf-edge { cursor: pointer; }
+.wf-edge.active path { stroke: var(--accent); stroke-width: 3; }
+.wf-edge.active rect { fill: var(--accent-soft); stroke: var(--accent); }
+.property-panel { display: grid; gap: 0.6rem; }
+.property-panel label { display: grid; gap: 0.3rem; font-size: 12px; color: var(--muted); }
+.property-panel input,
+.property-panel select,
+.property-panel textarea { width: 100%; color: var(--fg); }
+.property-panel h4 { margin: 0.35rem 0 0; font-size: 13px; }
+.role-list { display: grid; gap: 0.4rem; }
+.property-panel button#apply-props { margin-top: 0.25rem; }
 
 .wf-detail-head { display: flex; align-items: flex-start; gap: 0.8rem; margin-bottom: 0.8rem; }
 .wf-detail-head h2 { margin: 0 0 0.15rem; font-size: 18px; line-height: 1.25; }

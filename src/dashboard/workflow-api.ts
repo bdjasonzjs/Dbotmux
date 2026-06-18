@@ -1,6 +1,6 @@
 import { createReadStream, promises as fs } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, basename, dirname } from 'node:path';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
 import {
@@ -136,6 +136,33 @@ export async function handleWorkflowApi(
     return true;
   }
 
+  if (req.method === 'POST' && url.pathname === '/api/workflows/definitions/validate') {
+    let body: { definition?: unknown };
+    try {
+      body = await readJsonBody<{ definition?: unknown }>(req);
+    } catch {
+      jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      return true;
+    }
+    try {
+      const def = parseWorkflowDefinition(body.definition);
+      jsonRes(res, 200, {
+        ok: true,
+        workflowId: def.workflowId,
+        nodeCount: Object.keys(def.nodes).length,
+        transitionCount: def.flow?.transitions.length ?? 0,
+      });
+    } catch (e: any) {
+      jsonRes(res, 400, {
+        ok: false,
+        error: 'invalid_workflow',
+        message: e?.message ?? String(e),
+        issues: e?.issues,
+      });
+    }
+    return true;
+  }
+
   if (
     req.method === 'GET' &&
     (m = url.pathname.match(/^\/api\/workflows\/definitions\/([^/]+)$/))
@@ -155,6 +182,85 @@ export async function handleWorkflowApi(
     } catch (e: any) {
       jsonRes(res, 500, {
         error: 'load_definition_failed',
+        message: e?.message ?? String(e),
+      });
+    }
+    return true;
+  }
+
+  if (
+    req.method === 'PUT' &&
+    (m = url.pathname.match(/^\/api\/workflows\/definitions\/([^/]+)$/))
+  ) {
+    const id = decodeURIComponent(m[1]);
+    if (!isValidWorkflowId(id)) {
+      jsonRes(res, 400, { ok: false, error: 'bad_id' });
+      return true;
+    }
+    let body: { definition?: unknown };
+    try {
+      body = await readJsonBody<{ definition?: unknown }>(req);
+    } catch {
+      jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      return true;
+    }
+    let def;
+    try {
+      def = parseWorkflowDefinition(body.definition);
+    } catch (e: any) {
+      jsonRes(res, 400, {
+        ok: false,
+        error: 'invalid_workflow',
+        message: e?.message ?? String(e),
+        issues: e?.issues,
+      });
+      return true;
+    }
+    if (def.workflowId !== id) {
+      jsonRes(res, 400, { ok: false, error: 'id_mismatch' });
+      return true;
+    }
+    const existing = await loadDefinition(id);
+    const path = existing?.path ?? join(homedir(), '.botmux', 'workflows', `${id}.workflow.json`);
+    try {
+      await fs.mkdir(dirname(path), { recursive: true });
+      await fs.writeFile(path, JSON.stringify(def, null, 2) + '\n', 'utf-8');
+      jsonRes(res, 200, { ok: true, workflowId: def.workflowId, path });
+    } catch (e: any) {
+      jsonRes(res, 500, {
+        ok: false,
+        error: 'save_definition_failed',
+        message: e?.message ?? String(e),
+      });
+    }
+    return true;
+  }
+
+  if (
+    req.method === 'DELETE' &&
+    (m = url.pathname.match(/^\/api\/workflows\/definitions\/([^/]+)$/))
+  ) {
+    const id = decodeURIComponent(m[1]);
+    if (!isValidWorkflowId(id)) {
+      jsonRes(res, 400, { ok: false, error: 'bad_id' });
+      return true;
+    }
+    try {
+      const existing = await loadDefinition(id);
+      if (!existing) {
+        jsonRes(res, 404, { ok: false, error: 'unknown_workflow' });
+        return true;
+      }
+      const deletedPath = join(
+        dirname(existing.path),
+        `${basename(existing.path)}.deleted-${Date.now()}`,
+      );
+      await fs.rename(existing.path, deletedPath);
+      jsonRes(res, 200, { ok: true, workflowId: id, path: existing.path, deletedPath });
+    } catch (e: any) {
+      jsonRes(res, 500, {
+        ok: false,
+        error: 'delete_definition_failed',
         message: e?.message ?? String(e),
       });
     }
