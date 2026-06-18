@@ -42,7 +42,7 @@ test.beforeAll(async () => {
     const url = new URL(req.url ?? '/', 'http://127.0.0.1');
     if (url.pathname === '/api/sessions') return json(res, { sessions: [] });
     if (url.pathname === '/api/schedules') return json(res, { schedules: [] });
-    if (url.pathname === '/api/bots') {
+    if (url.pathname === '/api/workflows/bots') {
       return json(res, {
         bots: [
           { larkAppId: 'cli_app', botName: '寇黛克斯', online: true },

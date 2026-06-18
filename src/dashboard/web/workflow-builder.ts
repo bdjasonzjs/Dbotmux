@@ -572,7 +572,7 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
 
   async function loadBots(): Promise<void> {
     try {
-      const res = await fetch(apiPath('/api/bots'));
+      const res = await fetch(apiPath('/api/workflows/bots'));
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const body = await res.json();
       availableBots = Array.isArray(body.bots)

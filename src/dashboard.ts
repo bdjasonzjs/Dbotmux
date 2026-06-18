@@ -794,6 +794,17 @@ const server = createServer(async (req, res) => {
     // Mutations are intentionally proxied to the owner daemon from
     // chat-binding.larkAppId so only the daemon with live workflow runtime
     // context writes the event log.
+    if (req.method === 'GET' && url.pathname === '/api/workflows/bots') {
+      const bots = [...registry.list()]
+        .sort((a, b) => a.botIndex - b.botIndex)
+        .map(d => ({
+          larkAppId: d.larkAppId,
+          botName: d.botName,
+          online: true,
+        }));
+      return jsonRes(res, 200, { bots });
+    }
+
     if (await handleWorkflowApi(req, res, url, {
       runsDir: getRunsDir(),
       proxyToDaemon,
