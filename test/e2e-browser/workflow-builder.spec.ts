@@ -219,7 +219,16 @@ test('PM can create, edit, connect, save, and delete a workflow on the canvas', 
   await expect(page.getByLabel('可编辑 workflow 画布')).toBeVisible();
   await expect(page.locator('main')).not.toContainText(/outputEquals|nodeId|value\.decision|visitCountLessThan|visitCountAtLeast/i);
 
+  await page.getByRole('button', { name: '导览' }).click();
+  await expect(page.locator('#builder-tour-title')).toHaveText('先新建一个 workflow');
+  await expect(page.locator('.builder-tour-spotlight')).toBeVisible();
+  await page.getByRole('button', { name: '下一步' }).click();
+  await expect(page.locator('#builder-tour-title')).toHaveText('添加角色');
+  await page.getByRole('button', { name: '结束' }).click();
+  await expect(page.locator('#builder-tour')).toBeHidden();
+
   await page.getByRole('button', { name: '新建' }).click();
+  await page.getByRole('button', { name: /自行创建/ }).click();
   await page.locator('#property-panel input[name="workflowId"]').fill('qa-release-flow');
   await page.locator('#property-panel input[name="title"]').fill('QA 发布流程');
   await page.locator('#property-panel button#apply-props').click();
@@ -285,6 +294,37 @@ test('PM can create, edit, connect, save, and delete a workflow on the canvas', 
 
   await page.getByRole('button', { name: '删除 workflow' }).click();
   await expect.poll(() => deletedWorkflowId).toBe('qa-release-flow');
+});
+
+test('onboarding offers tutorial, assisted creation, and natural language edit', async ({ page }) => {
+  savedDefinition = undefined;
+  updatedDefinition = undefined;
+  await page.goto(`${baseUrl}/#/workflows/builder`);
+
+  await page.getByRole('button', { name: '新建' }).click();
+  await expect(page.getByRole('dialog', { name: '新建 Workflow' })).toBeVisible();
+  await page.getByRole('button', { name: /教程/ }).click();
+  await expect(page.locator('#property-panel input[name="workflowId"]')).toHaveValue('workflow-onboarding-tutorial');
+  await expect(page.locator('.wf-node')).toHaveCount(9);
+  await page.getByRole('button', { name: '保存' }).click();
+  await expect.poll(() => savedDefinition?.workflowId).toBe('workflow-onboarding-tutorial');
+  expect(Object.values(savedDefinition.nodes).some((node: any) => node.type === 'hostExecutor')).toBe(true);
+  expect(Object.values(savedDefinition.nodes).some((node: any) => node.type === 'subagent')).toBe(true);
+  expect(Object.values(savedDefinition.nodes).some((node: any) => node.type === 'semantic' && node.kind === 'reviewDecision')).toBe(true);
+
+  await page.getByRole('button', { name: '新建' }).click();
+  await page.getByRole('button', { name: /帮你配置/ }).click();
+  await page.locator('#workflow-assist-prompt').fill('开发一个功能，审查通过后自动通知并汇报');
+  await page.getByRole('button', { name: '生成草稿' }).click();
+  await expect(page.locator('#property-panel input[name="title"]')).toHaveValue(/开发一个功能/);
+  await expect(page.locator('.wf-node[data-node="review"]')).toBeVisible();
+  await expect(page.locator('.wf-node[data-node="report"]')).toBeVisible();
+
+  await page.getByRole('button', { name: '你说我改' }).click();
+  await expect(page.getByRole('dialog', { name: '你说我改' })).toBeVisible();
+  await page.locator('#workflow-assist-prompt').fill('加一个脚本验证步骤');
+  await page.getByRole('button', { name: '应用修改' }).click();
+  await expect(page.locator('.wf-node[data-node="automation"]')).toBeVisible();
 });
 
 test('full review workflow runs rework loop then approval report from builder config', async ({ page }) => {

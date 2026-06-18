@@ -284,6 +284,128 @@ function defaultCanvas(): CanvasWorkflow {
   return fromDefinition(def, '开发审查流程');
 }
 
+function tutorialCanvas(bot: string | undefined): CanvasWorkflow {
+  const workflowId = 'workflow-onboarding-tutorial';
+  const mainBot = bot || 'codex';
+  return {
+    workflowId,
+    version: 1,
+    title: '教程：从需求到汇报',
+    roles: [
+      newRole('owner', '需求负责人', 'custom'),
+      newRole('developer', '执行 Bot', 'developer'),
+      newRole('reviewer', 'Reviewer', 'reviewer'),
+      newRole('reporter', '汇报员', 'reporter'),
+      newRole('observer', '观察者', 'observer'),
+    ],
+    nodes: [
+      { id: 'kickoff', label: '确认目标', type: 'semantic', semanticKind: 'milestone', roleId: 'owner', description: '确认需求目标和验收口径', x: 60, y: 170 },
+      { id: 'work', label: 'Bot 执行', type: 'subagent', roleId: 'developer', bot: mainBot, prompt: '按需求完成实现，产出可审查结果，并说明验证方式。', description: '交给 Bot 完成主要工作', x: 280, y: 170 },
+      { id: 'submit', label: '提交审查', type: 'semantic', semanticKind: 'submitGate', roleId: 'developer', description: '执行完成后进入审查', x: 500, y: 170 },
+      { id: 'review', label: 'Reviewer 判定', type: 'semantic', semanticKind: 'reviewDecision', roleId: 'reviewer', humanGate: true, description: '人工或 Reviewer 判定通过/打回', x: 720, y: 170 },
+      { id: 'rework', label: '返工修正', type: 'subagent', roleId: 'developer', bot: mainBot, prompt: '根据 Reviewer 意见修正，再提交审查。', description: '打回后的返工节点', x: 500, y: 350 },
+      { id: 'notify', label: '自动通知', type: 'hostExecutor', roleId: 'reporter', executor: 'shell-command', scriptCommand: 'node', scriptArgs: '-e\nconsole.log("workflow approved")', scriptTimeoutMs: 120_000, humanGate: true, description: '通过后执行一个自动动作示例', x: 940, y: 120 },
+      { id: 'report', label: '最终汇报', type: 'semantic', semanticKind: 'report', roleId: 'reporter', description: '汇总结果、验证和风险', x: 1160, y: 120 },
+      { id: 'observe', label: '旁路观察', type: 'semantic', semanticKind: 'observer', roleId: 'observer', description: '旁路记录或通知，不改变主线', x: 940, y: 260 },
+      { id: 'fail', label: '失败兜底', type: 'semantic', semanticKind: 'fail', roleId: 'owner', description: '轮数耗尽或异常后的出口', x: 720, y: 420 },
+    ],
+    edges: [
+      { id: 'kickoff-work', from: 'kickoff', to: 'work', label: '开始执行', conditionKind: 'always' },
+      { id: 'work-submit', from: 'work', to: 'submit', label: '完成后提审', conditionKind: 'always' },
+      { id: 'submit-review', from: 'submit', to: 'review', label: '进入审查', conditionKind: 'always' },
+      { id: 'review-rework', from: 'review', to: 'rework', label: '打回返工', conditionKind: 'rejected', decisionValue: 'rejected', maxVisits: 2 },
+      { id: 'rework-submit', from: 'rework', to: 'submit', label: '重新提审', conditionKind: 'always' },
+      { id: 'review-notify', from: 'review', to: 'notify', label: '通过', conditionKind: 'approved', decisionValue: 'approved' },
+      { id: 'notify-report', from: 'notify', to: 'report', label: '通知后汇报', conditionKind: 'always' },
+      { id: 'review-observe', from: 'review', to: 'observe', label: '旁路记录', conditionKind: 'custom', decisionValue: 'observe' },
+      { id: 'review-fail', from: 'review', to: 'fail', label: '兜底失败', conditionKind: 'custom', decisionValue: 'review_failed' },
+    ],
+  };
+}
+
+function assistedCanvas(prompt: string, bot: string | undefined, existingIds: Set<string>): CanvasWorkflow {
+  const base = prompt.trim() || '自动生成 workflow';
+  const workflowId = uniqueId(labelToId(base.slice(0, 28), 'assisted-workflow'), existingIds);
+  const wantsReview = /审|review|检查|验收|批准|通过|打回/.test(base);
+  const wantsScript = /脚本|命令|shell|执行|部署|测试|build|test/.test(base);
+  const wantsReport = /汇报|报告|通知|总结|发消息/.test(base);
+  const mainBot = bot || 'codex';
+  const nodes: CanvasNode[] = [
+    { id: 'plan', label: '理解需求', type: 'subagent', roleId: 'owner', bot: mainBot, prompt: `请理解并拆解需求：${base}`, description: '把自然语言需求拆成可执行计划', x: 70, y: 190 },
+    { id: 'work', label: '执行任务', type: 'subagent', roleId: 'executor', bot: mainBot, prompt: `请按计划执行：${base}`, description: '执行主要工作', x: 300, y: 190 },
+  ];
+  const edges: CanvasEdge[] = [
+    { id: 'plan-work', from: 'plan', to: 'work', label: '开始执行', conditionKind: 'always' },
+  ];
+  let last = 'work';
+  if (wantsScript) {
+    nodes.push({
+      id: 'verify',
+      label: '自动验证',
+      type: 'hostExecutor',
+      roleId: 'operator',
+      executor: 'shell-command',
+      scriptCommand: '',
+      scriptArgs: '',
+      scriptTimeoutMs: 120_000,
+      humanGate: true,
+      description: '需要补充实际命令',
+      x: 530,
+      y: 190,
+    });
+    edges.push({ id: 'work-verify', from: last, to: 'verify', label: '执行验证', conditionKind: 'always' });
+    last = 'verify';
+  }
+  if (wantsReview) {
+    nodes.push({ id: 'review', label: '审查判定', type: 'semantic', semanticKind: 'reviewDecision', roleId: 'reviewer', humanGate: true, description: 'Reviewer 判定通过或打回', x: 760, y: 190 });
+    edges.push({ id: `${last}-review`, from: last, to: 'review', label: '提交审查', conditionKind: 'always' });
+    nodes.push({ id: 'rework', label: '打回修正', type: 'subagent', roleId: 'executor', bot: mainBot, prompt: '根据审查意见修正并重新提交。', description: '审查未通过后的返工', x: 530, y: 350 });
+    edges.push({ id: 'review-rework', from: 'review', to: 'rework', label: '打回', conditionKind: 'rejected', decisionValue: 'rejected', maxVisits: 2 });
+    edges.push({ id: 'rework-review', from: 'rework', to: 'review', label: '重新审查', conditionKind: 'always' });
+    last = 'review';
+  }
+  if (wantsReport) {
+    nodes.push({ id: 'report', label: '结果汇报', type: 'semantic', semanticKind: 'report', roleId: 'reporter', description: '汇总完成结果和风险', x: 990, y: 190 });
+    edges.push({ id: `${last}-report`, from: last, to: 'report', label: wantsReview ? '通过后汇报' : '完成后汇报', conditionKind: wantsReview ? 'approved' : 'always', decisionValue: wantsReview ? 'approved' : undefined });
+  }
+  return {
+    workflowId,
+    version: 1,
+    title: base.length > 24 ? `${base.slice(0, 24)}...` : base,
+    roles: [
+      newRole('owner', '需求负责人', 'custom'),
+      newRole('executor', '执行 Bot', 'developer'),
+      newRole('reviewer', 'Reviewer', 'reviewer'),
+      newRole('reporter', '汇报员', 'reporter'),
+      newRole('operator', '自动执行器', 'custom'),
+    ],
+    nodes,
+    edges,
+  };
+}
+
+function applyAssistedEdit(canvas: CanvasWorkflow, prompt: string, bot: string | undefined): string {
+  const text = prompt.trim();
+  if (!text) return '请输入要怎么改。';
+  const used = new Set(canvas.nodes.map((n) => n.id));
+  const mainBot = bot || canvas.nodes.find((n) => n.type === 'subagent')?.bot || 'codex';
+  if (/审|review|检查|验收|批准|通过|打回/.test(text) && !canvas.nodes.some((n) => n.type === 'semantic' && n.semanticKind === 'reviewDecision')) {
+    const id = uniqueId('review', used);
+    canvas.nodes.push({ id, label: '审查判定', type: 'semantic', semanticKind: 'reviewDecision', roleId: 'reviewer', humanGate: true, description: text, x: 70 + canvas.nodes.length * 230, y: 190 });
+    const prev = canvas.nodes.at(-2);
+    if (prev) canvas.edges.push({ id: uniqueId(`${prev.id}-${id}`, new Set(canvas.edges.map((e) => e.id))), from: prev.id, to: id, label: '提交审查', conditionKind: 'always' });
+    return '已加入审查判定节点。';
+  }
+  if (/脚本|命令|shell|执行|部署|测试|build|test/.test(text)) {
+    const id = uniqueId('automation', used);
+    canvas.nodes.push({ id, label: '自动动作', type: 'hostExecutor', roleId: 'operator', executor: 'shell-command', scriptCommand: '', scriptArgs: '', scriptTimeoutMs: 120_000, humanGate: true, description: text, x: 70 + canvas.nodes.length * 230, y: 260 });
+    return '已加入自动动作节点，请补充实际命令。';
+  }
+  const id = uniqueId(labelToId(text.slice(0, 18), 'task'), used);
+  canvas.nodes.push({ id, label: text.length > 12 ? `${text.slice(0, 12)}...` : text, type: 'subagent', roleId: 'executor', bot: mainBot, prompt: text, description: text, x: 70 + canvas.nodes.length * 230, y: 190 });
+  return '已按描述加入一个 Bot 任务节点。';
+}
+
 function autoLayout(
   ids: string[],
   edges: Array<{ from: string; to: string }>,
@@ -506,10 +628,52 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
       </div>
       <div class="builder-actions">
         <button id="builder-new" type="button">新建</button>
+        <button id="builder-tour-start" type="button">导览</button>
+        <button id="builder-ai-edit" type="button">你说我改</button>
         <button id="builder-save" type="button" class="primary">保存</button>
         <button id="builder-delete" type="button" class="danger">删除 workflow</button>
       </div>
     </section>
+    <div id="workflow-start" class="workflow-start" hidden>
+      <div class="workflow-start-dialog" role="dialog" aria-modal="true" aria-labelledby="workflow-start-title">
+        <header>
+          <div>
+            <h3 id="workflow-start-title">新建 Workflow</h3>
+            <p id="workflow-start-subtitle" class="muted">选择一种开始方式。</p>
+          </div>
+          <button id="workflow-start-close" type="button">关闭</button>
+        </header>
+        <div id="workflow-start-options" class="workflow-start-options">
+          <button type="button" data-start-option="tutorial">
+            <strong>教程</strong>
+            <span>生成一个覆盖 Bot 任务、流程控制、人工判定、自动动作、汇报和兜底分支的示例。</span>
+          </button>
+          <button type="button" data-start-option="assist">
+            <strong>帮你配置</strong>
+            <span>选择一个 Bot，输入自然语言需求，先生成可编辑草稿；后续接入 bot tool 后可直接由 Bot 修改。</span>
+          </button>
+          <button type="button" data-start-option="blank">
+            <strong>自行创建</strong>
+            <span>从空白 workflow 开始，手动添加角色、节点和连线。</span>
+          </button>
+        </div>
+        <section id="workflow-assist" class="workflow-assist" hidden>
+          <label>
+            <span>用哪个 Bot 帮你配置</span>
+            <select id="workflow-assist-bot"></select>
+          </label>
+          <label>
+            <span>你想要什么流程</span>
+            <textarea id="workflow-assist-prompt" rows="6" placeholder="例如：我想做一个开发-审查-打回返工-通过后自动通知并汇报的流程"></textarea>
+          </label>
+          <div class="workflow-assist-actions">
+            <button id="workflow-assist-back" type="button">返回</button>
+            <button id="workflow-assist-apply" type="button" class="primary">生成草稿</button>
+          </div>
+          <p class="builder-help">当前先在页面内生成/修改草稿；真正让 Bot 自动增删改查 workflow，需要后续接入可被 Bot 调用的 workflow tool。</p>
+        </section>
+      </div>
+    </div>
     <div class="workflow-admin">
       <aside class="workflow-admin-list">
         <h3>Workflow 列表</h3>
@@ -530,6 +694,20 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
       </section>
       <aside id="property-panel" class="property-panel"></aside>
     </div>
+    <div id="builder-tour" class="builder-tour" hidden>
+      <div class="builder-tour-backdrop"></div>
+      <div class="builder-tour-spotlight"></div>
+      <section class="builder-tour-card" role="dialog" aria-live="polite" aria-labelledby="builder-tour-title">
+        <p id="builder-tour-step" class="builder-tour-step"></p>
+        <h3 id="builder-tour-title"></h3>
+        <p id="builder-tour-body"></p>
+        <div class="builder-tour-actions">
+          <button id="builder-tour-prev" type="button">上一步</button>
+          <button id="builder-tour-next" type="button" class="primary">下一步</button>
+          <button id="builder-tour-close" type="button">结束</button>
+        </div>
+      </section>
+    </div>
   `;
 
   const listEl = root.querySelector<HTMLElement>('#workflow-list')!;
@@ -538,12 +716,68 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
   const status = root.querySelector<HTMLElement>('#builder-status')!;
   const save = root.querySelector<HTMLButtonElement>('#builder-save')!;
   const deleteWorkflow = root.querySelector<HTMLButtonElement>('#builder-delete')!;
+  const startModal = root.querySelector<HTMLElement>('#workflow-start')!;
+  const startTitle = root.querySelector<HTMLElement>('#workflow-start-title')!;
+  const startSubtitle = root.querySelector<HTMLElement>('#workflow-start-subtitle')!;
+  const startOptions = root.querySelector<HTMLElement>('#workflow-start-options')!;
+  const assistPanel = root.querySelector<HTMLElement>('#workflow-assist')!;
+  const assistBot = root.querySelector<HTMLSelectElement>('#workflow-assist-bot')!;
+  const assistPrompt = root.querySelector<HTMLTextAreaElement>('#workflow-assist-prompt')!;
+  const assistApply = root.querySelector<HTMLButtonElement>('#workflow-assist-apply')!;
+  const tour = root.querySelector<HTMLElement>('#builder-tour')!;
+  const tourSpotlight = root.querySelector<HTMLElement>('.builder-tour-spotlight')!;
+  const tourCard = root.querySelector<HTMLElement>('.builder-tour-card')!;
+  const tourStepEl = root.querySelector<HTMLElement>('#builder-tour-step')!;
+  const tourTitle = root.querySelector<HTMLElement>('#builder-tour-title')!;
+  const tourBody = root.querySelector<HTMLElement>('#builder-tour-body')!;
+  const tourPrev = root.querySelector<HTMLButtonElement>('#builder-tour-prev')!;
+  const tourNext = root.querySelector<HTMLButtonElement>('#builder-tour-next')!;
+  const tourClose = root.querySelector<HTMLButtonElement>('#builder-tour-close')!;
+  let startMode: 'create' | 'edit' = 'create';
   let catalog: CatalogEntry[] = [];
   let availableBots: BotOption[] = [];
   let canvas = defaultCanvas();
   let selected: Selection = { kind: 'workflow' };
   let connectFrom: string | null = null;
   let drag: { id: string; dx: number; dy: number } | null = null;
+  let tourIndex = 0;
+  const tourSteps = [
+    {
+      target: '#builder-new',
+      title: '先新建一个 workflow',
+      body: '这里会创建一张空白画布，后面所有角色、节点、连线都会保存成 workflow definition。',
+    },
+    {
+      target: '#add-role',
+      title: '添加角色',
+      body: '角色用来表达谁负责：开发者、Reviewer、汇报员，或者你自己的自定义角色。',
+    },
+    {
+      target: '#add-subagent',
+      title: '添加 Bot 任务',
+      body: 'Bot 任务是真正交给某个在线 Bot 做的步骤，例如开发、review、写汇报。右侧面板里选择 Bot 和任务说明。',
+    },
+    {
+      target: '#add-semantic',
+      title: '添加流程控制点',
+      body: '流程控制点不直接干活，而是表达提审、人工判定、汇报、里程碑、失败兜底这些流程语义。',
+    },
+    {
+      target: '#workflow-canvas',
+      title: '在画布上调整流程',
+      body: '节点可以拖动；选中一个节点后点“点击连线”，再点另一个节点，就能画出流程走向。',
+    },
+    {
+      target: '#property-panel',
+      title: '右侧编辑属性',
+      body: '这里改名称、角色、Bot、判定类型、脚本命令等。高级 ID 默认收起，不需要普通用户手写。',
+    },
+    {
+      target: '#builder-save',
+      title: '最后保存',
+      body: '保存会先校验，再生成标准 workflow definition。运行时只读取这份配置，保证配置是唯一事实来源。',
+    },
+  ];
 
   panel.addEventListener('click', (ev) => {
     const card = (ev.target as HTMLElement).closest<HTMLButtonElement>('.choice-card');
@@ -568,6 +802,49 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
   });
 
   function setStatus(text: string): void { status.textContent = text; }
+
+  function startTour(index = 0): void {
+    tourIndex = Math.max(0, Math.min(index, tourSteps.length - 1));
+    tour.hidden = false;
+    renderTour();
+  }
+
+  function stopTour(): void {
+    tour.hidden = true;
+    root.querySelectorAll('.builder-tour-target').forEach((el) => el.classList.remove('builder-tour-target'));
+  }
+
+  function renderTour(): void {
+    if (tour.hidden) return;
+    const step = tourSteps[tourIndex]!;
+    const target = root.querySelector<HTMLElement>(step.target) ?? root.querySelector<HTMLElement>('.workflow-admin')!;
+    root.querySelectorAll('.builder-tour-target').forEach((el) => el.classList.remove('builder-tour-target'));
+    target.classList.add('builder-tour-target');
+    const rect = target.getBoundingClientRect();
+    const pad = 8;
+    tourSpotlight.style.left = `${Math.max(8, rect.left - pad)}px`;
+    tourSpotlight.style.top = `${Math.max(8, rect.top - pad)}px`;
+    tourSpotlight.style.width = `${Math.min(window.innerWidth - 16, rect.width + pad * 2)}px`;
+    tourSpotlight.style.height = `${Math.min(window.innerHeight - 16, rect.height + pad * 2)}px`;
+
+    const cardWidth = 340;
+    const rightRoom = window.innerWidth - rect.right;
+    const left = rightRoom >= cardWidth + 32
+      ? rect.right + 18
+      : Math.max(16, Math.min(window.innerWidth - cardWidth - 16, rect.left));
+    const belowTop = rect.bottom + 14;
+    const aboveTop = rect.top - 188;
+    const top = belowTop + 188 < window.innerHeight
+      ? belowTop
+      : Math.max(16, aboveTop);
+    tourCard.style.left = `${left}px`;
+    tourCard.style.top = `${top}px`;
+    tourStepEl.textContent = `${tourIndex + 1} / ${tourSteps.length}`;
+    tourTitle.textContent = step.title;
+    tourBody.textContent = step.body;
+    tourPrev.disabled = tourIndex === 0;
+    tourNext.textContent = tourIndex === tourSteps.length - 1 ? '完成' : '下一步';
+  }
 
   async function loadCatalog(): Promise<void> {
     try {
@@ -598,6 +875,91 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
       availableBots = [];
     }
     renderPanel();
+    renderAssistBots();
+  }
+
+  function renderAssistBots(): void {
+    const fallback = canvas.nodes.find((n) => n.type === 'subagent')?.bot ?? availableBots[0]?.larkAppId ?? 'codex';
+    const options = availableBots.length > 0
+      ? availableBots.map((bot) => `<option value="${escapeHtml(bot.larkAppId)}" ${bot.larkAppId === fallback ? 'selected' : ''}>${escapeHtml(bot.botName ?? bot.larkAppId)} · ${escapeHtml(bot.larkAppId)}</option>`).join('')
+      : `<option value="${escapeHtml(fallback)}">${escapeHtml(fallback)}</option>`;
+    assistBot.innerHTML = options;
+  }
+
+  function openStart(mode: 'create' | 'edit'): void {
+    startMode = mode;
+    renderAssistBots();
+    startModal.hidden = false;
+    assistPanel.hidden = mode !== 'edit';
+    startOptions.hidden = mode === 'edit';
+    startTitle.textContent = mode === 'edit' ? '你说我改' : '新建 Workflow';
+    startSubtitle.textContent = mode === 'edit'
+      ? '用自然语言描述要改什么，我会先改成可审查草稿。'
+      : '选择一种开始方式。';
+    assistApply.textContent = mode === 'edit' ? '应用修改' : '生成草稿';
+    assistPrompt.value = '';
+    assistPrompt.placeholder = mode === 'edit'
+      ? '例如：加一个 Reviewer 判定，打回后返工两轮；通过后自动发通知'
+      : '例如：我想做一个开发-审查-打回返工-通过后自动通知并汇报的流程';
+    if (mode === 'edit') assistPrompt.focus();
+  }
+
+  function closeStart(): void {
+    startModal.hidden = true;
+    assistPanel.hidden = true;
+    startOptions.hidden = false;
+  }
+
+  function blankCanvas(): CanvasWorkflow {
+    return {
+      workflowId: uniqueId('new-workflow', new Set(catalog.map((e) => e.workflowId))),
+      version: 1,
+      title: '新 Workflow',
+      roles: [newRole('owner', '执行者', 'custom')],
+      nodes: [],
+      edges: [],
+    };
+  }
+
+  function startTutorial(): void {
+    canvas = tutorialCanvas(assistBot.value || availableBots[0]?.larkAppId);
+    selected = { kind: 'workflow' };
+    connectFrom = null;
+    closeStart();
+    renderAll();
+    startTour(0);
+    setStatus('已生成教程 workflow：按右侧属性面板逐步查看每类节点和分支。');
+  }
+
+  function startBlank(): void {
+    canvas = blankCanvas();
+    selected = { kind: 'workflow' };
+    connectFrom = null;
+    closeStart();
+    renderAll();
+    setStatus('已创建空白 workflow。');
+  }
+
+  function applyAssistantDraft(): void {
+    const prompt = assistPrompt.value.trim();
+    const bot = assistBot.value || availableBots[0]?.larkAppId;
+    if (!prompt) {
+      setStatus('请先输入要配置或修改的流程。');
+      return;
+    }
+    if (startMode === 'create') {
+      canvas = assistedCanvas(prompt, bot, new Set(catalog.map((e) => e.workflowId)));
+      selected = { kind: 'workflow' };
+      connectFrom = null;
+      closeStart();
+      renderAll();
+      setStatus('已根据自然语言生成 workflow 草稿，请检查节点、连线和 Bot 后保存。');
+      return;
+    }
+    const message = applyAssistedEdit(canvas, prompt, bot);
+    closeStart();
+    renderAll();
+    setStatus(`${message} 请检查后保存。`);
   }
 
   function renderList(): void {
@@ -1054,11 +1416,33 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
     renderAll();
   }
 
-  root.querySelector<HTMLButtonElement>('#builder-new')!.onclick = () => {
-    canvas = { workflowId: uniqueId('new-workflow', new Set(catalog.map((e) => e.workflowId))), version: 1, title: '新 Workflow', roles: [newRole('owner', '执行者', 'custom')], nodes: [], edges: [] };
-    selected = { kind: 'workflow' };
-    renderAll();
+  root.querySelector<HTMLButtonElement>('#builder-new')!.onclick = () => openStart('create');
+  root.querySelector<HTMLButtonElement>('#builder-tour-start')!.onclick = () => startTour(0);
+  root.querySelector<HTMLButtonElement>('#builder-ai-edit')!.onclick = () => openStart('edit');
+  root.querySelector<HTMLButtonElement>('#workflow-start-close')!.onclick = closeStart;
+  root.querySelector<HTMLButtonElement>('#workflow-assist-back')!.onclick = () => {
+    if (startMode === 'edit') closeStart();
+    else {
+      assistPanel.hidden = true;
+      startOptions.hidden = false;
+      startSubtitle.textContent = '选择一种开始方式。';
+    }
   };
+  assistApply.onclick = applyAssistantDraft;
+  startOptions.querySelectorAll<HTMLButtonElement>('[data-start-option]').forEach((btn) => {
+    btn.onclick = () => {
+      const option = btn.dataset.startOption;
+      if (option === 'tutorial') startTutorial();
+      else if (option === 'blank') startBlank();
+      else {
+        renderAssistBots();
+        startOptions.hidden = true;
+        assistPanel.hidden = false;
+        startSubtitle.textContent = '描述你想要的流程，我会生成一个可编辑草稿。';
+        assistPrompt.focus();
+      }
+    };
+  });
   root.querySelector<HTMLButtonElement>('#add-role')!.onclick = addRole;
   root.querySelector<HTMLButtonElement>('#add-subagent')!.onclick = () => addNode('subagent');
   root.querySelector<HTMLButtonElement>('#add-semantic')!.onclick = () => addNode('semantic');
@@ -1071,9 +1455,20 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
   root.querySelector<HTMLButtonElement>('#auto-layout')!.onclick = layout;
   save.onclick = () => void saveDefinition();
   deleteWorkflow.onclick = () => void deleteCurrentWorkflow();
+  tourPrev.onclick = () => { if (tourIndex > 0) { tourIndex -= 1; renderTour(); } };
+  tourNext.onclick = () => {
+    if (tourIndex >= tourSteps.length - 1) stopTour();
+    else { tourIndex += 1; renderTour(); }
+  };
+  tourClose.onclick = stopTour;
+  window.addEventListener('resize', renderTour);
+  window.addEventListener('scroll', renderTour, true);
 
   renderAll();
   void loadCatalog();
   void loadBots();
-  return () => {};
+  return () => {
+    window.removeEventListener('resize', renderTour);
+    window.removeEventListener('scroll', renderTour, true);
+  };
 }
