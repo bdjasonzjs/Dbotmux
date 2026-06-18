@@ -169,6 +169,7 @@ export const SIDE_EFFECT_EXECUTORS: ReadonlySet<string> = new Set([
   'feishu-send',
   'feishu-reply',
   'botmux-schedule',
+  'shell-command',
 ]);
 
 export function isSideEffectExecutor(executor: string): boolean {

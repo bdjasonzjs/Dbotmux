@@ -13,6 +13,10 @@ import {
   parseFeishuReplyInput,
 } from './feishu-reply.js';
 import { feishuImReconciler } from './feishu-im.js';
+import {
+  parseShellCommandInput,
+  shellCommandExecutor,
+} from './shell-command.js';
 import type { SideEffectingExecutor } from './types.js';
 
 export type RegisteredHostExecutor<Input = unknown, Output = unknown> = {
@@ -43,6 +47,13 @@ export function createDefaultHostExecutorRegistry(): HostExecutorRegistry {
       {
         executor: feishuReplyExecutor,
         parseInput: parseFeishuReplyInput,
+      } satisfies RegisteredHostExecutor,
+    ],
+    [
+      'shell-command',
+      {
+        executor: shellCommandExecutor,
+        parseInput: parseShellCommandInput,
       } satisfies RegisteredHostExecutor,
     ],
   ]);
