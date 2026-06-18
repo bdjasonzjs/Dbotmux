@@ -22,6 +22,10 @@ type CanvasNode = {
   bot?: string;
   prompt?: string;
   executor?: string;
+  scriptCommand?: string;
+  scriptArgs?: string;
+  scriptCwd?: string;
+  scriptTimeoutMs?: number;
   description?: string;
   humanGate?: boolean;
   x: number;
@@ -55,9 +59,16 @@ type CatalogEntry = {
   nodeCount?: number;
 };
 
+type BotOption = {
+  larkAppId: string;
+  botName?: string;
+  online?: boolean;
+};
+
 const nodeTypeOptions: NodeType[] = ['subagent', 'hostExecutor', 'semantic'];
 const semanticKindOptions: SemanticKind[] = ['submitGate', 'reviewDecision', 'report', 'observer', 'milestone', 'fail'];
 const roleKindOptions: RoleKind[] = ['developer', 'reviewer', 'reporter', 'observer', 'custom'];
+const hostExecutorOptions = ['shell-command', 'botmux-schedule', 'feishu-send', 'feishu-reply'];
 const nodeW = 150;
 const nodeH = 70;
 
@@ -87,8 +98,66 @@ function newRole(id: string, label: string, kind: RoleKind): CanvasRole {
 
 function newNode(id: string, label: string, type: NodeType, x: number, y: number): CanvasNode {
   if (type === 'semantic') return { id, label, type, semanticKind: 'milestone', description: label, x, y };
-  if (type === 'hostExecutor') return { id, label, type, executor: 'noop', description: label, x, y };
-  return { id, label, type, bot: 'codex', prompt: label, description: label, x, y };
+  if (type === 'hostExecutor') {
+    return {
+      id,
+      label,
+      type,
+      executor: 'shell-command',
+      scriptCommand: '',
+      scriptArgs: '',
+      scriptCwd: '',
+      scriptTimeoutMs: 120_000,
+      humanGate: true,
+      description: label,
+      x,
+      y,
+    };
+  }
+  return { id, label, type, bot: '', prompt: label, description: label, x, y };
+}
+
+function nodeTypeLabel(type: NodeType): string {
+  if (type === 'subagent') return '人工任务';
+  if (type === 'hostExecutor') return '自动动作';
+  return '流程关卡';
+}
+
+function semanticKindLabel(kind: SemanticKind): string {
+  if (kind === 'submitGate') return '提审门';
+  if (kind === 'reviewDecision') return '人工判定';
+  if (kind === 'report') return '汇报点';
+  if (kind === 'observer') return '旁路观察';
+  if (kind === 'fail') return '失败兜底';
+  return '里程碑';
+}
+
+function hostExecutorLabel(executor: string): string {
+  if (executor === 'shell-command') return '执行脚本/命令';
+  if (executor === 'botmux-schedule') return '创建定时任务';
+  if (executor === 'feishu-send') return '发送飞书消息';
+  if (executor === 'feishu-reply') return '回复飞书消息';
+  return executor;
+}
+
+function roleKindLabel(kind: string): string {
+  if (kind === 'developer') return '开发者';
+  if (kind === 'reviewer') return 'Reviewer';
+  if (kind === 'reporter') return '汇报员';
+  if (kind === 'observer') return '观察者';
+  return '自定义';
+}
+
+function optionLabel(value: string, labels?: Record<string, string>): string {
+  return labels?.[value] ?? value;
+}
+
+function parseScriptArgs(raw: string | undefined): string[] {
+  return (raw ?? '').split('\n').map((line) => line.trim()).filter(Boolean);
+}
+
+function stringifyScriptArgs(args: unknown): string {
+  return Array.isArray(args) ? args.map((arg) => String(arg)).join('\n') : '';
 }
 
 function shortNodeLabel(id: string, node: WorkflowNode): string {
@@ -199,7 +268,17 @@ function fromDefinition(def: WorkflowDefinition, title = def.workflowId): Canvas
       y: pos.y,
     };
     if (node.type === 'semantic') return { ...base, semanticKind: node.kind };
-    if (node.type === 'hostExecutor') return { ...base, executor: node.executor };
+    if (node.type === 'hostExecutor') {
+      const input = node.input && typeof node.input === 'object' ? node.input as Record<string, unknown> : {};
+      return {
+        ...base,
+        executor: node.executor,
+        scriptCommand: typeof input.command === 'string' ? input.command : '',
+        scriptArgs: stringifyScriptArgs(input.args),
+        scriptCwd: typeof input.cwd === 'string' ? input.cwd : '',
+        scriptTimeoutMs: typeof input.timeoutMs === 'number' ? input.timeoutMs : undefined,
+      };
+    }
     return { ...base, bot: node.bot, prompt: typeof node.prompt === 'string' ? node.prompt : JSON.stringify(node.prompt) };
   });
   const edges = definitionEdges.map((tr, index) => ({
@@ -257,7 +336,16 @@ function toDefinition(canvas: CanvasWorkflow): WorkflowDefinition {
         output: n.semanticKind === 'reviewDecision' ? undefined : { action: n.semanticKind ?? 'milestone', summary: n.label },
       };
     } else if (n.type === 'hostExecutor') {
-      nodes[n.id] = { ...common, type: 'hostExecutor', executor: n.executor || 'noop', input: { nodeId: n.id, label: n.label } };
+      const executor = n.executor || 'shell-command';
+      const input = executor === 'shell-command'
+        ? {
+            command: (n.scriptCommand ?? '').trim(),
+            args: parseScriptArgs(n.scriptArgs),
+            cwd: (n.scriptCwd ?? '').trim() || undefined,
+            timeoutMs: n.scriptTimeoutMs && n.scriptTimeoutMs > 0 ? n.scriptTimeoutMs : undefined,
+          }
+        : { nodeId: n.id, label: n.label };
+      nodes[n.id] = { ...common, type: 'hostExecutor', executor, input };
     } else {
       nodes[n.id] = { ...common, type: 'subagent', bot: n.bot || 'codex', prompt: n.prompt || n.label };
     }
@@ -345,9 +433,9 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
       <section class="workflow-admin-canvas">
         <div class="canvas-toolbar">
           <button id="add-role" type="button">添加角色</button>
-          <button id="add-subagent" type="button">添加任务节点</button>
-          <button id="add-semantic" type="button">添加语义节点</button>
-          <button id="add-host" type="button">添加执行器节点</button>
+          <button id="add-subagent" type="button">添加人工任务</button>
+          <button id="add-semantic" type="button">添加流程关卡</button>
+          <button id="add-host" type="button">添加自动动作</button>
           <button id="connect-mode" type="button">点击连线</button>
           <button id="delete-selected" type="button">删除选中</button>
           <button id="auto-layout" type="button">自动布局</button>
@@ -366,6 +454,7 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
   const save = root.querySelector<HTMLButtonElement>('#builder-save')!;
   const deleteWorkflow = root.querySelector<HTMLButtonElement>('#builder-delete')!;
   let catalog: CatalogEntry[] = [];
+  let availableBots: BotOption[] = [];
   let canvas = defaultCanvas();
   let selected: Selection = { kind: 'workflow' };
   let connectFrom: string | null = null;
@@ -382,6 +471,25 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
       catalog = [];
     }
     renderList();
+  }
+
+  async function loadBots(): Promise<void> {
+    try {
+      const res = await fetch('/api/bots');
+      const body = await res.json();
+      availableBots = Array.isArray(body.bots)
+        ? body.bots
+            .filter((bot: any): bot is BotOption => typeof bot?.larkAppId === 'string' && bot.larkAppId.length > 0)
+            .map((bot: any) => ({
+              larkAppId: bot.larkAppId,
+              botName: typeof bot.botName === 'string' ? bot.botName : undefined,
+              online: bot.online !== false,
+            }))
+        : [];
+    } catch {
+      availableBots = [];
+    }
+    renderPanel();
   }
 
   function renderList(): void {
@@ -438,7 +546,7 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
         <g class="wf-node ${active}" data-node="${escapeHtml(n.id)}" transform="translate(${n.x}, ${n.y})">
           <rect width="${nodeW}" height="${nodeH}" rx="8"></rect>
           <text x="14" y="24" class="wf-node-title">${escapeHtml(n.label || n.id)}</text>
-          <text x="14" y="45">${escapeHtml(n.type)}${n.type === 'semantic' ? ` · ${escapeHtml(n.semanticKind ?? 'milestone')}` : ''}</text>
+          <text x="14" y="45">${escapeHtml(nodeTypeLabel(n.type))}${n.type === 'semantic' ? ` · ${escapeHtml(semanticKindLabel(n.semanticKind ?? 'milestone'))}` : ''}</text>
           <text x="14" y="62">${escapeHtml(role?.label ?? '未分配角色')}</text>
         </g>
       `;
@@ -490,11 +598,28 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
   svg.addEventListener('pointerup', () => { drag = null; });
   svg.addEventListener('pointerleave', () => { drag = null; });
 
-  function field(label: string, name: string, value: string, options?: string[]): string {
+  function field(label: string, name: string, value: string, options?: string[], labels?: Record<string, string>): string {
     if (options) {
-      return `<label><span>${escapeHtml(label)}</span><select name="${escapeHtml(name)}">${options.map((o) => `<option value="${escapeHtml(o)}" ${o === value ? 'selected' : ''}>${escapeHtml(o)}</option>`).join('')}</select></label>`;
+      return `<label><span>${escapeHtml(label)}</span><select name="${escapeHtml(name)}">${options.map((o) => `<option value="${escapeHtml(o)}" ${o === value ? 'selected' : ''}>${escapeHtml(optionLabel(o, labels))}</option>`).join('')}</select></label>`;
     }
     return `<label><span>${escapeHtml(label)}</span><input name="${escapeHtml(name)}" value="${escapeHtml(value)}" /></label>`;
+  }
+
+  function botField(currentBot: string | undefined): string {
+    const value = currentBot ?? '';
+    if (availableBots.length > 0) {
+      const values = availableBots.map((bot) => bot.larkAppId);
+      const options = value && !values.includes(value) ? [value, ...values] : values;
+      const labels = Object.fromEntries([
+        ...(value && !values.includes(value) ? [[value, `${value}（当前值，未在在线列表）`]] : []),
+        ...availableBots.map((bot) => [
+          bot.larkAppId,
+          `${bot.botName ?? bot.larkAppId}${bot.online === false ? '（离线）' : ''} · ${bot.larkAppId}`,
+        ]),
+      ]);
+      return field('执行 Bot', 'bot', value || options[0] || '', options, labels);
+    }
+    return `${field('执行 Bot', 'bot', value)}<p class="muted">未能加载真实 Bot 列表；这里应填写 bots.json 里的 larkAppId。</p>`;
   }
 
   function svgPoint(ev: PointerEvent): { x: number; y: number } {
@@ -537,11 +662,24 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
       panel.innerHTML = `<h3>节点属性</h3>
         ${field('节点 ID', 'id', node.id)}
         ${field('名称', 'label', node.label)}
-        ${field('节点类型', 'type', node.type, nodeTypeOptions)}
+        ${field('节点类型', 'type', node.type, nodeTypeOptions, {
+          subagent: '人工任务',
+          hostExecutor: '自动动作',
+          semantic: '流程关卡',
+        })}
         ${field('角色', 'roleId', node.roleId ?? '', ['', ...canvas.roles.map((r) => r.id)])}
-        ${node.type === 'semantic' ? field('语义类型', 'semanticKind', node.semanticKind ?? 'milestone', semanticKindOptions) : ''}
-        ${node.type === 'subagent' ? field('Bot', 'bot', node.bot ?? 'codex') + '<label><span>任务说明</span><textarea name="prompt" rows="4">' + escapeHtml(node.prompt ?? '') + '</textarea></label>' : ''}
-        ${node.type === 'hostExecutor' ? field('Executor', 'executor', node.executor ?? 'noop') : ''}
+        ${node.type === 'semantic' ? field('关卡类型', 'semanticKind', node.semanticKind ?? 'milestone', semanticKindOptions, Object.fromEntries(semanticKindOptions.map((kind) => [kind, semanticKindLabel(kind)]))) : ''}
+        ${node.type === 'subagent' ? botField(node.bot) + '<label><span>任务说明</span><textarea name="prompt" rows="4">' + escapeHtml(node.prompt ?? '') + '</textarea></label>' : ''}
+        ${node.type === 'hostExecutor' ? `
+          ${field('自动动作', 'executor', node.executor ?? 'shell-command', hostExecutorOptions, Object.fromEntries(hostExecutorOptions.map((executor) => [executor, hostExecutorLabel(executor)])))}
+          ${(node.executor ?? 'shell-command') === 'shell-command' ? `
+            ${field('脚本/命令', 'scriptCommand', node.scriptCommand ?? '')}
+            <label><span>参数（每行一个）</span><textarea name="scriptArgs" rows="3">${escapeHtml(node.scriptArgs ?? '')}</textarea></label>
+            ${field('工作目录', 'scriptCwd', node.scriptCwd ?? '')}
+            ${field('超时毫秒', 'scriptTimeoutMs', String(node.scriptTimeoutMs ?? 120000))}
+            <p class="muted">例：命令填 <code>pnpm</code>，参数分两行填 <code>test</code> 和 <code>--runInBand</code>。执行时不走 shell 拼接，避免注入。</p>
+          ` : '<p class="muted">该自动动作使用内置执行器；详细输入暂由系统定义。</p>'}
+        ` : ''}
         <label class="builder-check"><input name="humanGate" type="checkbox" ${node.humanGate ? 'checked' : ''}/> <span>需要人工确认</span></label>
         <button id="apply-props" type="button">应用</button>`;
       panel.querySelector<HTMLButtonElement>('#apply-props')!.onclick = () => {
@@ -552,10 +690,18 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
         node.type = String(fd.get('type') ?? node.type) as NodeType;
         node.roleId = String(fd.get('roleId') ?? '') || undefined;
         node.semanticKind = String(fd.get('semanticKind') ?? node.semanticKind ?? 'milestone') as SemanticKind;
-        node.bot = String(fd.get('bot') ?? node.bot ?? 'codex');
+        node.bot = String(fd.get('bot') ?? node.bot ?? availableBots[0]?.larkAppId ?? 'codex');
         node.prompt = String(fd.get('prompt') ?? node.prompt ?? node.label);
-        node.executor = String(fd.get('executor') ?? node.executor ?? 'noop');
-        node.humanGate = fd.get('humanGate') === 'on';
+        node.executor = String(fd.get('executor') ?? node.executor ?? 'shell-command');
+        node.scriptCommand = String(fd.get('scriptCommand') ?? node.scriptCommand ?? '');
+        node.scriptArgs = String(fd.get('scriptArgs') ?? node.scriptArgs ?? '');
+        node.scriptCwd = String(fd.get('scriptCwd') ?? node.scriptCwd ?? '');
+        const timeoutMs = Number(fd.get('scriptTimeoutMs') ?? node.scriptTimeoutMs ?? 120000);
+        node.scriptTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : undefined;
+        const requestedHumanGate = fd.get('humanGate') === 'on';
+        node.humanGate = node.type === 'hostExecutor' && node.executor === 'shell-command'
+          ? true
+          : requestedHumanGate;
         canvas.edges.forEach((e) => { if (e.from === old) e.from = node.id; if (e.to === old) e.to = node.id; });
         selected = { kind: 'node', id: node.id };
         renderAll();
@@ -595,7 +741,7 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
       ${field('标题', 'title', canvas.title)}
       ${field('版本', 'version', String(canvas.version))}
       <h4>角色</h4>
-      <div class="role-list">${canvas.roles.map((role) => `<button type="button" data-role="${escapeHtml(role.id)}">${escapeHtml(role.label)}<small>${escapeHtml(role.kind)}</small></button>`).join('')}</div>
+      <div class="role-list">${canvas.roles.map((role) => `<button type="button" data-role="${escapeHtml(role.id)}">${escapeHtml(role.label)}<small>${escapeHtml(roleKindLabel(role.kind))}</small></button>`).join('')}</div>
       <button id="apply-props" type="button">应用</button>`;
     panel.querySelectorAll<HTMLButtonElement>('[data-role]').forEach((btn) => {
       btn.onclick = () => { selected = { kind: 'role', id: btn.dataset.role! }; renderAll(); };
@@ -639,11 +785,12 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
     const index = canvas.nodes.length;
     canvas.nodes.push(newNode(
       id,
-      type === 'semantic' ? '语义节点' : type === 'hostExecutor' ? '执行器节点' : '任务节点',
+      type === 'semantic' ? '流程关卡' : type === 'hostExecutor' ? '自动动作' : '人工任务',
       type,
       90 + index * 230,
       150 + (index % 2) * 70,
     ));
+    if (type === 'subagent' && availableBots[0]) canvas.nodes[canvas.nodes.length - 1]!.bot = availableBots[0].larkAppId;
     selected = { kind: 'node', id };
     renderAll();
   }
@@ -732,5 +879,6 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
 
   renderAll();
   void loadCatalog();
+  void loadBots();
   return () => {};
 }
