@@ -38,7 +38,10 @@ vi.mock('../src/services/spawn-idempotency-store.js', () => ({
     return { entry, cacheHit: false };
   },
 }));
-vi.mock('../src/services/session-store.js', () => ({ getSession: (id: string) => mockSessions.get(id) }));
+vi.mock('../src/services/session-store.js', () => ({
+  getSession: (id: string) => mockSessions.get(id),
+  findActiveChatScopeSessionsByChat: (chatId: string) => Array.from(mockSessions.values()).filter((s: any) => s.chatId === chatId && s.status === 'active' && s.scope === 'chat'),
+}));
 vi.mock('../src/services/main-topic-config.js', () => ({ getMainTopicChatId: () => 'oc_main' }));
 vi.mock('../src/services/base-relay.js', () => ({
   DEFAULT_GROUP_NOT_FOUND_RETRY_TIMEOUT_MS: 0, sendAsOwner: vi.fn(),
@@ -50,6 +53,7 @@ import {
   createSubTask, getSubTask, transitionStatus, listCommands,
   __resetForTesting, type SubTask, type SubTaskBot, type OutboxCommand,
 } from '../src/services/subtask-store.js';
+import { create as createChatContext } from '../src/services/chat-context-store.js';
 
 const CLAUDE_MAIN: SubTaskBot[] = [
   { openId: 'ou_claude', name: '克劳德', role: 'main' },
@@ -78,7 +82,7 @@ async function mkTask(over: Partial<Parameters<typeof createSubTask>[0]> & { key
 
 /** 子群执行者 session（嵌套 spawn 的调用方）。 */
 function botSession(id: string, chatId: string, larkAppId = 'app_claude', ownerOpenId: string | undefined = 'ou_jason') {
-  const s = { sessionId: id, chatId, rootMessageId: `om_${chatId}`, larkAppId, ownerOpenId, title: 't', status: 'active', createdAt: 't' };
+  const s = { sessionId: id, chatId, rootMessageId: `om_${chatId}`, larkAppId, ownerOpenId, title: 't', status: 'active', createdAt: 't', scope: 'chat' };
   mockSessions.set(id, s);
   return s;
 }
@@ -262,6 +266,147 @@ describe('childToParentSummon 唤醒对象（最小地址簿）', () => {
   it('父=主话题（无登记）→ 回退克劳德（存量行为不变）', async () => {
     const t = await mkTask();   // parentChatId = oc_main，无任务记录
     expect(childToParentSummon(helpCmd, t)).toContain('【克劳德】');
+  });
+
+  it('父=旧主话题且子任务 main 是 Codex/clone → 仍唤旧父群 orchestrator 克劳德，不唤子群 main', async () => {
+    const t = await mkTask({
+      chatId: 'oc_legacy_codex_child',
+      parentChatId: 'oc_legacy_main',
+      bots: [
+        { openId: 'ou_codex', name: '蔻黛克斯', role: 'main', larkAppId: 'app_codex' },
+        { openId: 'ou_coco', name: '缇蕾', role: 'observer', larkAppId: 'app_coco' },
+      ],
+      rootChatId: 'oc_legacy_main',
+    });
+    const text = childToParentSummon(helpCmd, t);
+    expect(text).toContain('【克劳德】');
+    expect(text).not.toContain('【蔻黛克斯】');
+  });
+
+  it('父=Codex Company root → report_help/report_urgent 唤 root CEO 蔻黛克斯，不回退克劳德', async () => {
+    createChatContext('oc_codex_root', {
+      purpose: 'Company root: CodexCo',
+      originType: 'bot_spawned',
+      parentChatId: null,
+      participants: [],
+      relatedRefs: ['ceoLarkAppId=app_codex', 'ceoOpenId=ou_codex', 'ceoBotName=蔻黛克斯'],
+    });
+    const child = await mkTask({
+      chatId: 'oc_codex_child',
+      parentChatId: 'oc_codex_root',
+      bots: [{ openId: 'ou_worker', name: '执行者', role: 'main', larkAppId: 'app_worker' }],
+      rootChatId: 'oc_codex_root',
+      createdBy: '蔻黛克斯',
+      createdByLarkAppId: 'app_codex',
+    });
+    expect(childToParentSummon(helpCmd, child)).toContain('【蔻黛克斯】');
+    expect(childToParentSummon({ ...helpCmd, commandType: 'report_urgent', payload: { summary: '事故', inboxEntryId: 'inbox_1' } } as any, child))
+      .toContain('【蔻黛克斯】');
+  });
+
+  it('父=Company root 但无显式 CEO 元数据 → 按 root chat 的当前 active session 解析 CEO', async () => {
+    createChatContext('oc_live_root', {
+      purpose: 'Company root: live',
+      originType: 'bot_spawned',
+      parentChatId: null,
+      participants: [],
+      relatedRefs: [],
+    });
+    mockSessions.set('root_codex', {
+      sessionId: 'root_codex',
+      chatId: 'oc_live_root',
+      rootMessageId: 'om_live',
+      larkAppId: 'app_codex',
+      ownerOpenId: 'ou_jason',
+      title: 'root',
+      status: 'active',
+      scope: 'chat',
+      createdAt: '2026-06-18T10:00:00.000Z',
+      lastMessageAt: '2026-06-18T10:10:00.000Z',
+    });
+    const child = await mkTask({
+      chatId: 'oc_live_child',
+      parentChatId: 'oc_live_root',
+      bots: [{ openId: 'ou_worker', name: '执行者', role: 'main', larkAppId: 'app_worker' }],
+      rootChatId: 'oc_live_root',
+    });
+    expect(childToParentSummon(helpCmd, child)).toContain('【蔻黛克斯】');
+  });
+
+  it('父=Company root 且 child 记录 createdByLarkAppId → 不被更新的非 CEO root session 覆盖', async () => {
+    createChatContext('oc_created_by_root', {
+      purpose: 'Company root: created-by',
+      originType: 'bot_spawned',
+      parentChatId: null,
+      participants: [],
+      relatedRefs: [],
+    });
+    mockSessions.set('root_codex_old', {
+      sessionId: 'root_codex_old',
+      chatId: 'oc_created_by_root',
+      rootMessageId: 'om_live',
+      larkAppId: 'app_codex',
+      ownerOpenId: 'ou_jason',
+      title: 'root',
+      status: 'active',
+      scope: 'chat',
+      createdAt: '2026-06-18T10:00:00.000Z',
+      lastMessageAt: '2026-06-18T10:00:00.000Z',
+    });
+    mockSessions.set('root_claude_newer', {
+      sessionId: 'root_claude_newer',
+      chatId: 'oc_created_by_root',
+      rootMessageId: 'om_live',
+      larkAppId: 'app_claude',
+      ownerOpenId: 'ou_jason',
+      title: 'root',
+      status: 'active',
+      scope: 'chat',
+      createdAt: '2026-06-18T11:00:00.000Z',
+      lastMessageAt: '2026-06-18T11:00:00.000Z',
+    });
+    const child = await mkTask({
+      chatId: 'oc_created_by_child',
+      parentChatId: 'oc_created_by_root',
+      bots: [{ openId: 'ou_worker', name: '执行者', role: 'main', larkAppId: 'app_worker' }],
+      rootChatId: 'oc_created_by_root',
+      createdBy: '蔻黛克斯',
+      createdByLarkAppId: 'app_codex',
+    });
+    expect(childToParentSummon(helpCmd, child)).toContain('【蔻黛克斯】');
+  });
+
+  it('父=Claude Company root → 仍唤 Claude CEO，不被子群 main bot 覆盖', async () => {
+    createChatContext('oc_claude_root', {
+      purpose: 'Company root: ClaudeCo',
+      originType: 'bot_spawned',
+      parentChatId: null,
+      participants: [],
+      relatedRefs: ['ceoLarkAppId=app_claude', 'ceoOpenId=ou_claude', 'ceoBotName=克劳德'],
+    });
+    const child = await mkTask({
+      chatId: 'oc_claude_child',
+      parentChatId: 'oc_claude_root',
+      bots: [{ openId: 'ou_codex', name: '蔻黛克斯', role: 'main', larkAppId: 'app_codex' }],
+      rootChatId: 'oc_claude_root',
+      createdBy: '克劳德',
+      createdByLarkAppId: 'app_claude',
+    });
+    expect(childToParentSummon(helpCmd, child)).toContain('【克劳德】');
+  });
+
+  it('Codex root 子任务 request_review 只唤 reviewer 蔻黛克斯', async () => {
+    const child = await mkTask({
+      chatId: 'oc_review_child',
+      bots: [
+        { openId: 'ou_worker', name: '执行者', role: 'main', larkAppId: 'app_worker' },
+        { openId: 'ou_codex', name: '蔻黛克斯', role: 'collab', larkAppId: 'app_codex' },
+      ],
+    });
+    const text = parentToChildSummon({ cmdId: 'cmd_r', commandType: 'request_review', payload: { summary: '/tmp/plan' } } as any, child);
+    expect(text).toContain('【蔻黛克斯】');
+    expect(text).not.toContain('【执行者】');
+    expect(text).not.toContain('【克劳德】');
   });
 });
 

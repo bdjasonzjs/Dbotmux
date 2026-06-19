@@ -38,7 +38,10 @@ vi.mock('../src/services/spawn-idempotency-store.js', () => ({
     return { entry, cacheHit: false };
   },
 }));
-vi.mock('../src/services/session-store.js', () => ({ getSession: (id: string) => mockSessions.get(id) }));
+vi.mock('../src/services/session-store.js', () => ({
+  getSession: (id: string) => mockSessions.get(id),
+  findActiveChatScopeSessionsByChat: (chatId: string) => Array.from(mockSessions.values()).filter((s: any) => s.chatId === chatId && s.status === 'active' && s.scope === 'chat'),
+}));
 vi.mock('../src/services/main-topic-config.js', () => ({ getMainTopicChatId: () => 'oc_main' }));
 vi.mock('../src/services/base-relay.js', () => ({ sendAsOwner: vi.fn(), DEFAULT_GROUP_NOT_FOUND_RETRY_TIMEOUT_MS: 0 }));
 

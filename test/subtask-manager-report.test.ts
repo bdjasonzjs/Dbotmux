@@ -29,7 +29,10 @@ vi.mock('../src/services/group-creator.js', () => ({ createGroupWithBots: (...a:
 vi.mock('../src/services/spawn-idempotency-store.js', () => ({
   getOrCompute: async (_k: string, c: () => Promise<any>) => ({ entry: await c(), cacheHit: false }),
 }));
-vi.mock('../src/services/session-store.js', () => ({ getSession: (id: string) => mockSessions.get(id) }));
+vi.mock('../src/services/session-store.js', () => ({
+  getSession: (id: string) => mockSessions.get(id),
+  findActiveChatScopeSessionsByChat: (chatId: string) => Array.from(mockSessions.values()).filter((s: any) => s.chatId === chatId && s.status === 'active' && s.scope === 'chat'),
+}));
 vi.mock('../src/services/main-topic-config.js', () => ({ getMainTopicChatId: () => 'oc_main' }));
 vi.mock('../src/services/base-relay.js', () => ({ sendAsOwner: vi.fn(), DEFAULT_GROUP_NOT_FOUND_RETRY_TIMEOUT_MS: 0 }));
 
@@ -44,10 +47,15 @@ import * as inbox from '../src/services/ceo-inbox-store.js';
 import { runDigestTick } from '../src/services/subtask-digest.js';
 import { childToParentSummon, parentToChildSummon } from '../src/services/outbox-dispatcher-executors.js';
 import { readLetter } from '../src/services/mailbox.js';
+import { create as createChatContext } from '../src/services/chat-context-store.js';
 
 const BOTS: SubTaskBot[] = [
   { openId: 'ou_claude', name: '克劳德', role: 'main' },
   { openId: 'ou_coco', name: '缇蕾', role: 'observer' },
+];
+const CODEX_MANAGER_BOTS: SubTaskBot[] = [
+  { openId: 'ou_codex_worker', name: 'Codex 经理', role: 'main', larkAppId: 'app_codex' },
+  { openId: 'ou_coco', name: '缇蕾', role: 'observer', larkAppId: 'app_coco' },
 ];
 // 父群=oc_main 的 orchestrator（主话题→克劳德）；manager 子群=oc_mgr。
 async function mkManager(chatId = 'oc_mgr', key = 'km'): Promise<string> {
@@ -144,6 +152,35 @@ describe('manager-report 机制门控', () => {
     expect(e.requestCommandId).toBe('req-xyz');
     expect(e.reportKind).toBe('requested');
   });
+  it('Codex/clone manager 正式 managerReport() 入口按 larkAppId 鉴权，不被 app-scoped openId 差异拦住', async () => {
+    createChatContext('oc_codex_root_entry', {
+      purpose: 'Company root: CodexCo',
+      originType: 'bot_spawned',
+      parentChatId: null,
+      participants: [],
+      relatedRefs: ['ceoLarkAppId=app_codex', 'ceoOpenId=ou_codex', 'ceoBotName=蔻黛克斯'],
+    });
+    const t = await createSubTask({
+      chatId: 'oc_mgr_codex_entry',
+      parentChatId: 'oc_codex_root_entry',
+      parentMessageId: 'om',
+      goal: 'manager 领域Codex formal',
+      acceptance: null,
+      bots: CODEX_MANAGER_BOTS,
+      requester: 'ou_jason',
+      createdBy: '蔻黛克斯',
+      createdByLarkAppId: 'app_codex',
+      idempotencyKey: 'km-codex-entry',
+      reportingMode: 'manager',
+    });
+    await transitionStatus(t.taskId, 'observing');
+    const sid = subSession('s_codex_entry', 'oc_mgr_codex_entry', 'app_codex');
+    const r = await managerReport({ sessionId: sid, taskId: t.taskId, summary: 'Codex manager 正式入口通过' });
+    expect(r.entryId).toBeTruthy();
+    const entries = inbox.listInbox('oc_codex_root_entry', 'ou_codex', {});
+    expect(entries).toHaveLength(1);
+    expect(entries[0].summary).toContain('正式入口通过');
+  });
   it('executor 任务调 manager-report → 400', async () => {
     const t = await createSubTask({ chatId: 'oc_ex', parentChatId: 'oc_main', parentMessageId: 'om', goal: 'exec', acceptance: null, bots: BOTS, requester: 'ou_jason', createdBy: 'claude', idempotencyKey: 'ke' });
     await transitionStatus(t.taskId, 'observing');
@@ -216,5 +253,40 @@ describe('渲染', () => {
     expect(text).toContain('急急如律令');
     expect(text).toContain('subtask-manager-report');
     expect(text).toContain('req1');
+  });
+
+  it('Codex CEO root 的 urgent manager report → inbox 收件人与急急如律令目标都是蔻黛克斯', async () => {
+    createChatContext('oc_codex_root', {
+      purpose: 'Company root: CodexCo',
+      originType: 'bot_spawned',
+      parentChatId: null,
+      participants: [],
+      relatedRefs: ['ceoLarkAppId=app_codex', 'ceoOpenId=ou_codex', 'ceoBotName=蔻黛克斯'],
+    });
+    const t = await createSubTask({
+      chatId: 'oc_mgr_codex',
+      parentChatId: 'oc_codex_root',
+      parentMessageId: 'om',
+      goal: 'manager 领域Codex',
+      acceptance: null,
+      bots: CODEX_MANAGER_BOTS,
+      requester: 'ou_jason',
+      createdBy: '蔻黛克斯',
+      createdByLarkAppId: 'app_codex',
+      idempotencyKey: 'km-codex',
+      reportingMode: 'manager',
+    });
+    await transitionStatus(t.taskId, 'observing');
+    const r = await managerReportCore(getSubTask(t.taskId)!, {
+      summary: '线上事故',
+      reportKind: 'urgent',
+      urgency: 'urgent',
+      reason: '需要 CEO 介入',
+      idempotencyKey: 'urgent-codex',
+    });
+    const entries = inbox.listInbox('oc_codex_root', 'ou_codex', {});
+    expect(entries).toHaveLength(1);
+    const cmd = getCommand(r.urgentCmdId!)!;
+    expect(childToParentSummon(cmd, getSubTask(t.taskId)!)).toContain('急急如律令：【蔻黛克斯】');
   });
 });

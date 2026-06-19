@@ -24,7 +24,8 @@ import {
 import { writeLetter as realWriteLetter, letterSentinel, type Letter, type LetterMeta } from './mailbox.js';
 import { SUBTASK_COLLAB_NORMS_ONELINE } from './subtask-norms.js';
 import { type DispatchExecutors } from './outbox-dispatcher.js';
-import { getByChatId, type CommandTargetRole, type OutboxCommand, type SubTask } from './subtask-store.js';
+import { type CommandTargetRole, type OutboxCommand, type SubTask } from './subtask-store.js';
+import { resolveParentOrchestrator } from './subtask-parent-orchestrator.js';
 
 /** 急急如律令口令前缀 —— **必须**与 event-dispatcher.parseUrgentSummon 的解析前缀一致。
  *  内联而非 import event-dispatcher，避免投递层拖入 IM 路由的重依赖 (也便于单测隔离)。 */
@@ -98,15 +99,8 @@ function mainBotName(task: SubTask): string {
   return task.bots.find(b => b.role === 'main')?.name ?? '克劳德';
 }
 
-/** 父群 orchestrator 名 (child→parent 唤它)。嵌套后父群可能也是任务群 → 唤它登记的 main bot；
- *  父=主话题 → getByChatId 不命中 → 回退「克劳德」(恰好正确)。最小地址簿 (方案 §1.4 规则 1+3)。 */
 function parentOrchestratorName(task: SubTask): string {
-  try {
-    const parent = getByChatId(task.parentChatId);
-    return parent?.bots.find(b => b.role === 'main')?.name ?? '克劳德';
-  } catch {
-    return '克劳德';   // store corrupt 等异常不阻塞投递，按单层语义回退
-  }
+  return resolveParentOrchestrator(task).name;
 }
 
 /** 优化 #1/#3 (蔻黛克斯 #1-blocker3)：按角色解析急急如律令名单，**绝不返回空名单**。

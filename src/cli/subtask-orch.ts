@@ -14,6 +14,7 @@ const DATA_DIR = join(homedir(), '.botmux', 'data');
 const CLAUDE_BOT_NAME_ZH = '克劳德';
 
 interface DaemonInfoFile { larkAppId?: string; botName: string; ipcPort: number; lastHeartbeat: number; }
+type DaemonSelection = { port: number; diagnostic?: string } | { error: string; diagnostic?: string };
 
 const VERB_ROUTE: Record<string, string> = {
   start: '/api/subtask-orch-create',
@@ -21,6 +22,7 @@ const VERB_ROUTE: Record<string, string> = {
   query: '/api/subtask-orch-query',
   finish: '/api/subtask-orch-finish',
   supplement: '/api/subtask-orch-supplement',
+  adopt: '/api/subtask-orch-adopt',
   askforhelp: '/api/subtask-orch-askforhelp',
   'request-review': '/api/subtask-orch-request-review',
   // 双层汇报 v6（经理汇报制度）：
@@ -32,7 +34,7 @@ const VERB_ROUTE: Record<string, string> = {
 };
 const NUM_FLAGS = new Set(['expectedVersion', 'limit']);
 const LIST_FLAGS = new Set(['bots', 'sourceMessageIds', 'relatedRefs', 'ids']);
-const BOOL_FLAGS = new Set(['force', 'spawnable', 'cascade', 'manager', 'noObserver', 'unreadOnly', 'withBody']);
+const BOOL_FLAGS = new Set(['force', 'spawnable', 'cascade', 'manager', 'noObserver', 'unreadOnly', 'withBody', 'commit']);
 // 注：bot 简写 c/k/t → claude|codex|tilly 的归一化已下沉到 orchestrator（N-bot ref 解析，
 // 支持 ref:role 后缀 + 分身 name/appId）。CLI 侧不再做映射，--bots 原样透传。
 
@@ -41,24 +43,10 @@ function kebabToCamel(s: string): string {
   return s.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
 }
 
-function findSessionLarkAppId(sessionId: string): string | null {
-  let files: string[];
-  try { files = readdirSync(DATA_DIR).filter(f => f.startsWith('sessions-') && f.endsWith('.json')); }
-  catch { return null; }
-  for (const f of files) {
-    try {
-      const sessions = JSON.parse(readFileSync(join(DATA_DIR, f), 'utf-8')) as Record<string, { larkAppId?: string }>;
-      const appId = sessions?.[sessionId]?.larkAppId;
-      if (appId) return appId;
-    } catch { /* skip corrupt */ }
-  }
-  return null;
-}
-
-export function findClaudeDaemonPort(sessionId?: string): number | null {
+function readFreshDaemons(): DaemonInfoFile[] {
   let files: string[];
   try { files = readdirSync(REGISTRY_DIR).filter(f => f.endsWith('.json')); }
-  catch { return null; }
+  catch { return []; }
   const now = Date.now(); const STALE = 90_000;
   const fresh: DaemonInfoFile[] = [];
   for (const f of files) {
@@ -68,21 +56,60 @@ export function findClaudeDaemonPort(sessionId?: string): number | null {
       fresh.push(d);
     } catch { /* skip corrupt */ }
   }
-  const envAppId = process.env.LARK_APP_ID;
-  if (envAppId) {
-    const own = fresh.find(d => d.larkAppId === envAppId);
-    if (own) return own.ipcPort;
-  }
-  const sessionAppId = sessionId ? findSessionLarkAppId(sessionId) : null;
-  if (sessionAppId) {
-    const own = fresh.find(d => d.larkAppId === sessionAppId);
-    if (own) return own.ipcPort;
-  }
-  return fresh.find(d => d.botName === CLAUDE_BOT_NAME_ZH)?.ipcPort ?? null;
+  return fresh;
 }
 
-function parseBody(argv: string[]): { body: Record<string, unknown> } | { error: string } {
+function findSessionAppId(sessionId: string): { larkAppId: string; chatId?: string; rootMessageId?: string } | null {
+  let files: string[];
+  try { files = readdirSync(DATA_DIR).filter(f => f.startsWith('sessions-') && f.endsWith('.json')); }
+  catch { return null; }
+  for (const f of files) {
+    try {
+      const raw = JSON.parse(readFileSync(join(DATA_DIR, f), 'utf-8'));
+      const sessions = Array.isArray(raw) ? raw : Object.values(raw.sessions ?? raw ?? {});
+      const hit: any = sessions.find((s: any) => s?.sessionId === sessionId);
+      if (hit?.larkAppId) return { larkAppId: hit.larkAppId, chatId: hit.chatId, rootMessageId: hit.rootMessageId };
+    } catch { /* skip corrupt */ }
+  }
+  return null;
+}
+
+function findSubtaskDaemonPort(sessionId?: string): DaemonSelection | null {
+  const fresh = readFreshDaemons();
+  if (!fresh.length) return null;
+  if (sessionId) {
+    const owner = findSessionAppId(sessionId);
+    if (owner) {
+      const daemon = fresh.find(d => d.larkAppId === owner.larkAppId);
+      if (daemon) {
+        return {
+          port: daemon.ipcPort,
+          diagnostic: `session=${sessionId} chat=${owner.chatId ?? 'unknown'} app=${owner.larkAppId} daemon=${daemon.botName}`,
+        };
+      }
+      return {
+        error: `session ${sessionId} belongs to app=${owner.larkAppId}, but no fresh daemon for that app`,
+        diagnostic: `session=${sessionId} chat=${owner.chatId ?? 'unknown'} app=${owner.larkAppId}; fresh daemons=${fresh.map(d => `${d.botName}/${d.larkAppId ?? 'unknown'}`).join(', ')}`,
+      };
+    }
+  }
+  const preferredAppId = process.env.BOTMUX_SUBTASK_DAEMON_APP_ID ?? process.env.LARK_APP_ID;
+  if (preferredAppId) {
+    const preferred = fresh.find(d => d.larkAppId === preferredAppId);
+    if (preferred) return { port: preferred.ipcPort, diagnostic: `preferred app=${preferredAppId} daemon=${preferred.botName}` };
+  }
+  const fallback = fresh.find(d => d.botName === CLAUDE_BOT_NAME_ZH) ?? fresh[0];
+  return { port: fallback.ipcPort, diagnostic: `fallback daemon=${fallback.botName}` };
+}
+
+export function findClaudeDaemonPort(sessionId?: string): number | null {
+  const selected = findSubtaskDaemonPort(sessionId);
+  return selected && !('error' in selected) ? selected.port : null;
+}
+
+function parseBody(argv: string[]): { body: Record<string, unknown>; sessionSource: 'flag' | 'env' } | { error: string } {
   const body: Record<string, unknown> = {};
+  let sessionSource: 'flag' | 'env' = 'env';
   let i = 0;
   while (i < argv.length) {
     const a = argv[i];
@@ -94,6 +121,7 @@ function parseBody(argv: string[]): { body: Record<string, unknown> } | { error:
     if (NUM_FLAGS.has(key)) body[key] = Number(val);
     else if (LIST_FLAGS.has(key)) body[key] = val.split(',').map(s => s.trim()).filter(Boolean);
     else body[key] = val;
+    if (key === 'sessionId') sessionSource = 'flag';
     i += 2;
   }
   // N-bot: pass --bots entries through verbatim. The orchestrator resolves each
@@ -102,7 +130,7 @@ function parseBody(argv: string[]): { body: Record<string, unknown> } | { error:
   // So `--bots claude:main,克隆2:collab` flows straight through.
   if (!body.sessionId) body.sessionId = process.env.BOTMUX_SESSION_ID;
   if (!body.sessionId) return { error: 'missing --session-id <sid> or env BOTMUX_SESSION_ID' };
-  return { body };
+  return { body, sessionSource };
 }
 
 const HELP = `botmux subtask-{start|report|query|finish|supplement} — 子任务编排 v2
@@ -121,6 +149,10 @@ const HELP = `botmux subtask-{start|report|query|finish|supplement} — 子任�
   subtask-supplement --task-id <id> --content "<补充>" --expected-version <n> [--force]
                      [--target-role main|reviewer|all]  (缺省 main：普通补充给执行者)
                      (expected-version 默认必传守 stale；人工强制结束/补充才加 --force)
+  subtask-adopt      --chat-id oc_xxx --goal "<这个群要承担什么>" [--parent-chat-id oc_parent]
+                     [--mode manager|executor] [--bots <ref>[:role],...] [--task-type prd|bug|misc]
+                     [--acceptance "<验收>"] [--related-refs a,b] [--commit]
+                     (默认 dry-run，只输出将写入的 SubTask/ChatContext/Topology；--commit 才落库)
   subtask-askforhelp --task-id <id> --summary "<卡在哪/需要什么>" [--source-message-ids m1,m2]
                      (子群执行 bot 向主 bot 求助：写求助进 store，由 coco 触发急急如律令唤主 bot)
   subtask-request-review --task-id <id> --summary "<可打开的飞书链接/本机绝对路径>" [--source-message-ids m1,m2]
@@ -149,19 +181,30 @@ export async function cmdSubtaskOrch(verb: string, argv: string[]): Promise<void
   const parsed = parseBody(argv);
   if ('error' in parsed) { console.error(`❌ ${parsed.error}`); process.exit(2); }
 
-  const port = findClaudeDaemonPort(String(parsed.body.sessionId ?? ''));
-  if (!port) { console.error(`❌ 找不到当前 session 所属 daemon（${REGISTRY_DIR} 无新鲜注册）`); process.exit(1); }
+  const sessionId = String(parsed.body.sessionId ?? '');
+  const selected = findSubtaskDaemonPort(sessionId);
+  if (!selected) { console.error(`❌ 找不到当前 session 所属 daemon（${REGISTRY_DIR} 无新鲜注册）`); process.exit(1); }
+  if ('error' in selected) {
+    console.log(JSON.stringify({ ok: false, error: selected.error, diagnostic: selected.diagnostic }));
+    process.exit(1);
+  }
 
   let res: Response;
   try {
-    res = await fetch(`http://127.0.0.1:${port}${route}`, {
+    res = await fetch(`http://127.0.0.1:${selected.port}${route}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(parsed.body),
     });
-  } catch (err: any) { console.error(`❌ 连不上 daemon (port ${port}): ${err.message}`); process.exit(1); }
+  } catch (err: any) { console.error(`❌ 连不上 daemon (port ${selected.port}): ${err.message}`); process.exit(1); }
 
   const json = await res.json().catch(() => ({ ok: false, error: 'invalid_json_response' }));
+  if (!res.ok || (json as any).ok === false) {
+    const sourceHint = parsed.sessionSource === 'env'
+      ? 'session came from BOTMUX_SESSION_ID; pass --session-id for the current chat or unset stale BOTMUX_SESSION_ID'
+      : 'session came from --session-id';
+    (json as any).diagnostic = [sourceHint, selected.diagnostic].filter(Boolean).join('; ');
+  }
   console.log(JSON.stringify(json));
   process.exit(res.ok && (json as any).ok !== false ? 0 : 1);
 }

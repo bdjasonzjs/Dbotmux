@@ -64,6 +64,7 @@ export interface SubTask {
   bots: SubTaskBot[];
   requester: string;
   createdBy: string;
+  createdByLarkAppId?: string;
   idempotencyKey: string;
   status: SubTaskStatus;
   version: number;
@@ -308,6 +309,7 @@ export async function createSubTask(opts: {
   chatId: string; parentChatId: string; parentMessageId: string;
   goal: string; acceptance?: string | null; bots: SubTaskBot[];
   requester: string; createdBy: string; idempotencyKey: string;
+  createdByLarkAppId?: string;
   staleAfter?: number | null; deadline?: string | null;
   depth?: number; rootChatId?: string; spawnable?: boolean;
   reportingMode?: 'manager' | 'executor';
@@ -323,6 +325,7 @@ export async function createSubTask(opts: {
       taskId: genId('st'), chatId: opts.chatId, parentChatId: opts.parentChatId,
       parentMessageId: opts.parentMessageId, goal: opts.goal, acceptance: opts.acceptance ?? null,
       bots: opts.bots, requester: opts.requester, createdBy: opts.createdBy,
+      createdByLarkAppId: opts.createdByLarkAppId,
       idempotencyKey: opts.idempotencyKey, status: 'creating', version: 1, createdAt: now, updatedAt: now,
       readCursor: null, committedCursor: null, deadline: opts.deadline ?? null,
       staleAfter: opts.staleAfter ?? null, compactSummary: null, lastError: null,

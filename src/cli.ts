@@ -3410,6 +3410,7 @@ switch (command) {
     break;
   }
   case 'subtask-start':
+  case 'subtask-adopt':
   case 'subtask-report':
   case 'subtask-query':
   case 'subtask-finish':

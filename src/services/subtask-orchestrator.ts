@@ -16,16 +16,21 @@
  *   report_progress=session.chatId===task.chatId（只能从该子群上报）。
  */
 import { randomUUID } from 'node:crypto';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { config } from '../config.js';
 import { HttpError, resolveBotIdent } from '../core/main-bot-playbook.js';
-import { getCompanyByRootChatId, getMainTopicBotRef, getMainTopicChatId, type CompanyConfig } from './main-topic-config.js';
+import { getMainTopicChatId } from './main-topic-config.js';
 import { getOrCompute, type IdempotencyEntry } from './spawn-idempotency-store.js';
 import { createGroupWithBots } from './group-creator.js';
 import { getSession } from './session-store.js';
 import { logger } from '../utils/logger.js';
 import { ensureCloneScopesProvisioned } from './clone-scope-provisioning.js';
 import type { Session } from '../types.js';
+import { create as createChatContext, read as readChatContext, update as updateChatContext, isSafeChatId } from './chat-context-store.js';
+import { readTopology, writeTopology, type ChatNode } from './chat-topology-store.js';
 import {
-  createSubTask, getSubTask, getByChatId, getCommand, transitionStatus, enqueueCommand, ackCommand,
+  createSubTask, getSubTask, getByChatId, getByIdempotencyKey, getCommand, transitionStatus, enqueueCommand, ackCommand,
   transitionAndEnqueueCommand, listObservations, listCommands, listSubTasks,
   helpReportDelivery, ACTIVE_STATUSES, isManager, shouldRealtimePush, recordManualDoneObservation, recordManualHelpObservation,
   VersionConflictError, CommandRetryMismatchError,
@@ -35,6 +40,7 @@ import {
 import { SUBTASK_COLLAB_NORMS } from './subtask-norms.js';
 import { writeLetter, readLetter } from './mailbox.js';
 import { enqueueEntry, listInbox, markRead, type ReportKind, type InboxEntry } from './ceo-inbox-store.js';
+import { resolveParentOrchestrator } from './subtask-parent-orchestrator.js';
 
 /** v2 编排链路标记 —— 进 chatContext.relatedRefs，dashboard/welcome card 可见，
  *  跟旧 watcher 链路区分 (边界3)。 */
@@ -45,27 +51,165 @@ const BOT_META: Record<'claude' | 'codex' | 'tilly', { name: string; role: SubTa
   codex: { name: '蔻黛克斯', role: 'collab' },
   tilly: { name: '缇蕾', role: 'observer' },
 };
-
-/** Built-in alias (lower-cased) → BOT_META key. Covers short codes (c/k/t) and
- *  full names so `bots:['c']` / `['CLAUDE']` keep the legacy name+role. Any ref
- *  not here is an arbitrary bot (clone) → name from registry, role defaults to
- *  'collab'. */
-const ALIAS_TO_META_KEY: Record<string, keyof typeof BOT_META> = {
-  claude: 'claude', c: 'claude',
-  codex: 'codex', k: 'codex',
-  tilly: 'tilly', t: 'tilly',
+const BOT_ALIASES: Record<string, 'claude' | 'codex' | 'tilly'> = {
+  c: 'claude', claude: 'claude',
+  k: 'codex', codex: 'codex',
+  t: 'tilly', tilly: 'tilly', coco: 'tilly',
 };
+const BOT_ROLES = new Set<SubTaskBot['role']>(['main', 'collab', 'observer']);
 
-/** Roles a `--bots ref:role` suffix may set. */
-const VALID_ROLES = new Set<string>(['main', 'collab', 'observer']);
-
-function isAutoCloneBotEntry(entry: string): boolean {
-  const lower = entry.trim().toLowerCase();
-  return lower.startsWith('auto@') || lower.startsWith('auto:');
+type BotSpecInput = 'claude' | 'codex' | 'tilly' | string | { ref?: string; key?: string; role?: SubTaskBot['role'] };
+interface BotCatalogEntry { larkAppId: string; botName: string; cliId: string; botOpenId: string; }
+interface ResolvedBotSpec {
+  ref: string;
+  larkAppId: string;
+  openId: string;
+  name: string;
+  role: SubTaskBot['role'];
 }
 
-/** Exported so the CEO-spawn key (ceo-spawn-store) mirrors createSubtask's
- *  idempotencyKey exactly (块7 第二轮 #5: subgroup + CEO-spawn state share one key). */
+function readBotCatalog(): BotCatalogEntry[] {
+  const p = join(config.session.dataDir, 'bots-info.json');
+  if (!existsSync(p)) return [];
+  try {
+    const raw = JSON.parse(readFileSync(p, 'utf-8'));
+    if (!Array.isArray(raw)) throw new Error('not an array');
+    return raw.filter((b: any): b is BotCatalogEntry =>
+      typeof b?.larkAppId === 'string'
+      && typeof b?.botName === 'string'
+      && typeof b?.cliId === 'string'
+      && typeof b?.botOpenId === 'string');
+  } catch (err) {
+    throw new HttpError(500, `failed to parse bots-info.json: ${err}`);
+  }
+}
+
+function openIdForCreatorScope(bot: BotCatalogEntry, creatorLarkAppId?: string): string {
+  if (creatorLarkAppId) {
+    const p = join(config.session.dataDir, `bot-openids-${creatorLarkAppId}.json`);
+    if (existsSync(p)) {
+      try {
+        const xref = JSON.parse(readFileSync(p, 'utf-8')) as Record<string, string>;
+        if (xref[bot.botName]) return xref[bot.botName];
+      } catch { /* fall through */ }
+    }
+  }
+  return bot.botOpenId;
+}
+
+function catalogEntryForApp(larkAppId?: string): BotCatalogEntry | null {
+  if (!larkAppId) return null;
+  try {
+    return readBotCatalog().find(b => b.larkAppId === larkAppId) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function parseBotSpec(input: BotSpecInput): { ref: string; role?: SubTaskBot['role'] } {
+  if (typeof input === 'object' && input !== null) {
+    const ref = input.ref ?? input.key;
+    if (!ref) throw new HttpError(400, `invalid bot entry: missing ref`);
+    if (input.role && !BOT_ROLES.has(input.role)) throw new HttpError(400, `invalid bot role: ${input.role} (allowed: main|collab|observer)`);
+    return { ref, role: input.role };
+  }
+  const raw = String(input).trim();
+  const idx = raw.lastIndexOf(':');
+  if (idx > 0) {
+    const maybeRole = raw.slice(idx + 1);
+    if (BOT_ROLES.has(maybeRole as SubTaskBot['role'])) {
+      return { ref: raw.slice(0, idx), role: maybeRole as SubTaskBot['role'] };
+    }
+  }
+  return { ref: raw };
+}
+
+function isAutoCloneBotEntry(ref: string): boolean {
+  const lower = ref.trim().toLowerCase();
+  return lower === 'auto' || lower.startsWith('auto@') || lower.startsWith('auto:');
+}
+
+function resolveBotSpec(input: BotSpecInput, creatorLarkAppId: string, callerLarkAppId: string): ResolvedBotSpec {
+  const spec = parseBotSpec(input);
+  if (isAutoCloneBotEntry(spec.ref)) {
+    throw new HttpError(400, `subtask-start --bots does not support auto-clone syntax "${spec.ref}"; use an existing clone appId/name in --bots (for example cli_xxx:collab), or use ceo-spawn --seats for auto-clone`);
+  }
+  const alias = BOT_ALIASES[spec.ref.toLowerCase()];
+  if (alias) {
+    const ident = resolveBotIdent(alias);
+    const meta = BOT_META[alias];
+    return {
+      ref: spec.ref,
+      larkAppId: ident.larkAppId,
+      openId: ident.openId,
+      name: meta.name,
+      role: spec.role ?? (ident.larkAppId === callerLarkAppId ? 'main' : alias === 'tilly' ? 'observer' : 'collab'),
+    };
+  }
+
+  try {
+    const ident = resolveBotIdent(spec.ref);
+    return {
+      ref: spec.ref,
+      larkAppId: ident.larkAppId,
+      openId: ident.openId,
+      name: ident.name,
+      role: spec.role ?? (ident.larkAppId === callerLarkAppId ? 'main' : 'collab'),
+    };
+  } catch {
+    // Fall back to bots-info.json below for app/runtime catalogs that are not wired into resolveBotIdent.
+  }
+
+  const catalog = readBotCatalog();
+  const byApp = catalog.filter(b => b.larkAppId === spec.ref);
+  const byName = catalog.filter(b => b.botName === spec.ref);
+  const byCli = catalog.filter(b => b.cliId === spec.ref);
+  const matches = byApp.length ? byApp : byName.length ? byName : byCli;
+  if (matches.length === 0) {
+    throw new HttpError(400, `unknown bot ref: ${spec.ref} (use claude|codex|tilly, exact botName, larkAppId, or unique cliId)`);
+  }
+  if (matches.length > 1) {
+    const names = matches.map(b => `${b.botName}/${b.larkAppId}`).join(', ');
+    throw new HttpError(400, `ambiguous bot ref: ${spec.ref} (${names}); use exact botName or larkAppId`);
+  }
+  const bot = matches[0];
+  return {
+    ref: spec.ref,
+    larkAppId: bot.larkAppId,
+    openId: openIdForCreatorScope(bot, creatorLarkAppId),
+    name: bot.botName,
+    role: spec.role ?? (bot.larkAppId === callerLarkAppId ? 'main' : bot.cliId === 'coco' ? 'observer' : 'collab'),
+  };
+}
+
+function defaultBotSpecsForCaller(callerLarkAppId: string): BotSpecInput[] {
+  const caller = catalogEntryForApp(callerLarkAppId);
+  const refs = [
+    caller?.larkAppId,
+    'claude',
+    'codex',
+    'tilly',
+  ].filter((x): x is string => !!x);
+  return Array.from(new Set(refs));
+}
+
+function resolveSubtaskBots(input: BotSpecInput[] | undefined, creatorLarkAppId: string, callerLarkAppId: string): ResolvedBotSpec[] {
+  const specs = input?.length ? input : defaultBotSpecsForCaller(callerLarkAppId);
+  const resolved = specs.map(s => resolveBotSpec(s, creatorLarkAppId, callerLarkAppId));
+  const byApp = new Map<string, ResolvedBotSpec>();
+  for (const bot of resolved) {
+    const prev = byApp.get(bot.larkAppId);
+    if (!prev) byApp.set(bot.larkAppId, bot);
+    else if (bot.role === 'main' || prev.role !== 'main') byApp.set(bot.larkAppId, bot);
+  }
+  const unique = Array.from(byApp.values());
+  const mains = unique.filter(b => b.role === 'main');
+  if (mains.length > 1) {
+    throw new HttpError(400, `subtask bots must contain at most one main role (got ${mains.length}); use ref:main/ref:collab/ref:observer`);
+  }
+  return unique;
+}
+
 export function slug(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 32) || 'task';
 }
@@ -80,30 +224,39 @@ export function djb2(s: string): string {
 /** session.larkAppId 反查到对应 bot 的 openId (report 鉴权: 发起 bot ∈ task.bots)。 */
 function sessionBotOpenId(larkAppId?: string): string | null {
   if (!larkAppId) return null;
-  try { return resolveBotIdent(larkAppId).openId; }
-  catch { return null; }
-}
-
-/** Match a task participant from the current session. Prefer larkAppId because
- *  Lark open_id is app-scoped; older tasks without larkAppId still fall back to
- *  the historical openId check. */
-function sessionTaskBot(task: SubTask, larkAppId?: string): SubTaskBot | undefined {
-  if (!larkAppId) return undefined;
-  const byAppId = task.bots.find(b => b.larkAppId === larkAppId);
-  if (byAppId) return byAppId;
-  const botOpenId = sessionBotOpenId(larkAppId);
-  return botOpenId ? task.bots.find(b => b.openId === botOpenId) : undefined;
+  const catalogEntry = catalogEntryForApp(larkAppId);
+  if (catalogEntry?.botOpenId) return catalogEntry.botOpenId;
+  for (const k of ['claude', 'codex', 'tilly'] as const) {
+    if (resolveBotIdent(k).larkAppId === larkAppId) return resolveBotIdent(k).openId;
+  }
+  return null;
 }
 
 /** session.larkAppId 反查 bot key（createdBy 记真实创建者用）。 */
-function sessionBotKey(larkAppId?: string): string | null {
+function sessionBotKey(larkAppId?: string): 'claude' | 'codex' | 'tilly' | null {
   if (!larkAppId) return null;
-  try { return resolveBotIdent(larkAppId).name; }
-  catch { /* fallback to legacy aliases below */ }
   for (const k of ['claude', 'codex', 'tilly'] as const) {
     if (resolveBotIdent(k).larkAppId === larkAppId) return k;
   }
   return null;
+}
+
+function sessionBotName(larkAppId?: string): string {
+  return catalogEntryForApp(larkAppId)?.botName ?? sessionBotKey(larkAppId) ?? 'unknown';
+}
+
+function taskBotMatchesSession(bot: SubTaskBot, session: Session): boolean {
+  return (!!bot.larkAppId && !!session.larkAppId && bot.larkAppId === session.larkAppId)
+    || (!!session.larkAppId && bot.openId === sessionBotOpenId(session.larkAppId));
+}
+
+function isCompanyRootChat(chatId: string): boolean {
+  const ctx = readChatContext(chatId);
+  const ctxRefs = ctx?.relatedRefs ?? [];
+  if (ctx?.purpose?.toLowerCase().startsWith('company root:')) return true;
+  if (ctxRefs.some(ref => ref.startsWith('company:') || ref.startsWith('root:'))) return true;
+  const node = readTopology().nodes.find(n => n.chatId === chatId);
+  return !!node && !node.parentChatId && node.summary.toLowerCase().startsWith('company root:');
 }
 
 // ─── 嵌套子任务：G 闸阈值（全部 env 可调；惰性读取便于测试与调参；**只对嵌套分支生效**，
@@ -146,23 +299,20 @@ interface SpawnCtx {
  */
 async function authzSpawn(sessionId: string): Promise<SpawnCtx> {
   if (!sessionId) throw new HttpError(400, 'missing sessionId');
-  const legacyMainTopic = getMainTopicChatId();
+  const mainTopic = getMainTopicChatId();
   const session = getSession(sessionId);
   if (!session) throw new HttpError(403, `unknown session: ${sessionId}`);
-  const rootCompany = getCompanyByRootChatId(session.chatId);
-  const mainTopic = rootCompany?.rootChatId ?? legacyMainTopic;
-  if (!mainTopic) throw new HttpError(500, 'mainTopicChatId/company root not configured — run `botmux create-company --ceo <bot>` or `botmux config set-main-topic <chatId>`');
+  if (!session.larkAppId) {
+    throw new HttpError(403, `session has no larkAppId; cannot identify caller bot`);
+  }
+  const callerLarkAppId = session.larkAppId;
 
   if (session.chatId === mainTopic) {
-    // —— 主话题分支：与 authzCheck (main-bot-playbook.ts) 行为 100% 一致 ——
-    const mainBotApp = rootCompany?.ceoLarkAppId ?? resolveBotIdent(getMainTopicBotRef(mainTopic)).larkAppId;
-    if (session.larkAppId !== mainBotApp) {
-      throw new HttpError(403, `only main bot can spawn subtasks (session.larkAppId=${session.larkAppId}, expected=${mainBotApp})`);
-    }
+    if (!sessionBotOpenId(callerLarkAppId)) throw new HttpError(403, `only registered bot sessions can spawn subtasks (session.larkAppId=${callerLarkAppId})`);
     return {
-      callerChatId: session.chatId, callerBotAppId: session.larkAppId,
+      callerChatId: session.chatId, callerBotAppId: callerLarkAppId,
       rootMessageId: session.rootMessageId, ownerOpenId: session.ownerOpenId,
-      depth: 0, rootChatId: mainTopic, parentTask: null,
+      depth: 0, rootChatId: mainTopic ?? session.chatId, parentTask: null,
     };
   }
 
@@ -170,12 +320,19 @@ async function authzSpawn(sessionId: string): Promise<SpawnCtx> {
   if (process.env.BOTMUX_NESTED_SUBTASK === '0') {
     throw new HttpError(403, 'nested subtask globally disabled (BOTMUX_NESTED_SUBTASK=0)');
   }
-  if (!session.larkAppId) {
-    throw new HttpError(403, `session has no larkAppId; cannot identify caller bot`);
-  }
   const task = getByChatId(session.chatId);
   if (!task) {
-    throw new HttpError(403, `spawn only allowed from main topic or a registered task chat (session.chatId=${session.chatId})`);
+    if (!sessionBotOpenId(callerLarkAppId)) {
+      throw new HttpError(403, `spawn only allowed from registered bot sessions (session.chatId=${session.chatId}, session.larkAppId=${callerLarkAppId})`);
+    }
+    if (!isCompanyRootChat(session.chatId)) {
+      throw new HttpError(403, `spawn only allowed from mainTopic, a registered task chat, or an explicit Company root chat (session.chatId=${session.chatId})`);
+    }
+    return {
+      callerChatId: session.chatId, callerBotAppId: callerLarkAppId,
+      rootMessageId: session.rootMessageId, ownerOpenId: session.ownerOpenId,
+      depth: 0, rootChatId: session.chatId, parentTask: null,
+    };
   }
   if (!ACTIVE_STATUSES.includes(task.status)) {
     throw new HttpError(403, `task ${task.taskId} is not active (status=${task.status}); cannot spawn from it`);
@@ -183,21 +340,20 @@ async function authzSpawn(sessionId: string): Promise<SpawnCtx> {
   if (task.spawnable !== true) {
     throw new HttpError(403, `task ${task.taskId} is not spawnable (create 时未授权 --spawnable)`);
   }
-  const callerBot = sessionTaskBot(task, session.larkAppId);
-  if (callerBot?.role !== 'main') {
+  const mainBot = task.bots.find(b => b.role === 'main');
+  if (!mainBot || !taskBotMatchesSession(mainBot, session)) {
     throw new HttpError(403, `only this chat's registered executor (main bot) can spawn (caller larkAppId=${session.larkAppId})`);
   }
   // owner 链 + 跨 app scope 防护 (蔻黛克斯 review blocker)：open_id 是 app-scoped，而 createSubtask
-  // 固定以配置的 main-bot app 建群 (group-creator 合同: userOpenIds 必须 creator scope)。非 main-bot 执行者
+  // 固定以 Claude app 建群 (group-creator 合同: userOpenIds 必须 creator scope)。非 Claude 执行者
   // 会话里的 ownerOpenId 是它自己 app 视角的 id，直接用会让 owner 邀请失败 → base relay 投不进新群。
-  // 所以只有 main-bot 会话的 ownerOpenId 可直接用；其余回退父任务 requester —— 整条建树链的 requester
-  // 都由 main-bot 链路写入，恒为 main-bot scope。'owner' 是历史占位符，视为无效。
-  const taskCompany = getCompanyByRootChatId(task.rootChatId ?? rootOf(task, getMainTopicChatId()));
-  const mainBotApp = taskCompany?.ceoLarkAppId ?? resolveBotIdent(getMainTopicBotRef(taskCompany?.rootChatId)).larkAppId;
+  // 所以只有 Claude 会话的 ownerOpenId 可直接用；其余回退父任务 requester —— 整条建树链的 requester
+  // 都由 Claude 链路写入，恒为 Claude scope。'owner' 是历史占位符，视为无效。
+  const claudeApp = resolveBotIdent('claude').larkAppId;
   const inheritedRequester = task.requester && task.requester !== 'owner' ? task.requester : undefined;
-  const ownerOpenId = (session.larkAppId === mainBotApp ? session.ownerOpenId : undefined) ?? inheritedRequester;
+  const ownerOpenId = (callerLarkAppId === claudeApp ? session.ownerOpenId : undefined) ?? inheritedRequester;
   return {
-    callerChatId: session.chatId, callerBotAppId: session.larkAppId,
+    callerChatId: session.chatId, callerBotAppId: callerLarkAppId,
     rootMessageId: session.rootMessageId,
     ownerOpenId,
     depth: task.depth ?? 1, rootChatId: rootOf(task, mainTopic), parentTask: task,
@@ -218,18 +374,20 @@ function assertNoCycle(startChatId: string, mainTopic: string): void {
   }
 }
 
-/** 父群 orchestrator bot 解析：父群是任务群 → 它登记的 main bot；父=主话题 → 配置的 main bot。 */
-function resolveCompanyCeoOpenId(company: CompanyConfig | null): string {
-  if (company?.ceoOpenId) return company.ceoOpenId;
-  if (company?.ceoLarkAppId) return resolveBotIdent(company.ceoLarkAppId).openId;
-  return resolveBotIdent(getMainTopicBotRef(company?.rootChatId)).openId;
+function parentOrchestratorOpenId(task: SubTask): string {
+  return resolveParentOrchestrator(task).openId
+    ?? task.bots.find(b => b.role === 'main')?.openId
+    ?? resolveBotIdent('claude').openId;
 }
 
-function parentOrchestratorOpenId(task: SubTask): string {
-  const parentTask = getByChatId(task.parentChatId);
-  const company = getCompanyByRootChatId(task.rootChatId ?? task.parentChatId);
-  return parentTask?.bots.find(b => b.role === 'main')?.openId
-    ?? resolveCompanyCeoOpenId(company);
+function parentOrchestratorBot(task: SubTask): SubTaskBot | null {
+  const resolved = resolveParentOrchestrator(task);
+  return {
+    openId: resolved.openId ?? '',
+    larkAppId: resolved.larkAppId ?? undefined,
+    name: resolved.name,
+    role: 'main',
+  };
 }
 
 /** 父群主 bot 鉴权：session 合法 + 是该 task 父群的 orchestrator bot（父=主话题→克劳德）+
@@ -239,8 +397,8 @@ function authzParentBot(sessionId: string, taskId: string): { session: Session; 
   if (!session) throw new HttpError(403, `unknown session: ${sessionId}`);
   const task = getSubTask(taskId);
   if (!task) throw new HttpError(404, `subtask not found: ${taskId}`);
-  const botOpenId = sessionBotOpenId(session.larkAppId);
-  if (!botOpenId || botOpenId !== parentOrchestratorOpenId(task)) {
+  const orchestrator = parentOrchestratorBot(task);
+  if (!orchestrator || !taskBotMatchesSession(orchestrator, session)) {
     throw new HttpError(403, 'only the parent-chat orchestrator bot can operate this subtask');
   }
   if (task.parentChatId !== session.chatId) {
@@ -254,9 +412,7 @@ export interface CreateSubtaskReq {
   sessionId: string;
   goal: string;
   acceptance?: string | null;
-  /** Bot refs: legacy aliases (claude/codex/tilly/c/k/t) OR any registered
-   *  bot's botName / larkAppId (clones). Default = the original 3 bots. */
-  bots?: string[];
+  bots?: BotSpecInput[];
   taskType?: 'prd' | 'bug' | 'misc';
   name?: string;
   relatedRefs?: string[];
@@ -265,7 +421,7 @@ export interface CreateSubtaskReq {
   spawnable?: boolean;
   /** 双层汇报：true=部门经理(manager，门控+定期 digest)；缺省/false=执行者(executor，实时直报)。 */
   manager?: boolean;
-  /** Explicit opt-out for executor groups that intentionally do not want an observer bot. */
+  /** 显式 opt-out：executor 群即使含 main 也不自动补 tilly observer。 */
   noObserver?: boolean;
 }
 
@@ -296,7 +452,7 @@ export async function createSubtask(req: CreateSubtaskReq): Promise<{ taskId: st
     if (newDepth > maxSubtaskDepth()) {
       throw new HttpError(422, `subtask depth limit exceeded (depth=${newDepth} > max=${maxSubtaskDepth()}); 把这一步并入当前任务或上报父群拆解`);
     }
-    assertNoCycle(ctx.callerChatId, getMainTopicChatId()!);
+    assertNoCycle(ctx.callerChatId, getMainTopicChatId() ?? ctx.rootChatId);
     // 双层汇报 Block4：预算闸（G3/G4/G5/G6）只统计 **executor** 子任务——manager 是组织协调层，
     // 不计入预算、也不受预算限制。① 新建 manager → 整块跳过；② 新建 executor → 用 activeExecutors 当分母。
     if (req.manager !== true) {
@@ -321,52 +477,19 @@ export async function createSubtask(req: CreateSubtaskReq): Promise<{ taskId: st
     }
   }
 
-  const botKeys = req.bots ?? ['claude', 'codex', 'tilly'];
-  // N-bot: each ref is a built-in alias (claude/codex/tilly/c/k/t) OR any
-  // registered bot's name/appId (clones). Legacy aliases keep their exact
-  // BOT_META name/role (byte-equivalent); arbitrary refs derive name from the
-  // registry and default to 'collab' (explicit roles land in the CLI parser).
-  const resolveBotEntry = (entry: string) => {
-    // Each entry is `ref` or `ref:role` (role ∈ main|collab|observer). The role
-    // suffix is an explicit override; without it we fall back to the alias's
-    // legacy role, else 'collab'.
-    if (isAutoCloneBotEntry(entry)) {
-      throw new HttpError(400, `subtask-start --bots does not support auto-clone syntax "${entry}"; use an existing clone appId/name in --bots (for example cli_xxx:collab), or use ceo-spawn --seats for auto-clone`);
-    }
-    const ci = entry.indexOf(':');
-    const ref = ci >= 0 ? entry.slice(0, ci) : entry;
-    const explicitRole = ci >= 0 ? entry.slice(ci + 1).trim().toLowerCase() : '';
-    if (explicitRole && !VALID_ROLES.has(explicitRole)) {
-      throw new HttpError(400, `invalid role "${explicitRole}" for bot "${ref}" (allowed: main|collab|observer)`);
-    }
-    let ident: ReturnType<typeof resolveBotIdent>;
-    try {
-      ident = resolveBotIdent(ref);
-    } catch {
-      throw new HttpError(400, `unknown bot ref: ${ref} (use claude|codex|tilly|c|k|t or a registered bot name/appId)`);
-    }
-    // Canonicalize built-in aliases (incl. short codes + case) to a BOT_META key
-    // for the default name/role — `c`/`CLAUDE` keep the legacy 本体 main, not collab.
-    const metaKey = ALIAS_TO_META_KEY[ref.toLowerCase()];
-    const meta = metaKey ? BOT_META[metaKey] : undefined;
-    const role = (explicitRole || meta?.role || 'collab') as SubTaskBot['role'];
-    return { key: ref, ident, name: meta?.name ?? ident.name, role };
-  };
-  const resolved = botKeys.map(resolveBotEntry);
+  const resolved = resolveSubtaskBots(req.bots, ctx.callerBotAppId, ctx.callerBotAppId);
   const isExecutorGroup = req.manager !== true && resolved.some(r => r.role === 'main');
   const tillyApp = resolveBotIdent('tilly').larkAppId;
-  if (isExecutorGroup && req.noObserver !== true && !resolved.some(r => r.ident.larkAppId === tillyApp)) {
-    resolved.push(resolveBotEntry('tilly:observer'));
+  if (isExecutorGroup && req.noObserver !== true && !resolved.some(r => r.larkAppId === tillyApp)) {
+    resolved.push(resolveBotSpec('tilly:observer', ctx.callerBotAppId, ctx.callerBotAppId));
   }
-  const company = getCompanyByRootChatId(ctx.rootChatId);
-  const creatorApp = company?.ceoLarkAppId ?? resolveBotIdent(getMainTopicBotRef(ctx.rootChatId)).larkAppId;
-  const larkAppIds = resolved.map(r => r.ident.larkAppId);
-  const subtaskBots: SubTaskBot[] = resolved.map(r => ({ openId: r.ident.openId, name: r.name, role: r.role, larkAppId: r.ident.larkAppId }));
+  const larkAppIds = resolved.map(r => r.larkAppId);
+  const subtaskBots: SubTaskBot[] = resolved.map(r => ({ openId: r.openId, name: r.name, role: r.role, larkAppId: r.larkAppId }));
 
   await ensureCloneScopesProvisioned({
-    creatorLarkAppId: creatorApp,
+    creatorLarkAppId: ctx.callerBotAppId,
     chatId: ctx.callerChatId,
-    bots: resolved.map(r => ({ larkAppId: r.ident.larkAppId, name: r.name, role: r.role })),
+    bots: resolved.map(r => ({ larkAppId: r.larkAppId, name: r.name, role: r.role })),
   });
 
   // 边界4: 建群 + 登记串同一 idempotencyKey。crash window 安全靠两步同 key。
@@ -378,7 +501,7 @@ export async function createSubtask(req: CreateSubtaskReq): Promise<{ taskId: st
 
   const { entry, cacheHit } = await getOrCompute(idempotencyKey, async (): Promise<IdempotencyEntry> => {
     const result = await createGroupWithBots({
-      creatorLarkAppId: creatorApp,
+      creatorLarkAppId: ctx.callerBotAppId,
       larkAppIds,
       // base relay 以 owner 身份写「接收群组」字段；owner 不在目标群时，
       // Base 会把该 oc_id 判为 800030410/not_found，kickoff/supplement 永远投不出。
@@ -390,7 +513,7 @@ export async function createSubtask(req: CreateSubtaskReq): Promise<{ taskId: st
       chatContext: {
         taskType: req.taskType,
         relatedRefs: [V2_MARKER, ...(req.relatedRefs ?? [])], // 边界3: v2 marker
-        participants: resolved.map(r => ({ openId: r.ident.openId, role: r.role })),
+        participants: resolved.map(r => ({ openId: r.openId, role: r.role })),
         parentDigest: req.parentDigest,
         rules: [...SUBTASK_COLLAB_NORMS], // 优化 #2: 固化协作 norms 进群规则 (欢迎卡 + <rules> 注入)
       },
@@ -404,7 +527,8 @@ export async function createSubtask(req: CreateSubtaskReq): Promise<{ taskId: st
     chatId: entry.chatId, parentChatId: ctx.callerChatId, parentMessageId: ctx.rootMessageId,
     goal: req.goal, acceptance: req.acceptance ?? null, bots: subtaskBots,
     requester: ctx.ownerOpenId ?? 'owner',
-    createdBy: sessionBotKey(session?.larkAppId) ?? 'claude',   // 记真实创建 bot（嵌套后不再恒为 claude）
+    createdBy: sessionBotName(session?.larkAppId),   // 记真实创建 bot（嵌套后不再恒为 claude）
+    createdByLarkAppId: session?.larkAppId,
     idempotencyKey,
     depth: newDepth, rootChatId: ctx.rootChatId, spawnable: req.spawnable === true,
     reportingMode: req.manager === true ? 'manager' : 'executor',
@@ -423,6 +547,240 @@ export async function createSubtask(req: CreateSubtaskReq): Promise<{ taskId: st
   // 边界3: v2 故意**不** registerWatch —— 这个群归新 observer，不让旧 watcher 也来管。
   logger.info(`[subtask-orch] create ${task.taskId} chat=${entry.chatId.slice(0, 12)} ${cacheHit ? 'CACHE_HIT' : 'NEW'}`);
   return { taskId: task.taskId, chatId: entry.chatId, isNew: !cacheHit };
+}
+
+// ─── adopt_existing_subtask ───────────────────────────────────────────────────
+export interface AdoptSubtaskReq {
+  sessionId: string;
+  chatId: string;
+  parentChatId?: string;
+  goal: string;
+  acceptance?: string | null;
+  mode?: 'manager' | 'executor';
+  taskType?: 'prd' | 'bug' | 'misc';
+  bots?: BotSpecInput[];
+  relatedRefs?: string[];
+  commit?: boolean;
+}
+
+type AdoptPlan = {
+  chatId: string;
+  parentChatId: string;
+  rootChatId: string;
+  depth: number;
+  reportingMode: 'manager' | 'executor';
+  taskType?: 'prd' | 'bug' | 'misc';
+  relatedRefs: string[];
+  goal: string;
+  acceptance: string | null;
+  bots: SubTaskBot[];
+  idempotencyKey: string;
+  writes: string[];
+  warnings: string[];
+};
+
+function assertParentChainDoesNotContain(parentChatId: string, childChatId: string): void {
+  let cur = getByChatId(parentChatId);
+  let steps = 0;
+  while (cur) {
+    if (cur.chatId === childChatId || cur.parentChatId === childChatId) {
+      throw new HttpError(422, `adopt would create a subtask cycle involving ${childChatId}`);
+    }
+    if (++steps > PARENT_WALK_MAX) {
+      throw new HttpError(422, `subtask parent chain corrupt (>${PARENT_WALK_MAX} hops) near ${parentChatId}`);
+    }
+    cur = getByChatId(cur.parentChatId);
+  }
+}
+
+function upsertAdoptedTopologyNode(plan: AdoptPlan): void {
+  const topo = readTopology();
+  const idx = topo.nodes.findIndex(n => n.chatId === plan.chatId);
+  const existing = idx >= 0 ? topo.nodes[idx] : null;
+  const nextNode: ChatNode = {
+    chatId: plan.chatId,
+    name: existing?.name ?? plan.chatId,
+    chatType: existing?.chatType ?? 'group',
+    originType: 'bot_spawned',
+    parentChatId: plan.parentChatId,
+    tags: Array.from(new Set([...(existing?.tags ?? []), 'adopted-subtask'])),
+    metrics: existing?.metrics ?? { lastMessageAt: null, messages24h: 0, hasUnansweredPing: false },
+    summary: existing?.summary || plan.goal.slice(0, 80),
+  };
+  if (idx >= 0) topo.nodes[idx] = nextNode;
+  else topo.nodes.push(nextNode);
+  const hasEdge = topo.edges.some(e => e.type === 'parent_child' && e.fromChatId === plan.parentChatId && e.toChatId === plan.chatId);
+  if (!hasEdge) {
+    topo.edges.push({
+      type: 'parent_child',
+      fromChatId: plan.parentChatId,
+      toChatId: plan.chatId,
+      rationale: `adopted existing chat as ${plan.reportingMode} subtask`,
+    });
+  }
+  writeTopology(topo);
+}
+
+function upsertAdoptedChatContext(plan: AdoptPlan): void {
+  const existing = readChatContext(plan.chatId);
+  const patch = {
+    purpose: plan.goal,
+    originType: 'bot_spawned' as const,
+    relatedRefs: Array.from(new Set([
+      V2_MARKER,
+      'adopted-subtask',
+      ...(existing?.relatedRefs ?? []),
+      ...plan.relatedRefs,
+      ...(plan.taskType ? [`taskType:${plan.taskType}`] : []),
+    ])),
+    participants: plan.bots.map(b => ({ openId: b.openId, role: b.role })),
+    inheritedFrom: { parentChatId: plan.parentChatId, parentDigest: existing?.inheritedFrom?.parentDigest ?? '' },
+    rules: Array.from(new Set([...(existing?.rules ?? []), ...SUBTASK_COLLAB_NORMS])),
+    injectionPolicy: existing?.injectionPolicy ?? 'manual',
+    taskType: plan.taskType,
+  };
+  if (existing) updateChatContext(plan.chatId, patch);
+  else {
+    createChatContext(plan.chatId, {
+      purpose: patch.purpose,
+      originType: patch.originType,
+      parentChatId: plan.parentChatId,
+      participants: patch.participants,
+      relatedRefs: patch.relatedRefs,
+      rules: patch.rules,
+      injectionPolicy: patch.injectionPolicy,
+      taskType: patch.taskType,
+    });
+  }
+}
+
+function assertAdoptChatAvailable(chatId: string, parentChatId: string, idempotencyKey: string): SubTask | null {
+  const byKey = getByIdempotencyKey(idempotencyKey);
+  const byChat = getByChatId(chatId);
+  if (byKey) {
+    if (byKey.chatId !== chatId) {
+      throw new HttpError(409, `adopt idempotency key already belongs to another chat: ${byKey.chatId}`);
+    }
+    if (byKey.parentChatId !== parentChatId) {
+      throw new HttpError(409, `adopt idempotency key parent mismatch: ${byKey.parentChatId}`);
+    }
+    return byKey;
+  }
+  if (byChat) {
+    throw new HttpError(409, `chat is already registered as a subtask: ${chatId}`);
+  }
+  return null;
+}
+
+function sameBotSet(a: SubTaskBot[], b: SubTaskBot[]): boolean {
+  const norm = (bots: SubTaskBot[]) => bots.map(bot => `${bot.openId}:${bot.role}`).sort().join('|');
+  return norm(a) === norm(b);
+}
+
+export async function adoptSubtask(req: AdoptSubtaskReq): Promise<{ dryRun: boolean; plan: AdoptPlan; taskId?: string; chatId: string; status?: string; version?: number }> {
+  if (!isSafeChatId(req.chatId)) throw new HttpError(400, 'invalid chatId');
+  if (req.parentChatId != null && !isSafeChatId(req.parentChatId)) throw new HttpError(400, 'invalid parentChatId');
+  if (!req.goal?.trim()) throw new HttpError(400, 'missing goal');
+  if (req.mode && req.mode !== 'manager' && req.mode !== 'executor') throw new HttpError(400, 'mode must be manager or executor');
+  if (req.taskType && !['prd', 'bug', 'misc'].includes(req.taskType)) throw new HttpError(400, 'taskType must be prd, bug, or misc');
+
+  const session = getSession(req.sessionId);
+  if (!session) throw new HttpError(403, `unknown session: ${req.sessionId}`);
+  const parentChatId = req.parentChatId ?? session.chatId;
+  if (!parentChatId) throw new HttpError(400, 'missing parentChatId');
+  if (req.chatId === parentChatId) throw new HttpError(400, 'chatId cannot equal parentChatId');
+  if (session.chatId !== parentChatId) {
+    throw new HttpError(403, `adopt must be issued from the parent chat (session.chatId=${session.chatId}, parentChatId=${parentChatId})`);
+  }
+
+  if (!session.larkAppId) throw new HttpError(403, `session has no larkAppId; cannot identify caller bot`);
+  const callerLarkAppId = session.larkAppId;
+  if (!sessionBotOpenId(callerLarkAppId)) throw new HttpError(403, `caller bot is not a registered orchestrator (larkAppId=${callerLarkAppId})`);
+  const parentTask = getByChatId(parentChatId);
+  if (parentTask) {
+    const parentMain = parentTask.bots.find(b => b.role === 'main');
+    if (!parentMain || !taskBotMatchesSession(parentMain, session)) {
+      throw new HttpError(403, 'only the parent task main bot can adopt child chats');
+    }
+    if (!ACTIVE_STATUSES.includes(parentTask.status)) {
+      throw new HttpError(403, `parent task ${parentTask.taskId} is not active (status=${parentTask.status})`);
+    }
+  }
+  assertParentChainDoesNotContain(parentChatId, req.chatId);
+
+  const mode = req.mode ?? 'executor';
+  const depth = (parentTask?.depth ?? 0) + 1;
+  const rootChatId = parentTask ? rootOf(parentTask, getMainTopicChatId()) : parentChatId;
+  const bots = resolveSubtaskBots(req.bots, callerLarkAppId, callerLarkAppId)
+    .map(b => ({ openId: b.openId, name: b.name, role: b.role, larkAppId: b.larkAppId }));
+  if (!bots.some(b => b.larkAppId === callerLarkAppId)) {
+    throw new HttpError(400, 'adopt --bots must include the caller bot');
+  }
+  const idempotencyKey = `${parentChatId}-${req.chatId}-adopt-${slug(req.goal)}-${djb2(req.goal)}`;
+  const existingTask = assertAdoptChatAvailable(req.chatId, parentChatId, idempotencyKey);
+  const warnings: string[] = [];
+  const existingCtx = readChatContext(req.chatId);
+  if (existingTask) {
+    if ((existingTask.reportingMode ?? 'executor') !== mode) {
+      throw new HttpError(409, `adopt replay immutable mismatch: reportingMode is ${existingTask.reportingMode ?? 'executor'}`);
+    }
+    if ((existingTask.acceptance ?? null) !== (req.acceptance ?? null)) {
+      throw new HttpError(409, 'adopt replay immutable mismatch: acceptance differs');
+    }
+    if (!sameBotSet(existingTask.bots, bots)) {
+      throw new HttpError(409, 'adopt replay immutable mismatch: bots differ');
+    }
+    if (existingCtx && req.taskType != null && existingCtx.taskType !== req.taskType) {
+      throw new HttpError(409, `adopt replay immutable mismatch: taskType is ${existingCtx.taskType ?? 'unset'}`);
+    }
+  }
+  if (existingCtx?.originType && existingCtx.originType !== 'bot_spawned') {
+    warnings.push(`chat context originType will change from ${existingCtx.originType} to bot_spawned`);
+  }
+  const topoNode = readTopology().nodes.find(n => n.chatId === req.chatId);
+  if (topoNode?.parentChatId && topoNode.parentChatId !== parentChatId) {
+    warnings.push(`topology parentChatId will change from ${topoNode.parentChatId} to ${parentChatId}`);
+  }
+  const plan: AdoptPlan = {
+    chatId: req.chatId,
+    parentChatId,
+    rootChatId,
+    depth,
+    reportingMode: existingTask?.reportingMode ?? mode,
+    taskType: existingTask ? (existingCtx?.taskType ?? req.taskType) : req.taskType,
+    relatedRefs: req.relatedRefs ?? [],
+    goal: existingTask?.goal ?? req.goal.trim(),
+    acceptance: existingTask?.acceptance ?? req.acceptance ?? null,
+    bots: existingTask?.bots ?? bots,
+    idempotencyKey,
+    writes: ['subtasks.json', 'chat-contexts/<chatId>.json', 'chat-topology.json'],
+    warnings,
+  };
+
+  if (req.commit !== true) return { dryRun: true, plan, chatId: req.chatId };
+
+  const task = existingTask ?? await createSubTask({
+    chatId: plan.chatId,
+    parentChatId: plan.parentChatId,
+    parentMessageId: session.rootMessageId,
+    goal: plan.goal,
+    acceptance: plan.acceptance,
+    bots: plan.bots,
+    requester: session.ownerOpenId ?? 'owner',
+    createdBy: sessionBotName(callerLarkAppId),
+    createdByLarkAppId: callerLarkAppId,
+    idempotencyKey: plan.idempotencyKey,
+    depth: plan.depth,
+    rootChatId: plan.rootChatId,
+    spawnable: false,
+    reportingMode: plan.reportingMode,
+  });
+  if (task.status === 'creating') await transitionStatus(task.taskId, 'observing');
+  upsertAdoptedChatContext(plan);
+  upsertAdoptedTopologyNode(plan);
+  const after = getSubTask(task.taskId)!;
+  logger.info(`[subtask-orch] adopt ${after.taskId} chat=${plan.chatId.slice(0, 12)} parent=${plan.parentChatId.slice(0, 12)} mode=${plan.reportingMode}`);
+  return { dryRun: false, plan, taskId: after.taskId, chatId: after.chatId, status: after.status, version: after.version };
 }
 
 // ─── report_progress ─────────────────────────────────────────────────────────
@@ -444,8 +802,7 @@ export async function reportProgress(req: ReportProgressReq): Promise<{ cmdId?: 
   if (session.chatId !== task.chatId) {
     throw new HttpError(403, `report_progress must come from the subtask chat (session.chatId=${session.chatId}, task.chatId=${task.chatId})`);
   }
-  const callerBot = sessionTaskBot(task, session.larkAppId);
-  if (!callerBot) {
+  if (!task.bots.some(b => taskBotMatchesSession(b, session))) {
     throw new HttpError(403, `reporting bot (larkAppId=${session.larkAppId}) is not a participant of this subtask`);
   }
   if (!req.summary?.trim()) throw new HttpError(400, 'missing summary');
@@ -559,7 +916,7 @@ export async function requestReview(req: RequestReviewReq): Promise<{ cmdId: str
     throw new HttpError(403, `request_review must come from the subtask chat (session.chatId=${session.chatId}, task.chatId=${task.chatId})`);
   }
   // 发起方必须是本任务的 main(执行者)
-  const me = sessionTaskBot(task, session.larkAppId);
+  const me = task.bots.find(b => taskBotMatchesSession(b, session));
   if (!me) throw new HttpError(403, `requesting bot (larkAppId=${session.larkAppId}) is not a participant of this subtask`);
   if (me.role !== 'main') throw new HttpError(403, `only the executor(main) bot can request review (caller role=${me.role})`);
   // 必须有 reviewer 可唤 (蔻黛克斯 #1-blocker3：空集合不发空名单)
@@ -610,8 +967,8 @@ export async function querySubtask(req: QuerySubtaskReq): Promise<QuerySubtaskRe
   }
   if (!task) throw new HttpError(404, 'subtask not found');
   // 鉴权: 父群 orchestrator bot 且只能从该 task 的父群查（嵌套后逐级各自成立，同 authzParentBot 闸）
-  const botOpenId = sessionBotOpenId(session.larkAppId);
-  if (!botOpenId || botOpenId !== parentOrchestratorOpenId(task)) {
+  const orchestrator = parentOrchestratorBot(task);
+  if (!orchestrator || !taskBotMatchesSession(orchestrator, session)) {
     throw new HttpError(403, 'only the parent-chat orchestrator bot can query this subtask');
   }
   if (task.parentChatId !== session.chatId) {
@@ -860,7 +1217,7 @@ export async function managerReport(req: ManagerReportReq): Promise<{ taskId: st
   if (!task) throw new HttpError(404, `subtask not found: ${req.taskId}`);
   if (!isManager(task)) throw new HttpError(400, `manager-report 仅 manager 子群适用（task ${req.taskId} 是 executor）`);
   if (session.chatId !== task.chatId) throw new HttpError(403, `manager-report must come from the manager subtask chat`);
-  const me = sessionTaskBot(task, session.larkAppId);
+  const me = task.bots.find(b => taskBotMatchesSession(b, session));
   if (!me || me.role !== 'main') throw new HttpError(403, `only the manager's executor(main) bot can manager-report`);
   if (!req.summary?.trim()) throw new HttpError(400, 'missing summary');
   // 蔻黛 M1：运行时枚举校验（TS 类型挡不住 IPC/CLI 输入）。非法 urgency 会绕过 reason 门控、写脏 store。
@@ -917,9 +1274,7 @@ export async function listManagerInbox(req: ListInboxReq): Promise<{ entries: Ar
 
 export interface ListManagersReq { sessionId: string; }
 
-/** 列调用者（CEO 主群）下当前活跃的**部门经理子群**——供"派活前先判归口"：
- *  知道现在有哪些常驻经理、各管什么域，从而判断"交对口经理 own"还是"CEO 直建"。
- *  只列 parentChatId == 调用者群 且 reportingMode=manager 且 ACTIVE 的子群。 */
+/** 列调用者（CEO 主群）下当前活跃的部门经理子群，供派活前判归口。 */
 export async function listManagers(req: ListManagersReq): Promise<{ managers: Array<{ taskId: string; chatId: string; status: SubTaskStatus; goal: string }> }> {
   const session = getSession(req.sessionId);
   if (!session) throw new HttpError(403, `unknown session: ${req.sessionId}`);

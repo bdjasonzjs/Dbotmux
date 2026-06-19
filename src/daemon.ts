@@ -1465,6 +1465,7 @@ ipcRoute('POST', '/api/subtask-close', async (req, res) => {
 // 幂等 + 版本。每个 service 抛 HttpError → 映射对应 4xx。
 const SUBTASK_ORCH_ROUTES: Array<[string, string]> = [
   ['/api/subtask-orch-create', 'createSubtask'],
+  ['/api/subtask-orch-adopt', 'adoptSubtask'],
   ['/api/subtask-orch-report', 'reportProgress'],
   ['/api/subtask-orch-query', 'querySubtask'],
   ['/api/subtask-orch-finish', 'finishSubtask'],

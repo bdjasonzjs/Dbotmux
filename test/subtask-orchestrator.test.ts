@@ -60,7 +60,10 @@ vi.mock('../src/services/spawn-idempotency-store.js', () => ({
     return { entry, cacheHit: false };
   },
 }));
-vi.mock('../src/services/session-store.js', () => ({ getSession: (id: string) => mockSessions.get(id) }));
+vi.mock('../src/services/session-store.js', () => ({
+  getSession: (id: string) => mockSessions.get(id),
+  findActiveChatScopeSessionsByChat: (chatId: string) => Array.from(mockSessions.values()).filter((s: any) => s.chatId === chatId && s.status === 'active' && s.scope === 'chat'),
+}));
 // 嵌套改造后 createSubtask 走内部 authzSpawn（authzCheck 不再被 v2 调用）：主话题判定靠 main-topic-config。
 vi.mock('../src/services/main-topic-config.js', () => ({
   getMainTopicChatId: () => 'oc_main',
@@ -69,12 +72,14 @@ vi.mock('../src/services/main-topic-config.js', () => ({
 }));
 
 import {
-  createSubtask, reportProgress, querySubtask, finishSubtask, supplementSubtask, requestReview, V2_MARKER,
+  createSubtask, adoptSubtask, reportProgress, querySubtask, finishSubtask, supplementSubtask, requestReview, V2_MARKER,
 } from '../src/services/subtask-orchestrator.js';
 import {
   createSubTask, getSubTask, getByChatId, transitionStatus, enqueueCommand, listCommands,
   getCommand, listObservations, __resetForTesting, ackCommand, type SubTaskBot,
 } from '../src/services/subtask-store.js';
+import { create as createChatContext, read as readChatContext } from '../src/services/chat-context-store.js';
+import { readTopology } from '../src/services/chat-topology-store.js';
 
 const BOTS: SubTaskBot[] = [
   { openId: 'ou_claude', name: '克劳德', role: 'main' },
@@ -353,16 +358,276 @@ describe('createSubtask', () => {
       .rejects.toMatchObject({ status: 400 });
   });
 
-  it('鉴权 (authzSpawn): 非主话题且非登记任务群 → 403；主话题非主bot → 403', async () => {
-    mockSessions.set('sess_x', { sessionId: 'sess_x', chatId: 'oc_unknown', rootMessageId: 'om_x', larkAppId: 'app_claude', ownerOpenId: 'ou_jason' });
-    await expect(createSubtask({ sessionId: 'sess_x', goal: 'x' })).rejects.toMatchObject({ status: 403 });
-    mockSessions.set('sess_y', { sessionId: 'sess_y', chatId: 'oc_main', rootMessageId: 'om_y', larkAppId: 'app_codex', ownerOpenId: 'ou_jason' });
-    await expect(createSubtask({ sessionId: 'sess_y', goal: 'x' })).rejects.toMatchObject({ status: 403 });
+  it('任意注册 bot root session 可创建子任务；Codex root 自动成为 main', async () => {
+    createChatContext('oc_unknown', {
+      purpose: 'Company root: test',
+      originType: 'bot_spawned',
+      parentChatId: null,
+    });
+    mockSessions.set('sess_x', { sessionId: 'sess_x', chatId: 'oc_unknown', rootMessageId: 'om_x', larkAppId: 'app_codex', ownerOpenId: 'ou_jason' });
+    const res = await createSubtask({ sessionId: 'sess_x', goal: 'x' });
+    const task = getSubTask(res.taskId)!;
+    expect(task.parentChatId).toBe('oc_unknown');
+    expect(task.rootChatId).toBe('oc_unknown');
+    expect(task.bots.find(b => b.larkAppId === 'app_codex')?.role).toBe('main');
+
+    mockSessions.set('sess_bad', { sessionId: 'sess_bad', chatId: 'oc_other', rootMessageId: 'om_bad', larkAppId: 'app_codex', ownerOpenId: 'ou_jason' });
+    await expect(createSubtask({ sessionId: 'sess_bad', goal: 'x' })).rejects.toMatchObject({ status: 403 });
   });
 
   it('缺 goal → 400', async () => {
     mainSession();
     await expect(createSubtask({ sessionId: 'sess_main', goal: '  ' })).rejects.toMatchObject({ status: 400 });
+  });
+});
+
+// ─── adopt_subtask ───────────────────────────────────────────────────────────
+describe('adoptSubtask', () => {
+  it('默认 dry-run：只返回计划，不写 SubTask/ChatContext/Topology', async () => {
+    subSession('sess_k_root', 'oc_main', 'app_codex');
+    const res = await adoptSubtask({
+      sessionId: 'sess_k_root',
+      chatId: 'oc_adopt',
+      goal: '承接现有基建任务',
+      mode: 'manager',
+      bots: ['codex', 'claude', 'tilly'],
+      taskType: 'misc',
+      relatedRefs: ['doc://plan'],
+    });
+
+    expect(res.dryRun).toBe(true);
+    expect(res.chatId).toBe('oc_adopt');
+    expect(res.plan.parentChatId).toBe('oc_main');
+    expect(res.plan.rootChatId).toBe('oc_main');
+    expect(res.plan.depth).toBe(1);
+    expect(res.plan.reportingMode).toBe('manager');
+    expect(res.plan.relatedRefs).toEqual(['doc://plan']);
+    expect(res.plan.bots.find(b => b.openId === 'ou_codex')?.role).toBe('main');
+    expect(res.plan.idempotencyKey).toContain('oc_main-oc_adopt-adopt-');
+    expect(res.plan.writes).toEqual(['subtasks.json', 'chat-contexts/<chatId>.json', 'chat-topology.json']);
+    expect(res.plan.warnings).toEqual([]);
+    expect(getByChatId('oc_adopt')).toBeNull();
+    expect(readChatContext('oc_adopt')).toBeNull();
+    expect(readTopology().nodes.find(n => n.chatId === 'oc_adopt')).toBeUndefined();
+  });
+
+  it('--commit：同时写 SubTask、ChatContext、ChatTopology', async () => {
+    subSession('sess_k_root', 'oc_main', 'app_codex');
+    const res = await adoptSubtask({
+      sessionId: 'sess_k_root',
+      chatId: 'oc_adopt',
+      goal: '承接现有基建任务',
+      mode: 'executor',
+      bots: ['codex', 'claude', 'tilly'],
+      taskType: 'misc',
+      relatedRefs: ['doc://plan'],
+      commit: true,
+    });
+
+    expect(res.dryRun).toBe(false);
+    expect(res.status).toBe('observing');
+    const task = getByChatId('oc_adopt')!;
+    expect(task.taskId).toBe(res.taskId);
+    expect(task.parentChatId).toBe('oc_main');
+    expect(task.rootChatId).toBe('oc_main');
+    expect(task.depth).toBe(1);
+    expect(task.reportingMode).toBe('executor');
+    expect(task.bots.find(b => b.openId === 'ou_codex')?.role).toBe('main');
+
+    const ctx = readChatContext('oc_adopt')!;
+    expect(ctx.originType).toBe('bot_spawned');
+    expect(ctx.inheritedFrom?.parentChatId).toBe('oc_main');
+    expect(ctx.relatedRefs).toContain(V2_MARKER);
+    expect(ctx.relatedRefs).toContain('adopted-subtask');
+    expect(ctx.relatedRefs).toContain('doc://plan');
+    expect(ctx.taskType).toBe('misc');
+
+    const topo = readTopology();
+    expect(topo.nodes.find(n => n.chatId === 'oc_adopt')?.parentChatId).toBe('oc_main');
+    expect(topo.edges).toContainEqual(expect.objectContaining({
+      type: 'parent_child',
+      fromChatId: 'oc_main',
+      toChatId: 'oc_adopt',
+    }));
+  });
+
+  it('同 idempotencyKey 重放 --commit → 返回既有结果，并补齐 crash 后缺失的 ChatContext/Topology', async () => {
+    subSession('sess_k_root', 'oc_main', 'app_codex');
+    const first = await adoptSubtask({ sessionId: 'sess_k_root', chatId: 'oc_adopt', goal: 'x', relatedRefs: ['doc://retry'], commit: true });
+    const ctx = readChatContext('oc_adopt');
+    expect(ctx).toBeTruthy();
+
+    // 模拟 crash repair：SubTask 已落库，但 context/topology 没来得及写完。
+    tempDir = mkdtempSync(join(tmpdir(), 'orch-test-crash-repair-'));
+    __resetForTesting();
+    mockSessions.clear();
+    subSession('sess_k_root', 'oc_main', 'app_codex');
+    await createSubTask({
+      chatId: 'oc_adopt', parentChatId: 'oc_main', parentMessageId: 'om_sub',
+      goal: 'x', acceptance: null, bots: first.plan.bots, requester: 'ou_jason',
+      createdBy: 'codex', idempotencyKey: first.plan.idempotencyKey,
+      depth: 1, rootChatId: 'oc_main', reportingMode: 'executor',
+    });
+    expect(readChatContext('oc_adopt')).toBeNull();
+    expect(readTopology().nodes.find(n => n.chatId === 'oc_adopt')).toBeUndefined();
+
+    const replay = await adoptSubtask({ sessionId: 'sess_k_root', chatId: 'oc_adopt', goal: 'x', relatedRefs: ['doc://retry'], commit: true });
+    expect(replay.dryRun).toBe(false);
+    expect(replay.taskId).toBe(getByChatId('oc_adopt')!.taskId);
+    expect(readChatContext('oc_adopt')!.relatedRefs).toContain('doc://retry');
+    expect(readTopology().nodes.find(n => n.chatId === 'oc_adopt')?.parentChatId).toBe('oc_main');
+  });
+
+  it('同 idempotencyKey 重放不可改写 SubTask 对应的 immutable context 字段，但可追加 relatedRefs', async () => {
+    subSession('sess_k_root', 'oc_main', 'app_codex');
+    const first = await adoptSubtask({
+      sessionId: 'sess_k_root',
+      chatId: 'oc_adopt',
+      goal: 'x',
+      mode: 'executor',
+      bots: ['codex', 'claude'],
+      taskType: 'misc',
+      relatedRefs: ['doc://A'],
+      commit: true,
+    });
+
+    const appended = await adoptSubtask({
+      sessionId: 'sess_k_root',
+      chatId: 'oc_adopt',
+      goal: 'x',
+      mode: 'executor',
+      bots: ['codex', 'claude'],
+      taskType: 'misc',
+      relatedRefs: ['doc://B'],
+      commit: true,
+    });
+    expect(appended.taskId).toBe(first.taskId);
+    expect(readChatContext('oc_adopt')!.relatedRefs).toEqual(expect.arrayContaining(['doc://A', 'doc://B']));
+
+    await expect(adoptSubtask({
+      sessionId: 'sess_k_root',
+      chatId: 'oc_adopt',
+      goal: 'x',
+      mode: 'manager',
+      bots: ['codex', 'claude'],
+      taskType: 'misc',
+      commit: true,
+    })).rejects.toMatchObject({ status: 409 });
+    await expect(adoptSubtask({
+      sessionId: 'sess_k_root',
+      chatId: 'oc_adopt',
+      goal: 'x',
+      mode: 'executor',
+      bots: ['codex', 'tilly'],
+      taskType: 'misc',
+      commit: true,
+    })).rejects.toMatchObject({ status: 409 });
+    await expect(adoptSubtask({
+      sessionId: 'sess_k_root',
+      chatId: 'oc_adopt',
+      goal: 'x',
+      mode: 'executor',
+      bots: ['codex', 'claude'],
+      acceptance: 'new acceptance',
+      taskType: 'misc',
+      commit: true,
+    })).rejects.toMatchObject({ status: 409 });
+    await expect(adoptSubtask({
+      sessionId: 'sess_k_root',
+      chatId: 'oc_adopt',
+      goal: 'x',
+      mode: 'executor',
+      bots: ['codex', 'claude'],
+      taskType: 'bug',
+      commit: true,
+    })).rejects.toMatchObject({ status: 409 });
+  });
+
+  it('重复 chat 但不同 key 或不同 parent → 409', async () => {
+    subSession('sess_k_root', 'oc_main', 'app_codex');
+    await adoptSubtask({ sessionId: 'sess_k_root', chatId: 'oc_adopt', goal: 'x', commit: true });
+    await expect(adoptSubtask({ sessionId: 'sess_k_root', chatId: 'oc_adopt', goal: 'different' }))
+      .rejects.toMatchObject({ status: 409 });
+
+    subSession('sess_other_parent', 'oc_other_parent', 'app_codex');
+    await expect(adoptSubtask({ sessionId: 'sess_other_parent', chatId: 'oc_adopt', goal: 'x' }))
+      .rejects.toMatchObject({ status: 409 });
+  });
+
+  it('父任务存在时只有父任务 main bot 可 adopt；--bots 必须包含调用者', async () => {
+    const parent = await createSubTask({
+      chatId: 'oc_parent', parentChatId: 'oc_main', parentMessageId: 'om_root',
+      goal: '父任务', acceptance: null, bots: BOTS_WITH_REVIEWER, requester: 'ou_jason',
+      createdBy: 'claude', idempotencyKey: 'parent', depth: 1, rootChatId: 'oc_main',
+    });
+    await transitionStatus(parent.taskId, 'observing');
+    subSession('sess_wrong', 'oc_parent', 'app_codex');
+    await expect(adoptSubtask({ sessionId: 'sess_wrong', chatId: 'oc_child', goal: 'x', bots: ['codex'] }))
+      .rejects.toMatchObject({ status: 403 });
+
+    subSession('sess_parent_main', 'oc_parent', 'app_claude');
+    await expect(adoptSubtask({ sessionId: 'sess_parent_main', chatId: 'oc_child', goal: 'x', bots: ['codex'] }))
+      .rejects.toMatchObject({ status: 400 });
+  });
+
+  it('只能从 parent 群发起，且拒绝 parent chain cycle', async () => {
+    const parent = await createSubTask({
+      chatId: 'oc_parent', parentChatId: 'oc_main', parentMessageId: 'om_root',
+      goal: '父任务', acceptance: null, bots: BOTS_WITH_REVIEWER, requester: 'ou_jason',
+      createdBy: 'claude', idempotencyKey: 'parent-cycle', depth: 1, rootChatId: 'oc_main',
+    });
+    await transitionStatus(parent.taskId, 'observing');
+    subSession('sess_wrong_chat', 'oc_other', 'app_claude');
+    await expect(adoptSubtask({ sessionId: 'sess_wrong_chat', parentChatId: 'oc_parent', chatId: 'oc_child', goal: 'x' }))
+      .rejects.toMatchObject({ status: 403 });
+
+    subSession('sess_parent_main', 'oc_parent', 'app_claude');
+    await expect(adoptSubtask({ sessionId: 'sess_parent_main', chatId: 'oc_main', goal: 'x' }))
+      .rejects.toMatchObject({ status: 422 });
+  });
+
+  it('Codex root parent: adopted main bot 可 finish/supplement 鉴权', async () => {
+    createChatContext('oc_main', {
+      purpose: 'Company root: CodexCo',
+      originType: 'bot_spawned',
+      parentChatId: null,
+      participants: [],
+      relatedRefs: ['ceoLarkAppId=app_codex', 'ceoOpenId=ou_codex', 'ceoBotName=蔻黛克斯'],
+    });
+    subSession('sess_k_root', 'oc_main', 'app_codex');
+    const adopted = await adoptSubtask({
+      sessionId: 'sess_k_root',
+      chatId: 'oc_adopt',
+      goal: 'Codex CEO root 子群',
+      bots: ['codex', 'claude', 'tilly'],
+      commit: true,
+    });
+    const task = getSubTask(adopted.taskId!)!;
+
+    const finish = await finishSubtask({
+      sessionId: 'sess_k_root',
+      taskId: task.taskId,
+      expectedVersion: task.version,
+      note: '验收通过',
+    });
+    expect(finish.status).toBe('finished');
+
+    const adopted2 = await adoptSubtask({
+      sessionId: 'sess_k_root',
+      chatId: 'oc_adopt_2',
+      goal: 'Codex CEO root 子群 2',
+      bots: ['codex', 'claude'],
+      commit: true,
+    });
+    await transitionStatus(adopted2.taskId!, 'reported_help');
+    const helpTask = getSubTask(adopted2.taskId!)!;
+    const supp = await supplementSubtask({
+      sessionId: 'sess_k_root',
+      taskId: helpTask.taskId,
+      content: '补充信息',
+      expectedVersion: helpTask.version,
+    });
+    expect(supp.status).toBe('observing');
   });
 });
 
