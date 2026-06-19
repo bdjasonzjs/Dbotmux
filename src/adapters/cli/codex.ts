@@ -248,6 +248,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
         const timeout = attempt === 0 ? INITIAL_CONFIRM_TIMEOUT_MS : RESCUE_CONFIRM_TIMEOUT_MS;
         const match = await waitForHistoryAppend(HISTORY_PATH, baseByte, marker, timeout);
         if (match.found) return submitResult(match);
+
       }
       // In-band budget exhausted. Hand the worker a recheck closure: a
       // slow-startup Codex (or one whose first turn is delayed by a heavy

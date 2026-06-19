@@ -7,16 +7,26 @@ export interface SubmitFailureRecheckDeps {
   onFound: (attempt: number) => void;
   onExhausted: () => void;
   onError?: (err: unknown, attempt: number) => void;
+  shouldSuppress?: () => boolean;
+  onSuppressed?: (attempt: number) => void;
 }
 
 export function scheduleSubmitFailureRechecks(deps: SubmitFailureRecheckDeps, attempt = 0): void {
   const delayMs = SUBMIT_RECHECK_DELAYS_MS[attempt];
   if (delayMs === undefined) {
+    if (deps.shouldSuppress?.()) {
+      deps.onSuppressed?.(attempt);
+      return;
+    }
     deps.onExhausted();
     return;
   }
   deps.setTimeout(() => {
     void (async () => {
+      if (deps.shouldSuppress?.()) {
+        deps.onSuppressed?.(attempt + 1);
+        return;
+      }
       try {
         if (await deps.recheck()) {
           deps.onFound(attempt + 1);
@@ -27,6 +37,10 @@ export function scheduleSubmitFailureRechecks(deps: SubmitFailureRecheckDeps, at
       }
       if (attempt + 1 < SUBMIT_RECHECK_DELAYS_MS.length) {
         scheduleSubmitFailureRechecks(deps, attempt + 1);
+        return;
+      }
+      if (deps.shouldSuppress?.()) {
+        deps.onSuppressed?.(attempt + 1);
         return;
       }
       deps.onExhausted();

@@ -91,6 +91,10 @@ export class CodexBridgeQueue {
     });
   }
 
+  hasStarted(turnId: string): boolean {
+    return this.queue.some(t => t.turnId === turnId && t.started);
+  }
+
   /** Drop all pending turns. Used when the worker decides it can't reliably
    *  attribute future events (e.g. a teardown). */
   clearPending(): CodexPendingTurn[] {

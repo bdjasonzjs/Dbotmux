@@ -248,6 +248,7 @@ let codexBridgeBaselineDone = false;
 const codexBridgeQueue = new CodexBridgeQueue();
 let codexBridgeWatcher: FSWatcher | null = null;
 let codexBridgeTimer: NodeJS.Timeout | null = null;
+const codexBridgeCompletedTurnIds = new Set<string>();
 /** Codex sessionId we received via writeInput but haven't yet resolved a
  *  rollout file for. The poller keeps retrying — the file appears on
  *  Codex's first user submit, but with some race delay after our submit
@@ -1493,11 +1494,18 @@ function codexBridgeIngest(): void {
 /** Mark a pending Lark turn for Codex. Crucially this works even before a
  *  rollout path is known — the queue is path-agnostic, and ingest after
  *  late-attach picks up the user_message and matches the fingerprint. */
-function codexBridgeMarkPendingTurn(messageText: string): boolean {
-  if (!codexBridgeFallbackActive()) return false;
+function codexBridgeMarkPendingTurn(messageText: string, markTimeMs = Date.now()): string | undefined {
+  if (!codexBridgeFallbackActive()) return undefined;
   const turnId = `codex-${randomBytes(8).toString('hex')}`;
-  codexBridgeQueue.mark(turnId, messageText);
-  return true;
+  codexBridgeQueue.mark(turnId, messageText, markTimeMs);
+  return turnId;
+}
+
+function codexBridgeTurnHasSubmitOrResponse(turnId: string | undefined, markTimeMs?: number): boolean {
+  if (turnId && (codexBridgeCompletedTurnIds.has(turnId) || codexBridgeQueue.hasStarted(turnId))) return true;
+  if (markTimeMs === undefined) return false;
+  const adoptMode = lastInitConfig?.adoptMode === true;
+  return shouldSuppressBridgeEmit({ markTimeMs, isLocal: false }, undefined, readSendMarkers(), adoptMode);
 }
 
 function codexBridgeDrainAndMaybeEmit(): void {
@@ -1521,6 +1529,11 @@ function emitReadyCodexTurns(): void {
   for (let i = 0; i < ready.length; i++) {
     const turn = ready[i];
     if (!turn.finalText) continue;
+    codexBridgeCompletedTurnIds.add(turn.turnId);
+    if (codexBridgeCompletedTurnIds.size > 200) {
+      const oldest = codexBridgeCompletedTurnIds.values().next().value;
+      if (oldest) codexBridgeCompletedTurnIds.delete(oldest);
+    }
     const nextBoundaryMs = (i + 1 < ready.length ? ready[i + 1].markTimeMs : nextPendingMarkTimeMs);
     if (shouldSuppressBridgeEmit({ markTimeMs: turn.markTimeMs, isLocal: turn.isLocal }, nextBoundaryMs, markers, adoptMode)) {
       log(`Codex bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (gate)`);
@@ -1561,6 +1574,7 @@ function stopCodexBridge(): void {
   codexBridgePendingTail = '';
   codexBridgeBaselineDone = false;
   codexBridgeQueue.clearPending();
+  codexBridgeCompletedTurnIds.clear();
   codexBridgeQueue.setLocalTurns(false);
   codexBridgePendingSessionId = undefined;
   codexAdoptPendingPid = undefined;
@@ -2200,6 +2214,7 @@ function scheduleSubmitFailureNotify(
   bridgeTurnId?: string,
   failureReason?: string,
   turnSeq = usageLimitTracker.currentTurn(),
+  shouldSuppress?: () => boolean,
 ): void {
   const preview = msg.length > 60 ? msg.slice(0, 60) + '…' : msg;
   const dropBridgeMark = (): void => {
@@ -2225,6 +2240,11 @@ function scheduleSubmitFailureNotify(
       log(`Deferred recheck missing but usage limit was detected for this turn — suppressing submit warning. preview="${preview}"`);
       return;
     }
+    if (shouldSuppress?.()) {
+      dropBridgeMark();
+      log(`Deferred recheck missing but submit/response was already observed — suppressing submit warning. preview="${preview}"`);
+      return;
+    }
     dropBridgeMark();
     log(`Deferred recheck still missing after ${waitMs}ms — notifying user. preview="${preview}"`);
     send({
@@ -2246,6 +2266,11 @@ function scheduleSubmitFailureNotify(
     },
     onError: (err, attempt) => {
       log(`Deferred recheck attempt ${attempt}/${SUBMIT_RECHECK_DELAYS_MS.length} threw (${(err as any)?.message ?? err}); continuing bounded rechecks.`);
+    },
+    shouldSuppress,
+    onSuppressed: attempt => {
+      dropBridgeMark();
+      log(`Deferred recheck suppressed on attempt ${attempt}/${SUBMIT_RECHECK_DELAYS_MS.length}: submit/response already observed. preview="${preview}"`);
     },
     onExhausted: () => notifyMissing(SUBMIT_RECHECK_TOTAL_MS, `有界多次重查约 ${Math.round(SUBMIT_RECHECK_TOTAL_MS / 1000)}s`),
   });
@@ -2293,6 +2318,8 @@ async function flushPending(): Promise<void> {
       // (at IPC arrival) would let a slow-finishing turn N's send leak
       // into turn N+1's window and falsely suppress its emit.
       let bridgeTurnId: string | undefined;
+      let codexBridgeTurnId: string | undefined;
+      let codexBridgeMarkTimeMs: number | undefined;
       if (claudeBridgeActive) {
         try { bridgeIngest(); } catch { /* best-effort */ }
         bridgeTurnId = bridgeMarkPendingTurn(msg);
@@ -2301,7 +2328,8 @@ async function flushPending(): Promise<void> {
         // queue is path-agnostic, and the late-attach below will start
         // ingest from offset 0 so the user_message that lands shortly
         // after still fingerprint-matches this turn.
-        codexBridgeMarkPendingTurn(msg);
+        codexBridgeMarkTimeMs = Date.now();
+        codexBridgeTurnId = codexBridgeMarkPendingTurn(msg, codexBridgeMarkTimeMs);
       }
       log(`Writing to PTY (flush): "${msg.substring(0, 80)}"`);
       // Defense in depth: TmuxPipeBackend's send methods no longer throw on a
@@ -2337,7 +2365,15 @@ async function flushPending(): Promise<void> {
       // nulled backend) the user already got a "CLI exited" notice; don't also
       // nag that the submit wasn't confirmed.
       if (result && result.submitted === false && backend) {
-        scheduleSubmitFailureNotify(msg, result.recheck, '会话 JSONL', bridgeTurnId, result.failureReason, turnSeq);
+        scheduleSubmitFailureNotify(
+          msg,
+          result.recheck,
+          '会话 JSONL',
+          bridgeTurnId,
+          result.failureReason,
+          turnSeq,
+          () => codexBridgeTurnHasSubmitOrResponse(codexBridgeTurnId, codexBridgeMarkTimeMs),
+        );
       }
       // Codex bridge: stop after one writeInput per idle cycle. Codex's
       // bridge queue doesn't yet attribute queued_command-equivalents, so
@@ -3314,6 +3350,8 @@ process.on('message', async (raw: unknown) => {
         // *this* Lark turn (not local user activity in the pane). Mark may
         // return false (baseline not ready) — we still write to the pane;
         // user just won't get a final_output for this message.
+        let codexBridgeTurnId: string | undefined;
+        let codexBridgeMarkTimeMs: number | undefined;
         if (bridgeJsonlPath) {
           try { bridgeIngest(); } catch { /* best effort */ }
           bridgeMarkPendingTurn(content);
@@ -3323,7 +3361,8 @@ process.on('message', async (raw: unknown) => {
           // this Lark turn's fingerprint window opens. Mark works even
           // pre-attach (queue is path-agnostic).
           try { codexBridgeIngest(); } catch { /* best effort */ }
-          codexBridgeMarkPendingTurn(content);
+          codexBridgeMarkTimeMs = Date.now();
+          codexBridgeTurnId = codexBridgeMarkPendingTurn(content, codexBridgeMarkTimeMs);
         }
         // Adopt mode write:
         //   - codex routes through cliAdapter.writeInput so the adapter's
@@ -3348,7 +3387,15 @@ process.on('message', async (raw: unknown) => {
                 codexBridgeNotifyCliSessionId(result.cliSessionId);
               }
               if (result && result.submitted === false) {
-                scheduleSubmitFailureNotify(content, result.recheck, 'Codex history', undefined, result.failureReason, turnSeq);
+                scheduleSubmitFailureNotify(
+                  content,
+                  result.recheck,
+                  'Codex history',
+                  undefined,
+                  result.failureReason,
+                  turnSeq,
+                  () => codexBridgeTurnHasSubmitOrResponse(codexBridgeTurnId, codexBridgeMarkTimeMs),
+                );
               }
             } catch (err: any) {
               log(`Codex adopt writeInput error: ${err.message}`);
