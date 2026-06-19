@@ -21,14 +21,34 @@ export function flowWorkActivityId(runId: string, nodeId: string, visit: number)
   return `${runId}::work::${nodeId}::v${visit}`;
 }
 
+export function flowGateActivityId(runId: string, nodeId: string, visit: number): string {
+  return `${runId}::gate::${nodeId}::v${visit}`;
+}
+
+function parseFlowActivityId(activityId: string): {
+  runId: string;
+  nodeId: string;
+  visit: number;
+  activityKind: 'gate' | 'work';
+} | undefined {
+  const match = activityId.match(/^(.*)::(gate|work)::([^:]+)::v([1-9]\d*)$/);
+  if (!match) return undefined;
+  return {
+    runId: match[1]!,
+    activityKind: match[2]! as 'gate' | 'work',
+    nodeId: match[3]!,
+    visit: Number(match[4]!),
+  };
+}
+
 export function parseFlowWorkActivityId(activityId: string): {
   runId: string;
   nodeId: string;
   visit: number;
 } | undefined {
-  const match = activityId.match(/^(.*)::work::([^:]+)::v([1-9]\d*)$/);
-  if (!match) return undefined;
-  return { runId: match[1]!, nodeId: match[2]!, visit: Number(match[3]!) };
+  const parsed = parseFlowActivityId(activityId);
+  if (!parsed || parsed.activityKind !== 'work') return undefined;
+  return { runId: parsed.runId, nodeId: parsed.nodeId, visit: parsed.visit };
 }
 
 export function latestFlowOutput(
@@ -65,6 +85,37 @@ export function decideStateFlowNextActions(
     cursor.nodeId,
     cursor.visit,
   );
+  const currentGateActivityId = flowGateActivityId(
+    snapshot.run.runId,
+    cursor.nodeId,
+    cursor.visit,
+  );
+  const node = def.nodes[cursor.nodeId]!;
+  const usesReviewDecisionGate =
+    node.type === 'semantic' && node.kind === 'reviewDecision' && node.humanGate;
+  if (node.humanGate && !usesReviewDecisionGate) {
+    const gateActivity = snapshot.activities.get(currentGateActivityId);
+    if (!gateActivity) {
+      return [dispatchFlowGate(snapshot, def, cursor.nodeId, cursor.visit)];
+    }
+    if (gateActivity.status === 'failed' || gateActivity.status === 'timedOut') {
+      return [{
+        kind: 'completeNodeFailed',
+        nodeId: cursor.nodeId,
+        lastActivityId: currentGateActivityId,
+        errorClass: deriveErrorClass(gateActivity.status, gateActivity),
+      } satisfies CompleteNodeFailedAction];
+    }
+    if (gateActivity.status === 'cancelled') {
+      return [{
+        kind: 'completeNodeFailed',
+        nodeId: cursor.nodeId,
+        lastActivityId: currentGateActivityId,
+        errorClass: 'manual',
+      } satisfies CompleteNodeFailedAction];
+    }
+    if (gateActivity.status !== 'succeeded') return [];
+  }
   const currentActivity = snapshot.activities.get(currentActivityId);
   if (!currentActivity) {
     return [dispatchFlowNode(snapshot, def, cursor.nodeId, cursor.visit)];
@@ -100,9 +151,26 @@ export function decideStateFlowNextActions(
 
   const nextVisit = countSucceededVisits(snapshot, next.to) + 1;
   const nextActivityId = flowWorkActivityId(snapshot.run.runId, next.to, nextVisit);
+  const nextGateActivityId = flowGateActivityId(snapshot.run.runId, next.to, nextVisit);
   const nextActivity = snapshot.activities.get(nextActivityId);
-  if (nextActivity) return [];
+  const nextGateActivity = snapshot.activities.get(nextGateActivityId);
+  if (nextActivity || nextGateActivity) return [];
   return [dispatchFlowNode(snapshot, def, next.to, nextVisit)];
+}
+
+function dispatchFlowGate(
+  snapshot: Snapshot,
+  def: WorkflowDefinition,
+  nodeId: string,
+  visit: number,
+): DispatchGateAction {
+  const node = def.nodes[nodeId]!;
+  return {
+    kind: 'dispatchGate',
+    nodeId,
+    activityId: flowGateActivityId(snapshot.run.runId, nodeId, visit),
+    humanGate: node.humanGate!,
+  } satisfies DispatchGateAction;
 }
 
 function dispatchFlowNode(
@@ -134,11 +202,11 @@ function resolveCursor(
   def: WorkflowDefinition,
 ): { nodeId: string; visit: number } | undefined {
   const pending = Array.from(snapshot.activities.values()).find((activity) => {
-    const parsed = parseFlowWorkActivityId(activity.activityId);
+    const parsed = parseFlowActivityId(activity.activityId);
     return parsed && !['succeeded', 'failed', 'timedOut', 'cancelled'].includes(activity.status);
   });
   if (pending) {
-    const parsed = parseFlowWorkActivityId(pending.activityId)!;
+    const parsed = parseFlowActivityId(pending.activityId)!;
     return { nodeId: parsed.nodeId, visit: parsed.visit };
   }
 

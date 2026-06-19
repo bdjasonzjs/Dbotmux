@@ -7,8 +7,8 @@ import { EventLog } from '../src/workflows/events/append.js';
 import { createRun } from '../src/workflows/run-init.js';
 import { runLoop } from '../src/workflows/loop.js';
 import { parseWorkflowDefinition, type WorkflowDefinition } from '../src/workflows/definition.js';
-import { flowWorkActivityId } from '../src/workflows/stateflow.js';
-import { resolveReviewDecision } from '../src/workflows/wait.js';
+import { flowGateActivityId, flowWorkActivityId } from '../src/workflows/stateflow.js';
+import { resolveReviewDecision, resolveWait } from '../src/workflows/wait.js';
 import { createDevelopmentReviewWorkflow } from '../src/dashboard/web/workflow-product-builder.js';
 
 let baseDir: string;
@@ -248,6 +248,73 @@ describe('workflow stateflow', () => {
     const review1 = result.lastSnapshot.activities.get(flowWorkActivityId(log.runId, 'review', 1));
     expect(review1?.attempts.at(-1)?.wait?.waitKind).toBe('human-gate');
     expect(result.lastSnapshot.outputs.has(flowWorkActivityId(log.runId, 'review', 1))).toBe(false);
+  });
+
+  it('honors humanGate before non-review flow work instead of bypassing it', async () => {
+    const def = parseWorkflowDefinition({
+      workflowId: 'gated-subagent-flow',
+      version: 1,
+      flow: { start: 'develop', transitions: [] },
+      nodes: {
+        develop: {
+          type: 'subagent',
+          bot: 'codex',
+          prompt: 'implement',
+          humanGate: { stage: 'before', prompt: '确认开始开发？' },
+        },
+      },
+    });
+    const log = new EventLog('run-gated-subagent-flow', baseDir);
+    await createRun(log, {
+      def,
+      params: {},
+      initiator: 'test',
+      botResolver: () => ({
+        botName: 'codex',
+        larkAppId: 'codex',
+        cliId: 'codex',
+        workingDir: baseDir,
+      }),
+    });
+
+    const first = await runLoop({
+      log,
+      def,
+      spawnSubagent: async () => {
+        throw new Error('humanGate must block subagent dispatch');
+      },
+    }, { maxTicks: 10 });
+    expect(first.reason).toBe('awaiting-wait');
+    const gateActivityId = flowGateActivityId(log.runId, 'develop', 1);
+    const gateActivity = first.lastSnapshot.activities.get(gateActivityId);
+    expect(gateActivity?.attempts.at(-1)?.wait?.waitKind).toBe('human-gate');
+    expect(first.lastSnapshot.activities.has(flowWorkActivityId(log.runId, 'develop', 1))).toBe(false);
+
+    await resolveWait(log, {
+      activityId: gateActivityId,
+      attemptId: gateActivity!.currentAttemptId!,
+      resolution: 'approved',
+      by: 'ou_reviewer',
+    });
+    const second = await runLoop({
+      log,
+      def,
+      spawnSubagent: async (input) => ({
+        kind: 'success',
+        output: { ok: true, prompt: input.prompt },
+        session: {
+          sessionId: `sess-${input.activityId}-${input.attemptId}`,
+          botName: input.botName,
+          cliId: 'codex',
+          workingDir: baseDir,
+          startedAt: 1,
+          endedAt: 2,
+        },
+      }),
+    }, { maxTicks: 10 });
+    expect(second.reason).toBe('terminal');
+    expect(second.lastSnapshot.run.status).toBe('succeeded');
+    expect(second.lastSnapshot.outputs.has(flowWorkActivityId(log.runId, 'develop', 1))).toBe(true);
   });
 
   it('fails the run when a flow work activity fails', async () => {
