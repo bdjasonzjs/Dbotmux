@@ -305,14 +305,11 @@ export function hasNewHelpProgress(
   parentResponded = false,
 ): boolean {
   if (!prev) return true; // 没上报过 → 首次，必须发
+  // 父群已通过 supplement/ack 介入后，observer 的逐 tick LLM 摘要不再作为重新升级依据。
+  // 同一 blocker 的自由文本措辞会抖动，继续比较 askChanged 会让 scout 把旧 blocker 当新求助反复上报。
+  // 后续重新升级只走显式 subtask-askforhelp 或 shouldStaleRereport 2h 兜底。
+  if (parentResponded) return false;
   const askChanged = normalizeAsk(curSummary) !== normalizeAsk(prev.summary);
-  // bug 修复 (2026-05-31 子任务工作流): 父群已通过 supplement **回应过**上次求助后，子群随后产生的新消息
-  // 绝大多数是"正在执行 supplement / 正常推进"的产物，而非新 blocker。若仍把这些新消息当"新证据"再上报，
-  // 就会出现「主 bot 刚 supplement 停了 need_help，同一 blocker 立刻又被反复上报刷屏」(本 bug 核心现象)。
-  // 故 parentResponded 时**只认诉求实质变化**(换了个 blocker) 才再上报，纯新消息一律静默。
-  // 注意：这不是永久压制 —— 同 blocker 真卡死时仍有两条逃生路：① 执行者显式 askforhelp (诉求/cmd 会变)；
-  // ② shouldStaleRereport 以"最近一次响应"为基准 2h 兜底重报。见各自实现。
-  if (parentResponded) return askChanged;
   const prevIds = new Set(prev.sourceMessageIds);
   const hasNewEvidence = curAnalyzedIds.some(id => !prevIds.has(id));
   if (hasNewEvidence) return true; // ① 子群有上次没覆盖过的新证据消息

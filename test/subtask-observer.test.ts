@@ -161,15 +161,15 @@ describe('hasNewHelpProgress', () => {
     const prev = mkPrev({ summary: '卡在 X', sourceMessageIds: ['m1', 'm2'] });
     expect(hasNewHelpProgress(prev, ['m1'], '现在卡在 Y 了')).toBe(true);
   });
-  // ── parentResponded=true: 父群已 supplement 回应 → 只认"诉求变化"，纯新证据静默 (bug 修复 2026-05-31) ──
+  // ── parentResponded=true: 父群已 supplement 回应 → 被动 LLM 推测不再触发重复升级 ──
   it('父群已响应 + 同 blocker(诉求未变) + 仅有新证据消息 → 静默 (不因新消息重复刷屏)', () => {
     const prev = mkPrev({ summary: '卡在 X', sourceMessageIds: ['m1', 'm2'] });
     // m3 是新消息，旧逻辑会判 true 刷屏；parentResponded 下应静默
     expect(hasNewHelpProgress(prev, ['m2', 'm3'], '卡在 X', true)).toBe(false);
   });
-  it('父群已响应 + 诉求实质变化(换了 blocker) → 仍上报 (新 blocker 该唤父群)', () => {
+  it('父群已响应 + summary 措辞完全不同 → 仍静默 (关闭被动 LLM 摘要重复升级)', () => {
     const prev = mkPrev({ summary: '卡在 X', sourceMessageIds: ['m1', 'm2'] });
-    expect(hasNewHelpProgress(prev, ['m1'], '现在卡在 Y 了', true)).toBe(true);
+    expect(hasNewHelpProgress(prev, ['m1'], '现在卡在完全不同的 Y 了，必须重新拍板', true)).toBe(false);
   });
   it('父群已响应 + prev=null(首次) → 仍发', () => {
     expect(hasNewHelpProgress(null, ['m1'], '卡住了', true)).toBe(true);
@@ -381,15 +381,16 @@ describe('runObserverTick', () => {
     expect(listCommands(t.taskId).filter(c => c.commandType === 'report_help')).toHaveLength(2); // 补发了第二条
   });
 
-  // ── parentResponded 接线 (bug 修复 2026-05-31): 存在**真** supplement 命令 → respondedBySupplement=true，
-  //    observing 路径不再因"纯新证据"重复上报；只有诉求实质变化才再 enqueue。 ──
+  // ── parentResponded 接线: 存在**真** supplement 命令 → respondedBySupplement=true，
+  //    observing 路径不再因被动 LLM 摘要/证据变化重复上报；显式 askforhelp 和 2h 兜底走独立通道。 ──
   it('父群真 supplement 回应后 + 同 blocker + 仅新证据 m3 → 静默 (修复 supplement 后刷屏)', async () => {
     const t = await mkObserving();
     const exec1 = mkExec({ messages: [{ id: 'm1', rendered: '卡在 X' }, { id: 'm2', rendered: '需拍板' }], judged: { signal: 'need_help', summary: '卡在 X' } });
     await runObserverTick(new Date(), exec1);
     expect(listCommands(t.taskId).filter(c => c.commandType === 'report_help')).toHaveLength(1);
     // 真 supplement 命令 (parent→child)，createdAt 晚于 help#1 → latestHelpReport.respondedBySupplement=true
-    await enqueueCommand({ taskId: t.taskId, direction: 'parent_to_child', targetChatId: 'oc_parent', commandType: 'supplement', payload: { content: '这样做' }, idempotencyKey: 'supp-1' });
+    const supp = await enqueueCommand({ taskId: t.taskId, direction: 'parent_to_child', targetChatId: 'oc_parent', commandType: 'supplement', payload: { content: '这样做' }, idempotencyKey: 'supp-1' });
+    await updateCommand(supp.cmdId, { createdAt: new Date(Date.now() + 1_000).toISOString() });
     expect(latestHelpReport(t.taskId)!.respondedBySupplement).toBe(true);
     await transitionStatus(t.taskId, 'observing');
     // 新证据 m3 但诉求未变 → 旧逻辑会刷屏；parentResponded 下应静默
@@ -399,16 +400,18 @@ describe('runObserverTick', () => {
     expect(listCommands(t.taskId).filter(c => c.commandType === 'report_help')).toHaveLength(1); // 没多发 help
   });
 
-  it('父群真 supplement 回应后 + 诉求实质变化 (新 blocker) → 仍 enqueue (新问题该唤父群)', async () => {
+  it('父群真 supplement 回应后 + LLM summary 变成新 blocker → 仍静默 (不走被动推测重复升级)', async () => {
     const t = await mkObserving();
     const exec1 = mkExec({ messages: [{ id: 'm1', rendered: '卡在 X' }, { id: 'm2', rendered: '需拍板' }], judged: { signal: 'need_help', summary: '卡在 X' } });
     await runObserverTick(new Date(), exec1);
-    await enqueueCommand({ taskId: t.taskId, direction: 'parent_to_child', targetChatId: 'oc_parent', commandType: 'supplement', payload: { content: '这样做' }, idempotencyKey: 'supp-1' });
+    const supp = await enqueueCommand({ taskId: t.taskId, direction: 'parent_to_child', targetChatId: 'oc_parent', commandType: 'supplement', payload: { content: '这样做' }, idempotencyKey: 'supp-1' });
+    await updateCommand(supp.cmdId, { createdAt: new Date(Date.now() + 1_000).toISOString() });
+    expect(latestHelpReport(t.taskId)!.respondedBySupplement).toBe(true);
     await transitionStatus(t.taskId, 'observing');
     const exec2 = mkExec({ messages: [{ id: 'm3', rendered: '又冒新问题' }], judged: { signal: 'need_help', summary: '现在卡在 Y 了' } });
     await runObserverTick(new Date(Date.now() + 2 * MIN_OBSERVE_INTERVAL_MS), exec2);
-    expect(getSubTask(t.taskId)!.status).toBe('reported_help');
-    expect(listCommands(t.taskId).filter(c => c.commandType === 'report_help')).toHaveLength(2);
+    expect(getSubTask(t.taskId)!.status).toBe('observing');
+    expect(listCommands(t.taskId).filter(c => c.commandType === 'report_help')).toHaveLength(1);
   });
 
   // ── 超时兜底重报集成 (松松追加): 无新进展但隔很久没人响应 → 兜底再报一次 ──
