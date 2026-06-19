@@ -1169,6 +1169,10 @@ input.row-select,
 }
 .workflow-start-options strong { font-size: 15px; }
 .workflow-start-options span { color: var(--muted); font-size: 12px; line-height: 1.45; }
+.role-create-dialog { width: min(820px, calc(100vw - 2rem)); }
+.role-template-list { margin-top: 0.7rem; }
+.role-template-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.55rem; }
+.role-template-card { min-height: 86px; }
 .workflow-assist { display: grid; gap: 0.65rem; }
 .workflow-assist label { display: grid; gap: 0.3rem; color: var(--muted); font-size: 12px; }
 .workflow-assist select,

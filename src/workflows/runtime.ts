@@ -360,6 +360,17 @@ async function dispatchSemanticNode(
     semanticKind: node.kind,
     nodeId: action.nodeId,
     roleId: node.roleId,
+    ...(node.roleId && ctx.def.roles?.[node.roleId]
+      ? {
+          role: {
+            id: ctx.def.roles[node.roleId]!.id,
+            kind: ctx.def.roles[node.roleId]!.kind,
+            label: ctx.def.roles[node.roleId]!.label,
+            responsibility: ctx.def.roles[node.roleId]!.responsibility,
+            bot: ctx.def.roles[node.roleId]!.bot,
+          },
+        }
+      : {}),
     visit: semanticVisit(action.activityId),
     value: resolved,
   };

@@ -237,6 +237,18 @@ function apiPath(path: string): string {
   return `${path}${sep}t=${encodeURIComponent(token)}`;
 }
 
+async function readJsonResponse(res: Response): Promise<any> {
+  const text = await res.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    if (res.headers.get('content-type')?.includes('text/html') || text.trimStart().startsWith('<')) {
+      throw new Error('登录或链接已过期，请刷新 dashboard 链接后重试');
+    }
+    throw new Error(text.slice(0, 160) || `HTTP ${res.status}`);
+  }
+}
+
 function parseScriptArgs(raw: string | undefined): string[] {
   return (raw ?? '').split('\n').map((line) => line.trim()).filter(Boolean);
 }
@@ -674,6 +686,36 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
         </section>
       </div>
     </div>
+    <div id="role-create" class="workflow-start" hidden>
+      <div class="workflow-start-dialog role-create-dialog" role="dialog" aria-modal="true" aria-labelledby="role-create-title">
+        <header>
+          <div>
+            <h3 id="role-create-title">添加角色</h3>
+            <p class="muted">先选择角色的能力方向，再填写这个 workflow 里的具体名称和职责。</p>
+          </div>
+          <button id="role-create-close" type="button">关闭</button>
+        </header>
+        <section id="role-type-step" data-tour="role-template">
+          <p class="builder-help">角色类型不是流程硬编码。它只决定默认职责模板、看板表达和别人理解这个角色的方式；真正的流程顺序、审批轮数、循环和汇报条件仍由节点和连线配置决定。</p>
+          <div id="role-template-list" class="role-template-list choice-field"></div>
+        </section>
+        <section id="role-detail-step" class="workflow-assist" hidden>
+          <p id="role-template-summary" class="builder-help"></p>
+          <label data-tour="role-create-label">
+            <span>角色名称</span>
+            <input id="role-create-label" placeholder="例如：Reviewer / 开发者 / 值班同学" />
+          </label>
+          <label data-tour="role-create-responsibility">
+            <span>这个角色负责什么</span>
+            <textarea id="role-create-responsibility" rows="4" placeholder="例如：审查开发产物，给出通过或打回意见"></textarea>
+          </label>
+          <div class="workflow-assist-actions">
+            <button id="role-create-back" type="button">返回选择类型</button>
+            <button id="role-create-apply" type="button" class="primary">创建角色</button>
+          </div>
+        </section>
+      </div>
+    </div>
     <div class="workflow-admin">
       <aside class="workflow-admin-list">
         <h3>Workflow 列表</h3>
@@ -724,6 +766,14 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
   const assistBot = root.querySelector<HTMLSelectElement>('#workflow-assist-bot')!;
   const assistPrompt = root.querySelector<HTMLTextAreaElement>('#workflow-assist-prompt')!;
   const assistApply = root.querySelector<HTMLButtonElement>('#workflow-assist-apply')!;
+  const roleCreateModal = root.querySelector<HTMLElement>('#role-create')!;
+  const roleTypeStep = root.querySelector<HTMLElement>('#role-type-step')!;
+  const roleDetailStep = root.querySelector<HTMLElement>('#role-detail-step')!;
+  const roleTemplateList = root.querySelector<HTMLElement>('#role-template-list')!;
+  const roleTemplateSummary = root.querySelector<HTMLElement>('#role-template-summary')!;
+  const roleCreateLabel = root.querySelector<HTMLInputElement>('#role-create-label')!;
+  const roleCreateResponsibility = root.querySelector<HTMLTextAreaElement>('#role-create-responsibility')!;
+  const roleCreateApply = root.querySelector<HTMLButtonElement>('#role-create-apply')!;
   const tour = root.querySelector<HTMLElement>('#builder-tour')!;
   const tourSpotlight = root.querySelector<HTMLElement>('.builder-tour-spotlight')!;
   const tourCard = root.querySelector<HTMLElement>('.builder-tour-card')!;
@@ -741,36 +791,155 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
   let connectFrom: string | null = null;
   let drag: { id: string; dx: number; dy: number } | null = null;
   let tourIndex = 0;
-  const tourSteps = [
+  let pendingRoleTemplate: {
+    kind: RoleKind;
+    label: string;
+    responsibility: string;
+    summary: string;
+  } | null = null;
+  type TourStep = {
+    target: string;
+    title: string;
+    body: string;
+    actionLabel?: string;
+    action?: () => void;
+    requiredInput?: string;
+    requiredChoiceName?: string;
+    requiredToggle?: string;
+  };
+  const completedTourInteractions = new Set<number>();
+  const tourSteps: TourStep[] = [
     {
       target: '#builder-new',
       title: '先新建一个 workflow',
-      body: '这里会创建一张空白画布，后面所有角色、节点、连线都会保存成 workflow definition。',
+      body: '点击高亮的新建按钮，会直接创建一张空白画布。后面所有角色、节点、连线都会保存成 workflow definition。',
+      actionLabel: '点击新建',
+      action: () => startBlank(),
     },
     {
       target: '#add-role',
       title: '添加角色',
-      body: '角色用来表达谁负责：开发者、Reviewer、汇报员，或者你自己的自定义角色。',
+      body: '角色用来表达谁负责，例如开发者、Reviewer、汇报员，或者你自己的自定义角色。点击高亮按钮后，先选择角色的能力方向。',
+      actionLabel: '添加角色',
+      action: () => openRoleCreator(),
+    },
+    {
+      target: '[data-tour="role-template"]',
+      title: '先选角色类型',
+      body: '类型是能力方向和默认职责模板，不是流程逻辑。开发、review、汇报怎么流转，仍然由节点和连线决定。这里也可以复用历史自定义角色，或创建新类型。',
+      requiredChoiceName: 'roleTemplate',
+    },
+    {
+      target: '[data-tour="role-create-label"]',
+      title: '填写角色名称',
+      body: '先给角色起一个人能看懂的名字，比如开发者、Reviewer、汇报员。角色 ID 会自动生成，普通用户不用先管。',
+      requiredInput: '#role-create-label',
+    },
+    {
+      target: '[data-tour="role-create-responsibility"]',
+      title: '写清楚角色职责',
+      body: '用一句话说明这个角色负责什么。后面给节点分配角色时，其他人能直接看懂为什么是它负责。',
+      requiredInput: '#role-create-responsibility',
+    },
+    {
+      target: '#role-create-apply',
+      title: '创建角色',
+      body: '确认后会把角色加入当前 workflow，并自动选中它。后续还可以在右侧属性面板继续微调。',
+      actionLabel: '创建角色',
+      action: () => {
+        createRoleFromCreator();
+        setStatus('已创建角色。');
+      },
     },
     {
       target: '#add-subagent',
       title: '添加 Bot 任务',
-      body: 'Bot 任务是真正交给某个在线 Bot 做的步骤，例如开发、review、写汇报。右侧面板里选择 Bot 和任务说明。',
+      body: 'Bot 任务是真正交给某个在线 Bot 做的步骤，例如开发、review、写汇报。点击高亮按钮添加后，在右侧选择实际 Bot 和任务说明。',
+      actionLabel: '添加 Bot 任务',
+      action: () => {
+        addNode('subagent');
+        const selectedNodeId = selected.kind === 'node' ? selected.id : undefined;
+        const node = selectedNodeId ? canvas.nodes.find((n) => n.id === selectedNodeId) : undefined;
+        if (node) {
+          node.label = '';
+          node.prompt = '';
+          renderAll();
+        }
+        setStatus('已添加 Bot 任务，可在右侧选择 Bot 并填写任务说明。');
+      },
+    },
+    {
+      target: '[data-tour="node-label"]',
+      title: '填写节点名称',
+      body: '节点名称是画布上看到的步骤名，比如开发实现、Reviewer 审查、发布汇报。节点 ID 会根据名称自动生成。',
+      requiredInput: '[data-tour="node-label"] input[name="label"]',
+    },
+    {
+      target: '[data-tour="node-type"]',
+      title: '确认这一步是什么',
+      body: 'Bot 任务表示把这一步交给一个真实 Bot 做；自动脚本/动作用于执行命令；流程控制用于提审、判定、汇报等节点。',
+      requiredChoiceName: 'type',
+    },
+    {
+      target: '[data-tour="node-role"]',
+      title: '指定负责角色',
+      body: '这里说明这一步归哪个角色负责。它不会改变 Bot 选择，但能让流程图和运行看板更容易读。',
+      requiredChoiceName: 'roleId',
+    },
+    {
+      target: '[data-tour="node-bot"]',
+      title: '选择执行 Bot',
+      body: '这里选择真实在线 Bot。不要猜 codex 之类内部值，列表会展示当前可用 Bot 和说明。',
+      requiredChoiceName: 'bot',
+    },
+    {
+      target: '[data-tour="node-prompt"]',
+      title: '写给 Bot 的任务说明',
+      body: '这里写流程运行到这个节点时要发给 Bot 的话。写清楚目标、产出、验收方式，Bot 才知道要做什么。',
+      requiredInput: '[data-tour="node-prompt"] textarea[name="prompt"]',
+    },
+    {
+      target: '[data-tour="node-human-gate"]',
+      title: '决定是否执行前确认',
+      body: '危险动作或关键步骤可以勾选执行前暂停确认。普通 Bot 任务一般不用勾，可以直接继续。',
+    },
+    {
+      target: '#apply-props',
+      title: '应用 Bot 任务设置',
+      body: '节点名称、负责角色、执行 Bot 和任务说明都填好后，点击应用。画布节点和 definition 会同步更新。',
+      actionLabel: '应用 Bot 任务设置',
+      action: () => {
+        applyCurrentPanel();
+        setStatus('已应用 Bot 任务设置。');
+      },
     },
     {
       target: '#add-semantic',
       title: '添加流程控制点',
-      body: '流程控制点不直接干活，而是表达提审、人工判定、汇报、里程碑、失败兜底这些流程语义。',
+      body: '流程控制点不直接干活，而是表达提审、人工判定、汇报、里程碑、失败兜底这些流程语义。点击高亮按钮添加一个控制点。',
+      actionLabel: '添加流程控制点',
+      action: () => {
+        addNode('semantic');
+        setStatus('已添加流程控制点，可在右侧选择提审、判定、汇报或里程碑等语义。');
+      },
+    },
+    {
+      target: '#connect-mode',
+      title: '连接流程走向',
+      body: '选中一个节点后点高亮的“点击连线”，再点目标节点，就能画出流程走向；打回、分支、回边都用连线表达。',
+      actionLabel: '进入连线模式',
+      action: () => {
+        const firstNode = canvas.nodes[0];
+        if (firstNode) selected = { kind: 'node', id: firstNode.id };
+        connectFrom = firstNode?.id ?? null;
+        renderAll();
+        setStatus(connectFrom ? `请选择 ${connectFrom} 的目标节点` : '先添加节点，再使用连线模式');
+      },
     },
     {
       target: '#workflow-canvas',
-      title: '在画布上调整流程',
-      body: '节点可以拖动；选中一个节点后点“点击连线”，再点另一个节点，就能画出流程走向。',
-    },
-    {
-      target: '#property-panel',
-      title: '右侧编辑属性',
-      body: '这里改名称、角色、Bot、判定类型、脚本命令等。高级 ID 默认收起，不需要普通用户手写。',
+      title: '在画布上检查结果',
+      body: '画布展示流程顺序和连线走向。节点可以拖动，自动布局会按流程从左到右排开，避免节点挤在一起。',
     },
     {
       target: '#builder-save',
@@ -779,16 +948,17 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
     },
   ];
 
-  panel.addEventListener('click', (ev) => {
+  function onChoiceCardClick(ev: Event): void {
     const card = (ev.target as HTMLElement).closest<HTMLButtonElement>('.choice-card');
     if (!card) return;
     const name = card.dataset.choiceName;
     const value = card.dataset.choiceValue;
     if (!name || value === undefined) return;
-    const input = panel.querySelector<HTMLInputElement>(`input[type="hidden"][name="${CSS.escape(name)}"]`);
+    const scope = card.closest<HTMLElement>('.choice-field') ?? root;
+    const input = scope.querySelector<HTMLInputElement>(`input[type="hidden"][name="${CSS.escape(name)}"]`);
     if (!input) return;
     input.value = value;
-    panel.querySelectorAll<HTMLButtonElement>(`.choice-card[data-choice-name="${CSS.escape(name)}"]`).forEach((btn) => {
+    scope.querySelectorAll<HTMLButtonElement>(`.choice-card[data-choice-name="${CSS.escape(name)}"]`).forEach((btn) => {
       btn.classList.toggle('active', btn === card);
     });
     const menu = card.closest<HTMLDetailsElement>('.choice-menu');
@@ -799,18 +969,32 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
       summary.innerHTML = `<strong>${escapeHtml(selectedLabel)}</strong><span>${escapeHtml(selectedDescription ?? '')}</span>`;
     }
     if (menu) menu.open = false;
-  });
+    const step = tourSteps[tourIndex];
+    if (!tour.hidden && step?.requiredChoiceName === name) {
+      completedTourInteractions.add(tourIndex);
+      updateTourInputGuard();
+    }
+    if (name === 'roleTemplate') selectRoleTemplate(value);
+  }
 
   function setStatus(text: string): void { status.textContent = text; }
 
+  function applyCurrentPanel(): void {
+    const apply = panel.querySelector<HTMLButtonElement>('#apply-props');
+    if (!apply?.onclick) return;
+    apply.onclick.call(apply, new MouseEvent('click') as any);
+  }
+
   function startTour(index = 0): void {
     tourIndex = Math.max(0, Math.min(index, tourSteps.length - 1));
+    completedTourInteractions.clear();
     tour.hidden = false;
     renderTour();
   }
 
   function stopTour(): void {
     tour.hidden = true;
+    if (!roleCreateModal.hidden) closeRoleCreator();
     root.querySelectorAll('.builder-tour-target').forEach((el) => el.classList.remove('builder-tour-target'));
   }
 
@@ -820,6 +1004,7 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
     const target = root.querySelector<HTMLElement>(step.target) ?? root.querySelector<HTMLElement>('.workflow-admin')!;
     root.querySelectorAll('.builder-tour-target').forEach((el) => el.classList.remove('builder-tour-target'));
     target.classList.add('builder-tour-target');
+    target.scrollIntoView({ block: 'center', inline: 'nearest' });
     const rect = target.getBoundingClientRect();
     const pad = 8;
     tourSpotlight.style.left = `${Math.max(8, rect.left - pad)}px`;
@@ -843,7 +1028,110 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
     tourTitle.textContent = step.title;
     tourBody.textContent = step.body;
     tourPrev.disabled = tourIndex === 0;
-    tourNext.textContent = tourIndex === tourSteps.length - 1 ? '完成' : '下一步';
+    tourNext.textContent = step.actionLabel ?? (tourIndex === tourSteps.length - 1 ? '完成' : '下一步');
+    wireTourInputGuard(step);
+  }
+
+  function requiredTourInput(step: TourStep): HTMLInputElement | HTMLTextAreaElement | null {
+    if (!step.requiredInput) return null;
+    return root.querySelector<HTMLInputElement | HTMLTextAreaElement>(step.requiredInput);
+  }
+
+  function requiredTourToggle(step: TourStep): HTMLInputElement | null {
+    if (!step.requiredToggle) return null;
+    return root.querySelector<HTMLInputElement>(step.requiredToggle);
+  }
+
+  function hasChoiceOptions(name: string): boolean {
+    return root.querySelectorAll<HTMLButtonElement>(`.choice-card[data-choice-name="${CSS.escape(name)}"]`).length > 0;
+  }
+
+  function updateTourInputGuard(): void {
+    const step = tourSteps[tourIndex];
+    const input = step ? requiredTourInput(step) : null;
+    if (input) {
+      const hasValue = input.value.trim().length > 0;
+      tourNext.disabled = !hasValue;
+      tourNext.title = hasValue ? '' : '先填写当前高亮字段，再继续下一步';
+      return;
+    }
+    if (step?.requiredChoiceName && hasChoiceOptions(step.requiredChoiceName)) {
+      const done = completedTourInteractions.has(tourIndex);
+      tourNext.disabled = !done;
+      tourNext.title = done ? '' : '先在当前高亮区域选一个选项，再继续下一步';
+      return;
+    }
+    if (step?.requiredToggle) {
+      const done = completedTourInteractions.has(tourIndex);
+      tourNext.disabled = !done;
+      tourNext.title = done ? '' : '先确认当前开关是否要打开，再继续下一步';
+      return;
+    }
+    tourNext.disabled = false;
+    tourNext.title = '';
+  }
+
+  function wireTourInputGuard(step: TourStep): void {
+    const input = requiredTourInput(step);
+    updateTourInputGuard();
+    if (input) {
+      input.focus();
+      input.select?.();
+      input.addEventListener('input', updateTourInputGuard);
+      return;
+    }
+    if (step.requiredChoiceName) {
+      const target = root.querySelector<HTMLElement>(step.target);
+      const menu = target?.querySelector<HTMLDetailsElement>('.choice-menu');
+      const active = target?.querySelector<HTMLElement>('.choice-card.active');
+      const first = target?.querySelector<HTMLElement>('.choice-card');
+      if (menu) menu.open = true;
+      (active ?? first ?? menu?.querySelector<HTMLElement>('summary'))?.focus();
+      return;
+    }
+    const toggle = requiredTourToggle(step);
+    if (toggle) {
+      toggle.focus();
+      toggle.onchange = () => {
+        completedTourInteractions.add(tourIndex);
+        updateTourInputGuard();
+      };
+    }
+  }
+
+  function advanceTour(): void {
+    if (tourIndex >= tourSteps.length - 1) stopTour();
+    else {
+      tourIndex += 1;
+      renderTour();
+    }
+  }
+
+  function runTourStep(): void {
+    const step = tourSteps[tourIndex];
+    if (!step) return;
+    updateTourInputGuard();
+    if (tourNext.disabled) {
+      const input = requiredTourInput(step);
+      const toggle = requiredTourToggle(step);
+      const target = root.querySelector<HTMLElement>(step.target);
+      (input ?? toggle ?? target)?.focus();
+      setStatus('请先完成当前高亮项，再继续下一步。');
+      return;
+    }
+    step.action?.();
+    advanceTour();
+  }
+
+  function onTourTargetClick(ev: Event): void {
+    if (tour.hidden) return;
+    const step = tourSteps[tourIndex];
+    if (!step?.action) return;
+    const target = ev.target instanceof Element ? ev.target.closest(step.target) : null;
+    if (!target || !root.contains(target)) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    runTourStep();
   }
 
   async function loadCatalog(): Promise<void> {
@@ -910,6 +1198,145 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
     startOptions.hidden = false;
   }
 
+  function builtinRoleTemplates(): Array<{ id: string; kind: RoleKind; label: string; responsibility: string; summary: string; description: string }> {
+    return [
+      {
+        id: 'developer',
+        kind: 'developer',
+        label: '开发者',
+        responsibility: '完成开发实现、修复问题，并提交可审查产物。',
+        summary: '开发者类型会给出开发实现的默认职责和看板语义；是否先开发、几轮返工、何时提审仍由节点和连线决定。',
+        description: '负责实现、修复和自测。',
+      },
+      {
+        id: 'reviewer',
+        kind: 'reviewer',
+        label: 'Reviewer',
+        responsibility: '审查产物，给出通过、打回或风险说明。',
+        summary: 'Reviewer 类型会给出审查/判定的默认职责和看板语义；通过或打回流向仍由连线条件决定。',
+        description: '负责审查、判定和打回。',
+      },
+      {
+        id: 'reporter',
+        kind: 'reporter',
+        label: '汇报员',
+        responsibility: '汇总进展、验证结论、风险和最终交付说明。',
+        summary: '汇报员类型会给出汇总表达的默认职责；何时汇报、汇报给谁仍由流程节点配置决定。',
+        description: '负责总结、汇报和收口。',
+      },
+      {
+        id: 'observer',
+        kind: 'observer',
+        label: '观察者',
+        responsibility: '旁路观察流程进展，接收通知或记录上下文。',
+        summary: '观察者类型适合旁路记录和通知，不会自动改变主流程；是否旁路由节点和连线决定。',
+        description: '只观察或接收通知。',
+      },
+      {
+        id: 'custom-new',
+        kind: 'custom',
+        label: '',
+        responsibility: '',
+        summary: '自定义类型用于表达团队自己的能力方向。它不会新增硬编码流程，只会保存为这个角色的名称和职责说明。',
+        description: '创建团队自己的角色能力方向。',
+      },
+    ];
+  }
+
+  function renderRoleTemplates(): void {
+    const customTemplates = canvas.roles
+      .filter((role) => role.kind === 'custom')
+      .map((role) => ({
+        id: `custom:${role.id}`,
+        kind: 'custom' as RoleKind,
+        label: role.label,
+        responsibility: role.responsibility ?? '',
+        summary: `复用历史自定义角色「${role.label}」的职责模板；新角色仍会生成自己的 ID 和职责，可继续修改。`,
+        description: role.responsibility ?? '复用已有自定义职责。',
+      }));
+    const templates = [...builtinRoleTemplates(), ...customTemplates];
+    roleTemplateList.innerHTML = `
+      <input type="hidden" name="roleTemplate" value="" />
+      <div class="role-template-grid">
+        ${templates.map((tpl) => `
+          <button type="button" class="choice-card role-template-card" data-choice-name="roleTemplate" data-choice-value="${escapeHtml(tpl.id)}" data-choice-label="${escapeHtml(tpl.label || '新自定义类型')}" data-choice-description="${escapeHtml(tpl.description)}">
+            <strong>${escapeHtml(tpl.label || '新自定义类型')}</strong>
+            <span>${escapeHtml(tpl.description)}</span>
+          </button>
+        `).join('')}
+      </div>`;
+  }
+
+  function openRoleCreator(): void {
+    pendingRoleTemplate = null;
+    renderRoleTemplates();
+    roleCreateModal.hidden = false;
+    roleTypeStep.hidden = false;
+    roleDetailStep.hidden = true;
+    roleCreateLabel.value = '';
+    roleCreateResponsibility.value = '';
+    roleCreateApply.disabled = true;
+    roleTemplateSummary.textContent = '';
+    setStatus('请选择角色类型或能力方向。');
+  }
+
+  function closeRoleCreator(): void {
+    roleCreateModal.hidden = true;
+    pendingRoleTemplate = null;
+  }
+
+  function selectRoleTemplate(templateId: string): void {
+    const templates = [
+      ...builtinRoleTemplates(),
+      ...canvas.roles.filter((role) => role.kind === 'custom').map((role) => ({
+        id: `custom:${role.id}`,
+        kind: 'custom' as RoleKind,
+        label: role.label,
+        responsibility: role.responsibility ?? '',
+        summary: `复用历史自定义角色「${role.label}」的职责模板；你可以直接改名或改职责。`,
+        description: role.responsibility ?? '',
+      })),
+    ];
+    const tpl = templates.find((item) => item.id === templateId);
+    if (!tpl) return;
+    pendingRoleTemplate = tpl;
+    const isHistoricalCustom = tpl.id.startsWith('custom:');
+    roleCreateLabel.value = isHistoricalCustom ? tpl.label : '';
+    roleCreateResponsibility.value = isHistoricalCustom ? tpl.responsibility : '';
+    roleCreateResponsibility.placeholder = tpl.responsibility || '例如：审查开发产物，给出通过或打回意见';
+    roleTemplateSummary.textContent = tpl.summary;
+    roleTypeStep.hidden = true;
+    roleDetailStep.hidden = false;
+    updateRoleCreateGuard();
+    roleCreateLabel.focus();
+    roleCreateLabel.select();
+  }
+
+  function updateRoleCreateGuard(): void {
+    roleCreateApply.disabled = !pendingRoleTemplate
+      || roleCreateLabel.value.trim().length === 0
+      || roleCreateResponsibility.value.trim().length === 0;
+  }
+
+  function createRoleFromCreator(): void {
+    if (!pendingRoleTemplate) return;
+    const label = roleCreateLabel.value.trim();
+    if (!label || !roleCreateResponsibility.value.trim()) {
+      updateRoleCreateGuard();
+      setStatus('请先填写角色名称和职责。');
+      return;
+    }
+    const responsibility = roleCreateResponsibility.value.trim();
+    const used = new Set(canvas.roles.map((role) => role.id));
+    const role = newRole(nextRoleIdFromLabel(label, pendingRoleTemplate.kind, used), label, pendingRoleTemplate.kind);
+    role.responsibility = responsibility;
+    canvas.roles.push(role);
+    selected = { kind: 'role', id: role.id };
+    closeRoleCreator();
+    renderAll();
+    setStatus(`已创建角色：${label}`);
+  }
+
   function blankCanvas(): CanvasWorkflow {
     return {
       workflowId: uniqueId('new-workflow', new Set(catalog.map((e) => e.workflowId))),
@@ -922,13 +1349,13 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
   }
 
   function startTutorial(): void {
-    canvas = tutorialCanvas(assistBot.value || availableBots[0]?.larkAppId);
+    canvas = blankCanvas();
     selected = { kind: 'workflow' };
     connectFrom = null;
     closeStart();
     renderAll();
     startTour(0);
-    setStatus('已生成教程 workflow：按右侧属性面板逐步查看每类节点和分支。');
+    setStatus('已进入交互式导览：按高亮按钮一步步创建 workflow。');
   }
 
   function startBlank(): void {
@@ -1068,12 +1495,13 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
   svg.addEventListener('pointerup', () => { drag = null; });
   svg.addEventListener('pointerleave', () => { drag = null; });
 
-  function field(label: string, name: string, value: string, options?: string[], labels?: Record<string, string>, help?: string, placeholder?: string): string {
+  function field(label: string, name: string, value: string, options?: string[], labels?: Record<string, string>, help?: string, placeholder?: string, tourId?: string): string {
     const labelText = labelWithHelp(label, help);
+    const tourAttr = tourId ? ` data-tour="${escapeHtml(tourId)}"` : '';
     if (options) {
-      return `<label><span>${labelText}</span><select name="${escapeHtml(name)}" ${help ? `title="${escapeHtml(help)}"` : ''}>${options.map((o) => `<option value="${escapeHtml(o)}" ${o === value ? 'selected' : ''}>${escapeHtml(optionLabel(o, labels))}</option>`).join('')}</select></label>`;
+      return `<label${tourAttr}><span>${labelText}</span><select name="${escapeHtml(name)}" ${help ? `title="${escapeHtml(help)}"` : ''}>${options.map((o) => `<option value="${escapeHtml(o)}" ${o === value ? 'selected' : ''}>${escapeHtml(optionLabel(o, labels))}</option>`).join('')}</select></label>`;
     }
-    return `<label><span>${labelText}</span><input name="${escapeHtml(name)}" value="${escapeHtml(value)}" ${help ? `title="${escapeHtml(help)}"` : ''} ${placeholder ? `placeholder="${escapeHtml(placeholder)}"` : ''} /></label>`;
+    return `<label${tourAttr}><span>${labelText}</span><input name="${escapeHtml(name)}" value="${escapeHtml(value)}" ${help ? `title="${escapeHtml(help)}"` : ''} ${placeholder ? `placeholder="${escapeHtml(placeholder)}"` : ''} /></label>`;
   }
 
   function choiceField(
@@ -1084,7 +1512,9 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
     labels: Record<string, string>,
     descriptions: Record<string, string>,
     help?: string,
+    tourId?: string,
   ): string {
+    const tourAttr = tourId ? ` data-tour="${escapeHtml(tourId)}"` : '';
     const selectedLabel = labels[value] ?? value;
     const selectedDescription = descriptions[value] ?? '';
     const cards = options.map((option) => `
@@ -1093,7 +1523,7 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
         <span>${escapeHtml(descriptions[option] ?? '')}</span>
       </button>
     `).join('');
-    return `<div class="choice-field">
+    return `<div class="choice-field"${tourAttr}>
       <span class="choice-label">${labelWithHelp(label, help)}</span>
       <input type="hidden" name="${escapeHtml(name)}" value="${escapeHtml(value)}" />
       <details class="choice-menu">
@@ -1123,9 +1553,9 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
           bot.online === false ? '当前离线，不建议用于新流程。' : '真实在线 Bot，可接收这个节点的任务。',
         ]),
       ]);
-      return choiceField('交给哪个 Bot', 'bot', value || options[0] || '', options, labels, descriptions, help);
+      return choiceField('交给哪个 Bot', 'bot', value || options[0] || '', options, labels, descriptions, help, 'node-bot');
     }
-    return `<div class="choice-field">
+    return `<div class="choice-field" data-tour="node-bot">
       <span class="choice-label">${labelWithHelp('交给哪个 Bot', help)}</span>
       <input type="hidden" name="bot" value="${escapeHtml(value)}" />
       <div class="builder-help">${value && value.includes('PLACEHOLDER') ? `当前是示例占位值 <code>${escapeHtml(value)}</code>，不是可运行 Bot。` : '还没有加载到真实 Bot 列表。'}请刷新页面或确认 dashboard 登录态后重试。</div>
@@ -1149,15 +1579,15 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
       if (!role) { selected = { kind: 'workflow' }; return renderPanel(); }
       panel.innerHTML = `<h3>角色属性</h3>
         ${helpBlock('角色是流程里的职责身份，例如开发者、Reviewer、汇报员。节点可以分配给角色，方便看懂谁负责哪一步。')}
-        ${field('名称', 'label', role.label, undefined, undefined, '给人看的角色名，例如开发者、Reviewer、汇报员。')}
+        ${field('名称', 'label', role.label, undefined, undefined, '给人看的角色名，例如开发者、Reviewer、汇报员。', undefined, 'role-name')}
         ${choiceField('类型', 'kind', role.kind, roleKindOptions, Object.fromEntries(roleKindOptions.map((kind) => [kind, roleKindLabel(kind)])), {
           developer: '负责开发实现、修复问题、产出代码。',
           reviewer: '负责审查、判定通过或打回。',
           reporter: '负责汇总进展、验证结论和风险。',
           observer: '只观察或接收通知，不负责主流程动作。',
           custom: '其他自定义角色。',
-        }, '选择最接近的角色类型；没有合适的就选自定义。')}
-        <label><span>${labelWithHelp('职责', '一句话说明这个角色在流程里负责什么。')}</span><textarea name="responsibility" rows="4" placeholder="例如：完成开发并提交可审查产物">${escapeHtml(role.responsibility ?? '')}</textarea></label>
+        }, '选择最接近的角色类型；没有合适的就选自定义。', 'role-kind')}
+        <label data-tour="role-responsibility"><span>${labelWithHelp('职责', '一句话说明这个角色在流程里负责什么。')}</span><textarea name="responsibility" rows="4" placeholder="例如：完成开发并提交可审查产物">${escapeHtml(role.responsibility ?? '')}</textarea></label>
         <details class="advanced-props"><summary>高级设置</summary>
           ${field('角色 ID', 'id', role.id, undefined, undefined, '内部唯一标识，建议用英文或拼音，例如 developer、reviewer。')}
         </details>
@@ -1187,7 +1617,7 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
       if (!node) { selected = { kind: 'workflow' }; return renderPanel(); }
       panel.innerHTML = `<h3>节点属性</h3>
         ${helpBlock(nodeTypeHelp(node.type))}
-        ${field('节点名称', 'label', node.label, undefined, undefined, '画布上显示给人看的名字，例如 开发实现、Reviewer 判定、发布汇报。')}
+        ${field('节点名称', 'label', node.label, undefined, undefined, '画布上显示给人看的名字，例如 开发实现、Reviewer 判定、发布汇报。', undefined, 'node-label')}
         ${choiceField('这一步是什么', 'type', node.type, nodeTypeOptions, {
           subagent: 'Bot 任务',
           hostExecutor: '自动脚本/动作',
@@ -1196,10 +1626,10 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
           subagent: '把任务交给一个真实 Bot 处理，比如开发、review、写汇报。',
           hostExecutor: '由系统执行命令、脚本、发消息或创建定时任务。',
           semantic: '不做具体任务，只控制流程：提审、判定、汇报、里程碑等。',
-        }, 'Bot 任务=交给 Bot 做；自动脚本/动作=系统执行；流程控制=提审/判定/汇报等流程点。')}
-        ${choiceField('由哪个角色负责', 'roleId', node.roleId ?? '', ['', ...canvas.roles.map((r) => r.id)], { '': '暂不指定角色', ...Object.fromEntries(canvas.roles.map((r) => [r.id, r.label])) }, { '': '可先不指定；之后也能补。', ...Object.fromEntries(canvas.roles.map((r) => [r.id, r.responsibility ?? `${r.label} 负责这一步`])) }, '可选。用于说明这一步归哪个角色负责，不影响 Bot 下拉本身。')}
+        }, 'Bot 任务=交给 Bot 做；自动脚本/动作=系统执行；流程控制=提审/判定/汇报等流程点。', 'node-type')}
+        ${choiceField('由哪个角色负责', 'roleId', node.roleId ?? '', ['', ...canvas.roles.map((r) => r.id)], { '': '暂不指定角色', ...Object.fromEntries(canvas.roles.map((r) => [r.id, r.label])) }, { '': '可先不指定；之后也能补。', ...Object.fromEntries(canvas.roles.map((r) => [r.id, r.responsibility ?? `${r.label} 负责这一步`])) }, '可选。用于说明这一步归哪个角色负责，不影响 Bot 下拉本身。', 'node-role')}
         ${node.type === 'semantic' ? choiceField('控制点类型', 'semanticKind', node.semanticKind ?? 'milestone', semanticKindOptions, Object.fromEntries(semanticKindOptions.map((kind) => [kind, semanticKindLabel(kind)])), Object.fromEntries(semanticKindOptions.map((kind) => [kind, semanticKindHelp(kind)])), semanticKindHelp(node.semanticKind ?? 'milestone')) + helpBlock(semanticKindHelp(node.semanticKind ?? 'milestone')) : ''}
-        ${node.type === 'subagent' ? botField(node.bot) + '<label><span>' + labelWithHelp('让 Bot 做什么', '写给 Bot 的任务说明。流程运行到这里时，会把这段话发给选中的 Bot。') + '</span><textarea name="prompt" rows="4" placeholder="例如：请完成这个需求的开发实现，完成后说明改了哪些文件、如何验证。">' + escapeHtml(node.prompt ?? '') + '</textarea></label>' : ''}
+        ${node.type === 'subagent' ? botField(node.bot) + '<label data-tour="node-prompt"><span>' + labelWithHelp('让 Bot 做什么', '写给 Bot 的任务说明。流程运行到这里时，会把这段话发给选中的 Bot。') + '</span><textarea name="prompt" rows="4" placeholder="例如：请完成这个需求的开发实现，完成后说明改了哪些文件、如何验证。">' + escapeHtml(node.prompt ?? '') + '</textarea></label>' : ''}
         ${node.type === 'hostExecutor' ? `
           ${choiceField('自动动作类型', 'executor', node.executor ?? 'shell-command', hostExecutorOptions, Object.fromEntries(hostExecutorOptions.map((executor) => [executor, hostExecutorLabel(executor)])), Object.fromEntries(hostExecutorOptions.map((executor) => [executor, hostExecutorHelp(executor)])), hostExecutorHelp(node.executor ?? 'shell-command'))}
           ${helpBlock(hostExecutorHelp(node.executor ?? 'shell-command'))}
@@ -1211,7 +1641,7 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
             <p class="builder-help">例：命令填 <code>node</code>，参数两行填 <code>-e</code> 和 <code>console.log("ok")</code>。</p>
           ` : '<p class="builder-help">该自动动作使用内置执行器；当前只展示类型选择，后续会按执行器补齐专用表单。</p>'}
         ` : ''}
-        <label class="builder-check" title="勾上后，流程走到这里会先停住，等人确认后再继续。"><input name="humanGate" type="checkbox" ${node.humanGate ? 'checked' : ''}/> <span>${labelWithHelp('执行前暂停确认', '适合脚本、发消息、部署等危险动作；确认后才会真正执行。')}</span></label>
+        <label class="builder-check" data-tour="node-human-gate" title="勾上后，流程走到这里会先停住，等人确认后再继续。"><input name="humanGate" type="checkbox" ${node.humanGate ? 'checked' : ''}/> <span>${labelWithHelp('执行前暂停确认', '适合脚本、发消息、部署等危险动作；确认后才会真正执行。')}</span></label>
         ${helpBlock(node.humanGate ? '当前会在执行前等待人工确认，适合防止误跑脚本或误发消息。' : '当前不会等待人工确认，流程到这里会直接继续。')}
         <details class="advanced-props"><summary>高级设置</summary>
           ${field('节点 ID', 'id', node.id, undefined, undefined, '会根据节点名称自动生成；不喜欢可以在这里手动改。', nextIdFromLabel(node.label, node.type === 'semantic' ? 'semantic' : node.type === 'hostExecutor' ? 'executor' : 'task', new Set(canvas.nodes.filter((n) => n !== node).map((n) => n.id))))}
@@ -1331,10 +1761,7 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
   }
 
   function addRole(): void {
-    const id = uniqueId('role', new Set(canvas.roles.map((r) => r.id)));
-    canvas.roles.push(newRole(id, '新角色', 'custom'));
-    selected = { kind: 'role', id };
-    renderAll();
+    openRoleCreator();
   }
 
   function addNode(type: NodeType): void {
@@ -1377,20 +1804,20 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
     save.disabled = true;
     try {
       const definition = toDefinition(canvas);
-      const validation = await fetch('/api/workflows/definitions/validate', {
+      const validation = await fetch(apiPath('/api/workflows/definitions/validate'), {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ definition }),
       });
-      const validationBody = await validation.json();
+      const validationBody = await readJsonResponse(validation);
       if (!validation.ok || !validationBody.ok) throw new Error(validationBody.message ?? validationBody.error ?? '校验失败');
       const exists = catalog.some((entry) => entry.workflowId === definition.workflowId);
-      const res = await fetch(exists ? `/api/workflows/definitions/${encodeURIComponent(definition.workflowId)}` : '/api/workflows/definitions', {
+      const res = await fetch(apiPath(exists ? `/api/workflows/definitions/${encodeURIComponent(definition.workflowId)}` : '/api/workflows/definitions'), {
         method: exists ? 'PUT' : 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ definition }),
       });
-      const body = await res.json();
+      const body = await readJsonResponse(res);
       if (!res.ok || !body.ok) throw new Error(body.message ?? body.error ?? `HTTP ${res.status}`);
       setStatus(`已保存 ${body.workflowId}`);
       await loadCatalog();
@@ -1403,8 +1830,8 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
 
   async function deleteCurrentWorkflow(): Promise<void> {
     if (!canvas.workflowId) return;
-    const res = await fetch(`/api/workflows/definitions/${encodeURIComponent(canvas.workflowId)}`, { method: 'DELETE' });
-    const body = await res.json();
+    const res = await fetch(apiPath(`/api/workflows/definitions/${encodeURIComponent(canvas.workflowId)}`), { method: 'DELETE' });
+    const body = await readJsonResponse(res);
     if (!res.ok || !body.ok) {
       setStatus(`删除失败：${body.error ?? res.status}`);
       return;
@@ -1429,6 +1856,15 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
     }
   };
   assistApply.onclick = applyAssistantDraft;
+  root.querySelector<HTMLButtonElement>('#role-create-close')!.onclick = closeRoleCreator;
+  root.querySelector<HTMLButtonElement>('#role-create-back')!.onclick = () => {
+    roleTypeStep.hidden = false;
+    roleDetailStep.hidden = true;
+    roleTemplateList.querySelector<HTMLInputElement>('input[name="roleTemplate"]')?.focus();
+  };
+  roleCreateLabel.addEventListener('input', updateRoleCreateGuard);
+  roleCreateResponsibility.addEventListener('input', updateRoleCreateGuard);
+  roleCreateApply.onclick = createRoleFromCreator;
   startOptions.querySelectorAll<HTMLButtonElement>('[data-start-option]').forEach((btn) => {
     btn.onclick = () => {
       const option = btn.dataset.startOption;
@@ -1456,11 +1892,10 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
   save.onclick = () => void saveDefinition();
   deleteWorkflow.onclick = () => void deleteCurrentWorkflow();
   tourPrev.onclick = () => { if (tourIndex > 0) { tourIndex -= 1; renderTour(); } };
-  tourNext.onclick = () => {
-    if (tourIndex >= tourSteps.length - 1) stopTour();
-    else { tourIndex += 1; renderTour(); }
-  };
+  tourNext.onclick = runTourStep;
   tourClose.onclick = stopTour;
+  root.addEventListener('click', onChoiceCardClick);
+  root.addEventListener('click', onTourTargetClick, true);
   window.addEventListener('resize', renderTour);
   window.addEventListener('scroll', renderTour, true);
 
@@ -1468,6 +1903,8 @@ export function renderWorkflowBuilderPage(root: HTMLElement): () => void {
   void loadCatalog();
   void loadBots();
   return () => {
+    root.removeEventListener('click', onChoiceCardClick);
+    root.removeEventListener('click', onTourTargetClick, true);
     window.removeEventListener('resize', renderTour);
     window.removeEventListener('scroll', renderTour, true);
   };
