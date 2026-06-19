@@ -181,6 +181,39 @@ describe('WorkflowEventWatcher', () => {
     watcher.close();
     expect(seen.filter((event) => event.type === 'waitCreated')).toHaveLength(1);
   });
+
+  it('falls back to short polling when fs.watch is unavailable', async () => {
+    await appendAttempt('gate-activity', 'gate-attempt');
+    const seen: WorkflowEvent[] = [];
+    const watcher = new WorkflowEventWatcher(
+      RUN_ID,
+      (event) => {
+        seen.push(event);
+      },
+      {
+        runsDir: baseDir,
+        pollIntervalMs: 60_000,
+        createFsWatcher: (() => {
+          const err = new Error('EMFILE synthetic');
+          (err as NodeJS.ErrnoException).code = 'EMFILE';
+          throw err;
+        }) as never,
+      },
+    );
+    await watcher.ready;
+
+    await createWait(log, {
+      activityId: 'gate-activity',
+      attemptId: 'gate-attempt',
+      nodeId: 'gate',
+      waitKind: 'human-gate',
+      prompt: 'approve?',
+    });
+
+    await waitFor(() => seen.some((event) => event.type === 'waitCreated'));
+    watcher.close();
+    expect(seen.filter((event) => event.type === 'waitCreated')).toHaveLength(1);
+  });
 });
 
 describe('handleWorkflowFanoutEvent', () => {

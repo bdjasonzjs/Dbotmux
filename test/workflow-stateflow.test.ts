@@ -10,6 +10,7 @@ import { parseWorkflowDefinition, type WorkflowDefinition } from '../src/workflo
 import { flowGateActivityId, flowWorkActivityId } from '../src/workflows/stateflow.js';
 import { resolveReviewDecision, resolveWait } from '../src/workflows/wait.js';
 import { createDevelopmentReviewWorkflow } from '../src/dashboard/web/workflow-product-builder.js';
+import { defaultObserverDriver } from '../src/workflows/observer-driver.js';
 
 let baseDir: string;
 
@@ -66,10 +67,19 @@ async function run(def: WorkflowDefinition) {
     initiator: 'test',
     botResolver: () => undefined,
   });
-  const result = await runLoop({ log, def, spawnSubagent: async () => {
-    throw new Error('semantic stateflow must not spawn subagents');
-  } }, { maxTicks: 50 });
+  const result = await runLoop(semanticCtx(log, def), { maxTicks: 50 });
   return { log, result };
+}
+
+function semanticCtx(log: EventLog, def: WorkflowDefinition) {
+  return {
+    log,
+    def,
+    driver: defaultObserverDriver(def, 'stateflow-test'),
+    spawnSubagent: async () => {
+      throw new Error('semantic stateflow must not spawn subagents');
+    },
+  };
 }
 
 describe('workflow stateflow', () => {
@@ -189,9 +199,7 @@ describe('workflow stateflow', () => {
         workingDir: baseDir,
       }),
     });
-    const result = await runLoop({ log, def, spawnSubagent: async () => {
-      throw new Error('semantic stateflow must not spawn subagents');
-    } }, { maxTicks: 12 });
+    const result = await runLoop(semanticCtx(log, def), { maxTicks: 12 });
     expect(result.reason).toBe('max-ticks');
     expect(result.lastSnapshot.outputs.has(flowWorkActivityId(log.runId, 'develop', 2))).toBe(true);
     expect(result.lastSnapshot.outputs.has(flowWorkActivityId(log.runId, 'report', 1))).toBe(false);
@@ -241,9 +249,7 @@ describe('workflow stateflow', () => {
       initiator: 'test',
       botResolver: () => undefined,
     });
-    const result = await runLoop({ log, def, spawnSubagent: async () => {
-      throw new Error('semantic stateflow must not spawn subagents');
-    } }, { maxTicks: 20 });
+    const result = await runLoop(semanticCtx(log, def), { maxTicks: 20 });
     expect(result.reason).toBe('awaiting-wait');
     const review1 = result.lastSnapshot.activities.get(flowWorkActivityId(log.runId, 'review', 1));
     expect(review1?.attempts.at(-1)?.wait?.waitKind).toBe('human-gate');
@@ -280,6 +286,7 @@ describe('workflow stateflow', () => {
     const first = await runLoop({
       log,
       def,
+      driver: defaultObserverDriver(def, 'stateflow-test'),
       spawnSubagent: async () => {
         throw new Error('humanGate must block subagent dispatch');
       },
@@ -299,6 +306,7 @@ describe('workflow stateflow', () => {
     const second = await runLoop({
       log,
       def,
+      driver: defaultObserverDriver(def, 'stateflow-test'),
       spawnSubagent: async (input) => ({
         kind: 'success',
         output: { ok: true, prompt: input.prompt },
@@ -341,6 +349,7 @@ describe('workflow stateflow', () => {
     const result = await runLoop({
       log,
       def,
+      driver: defaultObserverDriver(def, 'stateflow-test'),
       spawnSubagent: async () => ({
         kind: 'failure',
         errorCode: 'WorkerCrashed',
@@ -368,9 +377,7 @@ describe('workflow stateflow', () => {
       initiator: 'test',
       botResolver: () => undefined,
     });
-    const first = await runLoop({ log, def, spawnSubagent: async () => {
-      throw new Error('semantic stateflow must not spawn subagents');
-    } }, { maxTicks: 20 });
+    const first = await runLoop(semanticCtx(log, def), { maxTicks: 20 });
     expect(first.reason).toBe('awaiting-wait');
     const review1 = first.lastSnapshot.activities.get(flowWorkActivityId(log.runId, 'review', 1));
     expect(review1?.attempts.at(-1)?.wait?.waitKind).toBe('human-gate');
@@ -382,9 +389,7 @@ describe('workflow stateflow', () => {
       comment: 'needs changes',
     });
 
-    const second = await runLoop({ log, def, spawnSubagent: async () => {
-      throw new Error('semantic stateflow must not spawn subagents');
-    } }, { maxTicks: 20 });
+    const second = await runLoop(semanticCtx(log, def), { maxTicks: 20 });
     expect(second.reason).toBe('awaiting-wait');
     expect(second.lastSnapshot.outputs.has(flowWorkActivityId(log.runId, 'develop', 2))).toBe(true);
     expect(second.lastSnapshot.outputs.has(flowWorkActivityId(log.runId, 'report', 1))).toBe(false);
@@ -405,9 +410,7 @@ describe('workflow stateflow', () => {
       initiator: 'test',
       botResolver: () => undefined,
     });
-    const first = await runLoop({ log, def, spawnSubagent: async () => {
-      throw new Error('semantic stateflow must not spawn subagents');
-    } }, { maxTicks: 20 });
+    const first = await runLoop(semanticCtx(log, def), { maxTicks: 20 });
     const review1 = first.lastSnapshot.activities.get(flowWorkActivityId(log.runId, 'review', 1));
     expect(review1?.attempts.at(-1)?.wait?.waitKind).toBe('human-gate');
     await resolveReviewDecision(log, {
@@ -416,9 +419,7 @@ describe('workflow stateflow', () => {
       resolution: 'rejected',
       by: 'ou_reviewer',
     });
-    const second = await runLoop({ log, def, spawnSubagent: async () => {
-      throw new Error('semantic stateflow must not spawn subagents');
-    } }, { maxTicks: 20 });
+    const second = await runLoop(semanticCtx(log, def), { maxTicks: 20 });
     expect(second.reason).toBe('terminal');
     expect(second.lastSnapshot.run.status).toBe('failed');
     expect(second.lastSnapshot.run.failedNodeId).toBe('review_failed');

@@ -18,6 +18,7 @@ import { join } from 'node:path';
 import { parseWorkflowDefinition } from '../src/workflows/definition.js';
 import { EventLog } from '../src/workflows/events/append.js';
 import { runLoop } from '../src/workflows/loop.js';
+import { defaultObserverDriver } from '../src/workflows/observer-driver.js';
 import { createRun } from '../src/workflows/run-init.js';
 
 const FIXTURE_PATH = join(__dirname, '..', 'workflows', 'schedule-demo.workflow.json');
@@ -75,6 +76,7 @@ describe('schedule-demo workflow — A1 dogfood', () => {
     const ctx = {
       log,
       def,
+      driver: defaultObserverDriver(def, 'a1-companion-test'),
       spawnSubagent: createStubSpawnFn(() => ({ never: 'called' })),
       hostExecutors: createDefaultHostExecutorRegistry(),
     };

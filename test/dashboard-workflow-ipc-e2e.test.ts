@@ -29,6 +29,7 @@ import type {
   WorkflowRuntimeContext,
   WorkerSpawnFn,
 } from '../src/workflows/runtime.js';
+import { defaultObserverDriver } from '../src/workflows/observer-driver.js';
 
 const WAIT_DEF = parseWorkflowDefinition({
   workflowId: 'ipc-wait',
@@ -623,6 +624,7 @@ async function seedOwnedWaitingRun(
   const ctx: WorkflowRuntimeContext = {
     log,
     def: WAIT_DEF,
+    driver: defaultObserverDriver(WAIT_DEF, 'dashboard-ipc-test'),
     spawnSubagent: unusedSpawn,
   };
   await runLoop(ctx);
@@ -645,6 +647,7 @@ async function seedOwnedSucceededRun(
   const ctx: WorkflowRuntimeContext = {
     log,
     def: DONE_DEF,
+    driver: defaultObserverDriver(DONE_DEF, 'dashboard-ipc-test'),
     spawnSubagent: async () => ({ kind: 'success', output: { ok: true } }),
   };
   await runLoop(ctx);

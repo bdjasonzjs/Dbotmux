@@ -18,6 +18,7 @@ import {
 import { runLoop } from '../src/workflows/loop.js';
 import { cancelWorkflowRun } from '../src/workflows/cancel-run.js';
 import { requestCancel } from '../src/workflows/cancel.js';
+import { defaultObserverDriver } from '../src/workflows/observer-driver.js';
 
 const noopResolver: BotResolver = () => ({});
 
@@ -30,6 +31,60 @@ afterEach(() => {
 });
 
 describe('cancel finalize e2e — running cancel walks chain to terminal', () => {
+  it('rejects non-observer cancel before writing cancelRequested', async () => {
+    const def: WorkflowDefinition = parseWorkflowDefinition({
+      workflowId: 'cancel-observer-gate',
+      version: 1,
+      nodes: {
+        gate: {
+          type: 'subagent',
+          bot: 'cli_gate',
+          prompt: 'gated work',
+          humanGate: { stage: 'before', prompt: 'continue?' },
+        },
+      },
+    });
+    const log = new EventLog('cancel-observer-gate', baseDir);
+    await createRun(log, { def, params: {}, initiator: 'tester', botResolver: noopResolver });
+    const ctx: WorkflowRuntimeContext = {
+      log,
+      def,
+      driver: defaultObserverDriver(def, 'cancel-observer-test'),
+      spawnSubagent: async (input) => ({
+        kind: 'success',
+        output: { ok: true },
+        session: {
+          sessionId: `s-${input.activityId}`,
+          botName: input.botName,
+          startedAt: 0,
+        },
+      }),
+    };
+
+    const first = await runLoop(ctx);
+    expect(first.reason).toBe('awaiting-wait');
+
+    await expect(
+      cancelWorkflowRun({
+        ctx: {
+          ...ctx,
+          driver: { actorId: 'ou_reviewer', roleKind: 'reviewer', source: 'test' },
+        },
+        reason: 'reviewer should not drive cancel',
+        by: 'ou_reviewer',
+      }),
+    ).rejects.toThrow(/requires observer driver/);
+    const afterReviewer = replay(await log.readAll());
+    expect(afterReviewer.cancelledRunIntent).toBeUndefined();
+
+    const observerCancel = await cancelWorkflowRun({
+      ctx,
+      reason: 'observer cancel',
+      by: 'ou_observer',
+    });
+    expect(observerCancel.snapshot.run.status).toBe('cancelled');
+  });
+
   it('case 10: writes full cancelRequested→activityCanceled→nodeCanceled→runCanceled chain and clears intent', async () => {
     // Reproduces the daemon-side finalize closure (Part 1b of v0.1.4-a):
     //   1. runLoop is in flight running B & C in parallel
@@ -90,6 +145,7 @@ describe('cancel finalize e2e — running cancel walks chain to terminal', () =>
     const ctx: WorkflowRuntimeContext = {
       log,
       def,
+      driver: defaultObserverDriver(def, 'cancel-finalize-test'),
       spawnSubagent: spawn,
       registerAborters: (map) => {
         aborters = map;

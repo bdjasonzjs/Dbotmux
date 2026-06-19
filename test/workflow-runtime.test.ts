@@ -37,6 +37,7 @@ import type {
   HostExecutorRegistry,
   RegisteredHostExecutor,
 } from '../src/workflows/hostExecutors/registry.js';
+import { defaultObserverDriver } from '../src/workflows/observer-driver.js';
 
 const RUN_ID = 'run-runtime-test-01';
 const noopResolver: BotResolver = () => ({});
@@ -147,6 +148,7 @@ async function bootstrap(
   const ctx: WorkflowRuntimeContext = {
     log,
     def,
+    driver: defaultObserverDriver(def, 'runtime-test'),
     spawnSubagent: spawn,
     now: () => 1_700_000_000_000,
   };
@@ -400,6 +402,7 @@ describe('dispatchWork — subagent', () => {
     const ctx: WorkflowRuntimeContext = {
       log,
       def,
+      driver: defaultObserverDriver(def, 'runtime-test'),
       spawnSubagent: async (input) => {
         prompts.push(input.prompt);
         return {
@@ -446,6 +449,7 @@ describe('dispatchWork — subagent', () => {
     const ctx: WorkflowRuntimeContext = {
       log,
       def,
+      driver: defaultObserverDriver(def, 'runtime-test'),
       spawnSubagent: async (input) => {
         prompts.push(input.prompt);
         return {
@@ -577,6 +581,7 @@ describe('dispatchWork — subagent', () => {
     const ctx: WorkflowRuntimeContext = {
       log,
       def,
+      driver: defaultObserverDriver(def, 'runtime-test'),
       spawnSubagent: successSpawn,
       hostExecutors: fakeHostRegistry(),
     };
@@ -693,6 +698,7 @@ describe('botSnapshots reach the spawner', () => {
     const ctx: WorkflowRuntimeContext = {
       log,
       def,
+      driver: defaultObserverDriver(def, 'runtime-test'),
       spawnSubagent: captureSpawn,
     };
 
@@ -747,7 +753,12 @@ describe('botSnapshots reach the spawner', () => {
       initiator: 'tester',
       botResolver: () => ({ workingDir: '/snapshot-cwd' }),
     });
-    const ctx: WorkflowRuntimeContext = { log, def, spawnSubagent: captureSpawn };
+    const ctx: WorkflowRuntimeContext = {
+      log,
+      def,
+      driver: defaultObserverDriver(def, 'runtime-test'),
+      spawnSubagent: captureSpawn,
+    };
     await dispatchWork(ctx, {
       kind: 'dispatchWork',
       nodeId: 'a',

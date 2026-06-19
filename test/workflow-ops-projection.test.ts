@@ -26,6 +26,7 @@ import { parseWorkflowDefinition } from '../src/workflows/definition.js';
 import { createRun } from '../src/workflows/run-init.js';
 import { runLoop } from '../src/workflows/loop.js';
 import { workActivityId } from '../src/workflows/orchestrator.js';
+import { defaultObserverDriver } from '../src/workflows/observer-driver.js';
 import type { WorkerSpawnFn } from '../src/workflows/runtime.js';
 
 let runsDir: string;
@@ -71,7 +72,12 @@ async function seedActive(runId: string): Promise<EventLog> {
 
 async function seedSucceeded(runId: string): Promise<void> {
   const log = await seedActive(runId);
-  await runLoop({ log, def: HELLO_DEF, spawnSubagent: okSpawn });
+  await runLoop({
+    log,
+    def: HELLO_DEF,
+    driver: defaultObserverDriver(HELLO_DEF, 'ops-projection-test'),
+    spawnSubagent: okSpawn,
+  });
 }
 
 // ─── isValidRunId ───────────────────────────────────────────────────────────
@@ -185,7 +191,12 @@ describe('listRuns', () => {
       errorMessage: 'city must be provided before planning can start',
     });
     const log = await seedActive('r-failed-row');
-    await runLoop({ log, def: HELLO_DEF, spawnSubagent: failingSpawn });
+    await runLoop({
+      log,
+      def: HELLO_DEF,
+      driver: defaultObserverDriver(HELLO_DEF, 'ops-projection-test'),
+      spawnSubagent: failingSpawn,
+    });
 
     const [row] = await listRuns(runsDir, { all: true });
     expect(row?.runId).toBe('r-failed-row');
@@ -355,7 +366,12 @@ describe('readRunSnapshot', () => {
       initiator: 'test',
       botResolver: () => ({}),
     });
-    await runLoop({ log, def, spawnSubagent: okSpawn });
+    await runLoop({
+      log,
+      def,
+      driver: defaultObserverDriver(def, 'ops-projection-test'),
+      spawnSubagent: okSpawn,
+    });
 
     const snap = await readRunSnapshot(runsDir, 'r-template');
     const attemptId = 'r-template::work::weather::att-1';
@@ -475,7 +491,12 @@ describe('readRunSnapshot', () => {
       initiator: 'test',
       botResolver: () => ({}),
     });
-    await runLoop({ log, def: HELLO_DEF, spawnSubagent: failingSpawn });
+    await runLoop({
+      log,
+      def: HELLO_DEF,
+      driver: defaultObserverDriver(HELLO_DEF, 'ops-projection-test'),
+      spawnSubagent: failingSpawn,
+    });
 
     const snap = await readRunSnapshot(runsDir, 'r-failed-msg');
     const activity = snap?.activities.find((a) => a.ownerNodeId === 'only');

@@ -114,6 +114,7 @@ import { resolveReviewDecision, resolveWait } from './workflows/wait.js';
 import { replay } from './workflows/events/replay.js';
 import { isValidRunId, readRunSnapshot } from './workflows/ops-projection.js';
 import { AttemptResumeManager } from './workflows/attempt-resume.js';
+import { defaultObserverDriver } from './workflows/observer-driver.js';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -1046,6 +1047,7 @@ async function attachColdWorkflowRuns(ownerLarkAppId: string): Promise<void> {
       makeContext: (run, log) => ({
         log,
         def: run.def,
+        driver: defaultObserverDriver(run.def, 'daemon-cold-attach'),
         spawnSubagent: workflowSpawnFn(),
         hostExecutors: createDefaultHostExecutorRegistry(),
         reconcilers: createDefaultProviderReconcilers(),
@@ -1615,6 +1617,7 @@ ipcRoute('POST', '/api/workflows/definitions/:id/run', async (req, res, params) 
       makeRuntimeContext: (log, def, spawnSubagent) => ({
         log,
         def,
+        driver: defaultObserverDriver(def, 'dashboard-trigger'),
         spawnSubagent,
         hostExecutors: createDefaultHostExecutorRegistry(),
         reconcilers: createDefaultProviderReconcilers(),

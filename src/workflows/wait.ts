@@ -103,7 +103,7 @@ export type ExpireWaitInput = {
 
 export type ResolveWaitResult = {
   resolutionEvent: WaitResolvedEvent;
-  terminalEvent: ActivitySucceededEvent | ActivityFailedEvent;
+  terminalEvent?: ActivitySucceededEvent | ActivityFailedEvent;
 };
 
 export type ResolveReviewDecisionInput = {
@@ -231,28 +231,7 @@ export async function resolveReviewDecision(
     },
   })) as WaitResolvedEvent;
 
-  const decision = input.resolution === 'approved' ? 'approved' : 'rejected';
-  const outputRef = await writeJsonBlob(log, {
-    semanticKind: 'reviewDecision',
-    value: {
-      decision,
-      by: input.by,
-      ...(input.comment ? { comment: input.comment } : {}),
-    },
-  });
-  const terminalEvent = (await log.append({
-    runId: log.runId,
-    type: 'activitySucceeded',
-    actor: 'scheduler',
-    payload: {
-      activityId: input.activityId,
-      attemptId: input.attemptId,
-      outputRef,
-      externalRefs: { resolution: input.resolution, decision, by: input.by },
-    },
-  })) as ActivitySucceededEvent;
-
-  return { resolutionEvent, terminalEvent };
+  return { resolutionEvent };
 }
 
 // ─── expireWait ────────────────────────────────────────────────────────────

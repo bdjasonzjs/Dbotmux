@@ -10,6 +10,10 @@ import {
   type RequestCancelActor,
 } from './cancel.js';
 import { isValidRunId, readRunSnapshot } from './ops-projection.js';
+import {
+  assertObserverDriver,
+  type WorkflowDriverContext,
+} from './observer-driver.js';
 
 export type CancelWorkflowRunInput = {
   ctx: WorkflowRuntimeContext;
@@ -62,6 +66,7 @@ export async function cancelWorkflowRun(
   input: CancelWorkflowRunInput,
 ): Promise<CancelWorkflowRunResult> {
   const { ctx, reason, by, actor = 'human', maxTicks = 200 } = input;
+  assertObserverDriver(ctx.driver, ctx.def, 'cancelWorkflowRun');
   let snapshot = replay(await ctx.log.readAll());
 
   if (isTerminalRunStatus(snapshot.run.status)) {
@@ -84,12 +89,12 @@ export async function cancelWorkflowRun(
   }
 
   snapshot = replay(await ctx.log.readAll());
-  await finalizeRunCancelIfPossible(ctx.log, ctx.def, snapshot);
+  await finalizeRunCancelIfPossible(ctx.log, ctx.def, snapshot, ctx.driver);
 
   const loopResult = await runLoop(ctx, { maxTicks });
 
   snapshot = replay(await ctx.log.readAll());
-  await finalizeRunCancelIfPossible(ctx.log, ctx.def, snapshot);
+  await finalizeRunCancelIfPossible(ctx.log, ctx.def, snapshot, ctx.driver);
   snapshot = replay(await ctx.log.readAll());
 
   return {
@@ -105,7 +110,9 @@ export async function finalizeRunCancelIfPossible(
   log: EventLog,
   def: WorkflowDefinition,
   snapshot: Snapshot,
+  driver?: WorkflowDriverContext,
 ): Promise<void> {
+  assertObserverDriver(driver, def, 'finalizeRunCancelIfPossible');
   const intent = snapshot.cancelledRunIntent;
   if (!intent) return;
 

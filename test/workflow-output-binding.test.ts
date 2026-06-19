@@ -30,6 +30,7 @@ import {
 import { decideNextActions } from '../src/workflows/orchestrator.js';
 import { createRun } from '../src/workflows/run-init.js';
 import { workActivityId } from '../src/workflows/orchestrator.js';
+import { defaultObserverDriver } from '../src/workflows/observer-driver.js';
 
 const RUN_ID = 'run-binding-test';
 
@@ -175,6 +176,7 @@ describe('resolveOutputRef — snapshot+blob walk', () => {
     const ctx: WorkflowRuntimeContext = {
       log,
       def,
+      driver: defaultObserverDriver(def, 'output-binding-test'),
       spawnSubagent: successSpawn,
     };
     const actions = decideNextActions(replay(await log.readAll()), def);
@@ -210,6 +212,7 @@ describe('resolveOutputRef — snapshot+blob walk', () => {
     const ctx: WorkflowRuntimeContext = {
       log,
       def,
+      driver: defaultObserverDriver(def, 'output-binding-test'),
       spawnSubagent: async () => ({ kind: 'success', output: {}, session: { sessionId: 'x', botName: 'b', startedAt: 0 } }),
       hostExecutors: new Map([
         ['test-host', {
@@ -690,6 +693,7 @@ describe('dispatchWork — hostExecutor with $ref input', () => {
     const ctx: WorkflowRuntimeContext = {
       log,
       def,
+      driver: defaultObserverDriver(def, 'output-binding-test'),
       spawnSubagent: successSpawn,
       hostExecutors: new Map([
         ['echo', {
@@ -732,6 +736,7 @@ describe('dispatchWork — hostExecutor with $ref input', () => {
     const ctx: WorkflowRuntimeContext = {
       log,
       def,
+      driver: defaultObserverDriver(def, 'output-binding-test'),
       spawnSubagent: async () => ({ kind: 'success', output: {}, session: { sessionId: 'x', botName: 'b', startedAt: 0 } }),
       hostExecutors: new Map([
         ['echo', {
@@ -792,6 +797,7 @@ describe('dispatchGate — bound prompt', () => {
     const ctx: WorkflowRuntimeContext = {
       log,
       def,
+      driver: defaultObserverDriver(def, 'output-binding-test'),
       spawnSubagent: async () => ({
         kind: 'success',
         output: { preview: 'Approve sending: Hello team' },
@@ -827,6 +833,7 @@ describe('dispatchGate — bound prompt', () => {
     const ctx: WorkflowRuntimeContext = {
       log,
       def,
+      driver: defaultObserverDriver(def, 'output-binding-test'),
       spawnSubagent: async () => ({
         kind: 'success',
         output: {},

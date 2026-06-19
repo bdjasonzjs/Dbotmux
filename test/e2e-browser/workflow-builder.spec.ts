@@ -9,6 +9,7 @@ import { EventLog } from '../../src/workflows/events/append.js';
 import { replay, type Snapshot } from '../../src/workflows/events/replay.js';
 import { parseWorkflowDefinition, type WorkflowDefinition } from '../../src/workflows/definition.js';
 import { runLoop } from '../../src/workflows/loop.js';
+import { defaultObserverDriver } from '../../src/workflows/observer-driver.js';
 import { createRun } from '../../src/workflows/run-init.js';
 import { flowWorkActivityId } from '../../src/workflows/stateflow.js';
 import { resolveReviewDecision } from '../../src/workflows/wait.js';
@@ -598,6 +599,7 @@ function ctx(log: EventLog, def: WorkflowDefinition) {
   return {
     log,
     def,
+    driver: defaultObserverDriver(def, 'workflow-builder-e2e'),
     spawnSubagent: async () => {
       throw new Error('workflow product E2E should use semantic nodes only');
     },

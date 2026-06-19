@@ -36,6 +36,8 @@
 import type { EventLog } from './events/append.js';
 import { computeInputHash } from './events/idempotency.js';
 import { replay, type Snapshot, type AttemptState } from './events/replay.js';
+import { writeJsonBlob } from './blob.js';
+import type { WorkflowDefinition } from './definition.js';
 import type {
   ActivityCanceledEvent,
   ActivityFailedEvent,
@@ -43,6 +45,10 @@ import type {
   ReconcileResultEvent,
   ResumeStartedEvent,
 } from './events/types.js';
+import {
+  assertObserverDriver,
+  type WorkflowDriverContext,
+} from './observer-driver.js';
 
 // ─── Public surface ─────────────────────────────────────────────────────────
 
@@ -123,6 +129,10 @@ export type ResumeContext = {
   log: EventLog;
   /** Match `log.runId`; passed explicitly so the contract is visible. */
   runId: string;
+  /** Definition is required to recover semantic reviewDecision waits. */
+  def?: WorkflowDefinition;
+  /** Only observer/monitor drivers may advance recovery state. */
+  driver?: WorkflowDriverContext;
   /** Daemon identifier for the resumeStarted audit event. */
   daemonId: string;
   /** Reconcilers keyed by provider name (`feishu-im`, `botmux-schedule`). */
@@ -281,6 +291,7 @@ export type ResumeResult = {
 // ─── Resume orchestrator ────────────────────────────────────────────────────
 
 export async function resume(ctx: ResumeContext): Promise<ResumeResult> {
+  assertObserverDriver(ctx.driver, undefined, 'resume');
   if (ctx.runId !== ctx.log.runId) {
     throw new Error(
       `resume: ctx.runId (${ctx.runId}) does not match log.runId (${ctx.log.runId})`,
@@ -589,6 +600,41 @@ async function recoverWaitResolution(
   const r = latest.wait.resolution;
 
   if (r.kind === 'resolved') {
+    if (!ctx.def) {
+      throw new Error(
+        `resume(${ctx.runId}): resolved wait ${activityId} requires workflow definition ` +
+          `to distinguish semantic reviewDecision from ordinary human gate recovery`,
+      );
+    }
+    if (isReviewDecisionActivity(ctx, activity.ownerNodeId) && (r.resolution === 'approved' || r.resolution === 'rejected')) {
+      const decision = r.resolution === 'approved' ? 'approved' : 'rejected';
+      const outputRef = await writeJsonBlob(ctx.log, {
+        semanticKind: 'reviewDecision',
+        value: {
+          decision,
+          by: r.by,
+          ...(r.comment ? { comment: r.comment } : {}),
+        },
+      });
+      const terminalEvent = (await ctx.log.append({
+        runId: ctx.runId,
+        type: 'activitySucceeded',
+        actor: 'system',
+        payload: {
+          activityId,
+          attemptId: latest.attemptId,
+          outputRef,
+          externalRefs: { resolution: r.resolution, decision, by: r.by },
+        },
+      })) as ActivitySucceededEvent;
+      return {
+        activityId,
+        attemptId: latest.attemptId,
+        kind: 'succeeded',
+        source: 'resolved',
+        terminalEvent,
+      };
+    }
     // approved | external → activitySucceeded.
     // rejected           → activityFailed { InputValidationFailed, userFault }.
     if (r.resolution === 'rejected') {
@@ -676,6 +722,15 @@ async function recoverWaitResolution(
     source: 'deadlineExceeded',
     terminalEvent,
   };
+}
+
+function isReviewDecisionActivity(
+  ctx: ResumeContext,
+  nodeId: string | undefined,
+): boolean {
+  if (!nodeId || !ctx.def) return false;
+  const node = ctx.def.nodes[nodeId];
+  return node?.type === 'semantic' && node.kind === 'reviewDecision';
 }
 
 async function writeRecoverySucceeded(

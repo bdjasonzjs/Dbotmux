@@ -21,6 +21,7 @@ import {
 } from '../src/workflows/definition.js';
 import { createRun } from '../src/workflows/run-init.js';
 import { runLoop } from '../src/workflows/loop.js';
+import { defaultObserverDriver } from '../src/workflows/observer-driver.js';
 import type { WorkerSpawnFn } from '../src/workflows/runtime.js';
 import type { CatalogEntry } from '../src/workflows/catalog.js';
 
@@ -738,6 +739,7 @@ async function seedWaitingRun(
   await runLoop({
     log,
     def,
+    driver: defaultObserverDriver(def, 'dashboard-workflow-api-test'),
     spawnSubagent: unusedSpawn,
   });
 }
@@ -753,6 +755,7 @@ async function seedSucceededRun(runId: string, def: WorkflowDefinition): Promise
   await runLoop({
     log,
     def,
+    driver: defaultObserverDriver(def, 'dashboard-workflow-api-test'),
     spawnSubagent: async () => ({ kind: 'success', output: { ok: true } }),
   });
 }

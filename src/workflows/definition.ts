@@ -21,6 +21,7 @@
 
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
+import { DEFAULT_OBSERVER_DRIVER_ROLE_ID } from './observer-driver.js';
 
 // ─── Field schemas ─────────────────────────────────────────────────────────
 
@@ -340,8 +341,34 @@ export function computeRevisionId(def: WorkflowDefinition): string {
  */
 export function parseWorkflowDefinition(raw: unknown): WorkflowDefinition {
   const def = WorkflowDefinitionSchema.parse(raw);
+  normalizeObserverRole(def);
   validateGraph(def);
   return def;
+}
+
+function normalizeObserverRole(def: WorkflowDefinition): void {
+  const roles = def.roles ?? {};
+  const hasObserver = Object.values(roles).some((role) => role.kind === 'observer');
+  if (hasObserver) {
+    if (!def.roles && Object.keys(roles).length > 0) def.roles = roles;
+    return;
+  }
+  const existingDefaultRole = roles[DEFAULT_OBSERVER_DRIVER_ROLE_ID];
+  if (existingDefaultRole && existingDefaultRole.kind !== 'observer') {
+    throw new Error(
+      `workflow role '${DEFAULT_OBSERVER_DRIVER_ROLE_ID}' is reserved for the default observer driver; ` +
+        `got kind=${existingDefaultRole.kind}`,
+    );
+  }
+  def.roles = {
+    ...roles,
+    [DEFAULT_OBSERVER_DRIVER_ROLE_ID]: {
+      id: DEFAULT_OBSERVER_DRIVER_ROLE_ID,
+      kind: 'observer',
+      label: 'Observer Driver',
+      responsibility: 'Default workflow monitor that is allowed to advance state.',
+    },
+  };
 }
 
 function validateGraph(def: WorkflowDefinition): void {

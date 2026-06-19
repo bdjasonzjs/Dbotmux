@@ -48,6 +48,7 @@ import type {
   WorkerSpawnFn,
   WorkflowRuntimeContext,
 } from '../src/workflows/runtime.js';
+import { defaultObserverDriver } from '../src/workflows/observer-driver.js';
 
 const RUN_ID = 'r1-cli-resume-test-01';
 
@@ -221,6 +222,7 @@ describe('R1 — feishu-send cold resume from runDir', () => {
     const ctx: WorkflowRuntimeContext = {
       log,
       def,
+      driver: defaultObserverDriver(def, 'r1-cli-resume-test'),
       spawnSubagent: resumeSpawnStub,
       hostExecutors: createDefaultHostExecutorRegistry(),
       reconcilers: createDefaultProviderReconcilers(),
@@ -308,6 +310,7 @@ describe('R1 — open humanGate cold resume from runDir', () => {
     const ctx: WorkflowRuntimeContext = {
       log,
       def,
+      driver: defaultObserverDriver(def, 'r1-cli-resume-test'),
       spawnSubagent: resumeSpawnStub,
       hostExecutors: createDefaultHostExecutorRegistry(),
       reconcilers: createDefaultProviderReconcilers(),
@@ -377,6 +380,7 @@ describe('R1 — fresh subagent dispatch during cold resume is rejected, not cra
     const ctx: WorkflowRuntimeContext = {
       log,
       def,
+      driver: defaultObserverDriver(def, 'r1-cli-resume-test'),
       spawnSubagent: resumeSpawnStub,
       hostExecutors: createDefaultHostExecutorRegistry(),
       reconcilers: createDefaultProviderReconcilers(),
@@ -476,6 +480,7 @@ describe('R2 — in-flight subagent activity on cold resume is marked crashed', 
     const ctx: WorkflowRuntimeContext = {
       log,
       def,
+      driver: defaultObserverDriver(def, 'r1-cli-resume-test'),
       spawnSubagent: async (input) => {
         spawnCalls++;
         return resumeSpawnStub(input);

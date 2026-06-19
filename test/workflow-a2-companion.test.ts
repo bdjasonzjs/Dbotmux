@@ -25,6 +25,7 @@ import { join } from 'node:path';
 import { parseWorkflowDefinition } from '../src/workflows/definition.js';
 import { EventLog } from '../src/workflows/events/append.js';
 import { runLoop } from '../src/workflows/loop.js';
+import { defaultObserverDriver } from '../src/workflows/observer-driver.js';
 import { createRun } from '../src/workflows/run-init.js';
 
 const FIXTURE_PATH = join(__dirname, '..', 'workflows', 'feishu-send-demo.workflow.json');
@@ -71,6 +72,7 @@ describe('feishu-send-demo workflow — A2 dogfood (mocked client)', () => {
     const ctx = {
       log,
       def,
+      driver: defaultObserverDriver(def, 'a2-companion-test'),
       spawnSubagent: createStubSpawnFn(() => ({ never: 'called' })),
       hostExecutors: createDefaultHostExecutorRegistry(),
     };

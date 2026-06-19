@@ -28,6 +28,7 @@ import {
 } from '../src/workflows/effect-input.js';
 import { EventLog, type EventDraft } from '../src/workflows/events/append.js';
 import { computeInputHash } from '../src/workflows/events/idempotency.js';
+import { defaultObserverDriver } from '../src/workflows/observer-driver.js';
 import { resume } from '../src/workflows/resume.js';
 
 const RUN_ID = 'r-hash-guard-01';
@@ -147,6 +148,7 @@ describe('inputHash guard — feishu-send', () => {
       log,
       runId: log.runId,
       daemonId: 'd-1',
+      driver: defaultObserverDriver(undefined, 'resume-input-hash-guard-test'),
       reconcilers: new Map([['feishu-im', feishuImReconciler]]),
       loadEffectInput: (aid, atid) => loadEffectInputSidecar(log, aid, atid),
     });
@@ -203,6 +205,7 @@ describe('inputHash guard — feishu-send', () => {
       log,
       runId: log.runId,
       daemonId: 'd-1',
+      driver: defaultObserverDriver(undefined, 'resume-input-hash-guard-test'),
       reconcilers: new Map([['feishu-im', feishuImReconciler]]),
       loadEffectInput: (aid, atid) => loadEffectInputSidecar(log, aid, atid),
     });
@@ -268,6 +271,7 @@ describe('inputHash guard — feishu-reply', () => {
       log,
       runId: log.runId,
       daemonId: 'd-1',
+      driver: defaultObserverDriver(undefined, 'resume-input-hash-guard-test'),
       reconcilers: new Map([['feishu-im', feishuImReconciler]]),
       loadEffectInput: (aid, atid) => loadEffectInputSidecar(log, aid, atid),
     });
@@ -310,6 +314,7 @@ describe('inputHash guard — config error', () => {
       log,
       runId: log.runId,
       daemonId: 'd-1',
+      driver: defaultObserverDriver(undefined, 'resume-input-hash-guard-test'),
       reconcilers: new Map([['custom-x', reconciler]]),
       loadEffectInput: (aid, atid) => loadEffectInputSidecar(log, aid, atid),
     });
@@ -367,6 +372,7 @@ describe('inputHash guard — combined feishu-im reconciler routing', () => {
       log,
       runId: log.runId,
       daemonId: 'd-1',
+      driver: defaultObserverDriver(undefined, 'resume-input-hash-guard-test'),
       reconcilers: new Map([['feishu-im', feishuImReconciler]]),
       loadEffectInput: (aid, atid) => loadEffectInputSidecar(log, aid, atid),
     });

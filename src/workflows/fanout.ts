@@ -20,6 +20,7 @@ export type WorkflowEventWatcherOptions = {
   onError?: (err: unknown) => void;
   pollIntervalMs?: number;
   useFsWatch?: boolean;
+  createFsWatcher?: typeof watch;
 };
 
 export class WorkflowEventWatcher {
@@ -89,14 +90,30 @@ export class WorkflowEventWatcher {
       await writeFile(this.log.eventsFile, '', { flag: 'a' });
     }
     this.lastSeq = await this.log.currentSeq();
+    let fsWatchActive = false;
+    let fsWatchUnavailable = false;
     if (this.opts.useFsWatch !== false) {
-      this.watcher = watch(this.log.eventsFile, { persistent: false }, () => {
-        void this.drain();
-      });
+      try {
+        const createFsWatcher = this.opts.createFsWatcher ?? watch;
+        this.watcher = createFsWatcher(this.log.eventsFile, { persistent: false }, () => {
+          void this.drain();
+        });
+        fsWatchActive = true;
+      } catch (err) {
+        fsWatchUnavailable = true;
+        logger.warn?.(
+          `workflow event watcher(${this.runId}) fs.watch unavailable; falling back to polling: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
     }
+    const pollIntervalMs = fsWatchUnavailable
+      ? Math.min(this.opts.pollIntervalMs ?? 100, 100)
+      : this.opts.pollIntervalMs ?? (fsWatchActive ? 5_000 : 100);
     this.pollTimer = setInterval(() => {
       void this.drain();
-    }, this.opts.pollIntervalMs ?? 5_000);
+    }, pollIntervalMs);
     this.pollTimer.unref?.();
   }
 }

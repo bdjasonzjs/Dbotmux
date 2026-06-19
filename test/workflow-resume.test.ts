@@ -9,6 +9,11 @@ import {
   type ResumeResult,
 } from '../src/workflows/resume.js';
 import { PROVIDER_TTL_MS } from '../src/workflows/events/schema.js';
+import { defaultObserverDriver } from '../src/workflows/observer-driver.js';
+import {
+  parseWorkflowDefinition,
+  type WorkflowDefinition,
+} from '../src/workflows/definition.js';
 
 const RUN_ID = 'run-resume-test-01';
 const SHA = 'sha256:' + 'c'.repeat(64);
@@ -92,15 +97,35 @@ function emptyReconcilers(): Map<string, ProviderReconciler> {
   return new Map();
 }
 
+function resumeWithObserver(ctx: Parameters<typeof resume>[0]) {
+  return resume({ driver: defaultObserverDriver(undefined, 'resume-test'), ...ctx });
+}
+
+function ordinaryGateDef(): WorkflowDefinition {
+  return parseWorkflowDefinition({
+    workflowId: 'wf-demo',
+    version: 1,
+    nodes: {
+      'n-1': {
+        type: 'subagent',
+        bot: 'codex',
+        prompt: 'ordinary gated work',
+        humanGate: { stage: 'before', prompt: 'approve?' },
+      },
+    },
+  });
+}
+
 // ─── resumeStarted is always written first ─────────────────────────────────
 
 describe('resume — resumeStarted audit entry', () => {
   it('writes resumeStarted as the first event of the resume cycle', async () => {
     await bootstrapWith();
     const before = (await log.readAll()).length;
-    const r = await resume({
+    const r = await resumeWithObserver({
       log,
       runId: RUN_ID,
+      def: ordinaryGateDef(),
       daemonId: 'd-1',
       reconcilers: emptyReconcilers(),
     });
@@ -117,7 +142,7 @@ describe('resume — resumeStarted audit entry', () => {
     // resumeStarted, so the run event log is never polluted by a
     // failed resume attempt.
     await expect(
-      resume({ log, runId: RUN_ID, daemonId: 'd-1', reconcilers: emptyReconcilers() }),
+      resumeWithObserver({ log, runId: RUN_ID, daemonId: 'd-1', reconcilers: emptyReconcilers() }),
     ).rejects.toThrow(/cannot resume an empty event log/);
     const events = await log.readAll();
     expect(events).toEqual([]);
@@ -150,7 +175,7 @@ describe('resume — resumeStarted audit entry', () => {
     await fs.writeFile(path, JSON.stringify(obj) + '\n', 'utf-8');
 
     await expect(
-      resume({ log, runId: RUN_ID, daemonId: 'd-1', reconcilers: emptyReconcilers() }),
+      resumeWithObserver({ log, runId: RUN_ID, daemonId: 'd-1', reconcilers: emptyReconcilers() }),
     ).rejects.toThrow(/first event must be runCreated/);
     const events = await log.readAll();
     expect(events).toHaveLength(1);
@@ -160,7 +185,7 @@ describe('resume — resumeStarted audit entry', () => {
   it('rejects runId mismatch between ctx and log', async () => {
     await bootstrapWith();
     await expect(
-      resume({ log, runId: 'wrong-run-id', daemonId: 'd-1', reconcilers: emptyReconcilers() }),
+      resumeWithObserver({ log, runId: 'wrong-run-id', daemonId: 'd-1', reconcilers: emptyReconcilers() }),
     ).rejects.toThrow(/does not match log.runId/);
   });
 });
@@ -182,9 +207,10 @@ describe('resume — terminal-state runs', () => {
         },
       },
     );
-    const r = await resume({
+    const r = await resumeWithObserver({
       log,
       runId: RUN_ID,
+      def: ordinaryGateDef(),
       daemonId: 'd-1',
       reconcilers: emptyReconcilers(),
     });
@@ -198,9 +224,10 @@ describe('resume — terminal-state runs', () => {
 describe('resume — worker-crashed path (pure-skill dangling)', () => {
   it('writes activityFailed{WorkerCrashed, retryable} for pure-skill dangling', async () => {
     await bootstrapWith(attemptCreated('a-pure', 'at-1'));
-    const r = await resume({
+    const r = await resumeWithObserver({
       log,
       runId: RUN_ID,
+      def: ordinaryGateDef(),
       daemonId: 'd-1',
       reconcilers: emptyReconcilers(),
     });
@@ -229,9 +256,10 @@ describe('resume — worker-crashed path (pure-skill dangling)', () => {
         },
       },
     );
-    const r = await resume({
+    const r = await resumeWithObserver({
       log,
       runId: RUN_ID,
+      def: ordinaryGateDef(),
       daemonId: 'd-1',
       reconcilers: emptyReconcilers(),
     });
@@ -261,7 +289,7 @@ describe('resume — manual decision (TTL expired)', () => {
         return { ok: true, externalRefs: { messageId: 'om_xxx' } };
       },
     };
-    const r = await resume({
+    const r = await resumeWithObserver({
       log,
       runId: RUN_ID,
       daemonId: 'd-1',
@@ -285,9 +313,10 @@ describe('resume — manual decision (TTL expired)', () => {
       attemptCreated('a-x', 'at-1'),
       effectAttempted('a-x', 'at-1', 'mystery-provider', 'wf_y'),
     );
-    const r = await resume({
+    const r = await resumeWithObserver({
       log,
       runId: RUN_ID,
+      def: ordinaryGateDef(),
       daemonId: 'd-1',
       reconcilers: emptyReconcilers(),
     });
@@ -315,7 +344,7 @@ describe('resume — completedByIdempotentSubmit via readOnlyLookup', () => {
         return { found: true, externalRefs: { taskId: 'wf_abc' }, evidence: { source: 'getTask' } };
       },
     };
-    const r = await resume({
+    const r = await resumeWithObserver({
       log,
       runId: RUN_ID,
       daemonId: 'd-1',
@@ -347,7 +376,7 @@ describe('resume — completedByIdempotentSubmit via idempotentSubmit', () => {
         return { ok: true, externalRefs: { messageId: 'om_xxx' } };
       },
     };
-    const r = await resume({
+    const r = await resumeWithObserver({
       log,
       runId: RUN_ID,
       daemonId: 'd-1',
@@ -381,7 +410,7 @@ describe('resume — completedByIdempotentSubmit via idempotentSubmit', () => {
         };
       },
     };
-    const r = await resume({
+    const r = await resumeWithObserver({
       log,
       runId: RUN_ID,
       daemonId: 'd-1',
@@ -425,7 +454,7 @@ describe('resume — completedByIdempotentSubmit via idempotentSubmit', () => {
         };
       },
     };
-    const r = await resume({
+    const r = await resumeWithObserver({
       log,
       runId: RUN_ID,
       daemonId: 'd-1',
@@ -457,7 +486,7 @@ describe('resume — freshRetry decision', () => {
         return { found: false, evidence: { source: 'getTask', returned: 'undefined' } };
       },
     };
-    const r = await resume({
+    const r = await resumeWithObserver({
       log,
       runId: RUN_ID,
       daemonId: 'd-1',
@@ -492,7 +521,7 @@ describe('resume — reconciler with no capability', () => {
       provider: 'stub-provider',
       // No readOnlyLookup, no idempotentSubmit
     };
-    const r = await resume({
+    const r = await resumeWithObserver({
       log,
       runId: RUN_ID,
       daemonId: 'd-1',
@@ -522,7 +551,7 @@ describe('resume — multiple dangling activities', () => {
         return { found: true, externalRefs: { taskId: 'wf_1' } };
       },
     };
-    const r = await resume({
+    const r = await resumeWithObserver({
       log,
       runId: RUN_ID,
       daemonId: 'd-1',
@@ -550,7 +579,7 @@ describe('resume — second resume after a successful first resume', () => {
         return { found: true, externalRefs: { taskId: 'wf_x' } };
       },
     };
-    const first = await resume({
+    const first = await resumeWithObserver({
       log,
       runId: RUN_ID,
       daemonId: 'd-1',
@@ -566,7 +595,7 @@ describe('resume — second resume after a successful first resume', () => {
         return { found: true, externalRefs: { taskId: 'wf_x' } };
       },
     };
-    const second = await resume({
+    const second = await resumeWithObserver({
       log,
       runId: RUN_ID,
       daemonId: 'd-1',
@@ -593,7 +622,7 @@ describe('resume — event order', () => {
         return { found: true, externalRefs: { taskId: 'wf_x' } };
       },
     };
-    await resume({
+    await resumeWithObserver({
       log,
       runId: RUN_ID,
       daemonId: 'd-1',
@@ -618,7 +647,7 @@ describe('resume — event order', () => {
         return { found: true, externalRefs: { taskId: 'wf_x' } };
       },
     };
-    await resume({
+    await resumeWithObserver({
       log,
       runId: RUN_ID,
       daemonId: 'd-1',
@@ -666,7 +695,7 @@ describe('resume — F1: crash between reconcileResult and terminal', () => {
         return { found: true, externalRefs: { taskId: 'wf_x' } };
       },
     };
-    const r = await resume({
+    const r = await resumeWithObserver({
       log,
       runId: RUN_ID,
       daemonId: 'd-1',
@@ -700,7 +729,7 @@ describe('resume — F1: crash between reconcileResult and terminal', () => {
         },
       },
     );
-    const r = await resume({
+    const r = await resumeWithObserver({
       log,
       runId: RUN_ID,
       daemonId: 'd-1',
@@ -741,7 +770,7 @@ describe('resume — F1: crash between reconcileResult and terminal', () => {
         return { found: true, externalRefs: { taskId: 'wf_z' } };
       },
     };
-    const r = await resume({
+    const r = await resumeWithObserver({
       log,
       runId: RUN_ID,
       daemonId: 'd-1',
@@ -778,7 +807,7 @@ describe('resume — F1: crash between reconcileResult and terminal', () => {
         },
       },
     );
-    const r = await resume({
+    const r = await resumeWithObserver({
       log,
       runId: RUN_ID,
       daemonId: 'd-1',
@@ -814,7 +843,7 @@ describe('resume — F1: crash between reconcileResult and terminal', () => {
         },
       },
     );
-    const r = await resume({
+    const r = await resumeWithObserver({
       log,
       runId: RUN_ID,
       daemonId: 'd-1',
@@ -857,7 +886,7 @@ describe('resume — F1: crash between reconcileResult and terminal', () => {
         },
       },
     );
-    const r = await resume({
+    const r = await resumeWithObserver({
       log,
       runId: RUN_ID,
       daemonId: 'd-1',
@@ -893,7 +922,7 @@ describe('resume — F1: crash between reconcileResult and terminal', () => {
     expect(recEvent).toBeDefined();
     const expectedEventId = recEvent!.eventId;
 
-    const r = await resume({
+    const r = await resumeWithObserver({
       log,
       runId: RUN_ID,
       daemonId: 'd-1',
@@ -924,7 +953,7 @@ describe('resume — F2: loadEffectInput + reconciler API takes input', () => {
         return { found: true, externalRefs: { taskId: 'wf_q' } };
       },
     };
-    await resume({
+    await resumeWithObserver({
       log,
       runId: RUN_ID,
       daemonId: 'd-1',
@@ -967,7 +996,7 @@ describe('resume — F2: loadEffectInput + reconciler API takes input', () => {
         return { ok: true, externalRefs: { messageId: 'om_p' } };
       },
     };
-    await resume({
+    await resumeWithObserver({
       log,
       runId: RUN_ID,
       daemonId: 'd-1',
@@ -994,7 +1023,7 @@ describe('resume — F2: loadEffectInput + reconciler API takes input', () => {
         return { ok: true, externalRefs: { messageId: 'om_p' } };
       },
     };
-    const r = await resume({
+    const r = await resumeWithObserver({
       log,
       runId: RUN_ID,
       daemonId: 'd-1',
@@ -1021,7 +1050,7 @@ describe('resume — F2: loadEffectInput + reconciler API takes input', () => {
         return { ok: true, externalRefs: {} };
       },
     };
-    const r = await resume({
+    const r = await resumeWithObserver({
       log,
       runId: RUN_ID,
       daemonId: 'd-1',
@@ -1052,7 +1081,7 @@ describe('resume — F2: loadEffectInput + reconciler API takes input', () => {
         return { found: true, externalRefs: { taskId: 'wf_q' } };
       },
     };
-    await resume({
+    await resumeWithObserver({
       log,
       runId: RUN_ID,
       daemonId: 'd-1',
@@ -1082,9 +1111,10 @@ describe('resume — Step 8: dangling wait resolutions', () => {
         payload: { activityId: 'a-wait', resolution: 'approved', by: 'ou_alice' },
       },
     );
-    const r = await resume({
+    const r = await resumeWithObserver({
       log,
       runId: RUN_ID,
+      def: ordinaryGateDef(),
       daemonId: 'd-1',
       reconcilers: emptyReconcilers(),
     });
@@ -1118,9 +1148,10 @@ describe('resume — Step 8: dangling wait resolutions', () => {
         },
       },
     );
-    const r = await resume({
+    const r = await resumeWithObserver({
       log,
       runId: RUN_ID,
+      def: ordinaryGateDef(),
       daemonId: 'd-1',
       reconcilers: emptyReconcilers(),
     });
@@ -1158,9 +1189,10 @@ describe('resume — Step 8: dangling wait resolutions', () => {
         },
       },
     );
-    const r = await resume({
+    const r = await resumeWithObserver({
       log,
       runId: RUN_ID,
+      def: ordinaryGateDef(),
       daemonId: 'd-1',
       reconcilers: emptyReconcilers(),
     });
@@ -1197,9 +1229,10 @@ describe('resume — Step 8: dangling wait resolutions', () => {
         },
       },
     );
-    const r = await resume({
+    const r = await resumeWithObserver({
       log,
       runId: RUN_ID,
+      def: ordinaryGateDef(),
       daemonId: 'd-1',
       reconcilers: emptyReconcilers(),
     });
@@ -1225,9 +1258,10 @@ describe('resume — Step 8: dangling wait resolutions', () => {
         payload: { activityId: 'a-wait', resolution: 'approved', by: 'x' },
       },
     );
-    const r = await resume({
+    const r = await resumeWithObserver({
       log,
       runId: RUN_ID,
+      def: ordinaryGateDef(),
       daemonId: 'd-1',
       reconcilers: emptyReconcilers(),
     });
@@ -1246,7 +1280,7 @@ describe('resume — Step 8: dangling wait resolutions', () => {
       },
       // No resolution.
     );
-    const r = await resume({
+    const r = await resumeWithObserver({
       log,
       runId: RUN_ID,
       daemonId: 'd-1',
@@ -1277,14 +1311,15 @@ describe('resume — Step 8: dangling wait resolutions', () => {
         payload: { activityId: 'a-wait', resolution: 'approved', by: 'x' },
       },
     );
-    const first = await resume({
+    const first = await resumeWithObserver({
       log,
       runId: RUN_ID,
+      def: ordinaryGateDef(),
       daemonId: 'd-1',
       reconcilers: emptyReconcilers(),
     });
     expect(first.waitRecoveryOutcomes).toHaveLength(1);
-    const second = await resume({
+    const second = await resumeWithObserver({
       log,
       runId: RUN_ID,
       daemonId: 'd-1',
@@ -1314,7 +1349,7 @@ describe('resume — Step 9: dangling cancel recovery', () => {
     const events = await log.readAll();
     const cancelReq = events.find((e) => e.type === 'cancelRequested')!;
 
-    const r = await resume({
+    const r = await resumeWithObserver({
       log,
       runId: RUN_ID,
       daemonId: 'd-1',
@@ -1354,7 +1389,7 @@ describe('resume — Step 9: dangling cancel recovery', () => {
         },
       },
     );
-    const r = await resume({
+    const r = await resumeWithObserver({
       log,
       runId: RUN_ID,
       daemonId: 'd-1',
@@ -1392,7 +1427,7 @@ describe('resume — Step 9: dangling cancel recovery', () => {
         return { found: true, externalRefs: { taskId: 'wf_x' } };
       },
     };
-    const r = await resume({
+    const r = await resumeWithObserver({
       log,
       runId: RUN_ID,
       daemonId: 'd-1',
@@ -1450,7 +1485,7 @@ describe('resume — Step 9: dangling cancel recovery', () => {
         return { found: false };
       },
     };
-    const r = await resume({
+    const r = await resumeWithObserver({
       log,
       runId: RUN_ID,
       daemonId: 'd-1',
@@ -1492,7 +1527,7 @@ describe('resume — Step 9: dangling cancel recovery', () => {
         return { found: true, externalRefs: { taskId: 'wf_x' } };
       },
     };
-    const r = await resume({
+    const r = await resumeWithObserver({
       log,
       runId: RUN_ID,
       daemonId: 'd-1',
@@ -1552,7 +1587,7 @@ describe('resume — Step 9: dangling cancel recovery', () => {
         };
       },
     };
-    const r = await resume({
+    const r = await resumeWithObserver({
       log,
       runId: RUN_ID,
       daemonId: 'd-1',
@@ -1597,7 +1632,7 @@ describe('resume — Step 9: dangling cancel recovery', () => {
         },
       },
     );
-    const r = await resume({
+    const r = await resumeWithObserver({
       log,
       runId: RUN_ID,
       daemonId: 'd-1',
@@ -1622,14 +1657,14 @@ describe('resume — Step 9: dangling cancel recovery', () => {
         },
       },
     );
-    const first = await resume({
+    const first = await resumeWithObserver({
       log,
       runId: RUN_ID,
       daemonId: 'd-1',
       reconcilers: emptyReconcilers(),
     });
     expect(first.cancelRecoveryOutcomes).toHaveLength(1);
-    const second = await resume({
+    const second = await resumeWithObserver({
       log,
       runId: RUN_ID,
       daemonId: 'd-1',
@@ -1654,7 +1689,7 @@ describe('resume — Step 9: dangling cancel recovery', () => {
         },
       },
     );
-    const r = await resume({
+    const r = await resumeWithObserver({
       log,
       runId: RUN_ID,
       daemonId: 'd-1',
@@ -1680,7 +1715,7 @@ describe('resume — Step 9: dangling cancel recovery', () => {
         },
       },
     );
-    const r = await resume({
+    const r = await resumeWithObserver({
       log,
       runId: RUN_ID,
       daemonId: 'd-1',
@@ -1714,7 +1749,7 @@ describe('resume — Step 10: workerLost recovery (Step 7 handles consequences)'
         return { found: true, externalRefs: { taskId: 'wf_x' } };
       },
     };
-    const r = await resume({
+    const r = await resumeWithObserver({
       log,
       runId: RUN_ID,
       daemonId: 'd-1',
@@ -1735,7 +1770,7 @@ describe('resume — Step 10: workerLost recovery (Step 7 handles consequences)'
         payload: { workerId: 'w-7', lostActivityIds: ['a-pure'] },
       },
     );
-    const r = await resume({
+    const r = await resumeWithObserver({
       log,
       runId: RUN_ID,
       daemonId: 'd-1',

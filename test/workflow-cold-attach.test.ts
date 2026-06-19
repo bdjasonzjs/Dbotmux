@@ -10,6 +10,7 @@ import { computeInputHash } from '../src/workflows/events/idempotency.js';
 import { replay } from '../src/workflows/events/replay.js';
 import { runLoop } from '../src/workflows/loop.js';
 import { workActivityId } from '../src/workflows/orchestrator.js';
+import { defaultObserverDriver } from '../src/workflows/observer-driver.js';
 import type { ProviderReconciler } from '../src/workflows/resume.js';
 import { createRun } from '../src/workflows/run-init.js';
 import type { WorkflowRuntimeContext } from '../src/workflows/runtime.js';
@@ -96,6 +97,7 @@ describe('attachColdWorkflowRunsForDaemon', () => {
       makeContext: (run, attachedLog) => ({
         log: attachedLog,
         def: run.def,
+        driver: defaultObserverDriver(run.def, 'cold-attach-test'),
         spawnSubagent: async () => {
           throw new Error('spawnSubagent should not run for effect recovery');
         },
@@ -156,6 +158,7 @@ describe('attachColdWorkflowRunsForDaemon', () => {
       makeContext: (run, attachedLog): WorkflowRuntimeContext => ({
         log: attachedLog,
         def: run.def,
+        driver: defaultObserverDriver(run.def, 'cold-attach-test'),
         spawnSubagent: async () => {
           spawnCalls++;
           return {
@@ -210,6 +213,7 @@ describe('attachColdWorkflowRunsForDaemon', () => {
       makeContext: (run, attachedLog) => ({
         log: attachedLog,
         def: run.def,
+        driver: defaultObserverDriver(run.def, 'cold-attach-test'),
         spawnSubagent: async () => {
           throw new Error('spawnSubagent should not run for skipped owner');
         },
