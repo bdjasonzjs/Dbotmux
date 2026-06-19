@@ -118,6 +118,54 @@ describe('workflow stateflow', () => {
     })).toThrow(/unknown node 'missing'/);
   });
 
+  it('rejects flow conditions that reference unknown node ids', () => {
+    expect(() => parseWorkflowDefinition({
+      workflowId: 'bad-condition-node',
+      version: 1,
+      flow: {
+        start: 'review',
+        transitions: [
+          {
+            from: 'review',
+            to: 'report',
+            when: { type: 'outputEquals', nodeId: 'ghost', path: 'value.decision', value: 'approved' },
+          },
+        ],
+      },
+      nodes: {
+        review: { type: 'semantic', kind: 'reviewDecision', output: { decision: 'approved' } },
+        report: { type: 'semantic', kind: 'report', output: { step: 'report' } },
+      },
+    })).toThrow(/transition\[0\]\.when references unknown node 'ghost'/);
+  });
+
+  it('rejects nested flow conditions that reference unknown node ids', () => {
+    expect(() => parseWorkflowDefinition({
+      workflowId: 'bad-nested-condition-node',
+      version: 1,
+      flow: {
+        start: 'review',
+        transitions: [
+          {
+            from: 'review',
+            to: 'develop',
+            when: {
+              type: 'all',
+              conditions: [
+                { type: 'outputEquals', path: 'value.decision', value: 'rejected' },
+                { type: 'visitCountLessThan', nodeId: 'missing-review', count: 2 },
+              ],
+            },
+          },
+        ],
+      },
+      nodes: {
+        review: { type: 'semantic', kind: 'reviewDecision', output: { decision: 'rejected' } },
+        develop: { type: 'semantic', kind: 'milestone', output: { step: 'develop' } },
+      },
+    })).toThrow(/transition\[0\]\.when\.conditions\[1\] references unknown node 'missing-review'/);
+  });
+
   it('executes reviewer approval from output condition and then reports', async () => {
     const { log, result } = await run(reviewLoopDef('approved'));
     expect(result.reason).toBe('terminal');

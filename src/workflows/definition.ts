@@ -420,12 +420,30 @@ function validateFlow(def: WorkflowDefinition): void {
       }
       transitionIds.add(transition.id);
     }
+    validateTransitionConditionNodeRefs(def, transition.when, `Workflow transition[${idx}].when`);
     const list = outgoing.get(transition.from) ?? [];
     list.push(transition);
     outgoing.set(transition.from, list);
   }
   validateFlowDefaultBranches(outgoing);
   validateFlowReachability(def, outgoing);
+}
+
+function validateTransitionConditionNodeRefs(
+  def: WorkflowDefinition,
+  condition: WorkflowTransitionCondition | undefined,
+  path: string,
+): void {
+  if (!condition) return;
+  if (condition.type === 'all' || condition.type === 'any') {
+    (condition.conditions as WorkflowTransitionCondition[]).forEach((child, idx) =>
+      validateTransitionConditionNodeRefs(def, child, `${path}.conditions[${idx}]`),
+    );
+    return;
+  }
+  if ('nodeId' in condition && condition.nodeId && !def.nodes[condition.nodeId]) {
+    throw new Error(`${path} references unknown node '${condition.nodeId}'`);
+  }
 }
 
 function validateFlowDefaultBranches(outgoing: Map<string, WorkflowTransition[]>): void {
