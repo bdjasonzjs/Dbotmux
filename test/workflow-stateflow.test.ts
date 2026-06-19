@@ -78,6 +78,37 @@ describe('workflow stateflow', () => {
     expect(def.flow?.transitions.some((t) => t.from === 'review' && t.to === 'develop')).toBe(true);
   });
 
+  it('rejects flow nodes that are not reachable from the configured start node', () => {
+    expect(() => parseWorkflowDefinition({
+      workflowId: 'unreachable-flow-node',
+      version: 1,
+      flow: { start: 'develop', transitions: [] },
+      nodes: {
+        develop: { type: 'semantic', kind: 'milestone', output: { step: 'develop' } },
+        report: { type: 'semantic', kind: 'report', output: { step: 'report' } },
+      },
+    })).toThrow(/cannot reach node 'report' from start 'develop'/);
+  });
+
+  it('rejects ambiguous default flow branches instead of depending on transition order', () => {
+    expect(() => parseWorkflowDefinition({
+      workflowId: 'ambiguous-default-branches',
+      version: 1,
+      flow: {
+        start: 'review',
+        transitions: [
+          { from: 'review', to: 'report', label: '通过并汇报' },
+          { from: 'review', to: 'develop', label: '打回返工', when: { type: 'always' } },
+        ],
+      },
+      nodes: {
+        review: { type: 'semantic', kind: 'reviewDecision', output: { decision: 'approved' } },
+        report: { type: 'semantic', kind: 'report', output: { step: 'report' } },
+        develop: { type: 'semantic', kind: 'milestone', output: { step: 'develop' } },
+      },
+    })).toThrow(/ambiguous always transitions from 'review'/);
+  });
+
   it('rejects invalid flow transitions at parse time', () => {
     expect(() => parseWorkflowDefinition({
       workflowId: 'bad-flow',
@@ -123,7 +154,52 @@ describe('workflow stateflow', () => {
     const output = resultOutput(log.runDir, log.runId, 'report', 1);
     expect(output.semanticKind).toBe('report');
     expect(output.roleId).toBe('reporter');
+    expect(output.role).toMatchObject({
+      id: 'reporter',
+      kind: 'reporter',
+      label: '汇报员',
+    });
     expect(output.value).toEqual({ step: 'report' });
+  });
+
+  it('opens a reviewDecision human gate even when the review node is reached by transition', async () => {
+    const def = parseWorkflowDefinition({
+      workflowId: 'transition-review-gate',
+      version: 1,
+      roles: {
+        developer: { id: 'developer', kind: 'developer', label: '开发者' },
+        reviewer: { id: 'reviewer', kind: 'reviewer', label: 'Reviewer' },
+      },
+      flow: {
+        start: 'submit',
+        transitions: [
+          { from: 'submit', to: 'review', label: '开始审查', when: { type: 'always' } },
+        ],
+      },
+      nodes: {
+        submit: { type: 'semantic', kind: 'submitGate', roleId: 'developer', output: { step: 'submit' } },
+        review: {
+          type: 'semantic',
+          kind: 'reviewDecision',
+          roleId: 'reviewer',
+          humanGate: { stage: 'before', prompt: '请审查' },
+        },
+      },
+    });
+    const log = new EventLog('run-transition-review-gate', baseDir);
+    await createRun(log, {
+      def,
+      params: {},
+      initiator: 'test',
+      botResolver: () => undefined,
+    });
+    const result = await runLoop({ log, def, spawnSubagent: async () => {
+      throw new Error('semantic stateflow must not spawn subagents');
+    } }, { maxTicks: 20 });
+    expect(result.reason).toBe('awaiting-wait');
+    const review1 = result.lastSnapshot.activities.get(flowWorkActivityId(log.runId, 'review', 1));
+    expect(review1?.attempts.at(-1)?.wait?.waitKind).toBe('human-gate');
+    expect(result.lastSnapshot.outputs.has(flowWorkActivityId(log.runId, 'review', 1))).toBe(false);
   });
 
   it('fails the run when a flow work activity fails', async () => {

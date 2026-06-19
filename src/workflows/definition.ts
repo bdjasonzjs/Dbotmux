@@ -2,13 +2,19 @@
  * WorkflowDefinition — canonical JSON shape for v0 workflows
  * (see /tmp/wf-ui-v0.md §3 for the spec).
  *
- * Two node types:
+ * Three node types:
  *   - subagent     — runtime spawns the bot's worker, feeds `prompt`,
  *                    collects `output` JSON.
  *   - hostExecutor — runtime calls the executor registered by `executor`.
+ *   - semantic     — runtime executes product-level workflow mechanics such
+ *                    as submit gates, review decisions, reports and observers.
  *
  * The schema enforces shape; cross-field invariants (deps reachability,
- * no cycles) are checked by `parseWorkflowDefinition`.  The `revisionId`
+ * DAG cycles, or stateflow transition integrity) are checked by
+ * `parseWorkflowDefinition`.  A definition may either use legacy DAG `depends`
+ * edges or an explicit `flow` state machine.  Flow definitions may contain
+ * loops/back-edges; all behavior still comes from authored transitions.
+ * The `revisionId`
  * helper computes a content hash over canonical JSON so semantically
  * equal definitions get identical ids regardless of key ordering.
  */
@@ -325,8 +331,9 @@ export function computeRevisionId(def: WorkflowDefinition): string {
 /**
  * Schema parse + cross-field invariants:
  *   1. every `depends` entry references an existing node
- *   2. graph is acyclic
- *   3. at least one root node (no deps)
+ *   2. legacy DAG graph is acyclic, or explicit stateflow transitions are
+ *      reachable and deterministic for default branches
+ *   3. legacy DAG has at least one root node (no deps)
  *
  * Throws on any failure.  Use `WorkflowDefinitionSchema.safeParse(...)`
  * directly if you only need shape checks (no graph validation).
@@ -399,6 +406,7 @@ function validateFlow(def: WorkflowDefinition): void {
     throw new Error(`Workflow flow.start references unknown node '${def.flow!.start}'`);
   }
   const transitionIds = new Set<string>();
+  const outgoing = new Map<string, WorkflowTransition[]>();
   for (const [idx, transition] of def.flow!.transitions.entries()) {
     if (!def.nodes[transition.from]) {
       throw new Error(`Workflow transition[${idx}].from references unknown node '${transition.from}'`);
@@ -412,7 +420,51 @@ function validateFlow(def: WorkflowDefinition): void {
       }
       transitionIds.add(transition.id);
     }
+    const list = outgoing.get(transition.from) ?? [];
+    list.push(transition);
+    outgoing.set(transition.from, list);
   }
+  validateFlowDefaultBranches(outgoing);
+  validateFlowReachability(def, outgoing);
+}
+
+function validateFlowDefaultBranches(outgoing: Map<string, WorkflowTransition[]>): void {
+  for (const [from, transitions] of outgoing.entries()) {
+    const defaultBranches = transitions.filter((transition) => isAlwaysCondition(transition.when));
+    if (defaultBranches.length > 1) {
+      const targets = defaultBranches.map((transition) => `'${transition.to}'`).join(', ');
+      throw new Error(
+        `Workflow flow has ambiguous always transitions from '${from}' to ${targets}; ` +
+        `make default routing explicit with mutually exclusive conditions`,
+      );
+    }
+  }
+}
+
+function validateFlowReachability(
+  def: WorkflowDefinition,
+  outgoing: Map<string, WorkflowTransition[]>,
+): void {
+  const reachable = new Set<string>();
+  const queue = [def.flow!.start];
+  while (queue.length > 0) {
+    const nodeId = queue.shift()!;
+    if (reachable.has(nodeId)) continue;
+    reachable.add(nodeId);
+    for (const transition of outgoing.get(nodeId) ?? []) {
+      if (!reachable.has(transition.to)) queue.push(transition.to);
+    }
+  }
+  const unreachable = Object.keys(def.nodes).filter((nodeId) => !reachable.has(nodeId));
+  if (unreachable.length > 0) {
+    throw new Error(
+      `Workflow flow cannot reach node '${unreachable[0]}' from start '${def.flow!.start}'`,
+    );
+  }
+}
+
+function isAlwaysCondition(condition: WorkflowTransitionCondition | undefined): boolean {
+  return !condition || condition.type === 'always';
 }
 
 function detectCycle(def: WorkflowDefinition): void {

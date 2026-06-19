@@ -173,7 +173,7 @@ export function decideDashboardAuth(opts: {
   }
 
   // First hit with `?t=<correct token>` sets the legacy cookie + redirects.
-  if (hasTokenParam && tokenAuthed && presentedToken) {
+  if (method === 'GET' && hasTokenParam && tokenAuthed && presentedToken) {
     return {
       kind: 'allow+set-cookie',
       token: presentedToken,

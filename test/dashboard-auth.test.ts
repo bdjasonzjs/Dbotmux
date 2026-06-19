@@ -221,6 +221,17 @@ describe('decideDashboardAuth — ?t=<token> cookie set redirect', () => {
     });
   });
 
+  it('POST with ?t=<correct> → allow without redirecting the request body away', () => {
+    const d = decideDashboardAuth({
+      method: 'POST',
+      pathname: '/api/workflows/definitions/validate',
+      hasTokenParam: true,
+      presentedToken: TOK,
+      activeToken: TOK,
+    });
+    expect(d.kind).toBe('allow');
+  });
+
   it('?t=<wrong> on protected route → deny401 (no cookie minted)', () => {
     const d = decideDashboardAuth({
       method: 'GET',

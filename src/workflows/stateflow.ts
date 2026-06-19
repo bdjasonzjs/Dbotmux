@@ -67,21 +67,7 @@ export function decideStateFlowNextActions(
   );
   const currentActivity = snapshot.activities.get(currentActivityId);
   if (!currentActivity) {
-    const node = def.nodes[cursor.nodeId]!;
-    if (node.type === 'semantic' && node.kind === 'reviewDecision' && node.humanGate) {
-      return [{
-        kind: 'dispatchGate',
-        nodeId: cursor.nodeId,
-        activityId: currentActivityId,
-        humanGate: node.humanGate,
-      } satisfies DispatchGateAction];
-    }
-    return [{
-      kind: 'dispatchWork',
-      nodeId: cursor.nodeId,
-      activityId: currentActivityId,
-      node,
-    } satisfies DispatchWorkAction];
+    return [dispatchFlowNode(snapshot, def, cursor.nodeId, cursor.visit)];
   }
   if (currentActivity.status === 'failed' || currentActivity.status === 'timedOut') {
     return [{
@@ -116,12 +102,31 @@ export function decideStateFlowNextActions(
   const nextActivityId = flowWorkActivityId(snapshot.run.runId, next.to, nextVisit);
   const nextActivity = snapshot.activities.get(nextActivityId);
   if (nextActivity) return [];
-  return [{
+  return [dispatchFlowNode(snapshot, def, next.to, nextVisit)];
+}
+
+function dispatchFlowNode(
+  snapshot: Snapshot,
+  def: WorkflowDefinition,
+  nodeId: string,
+  visit: number,
+): DispatchGateAction | DispatchWorkAction {
+  const node = def.nodes[nodeId]!;
+  const activityId = flowWorkActivityId(snapshot.run.runId, nodeId, visit);
+  if (node.type === 'semantic' && node.kind === 'reviewDecision' && node.humanGate) {
+    return {
+      kind: 'dispatchGate',
+      nodeId,
+      activityId,
+      humanGate: node.humanGate,
+    } satisfies DispatchGateAction;
+  }
+  return {
     kind: 'dispatchWork',
-    nodeId: next.to,
-    activityId: nextActivityId,
-    node: def.nodes[next.to]!,
-  } satisfies DispatchWorkAction];
+    nodeId,
+    activityId,
+    node,
+  } satisfies DispatchWorkAction;
 }
 
 function resolveCursor(

@@ -23,6 +23,10 @@ let currentRunRow: any;
 let currentSnapshot: any;
 let currentEvents: any[] = [];
 let workflowStore = new Map<string, WorkflowDefinition>();
+let mockedBots = [
+  { larkAppId: 'cli_app', botName: '寇黛克斯', online: true },
+  { larkAppId: 'claude_app', botName: '克劳德', online: true },
+];
 
 test.use({
   launchOptions: {
@@ -44,10 +48,7 @@ test.beforeAll(async () => {
     if (url.pathname === '/api/schedules') return json(res, { schedules: [] });
     if (url.pathname === '/api/workflows/bots') {
       return json(res, {
-        bots: [
-          { larkAppId: 'cli_app', botName: '寇黛克斯', online: true },
-          { larkAppId: 'claude_app', botName: '克劳德', online: true },
-        ],
+        bots: mockedBots,
       });
     }
     if (url.pathname === '/api/workflows/runs') {
@@ -209,6 +210,24 @@ test.afterAll(async () => {
   await new Promise<void>((resolve, reject) => server.close((err) => err ? reject(err) : resolve()));
 });
 
+test.beforeEach(() => {
+  mockedBots = [
+    { larkAppId: 'cli_app', botName: '寇黛克斯', online: true },
+    { larkAppId: 'claude_app', botName: '克劳德', online: true },
+  ];
+});
+
+async function createRoleThroughDialog(page: Page, kind: string, label: string, responsibility: string): Promise<void> {
+  await page.getByRole('button', { name: '添加角色' }).click();
+  await expect(page.getByRole('dialog', { name: '添加角色' })).toBeVisible();
+  await expect(page.locator('[data-tour="role-template"]')).toContainText('角色类型不是流程硬编码');
+  await page.locator(`[data-tour="role-template"] .choice-card[data-choice-value="${kind}"]`).click();
+  await page.locator('#role-create-label').fill(label);
+  await page.locator('#role-create-responsibility').fill(responsibility);
+  await page.locator('#role-create-apply').click();
+  await expect(page.getByRole('dialog', { name: '添加角色' })).toBeHidden();
+}
+
 test('PM can create, edit, connect, save, and delete a workflow on the canvas', async ({ page }) => {
   const pageErrors: string[] = [];
   page.on('pageerror', (err) => pageErrors.push(err.message));
@@ -222,8 +241,66 @@ test('PM can create, edit, connect, save, and delete a workflow on the canvas', 
   await page.getByRole('button', { name: '导览' }).click();
   await expect(page.locator('#builder-tour-title')).toHaveText('先新建一个 workflow');
   await expect(page.locator('.builder-tour-spotlight')).toBeVisible();
-  await page.getByRole('button', { name: '下一步' }).click();
+  await page.getByRole('button', { name: '点击新建' }).click();
   await expect(page.locator('#builder-tour-title')).toHaveText('添加角色');
+  await page.locator('#builder-tour .primary').click();
+  await expect(page.getByRole('dialog', { name: '添加角色' })).toBeVisible();
+  await expect(page.locator('[data-tour="role-template"]')).toContainText('真正的流程顺序');
+  await expect(page.locator('#builder-tour-title')).toHaveText('先选角色类型');
+  await expect(page.locator('#builder-tour .primary')).toBeDisabled();
+  await page.locator('[data-tour="role-template"] .choice-card[data-choice-value="reviewer"]').click();
+  await expect(page.locator('#builder-tour .primary')).toBeEnabled();
+  await page.getByRole('button', { name: '下一步' }).click();
+  await expect(page.locator('#builder-tour-title')).toHaveText('填写角色名称');
+  await expect(page.locator('#role-create-label')).toBeFocused();
+  await expect(page.locator('#builder-tour .primary')).toBeDisabled();
+  await page.locator('#role-create-label').fill('Reviewer');
+  await expect(page.locator('#builder-tour .primary')).toBeEnabled();
+  await page.getByRole('button', { name: '下一步' }).click();
+  await expect(page.locator('#builder-tour-title')).toHaveText('写清楚角色职责');
+  await expect(page.locator('#role-create-responsibility')).toBeFocused();
+  await expect(page.locator('#builder-tour .primary')).toBeDisabled();
+  await page.locator('#role-create-responsibility').fill('负责审查并给出结论');
+  await expect(page.locator('#builder-tour .primary')).toBeEnabled();
+  await page.getByRole('button', { name: '下一步' }).click();
+  await expect(page.locator('#builder-tour-title')).toHaveText('创建角色');
+  await page.locator('#builder-tour .primary').click();
+  await expect(page.getByRole('dialog', { name: '添加角色' })).toBeHidden();
+  await expect(page.locator('#builder-tour-title')).toHaveText('添加 Bot 任务');
+  await page.locator('#builder-tour .primary').click();
+  await expect(page.locator('#builder-tour-title')).toHaveText('填写节点名称');
+  await expect(page.locator('#property-panel input[name="label"]')).toBeFocused();
+  await expect(page.locator('#property-panel input[name="label"]')).toHaveValue('');
+  await expect(page.locator('#builder-tour .primary')).toBeDisabled();
+  await page.locator('#property-panel input[name="label"]').fill('开发实现');
+  await expect(page.locator('#builder-tour .primary')).toBeEnabled();
+  await page.getByRole('button', { name: '下一步' }).click();
+  await expect(page.locator('#builder-tour-title')).toHaveText('确认这一步是什么');
+  await expect(page.locator('#builder-tour .primary')).toBeDisabled();
+  await expect(page.locator('[data-tour="node-type"] details.choice-menu')).toHaveAttribute('open', '');
+  await page.locator('[data-tour="node-type"] .choice-card[data-choice-value="subagent"]').click();
+  await expect(page.locator('#builder-tour .primary')).toBeEnabled();
+  await page.getByRole('button', { name: '下一步' }).click();
+  await expect(page.locator('#builder-tour-title')).toHaveText('指定负责角色');
+  await expect(page.locator('#builder-tour .primary')).toBeDisabled();
+  await expect(page.locator('[data-tour="node-role"] details.choice-menu')).toHaveAttribute('open', '');
+  await page.locator('[data-tour="node-role"] .choice-card[data-choice-value="reviewer"]').click();
+  await expect(page.locator('#builder-tour .primary')).toBeEnabled();
+  await page.getByRole('button', { name: '下一步' }).click();
+  await expect(page.locator('#builder-tour-title')).toHaveText('选择执行 Bot');
+  await expect(page.locator('#builder-tour .primary')).toBeDisabled();
+  await expect(page.locator('[data-tour="node-bot"] details.choice-menu')).toHaveAttribute('open', '');
+  await page.locator('[data-tour="node-bot"] .choice-card[data-choice-value="cli_app"]').click();
+  await expect(page.locator('#builder-tour .primary')).toBeEnabled();
+  await page.getByRole('button', { name: '下一步' }).click();
+  await expect(page.locator('#builder-tour-title')).toHaveText('写给 Bot 的任务说明');
+  await expect(page.locator('#property-panel textarea[name="prompt"]')).toBeFocused();
+  await expect(page.locator('#builder-tour .primary')).toBeDisabled();
+  await page.locator('#property-panel textarea[name="prompt"]').fill('完成实现并说明验证结果');
+  await expect(page.locator('#builder-tour .primary')).toBeEnabled();
+  await page.getByRole('button', { name: '下一步' }).click();
+  await expect(page.locator('#builder-tour-title')).toHaveText('决定是否执行前确认');
+  await expect(page.locator('#builder-tour .primary')).toBeEnabled();
   await page.getByRole('button', { name: '结束' }).click();
   await expect(page.locator('#builder-tour')).toBeHidden();
 
@@ -233,11 +310,7 @@ test('PM can create, edit, connect, save, and delete a workflow on the canvas', 
   await page.locator('#property-panel input[name="title"]').fill('QA 发布流程');
   await page.locator('#property-panel button#apply-props').click();
 
-  await page.getByRole('button', { name: '添加角色' }).click();
-  await page.locator('#property-panel input[name="label"]').fill('Reviewer');
-  await selectChoice(page, 'kind', 'reviewer');
-  await page.locator('#property-panel textarea[name="responsibility"]').fill('审查发布风险并给出结论');
-  await page.locator('#property-panel button#apply-props').click();
+  await createRoleThroughDialog(page, 'reviewer', 'Reviewer', '审查发布风险并给出结论');
 
   await page.getByRole('button', { name: '添加 Bot 任务' }).click();
   await page.locator('#property-panel input[name="label"]').fill('开发实现');
@@ -304,13 +377,22 @@ test('onboarding offers tutorial, assisted creation, and natural language edit',
   await page.getByRole('button', { name: '新建' }).click();
   await expect(page.getByRole('dialog', { name: '新建 Workflow' })).toBeVisible();
   await page.getByRole('button', { name: /教程/ }).click();
-  await expect(page.locator('#property-panel input[name="workflowId"]')).toHaveValue('workflow-onboarding-tutorial');
-  await expect(page.locator('.wf-node')).toHaveCount(9);
-  await page.getByRole('button', { name: '保存' }).click();
-  await expect.poll(() => savedDefinition?.workflowId).toBe('workflow-onboarding-tutorial');
-  expect(Object.values(savedDefinition.nodes).some((node: any) => node.type === 'hostExecutor')).toBe(true);
-  expect(Object.values(savedDefinition.nodes).some((node: any) => node.type === 'subagent')).toBe(true);
-  expect(Object.values(savedDefinition.nodes).some((node: any) => node.type === 'semantic' && node.kind === 'reviewDecision')).toBe(true);
+  await expect(page.locator('#builder-tour-title')).toHaveText('先新建一个 workflow');
+  await page.locator('#builder-tour .primary').click();
+  await expect(page.locator('#property-panel input[name="workflowId"]')).toHaveValue('new-workflow');
+  await expect(page.locator('#builder-tour-title')).toHaveText('添加角色');
+  await page.locator('#builder-tour .primary').click();
+  await expect(page.locator('#builder-tour-title')).toHaveText('先选角色类型');
+  await expect(page.locator('[data-tour="role-template"]')).toContainText('角色类型不是流程硬编码');
+  await page.locator('[data-tour="role-template"] .choice-card[data-choice-value="developer"]').click();
+  await page.locator('#builder-tour .primary').click();
+  await expect(page.locator('#builder-tour-title')).toHaveText('填写角色名称');
+  await expect(page.locator('#role-create-label')).toBeFocused();
+  await expect(page.locator('#builder-tour .primary')).toBeDisabled();
+  await page.locator('#role-create-label').fill('开发者');
+  await expect(page.locator('#builder-tour .primary')).toBeEnabled();
+  await page.getByRole('button', { name: '结束' }).click();
+  await expect(page.locator('#builder-tour')).toBeHidden();
 
   await page.getByRole('button', { name: '新建' }).click();
   await page.getByRole('button', { name: /帮你配置/ }).click();
@@ -325,6 +407,49 @@ test('onboarding offers tutorial, assisted creation, and natural language edit',
   await page.locator('#workflow-assist-prompt').fill('加一个脚本验证步骤');
   await page.getByRole('button', { name: '应用修改' }).click();
   await expect(page.locator('.wf-node[data-node="automation"]')).toBeVisible();
+});
+
+test('guided tour still highlights Bot selector fallback when bot list is empty', async ({ page }) => {
+  mockedBots = [];
+  await page.goto(`${baseUrl}/#/workflows/builder`);
+
+  await page.getByRole('button', { name: '导览' }).click();
+  await page.locator('#builder-tour .primary').click();
+  await page.locator('#builder-tour .primary').click();
+  await page.locator('[data-tour="role-template"] .choice-card[data-choice-value="developer"]').click();
+  await page.getByRole('button', { name: '下一步' }).click();
+  await page.locator('#role-create-label').fill('开发者');
+  await page.getByRole('button', { name: '下一步' }).click();
+  await page.locator('#role-create-responsibility').fill('负责执行任务');
+  await page.getByRole('button', { name: '下一步' }).click();
+  await page.locator('#builder-tour .primary').click();
+  await page.locator('#builder-tour .primary').click();
+  await page.locator('#property-panel input[name="label"]').fill('开发实现');
+  await page.getByRole('button', { name: '下一步' }).click();
+  await page.locator('[data-tour="node-type"] .choice-card[data-choice-value="subagent"]').click();
+  await page.getByRole('button', { name: '下一步' }).click();
+  await page.locator('[data-tour="node-role"] .choice-card[data-choice-value="developer"]').click();
+  await page.getByRole('button', { name: '下一步' }).click();
+
+  await expect(page.locator('#builder-tour-title')).toHaveText('选择执行 Bot');
+  await expect(page.locator('[data-tour="node-bot"].builder-tour-target')).toBeVisible();
+  await expect(page.locator('[data-tour="node-bot"]')).toContainText('还没有加载到真实 Bot 列表');
+});
+
+test('save mutations preserve dashboard token query when present', async ({ page }) => {
+  savedDefinition = undefined;
+  const postUrls: string[] = [];
+  page.on('request', (request) => {
+    if (request.method() === 'POST' && request.url().includes('/api/workflows/definitions')) {
+      postUrls.push(request.url());
+    }
+  });
+
+  await page.goto(`${baseUrl}/?t=live-token#/workflows/builder`);
+  await page.getByRole('button', { name: '保存' }).click();
+  await expect.poll(() => savedDefinition?.workflowId).toBe('development-review-flow');
+  expect(postUrls.length).toBeGreaterThanOrEqual(2);
+  expect(postUrls.every((url) => url.includes('t=live-token'))).toBe(true);
 });
 
 test('full review workflow runs rework loop then approval report from builder config', async ({ page }) => {
