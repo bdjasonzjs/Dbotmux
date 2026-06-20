@@ -1,0 +1,57 @@
+<title>Clone Integrity Gate Implementation Review 3</title>
+
+<callout emoji="✅" background-color="light-green" border-color="green">
+  <p><b>结论：</b>implementation-3 code review 通过，未发现新的 P0/P1 blocker。implementation-2 的 sender-scoped resolver P1 已闭合。</p>
+</callout>
+
+<h1>Review Target</h1>
+<table>
+  <tbody>
+    <tr><td>Reviewer</td><td>Codex 初号机</td></tr>
+    <tr><td>Date</td><td>2026-06-20</td></tr>
+    <tr><td>Input</td><td><code>/data00/home/zoujinsong.jason/work/Dbotmux_wt/clone-integrity-gate/docs/clone-integrity-gate-implementation-3.md</code></td></tr>
+  </tbody>
+</table>
+
+<h1>Conclusion</h1>
+<p>Pass for implementation-3 code review. I did not find any new P0/P1 blocker.</p>
+<p>The implementation-2 P1 is closed: direct-mention target resolution now prefers the sender-app cross-ref store before the observed-bots fallback, and still fails closed instead of falling back to the clone self open_id.</p>
+
+<h1>Checked Scope</h1>
+<ul>
+  <li><code>src/services/clone-mention-resolver.ts</code></li>
+  <li><code>src/services/ceo-spawn-service.ts</code></li>
+  <li><code>src/services/clone-integrity-gate.ts</code></li>
+  <li><code>src/services/ceo-clone-orchestration.ts</code></li>
+  <li><code>src/im/lark/event-dispatcher.ts</code></li>
+  <li><code>test/clone-mention-resolver.test.ts</code></li>
+  <li>related focused test suite</li>
+</ul>
+
+<hr/>
+
+<h1>Findings</h1>
+<callout emoji="✅" background-color="light-green" border-color="green">
+  <p>No blocking findings.</p>
+</callout>
+
+<h2>P2 - Stale comment in direct-ack trust block</h2>
+<p><code>src/im/lark/event-dispatcher.ts:993</code> describes the trusted direct-ack sender conditions as "oncall-bound, already owns the session, or bootstrapped". The code now correctly trusts only oncall-bound or known-peer/bootstrap state for <code>recordDirectAck</code>, and does not trust <code>ownsSession</code> for direct-ack recording.</p>
+<p>This is not a behavior blocker, but the comment should be cleaned up before final polish to avoid future regressions where someone re-adds <code>ownsSession</code> to the direct-ack trust condition.</p>
+
+<h1>Verification</h1>
+<table>
+  <thead>
+    <tr><th background-color="light-gray">Command</th><th background-color="light-gray">Result</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>pnpm vitest run test/event-dispatcher.test.ts test/clone-app-preset.test.ts test/bot-clone.test.ts test/clone-integrity-gate.test.ts test/clone-mention-resolver.test.ts test/ceo-clone-orchestration.test.ts test/ceo-spawn-wiring.test.ts</code></td><td>7 test files passed; 229 tests passed</td></tr>
+    <tr><td><code>pnpm exec tsc --noEmit</code></td><td>passed</td></tr>
+    <tr><td><code>git diff --check</code></td><td>passed</td></tr>
+  </tbody>
+</table>
+
+<h1>Residual Risk</h1>
+<callout emoji="⚠️" background-color="light-yellow" border-color="yellow">
+  <p>This review is still code/test review only. The required live E2E clone path, including real description/scope/group membership/direct @/urgent summon/work execution, still needs to run after deployment/restart authorization.</p>
+</callout>

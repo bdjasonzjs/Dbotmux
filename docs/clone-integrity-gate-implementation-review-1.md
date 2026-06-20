@@ -1,0 +1,38 @@
+# clone-integrity-gate implementation-1 Review
+
+结论：暂不通过，发现 1 个 P1。核心 direct @ 双 mention bootstrap、unknown 阻断、结构化 post 方向基本落地；但 orchestration 仍存在“预热失败后已经写入 subtask 成员表”的残缺交付状态。
+
+## P1：post-gate 第二次 preheat 失败时，clone 已经被 addBotToSubTask
+
+代码路径：
+
+- `src/services/ceo-spawn-service.ts:297-309`：`verifyCloneIntegrity()` 内部已经把 `urgent_summon` 作为 gate 项，调用 `preheatConfirmOnline()` 并把失败转成 blocked。
+- `src/services/ceo-clone-orchestration.ts:325-341`：integrity report 非 ok 时会阻断，符合要求。
+- `src/services/ceo-clone-orchestration.ts:344`：report ok 后立即 `addBotToSubTask()`。
+- `src/services/ceo-clone-orchestration.ts:345-363`：随后又做第二次 `preheatConfirmOnline()`；如果这次失败，代码返回 `awaiting_clone_join` 且不发 `lateKickoff()`，但 subtask 成员表已经被写入。
+
+这违反 implementation review 请求里的第 5 点：“preheat fails 时不 register subtask membership”。也违背本任务的交付门禁语义：ready 前不应该把 clone 作为可协作成员写入 subtask 成员表。现在的失败状态会留下“已在成员表、未 lateKickoff、未 joined”的半交付 clone，后续 `request_review` / role routing / 人工排查会看到一个尚未真正 ready 的成员。
+
+建议修正：
+
+1. 既然 `urgent_summon` 已经纳入 `runCloneIntegrityGate()`，删除 `ceo-clone-orchestration.ts` 中 gate 后的第二次 preheat；gate ok 后直接 `addBotToSubTask()` + `lateKickoff()` + `joined`。
+2. 如果仍要保留 final preheat，就必须把它放在 `addBotToSubTask()` 之前，并补测试断言 final preheat fail 时 `addBotToSubTask === 0`、`lateKickoff === 0`、不写 `joined`。
+
+需要补测试：
+
+- “integrity gate pass，但 post-gate final preheat fail”场景必须覆盖，并断言不会调用 `addBotToSubTask()`。
+- 或者删除第二次 preheat 后，断言 `confirmUrgent` 是唯一的 preheat delivery gate。
+
+## P2：direct probe 在 existing session + unknown sender 场景可能落入 CLI
+
+`src/im/lark/event-dispatcher.ts:987-992` 的 foreign-bot gate 允许 `ownsSession` 放行；但 `src/im/lark/event-dispatcher.ts:997-1003` 的 `trustedDirectAckSender` 只看 oncall / `isKnownPeerBot()`，不看 `ownsSession`。结果是：如果一个带 `[[direct-ack:...]]` 的 bot-originated probe 在 existing chat-scope session 里来自 unknown sender，它会通过 foreign-bot gate，但不会被 direct ack 分支 return，最终落到 `handleThreadReply()`。
+
+这不会造成 ack 误绿，但会违反 probe-only 不污染 CLI session 的实现意图。建议明确处理：只要识别到 direct ack token 但 sender 不满足 direct-ack trust，就 drop/return；不要把 probe token 交给 CLI。补一个 ownsSession + unknown peer + direct token 的单测。
+
+## 已核对通过的部分
+
+- `unknown` 不会算 `report.ok=true`。
+- bot-originated direct ack 写入在 peer/oncall gate 之后。
+- 双 mention bootstrap 使用 clone 接收事件的 `message.mentions[]` 写 `bot-openids-${cloneAppId}.json`。
+- raw `<at>` + `post` 示例已改为结构化 post JSON。
+- 我复跑了执行者列出的 focused Vitest，6 files / 225 tests 通过；`pnpm exec tsc --noEmit` 通过；`git diff --check` 当前无输出。

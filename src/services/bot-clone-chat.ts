@@ -34,6 +34,8 @@ export interface CloneBotInChatArgs {
   /** Source 本体's display name (probed Lark botName) → clone's『本体名（N号机）』
    *  (only when no cloneName is given). */
   sourceDisplayName?: string;
+  /** Trustworthy source app description supplied by the CEO/clone entrypoint. */
+  sourceDescription?: string;
   /** Custom Feishu name for the clone (块8). When set, it overrides『本体名（N号机）』
    *  both as the pre-filled app name and the bots.json displayName, and the clone
    *  does NOT participate in N号机 sibling numbering (clonedFromName unset). */
@@ -157,6 +159,7 @@ export async function cloneBotInChat(
       // sourceClaudeHome omitted → cloneBot derives it engine-aware (codex 本体 →
       // ~/.codex, not ~/.claude). Round-4 B4.
       sourceDisplayName: args.sourceDisplayName,
+      sourceDescription: args.sourceDescription,
       cloneName: args.cloneName,
       botNamesByAppId: args.botNamesByAppId,
     },

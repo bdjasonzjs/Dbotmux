@@ -427,7 +427,17 @@ describe('cloneBot', () => {
     expect(captured.appPreset).toEqual({ name: '克劳德（初号机）', avatar: 'https://x/a.png' });
   });
 
-  it('#2: avatar fetch returns undefined → appPreset has name only (fail-soft, no desc)', async () => {
+  it('#2: trusted sourceDescription is copied into appPreset.desc', async () => {
+    const { configDir, srcHome, botsJsonPath } = dirs();
+    let captured: any;
+    await cloneBot(
+      { sourceBot: source(), configDir, botsJsonPath, sourceClaudeHome: srcHome, sourceDisplayName: '克劳德', sourceDescription: '本体描述' },
+      { registerApp: async (opts) => { captured = opts; return okScan; }, fetchSourceAvatar: async () => undefined },
+    );
+    expect(captured.appPreset).toEqual({ name: '克劳德（初号机）', desc: '本体描述' });
+  });
+
+  it('#2: avatar fetch returns undefined → appPreset has name only when no trusted desc', async () => {
     const { configDir, srcHome, botsJsonPath } = dirs();
     let captured: any;
     await cloneBot(

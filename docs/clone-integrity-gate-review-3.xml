@@ -1,0 +1,49 @@
+<title>clone-integrity-gate 三轮技术方案 Review</title>
+
+<callout emoji="⚠️" background-color="light-red" border-color="red">
+  <p><b>结论：</b>仍有 1 个 P1，需要执行者修正后再进入实现。三轮方案已经补上 sender-scoped outbound mention，但 direct @ probe 的接收侧仍可能在现有 foreign-bot peer/oncall gate 被提前丢弃。</p>
+</callout>
+
+<h1>P1：direct @ bot-sent probe 只解决发送侧，没有保证接收侧能过 foreign-bot vetting</h1>
+
+<table>
+  <colgroup><col span="1" width="140"/><col span="1" width="520"/></colgroup>
+  <thead><tr><th background-color="light-gray">证据点</th><th background-color="light-gray">说明</th></tr></thead>
+  <tbody>
+    <tr><td>方案行 111</td><td>direct @ probe 由 CEO/编排 bot 走 bot-sent path。</td></tr>
+    <tr><td>方案行 114</td><td>clone 接收侧 bot/app sender 分支先 isBotMentioned，再通过现有 peer/oncall vetting，通过后才记录 direct ack。</td></tr>
+    <tr><td>方案行 116-124</td><td>outbound mention open_id 必须是发送 app 视角的 sender-scoped open_id，缺失则 direct_mention=unknown 阻断。</td></tr>
+    <tr><td>event-dispatcher.ts:955-959</td><td>foreign bot 在 chat-scope 且非 oncall 群时，若 senderOpenId 不在接收 app 的 cross-ref，会在 ack hook 前直接 return。</td></tr>
+    <tr><td>subtask-orchestrator.ts:503-520</td><td>普通 subtask 建群调用 createGroupWithBots 没传 bindWorkingDir。</td></tr>
+    <tr><td>group-creator.ts:146-166</td><td>只有传 bindWorkingDir 才会给新群写 oncall binding。</td></tr>
+  </tbody>
+</table>
+
+<p>三轮方案现在只保证“CEO 发送 app 能正确 @ 到 clone”，但没有保证“clone 接收 app 认识 CEO senderOpenId，或该群已 oncall-bound”。在普通 subtask 非 oncall 群里，CEO -&gt; clone 的 direct probe 仍会在 record ack 前被 foreign-bot gate 丢弃。这个问题与 review-2 的 sender-scoped target ID 不同：一个是 outbound target ID，一个是 receiver-side sender trust。</p>
+
+<h2>要求修正其一</h2>
+<ol>
+  <li seq="auto">在 integrity gate 运行前，明确 bootstrap 接收侧 bot-openids-${cloneAppId}.json，让 clone app 视角能识别 CEO/编排 bot 的 senderOpenId。</li>
+  <li seq="auto">明确 clone 子群在 direct probe 前已对 clone app oncall-bound，并把失败视为 gate unknown/block。</li>
+  <li seq="auto">给 direct-ack probe 增加一个窄授权例外：在 foreign-bot branch 中，isBotMentioned + token/nonce 命中当前 task 预期 + sender app/role 与编排状态匹配时，可以在 peer gate 前仅记录 ack 并 return。这个例外必须不创建/恢复 CLI session，也不能放行普通 bot-to-bot 对话。</li>
+</ol>
+
+<h2>测试要求</h2>
+<ul>
+  <li>非 oncall 群、unknown peer bot-sent mention：不能写 ack。</li>
+  <li>预期 CEO probe 但 clone app 缺 receiver-side cross-ref：当前旧逻辑应复现失败，gate 为 direct_mention=unknown/blocked，不能误绿。</li>
+  <li>采用 bootstrap/oncall/窄授权例外后：真实 sender-scoped mention 才能写 direct ack，且 probe-only 不创建/恢复 CLI session。</li>
+</ul>
+
+<hr/>
+
+<h1>P2：发送示例容易误导成无效 post payload</h1>
+
+<p>docs/clone-integrity-gate-plan.md:131 示例把 sendMessage(..., '&lt;at ...&gt;', 'post') 写成 raw string。sendMessage() 对非 text 类型会原样把 content 交给 Feishu，真正 post 应该是结构化 post JSON。虽然方案行 134 已说明实际实现优先结构化 post/at 节点，但建议把示例也改成结构化 JSON，避免实现时照抄出一个不会产生 message.mentions[] 的探针。</p>
+
+<h1>可保留点</h1>
+
+<ul>
+  <li>scope unknown 阻断、description trusted-source 阻断、急急如律令失败不 lateKickoff() 这几处已经符合前两轮 review 要求。</li>
+  <li>outbound mention 禁止 fallback 到 clone self open_id 的约束是必要的，保留。</li>
+</ul>

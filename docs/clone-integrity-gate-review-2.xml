@@ -1,0 +1,75 @@
+<title>clone integrity gate plan review 2</title>
+
+<callout emoji="⚠️" background-color="light-red" border-color="red">
+  <p><b>结论：</b>二轮方案还需要再修一处 P1 后才能实现。review-1 的两个 blocker 已方向性关闭，但 direct mention probe 的生产发送路径仍未闭合。</p>
+</callout>
+
+<h1>Review Scope</h1>
+<ul>
+  <li>Feishu docx: <a href="https://bytedance.larkoffice.com/docx/CmZtdnQgholWIUxASuiceZRBn8c">CmZtdnQgholWIUxASuiceZRBn8c</a></li>
+  <li>Local source: <code>/data00/home/zoujinsong.jason/work/Dbotmux_wt/clone-integrity-gate/docs/clone-integrity-gate-plan.md</code></li>
+  <li>Code seams: <code>event-dispatcher.ts</code>, <code>cli.ts</code>, <code>client.ts</code>, <code>observed-bots-store.ts</code>, <code>clone-scope-provisioning.ts</code>, <code>subtask-store.ts</code></li>
+</ul>
+
+<hr/>
+
+<h1>P1 Blocker</h1>
+<h2>Direct @ probe still lacks a valid production sending path</h2>
+<p>The v2 plan records direct ack only in the group user-message route, then proposes sending a real mention from the CEO/owner app using <code>&lt;at user_id="{cloneOpenId}"&gt;name&lt;/at&gt; [[direct-ack:...]]</code>.</p>
+
+<table>
+  <thead>
+    <tr>
+      <th background-color="light-gray">Risk</th>
+      <th background-color="light-gray">Why It Breaks</th>
+      <th background-color="light-gray">Required Revision</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Wrong sender branch</td>
+      <td>If the CEO bot/app sends the probe via <code>sendMessage()</code>, the clone daemon receives <code>sender_type='app'/'bot'</code>, not a user message. Current <code>event-dispatcher.ts</code> handles that in the foreign-bot branch and returns before the user-message route.</td>
+      <td>Either send through a real user/owner identity path, or add the direct-ack hook to the bot-originated mention branch after peer/oncall vetting.</td>
+    </tr>
+    <tr>
+      <td>Wrong open_id scope</td>
+      <td><code>cloneOpenId</code> from <code>/bot/v3/info</code> / <code>bots-info.json</code> is the clone self-view open_id. Existing <code>botmux send</code> avoids this fallback because outbound mentions need the target ID in the sender app's scope.</td>
+      <td>Resolve the mention target from sender-scoped cross-ref or an equivalent Lark mention/chat-member source. If unavailable, mark <code>direct_mention=unknown</code> and block.</td>
+    </tr>
+    <tr>
+      <td>Test can pass falsely</td>
+      <td>A unit test whose <code>message.mentions</code> contains the clone self open_id proves only receiver parsing, not the real sender app's event view.</td>
+      <td>Add tests for bot-sent probe routing and wrong-scope/no-mentions failure.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>Required Plan Update</h2>
+<ul>
+  <li>Decide the real probe sender: user/owner path vs bot-sent path.</li>
+  <li>Use sender-scoped open_id for outbound mention; do not fall back to <code>bots-info.botOpenId</code>.</li>
+  <li>If sender-scoped ID is unavailable, block as <code>unknown</code> with remediation such as <code>/introduce</code>, <code>botmux bots list</code>, or a verified chat-member/mention source.</li>
+  <li>Cover both sender branch and open_id scope in tests.</li>
+</ul>
+
+<hr/>
+
+<h1>Accepted From Review 1</h1>
+<ul>
+  <li><code>unknown</code> is now explicitly not green.</li>
+  <li>Strict delivery scope gate is separated from the existing fail-open subgroup provisioning gate.</li>
+  <li>Description source and no-post-scan-self-heal semantics are explicit.</li>
+  <li>Preheat failure no longer proceeds to <code>lateKickoff()</code> / <code>joined</code> in the proposed flow.</li>
+  <li>Restart remediation now has a clone-only hook and an authorization boundary.</li>
+</ul>
+
+<h1>Minor Follow-Up</h1>
+<callout emoji="💡" background-color="light-yellow" border-color="yellow">
+  <p>If the direct probe is only a receipt proof, define whether probe-only messages should be swallowed after ack. Otherwise a token-stripped empty/body-only probe can create or resume a CLI session unnecessarily.</p>
+</callout>
+
+<h1>Local Hygiene</h1>
+<ul>
+  <li><code>git diff --check</code> passes.</li>
+  <li>Reviewer made docs-only review artifacts; no implementation code was changed.</li>
+</ul>

@@ -2,10 +2,15 @@ import { describe, it, expect, vi } from 'vitest';
 import { buildClonePreset, fetchSourceBotAvatar } from '../src/services/clone-app-preset.js';
 
 describe('buildClonePreset (块7 #2 守点4)', () => {
-  it('name always set; desc never set', () => {
+  it('name always set; desc omitted when no trusted source description is provided', () => {
     const p = buildClonePreset('克劳德（初号机）');
     expect(p).toEqual({ name: '克劳德（初号机）' });
     expect('desc' in p).toBe(false);
+  });
+  it('desc is copied only from a non-empty trusted caller value', () => {
+    expect(buildClonePreset('X', undefined, ' source desc ')).toEqual({ name: 'X', desc: 'source desc' });
+    expect(buildClonePreset('X', undefined, '')).toEqual({ name: 'X' });
+    expect(buildClonePreset('X', undefined, '   ')).toEqual({ name: 'X' });
   });
   it('avatar attached only when present + non-empty', () => {
     expect(buildClonePreset('X', 'https://x/a.png')).toEqual({ name: 'X', avatar: 'https://x/a.png' });

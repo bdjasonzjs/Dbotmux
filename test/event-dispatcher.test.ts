@@ -256,6 +256,13 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
 
   beforeEach(() => {
     capturedHandlers = {};
+    vi.clearAllMocks();
+    mockGetChatMode.mockReset();
+    mockGetChatMode.mockResolvedValue('topic');
+    mockReadFileSync.mockReset();
+    mockReadFileSync.mockReturnValue('[]');
+    mockExistsSync.mockReset();
+    mockExistsSync.mockReturnValue(true);
     setupBotState();
     handlers = makeHandlers();
     mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
@@ -454,6 +461,124 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
+  it('records direct @ probe ack for a known peer and returns before handleThreadReply', async () => {
+    mockGetChatMode.mockResolvedValueOnce('group');
+    mockReadFileSync.mockReturnValue(JSON.stringify({ BotB: OTHER_BOT_OPEN_ID }));
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({
+        zh_cn: { content: [[
+          { tag: 'at', user_id: MY_OPEN_ID },
+          { tag: 'text', text: ' [[direct-ack:st_direct:wk_direct]] ' },
+        ]] },
+      }),
+      rootId: undefined,
+    });
+    event.message.root_id = undefined as any;
+
+    await capturedHandlers['im.message.receive_v1'](event);
+
+    expect(mockRecordWakeAck).toHaveBeenCalledWith('st_direct', MY_APP_ID, 'wk_direct');
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('does not record direct @ probe ack from an unknown non-oncall peer', async () => {
+    mockGetChatMode.mockResolvedValueOnce('group');
+    mockReadFileSync.mockReturnValue('{}');
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({
+        zh_cn: { content: [[
+          { tag: 'at', user_id: MY_OPEN_ID },
+          { tag: 'text', text: ' [[direct-ack:st_direct:wk_bad]] ' },
+        ]] },
+      }),
+      rootId: undefined,
+    });
+    event.message.root_id = undefined as any;
+
+    await capturedHandlers['im.message.receive_v1'](event);
+
+    expect(mockRecordWakeAck).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('drops unknown bot direct token even when an existing chat-scope session would otherwise route', async () => {
+    mockGetChatMode.mockResolvedValueOnce('group');
+    mockReadFileSync.mockReturnValue('{}');
+    handlers.isSessionOwner.mockReturnValue(true);
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({
+        zh_cn: { content: [[
+          { tag: 'at', user_id: MY_OPEN_ID },
+          { tag: 'text', text: ' [[direct-ack:st_direct:wk_unknown_session]] ' },
+        ]] },
+      }),
+      rootId: undefined,
+    });
+    event.message.root_id = undefined as any;
+
+    await capturedHandlers['im.message.receive_v1'](event);
+
+    expect(mockRecordWakeAck).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('bootstraps direct @ probe trust only from the clone received message.mentions[] cross-ref', async () => {
+    mockGetChatMode.mockResolvedValueOnce('group');
+    const crossRef: Record<string, string> = {};
+    mockReadFileSync.mockImplementation((fp: string) => {
+      if (String(fp).endsWith('bots-info.json')) return JSON.stringify([{ botName: 'BotA' }, { botName: 'BotB' }]);
+      if (String(fp).includes('bot-openids-')) return JSON.stringify(crossRef);
+      return '[]';
+    });
+    mockWriteFileSync.mockImplementation((fp: string, body: string) => {
+      if (String(fp).includes('bot-openids-')) Object.assign(crossRef, JSON.parse(body));
+    });
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({ text: '@_bot_a [[direct-ack:st_boot:wk_boot]]' }),
+      mentions: [
+        { key: '@_bot_b', name: 'BotB', id: { open_id: OTHER_BOT_OPEN_ID } },
+        { key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } },
+      ],
+      rootId: undefined,
+    });
+    event.message.root_id = undefined as any;
+
+    await capturedHandlers['im.message.receive_v1'](event);
+
+    expect(crossRef.BotB).toBe(OTHER_BOT_OPEN_ID);
+    expect(mockRecordWakeAck).toHaveBeenCalledWith('st_boot', MY_APP_ID, 'wk_boot');
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('does not record direct probe when outbound mention used the wrong scope and message.mentions[] is missing', async () => {
+    mockGetChatMode.mockResolvedValueOnce('group');
+    mockReadFileSync.mockReturnValue(JSON.stringify({ BotB: OTHER_BOT_OPEN_ID }));
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({ text: '@BotA [[direct-ack:st_wrong:wk_wrong]]' }),
+      mentions: undefined,
+      rootId: undefined,
+    });
+    event.message.root_id = undefined as any;
+
+    await capturedHandlers['im.message.receive_v1'](event);
+
+    expect(mockRecordWakeAck).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
   it('does not let oncall exemption resurrect self-message routing beyond exact /close', async () => {
     // oncall 豁免只放在 foreign-bot chat-scope gate 上，位于 self-message 特判
     // (787-799) 之后。所以即便 chat 是 oncall-bound，本 bot 自己发的非 /close
@@ -499,7 +624,7 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     // "⚠️ 无操作权限" when @-mentioned by anyone outside the allowlist.
     // isChatOncallBoundForAnyBot now answers true if ANY bot has the chat
     // bound, so unbound siblings join the relaxed talking gate too.
-    mockGetChatMode.mockResolvedValueOnce('topic');
+    mockGetChatMode.mockResolvedValueOnce('topic').mockResolvedValueOnce('topic');
     mockIsChatOncallBoundForAnyBot.mockReturnValue(true);
     mockGetBot.mockReturnValue({
       config: { larkAppId: MY_APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' },

@@ -70,6 +70,7 @@ const CEO_SPAWN_HELP = `botmux bot ceo-spawn — CEO 端到端建群编排（聊
                                             或 <ref>:<role>（指定已注册 bot）。role ∈ main|collab|observer。
                                             缺省 = "auto:main,auto:collab"（worker 本体 + reviewer 克隆）。
   --activation-approved <appId>             松松已批准激活该克隆（部署门控）才传；daemon 侧再做 owner-scope 校验。
+  --source-description "<描述>"             源配置无可信描述时，用该描述预填新 clone 应用描述；未提供则完整性 gate 阻断。
   [--session-id <sid>]                      缺省取 env BOTMUX_SESSION_ID。
 
 返回 outcome JSON：spawned / awaiting_activation / awaiting_openid / refused / error。

@@ -3,14 +3,15 @@
  *
  * registerApp's `appPreset` PRE-FILLS the Feishu app-creation page (the scanning
  * owner can still edit it) — it is NOT a forced setter. We use it so a clone's
- * Feishu name/avatar default to『本体名（N号机）』+ the source bot's avatar, and the
- * owner just confirms. The authoritative Lark botName still comes from the
+ * Feishu name/avatar/description default to『本体名（N号机）』+ source metadata, and
+ * the owner just confirms. The authoritative Lark botName still comes from the
  * post-scan /bot/v3/info; round-2's displayName-match stays as the fallback.
  *
  * Design (蔻黛 守点 4/5):
  *  - name is ALWAYS set (= the computed display name).
  *  - avatar only when the source bot's avatar_url is a present, non-empty string.
- *  - desc is OMITTED — /bot/v3/info exposes no trustworthy app description, and we
+ *  - desc is set only when the clone caller supplies a trustworthy source
+ *    description; /bot/v3/info exposes no trustworthy app description, and we
  *    must not write a system-guessed string that looks like a real description.
  *  - Source info is read via a SEPARATE /bot/v3/info fetch (NOT by extending the
  *    daemon's probeBotOpenId), so existing open_id/app_name parsing is untouched.
@@ -20,6 +21,7 @@
 export interface ClonePreset {
   name: string;
   avatar?: string;
+  desc?: string;
 }
 
 type FetchImpl = typeof fetch;
@@ -62,12 +64,14 @@ export async function fetchSourceBotAvatar(
 
 /**
  * Build the appPreset for a clone. `name` is required (the『本体名（N号机）』display
- * name); `avatar` is attached only when a trustworthy non-empty URL is given;
- * `desc` is never set (蔻黛 守点4: omit, don't template).
+ * name); `avatar` and `desc` are attached only when trustworthy non-empty
+ * values are supplied by the caller. Description is never guessed from bot
+ * info or templates.
  */
-export function buildClonePreset(displayName: string, avatarUrl?: string): ClonePreset {
+export function buildClonePreset(displayName: string, avatarUrl?: string, desc?: string): ClonePreset {
   if (!displayName?.trim()) throw new Error('clone-app-preset: displayName is required for appPreset.name');
   const preset: ClonePreset = { name: displayName };
   if (typeof avatarUrl === 'string' && avatarUrl.trim()) preset.avatar = avatarUrl;
+  if (typeof desc === 'string' && desc.trim()) preset.desc = desc.trim();
   return preset;
 }

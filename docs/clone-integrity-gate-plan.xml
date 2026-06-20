@@ -1,0 +1,142 @@
+<title>botmux 克隆完整性门禁技术方案 v4</title>
+<callout emoji="✅" background-color="light-green" border-color="green">
+  <p><b>请求四轮 review：</b>本版修正 review-1/2/3 的 blocker：scope delivery gate 不复用 fail-open provisioning，<code>unknown</code> 必须阻断；direct @ probe 采用 bot-sent 生产发送路径，并用双 mention bootstrap 闭合 clone 接收侧 foreign-bot gate。</p>
+</callout>
+
+<h1>一、现状判断</h1>
+<table>
+  <thead><tr><th background-color="light-gray">问题</th><th background-color="light-gray">代码位置</th><th background-color="light-gray">现状</th><th background-color="light-gray">风险</th></tr></thead>
+  <tbody>
+    <tr><td>描述没复制</td><td><code>clone-app-preset.ts</code><br/><code>bot-clone.ts</code></td><td><code>ClonePreset</code> 只有 name/avatar；<code>CloneBotInput</code> 没有描述字段。</td><td>新 clone 不像完整应用。</td></tr>
+    <tr><td>scope 检查 fail-open</td><td><code>clone-scope-provisioning.ts</code></td><td>无 secret、API error、granted=[] 都允许继续。</td><td>scope 无法确认时仍可能交付。</td></tr>
+    <tr><td>直接 @ 没 ack</td><td><code>event-dispatcher.ts</code><br/><code>client.ts</code></td><td><code>recordWakeAck()</code> 只在急急如律令分支写；自动 probe 若由 CEO bot <code>sendMessage()</code> 发送，会进入 sender_type=app/bot 分支，不会进 user-message route。</td><td>直接 @ 可收没有真实证据路径；若误用 clone 自报 open_id，还会因 app-scoped ID 错误导致无结构化 mentions。</td></tr>
+    <tr><td>preheat 失败不阻断</td><td><code>ceo-preheat.ts</code><br/><code>ceo-clone-orchestration.ts</code></td><td>预热失败只 warning，仍 lateKickoff、joined、齐活。</td><td>漏订阅 clone 被宣布成功。</td></tr>
+    <tr><td>interactive summon 解析过窄</td><td><code>event-dispatcher.ts</code></td><td>raw content 不含“急急如律令”就不 resolve 卡片。</td><td>base relay 卡片可能无法唤醒新 clone。</td></tr>
+  </tbody>
+</table>
+
+<hr/>
+<h1>二、门禁结果模型</h1>
+<callout emoji="⚠️" background-color="light-yellow" border-color="yellow">
+  <p><b>核心规则：</b><code>pass</code> 和 <code>repaired</code> 才是绿灯；<code>blocked</code> 与 <code>unknown</code> 都不能交付。unknown 要明确展示为“无法验证”，不能被当成成功。</p>
+</callout>
+<pre lang="ts" caption="clone-integrity-gate.ts report schema"><code>export type IntegrityStatus = 'pass' | 'repaired' | 'blocked' | 'unknown';
+
+export interface IntegrityItem {
+  key: 'scopes' | 'in_chat' | 'direct_mention' | 'urgent_summon' | 'name' | 'avatar' | 'description';
+  status: IntegrityStatus;
+  evidence?: string;
+  remediation?: string;
+  reason?: string;
+}
+
+export interface CloneIntegrityReport {
+  ok: boolean; // true only if every item is pass or repaired
+  items: IntegrityItem[];
+}</code></pre>
+
+<h1>三、修复方案</h1>
+<h2>1. 描述复制与来源</h2>
+<ul>
+  <li><code>ClonePreset</code> 扩为 <code>{ name, avatar?, desc? }</code>。</li>
+  <li><code>CloneBotInput</code> 新增 <code>sourceDescription?: string</code>，chat/CEO clone 路径逐层透传到 <code>cloneBot()</code>。</li>
+  <li><code>/bot/v3/info</code> 本轮只继续作为头像来源；描述只接受显式传入或已知可靠配置字段，不从未知 API 字段猜。</li>
+  <li>没有可信描述时，门禁项 <code>description=blocked</code>；当前没有可靠 post-scan setter，不承诺自愈。</li>
+</ul>
+
+<h2>2. scope 全：严格 delivery gate</h2>
+<ul>
+  <li>保留 <code>ensureCloneScopesProvisioned()</code> 的 subgroup fail-open 语义，避免破坏历史建群；但它不能作为完整性交付 pass。</li>
+  <li>新增 <code>verifyCloneScopesStrict()</code>：非空 granted 且覆盖 <code>CLONE_CORE_SCOPES</code> 才 pass。</li>
+  <li>无 secret、<code>need_self_manage</code>、network、unknown、<code>granted=[]</code> 都标记 <code>unknown</code> 并阻断。</li>
+  <li>如果 scope.list 对 clone 不可靠，则只用 concrete capability probes 补证据；probe 覆盖不了的 scope 仍 unknown。</li>
+</ul>
+
+<h2>3. 直接 @ 可收：bot-sent 生产发送路径 + 双 mention 接收侧 bootstrap</h2>
+<ul>
+  <li>新增直接 @ token：<code>[[direct-ack:taskId:wakeId]]</code>。</li>
+  <li>probe sender 选择 bot-sent path：由 CEO/编排 bot 使用 <code>sendMessage(senderLarkAppId, chatId, post/text with at)</code> 发真实 Lark mention，不引入新的 owner user-token 发送链路。</li>
+  <li>接收侧覆盖两条分支：user-message route 中 allowed user mention 写 ack；bot-originated branch 中先要求 <code>isBotMentioned()</code>，再通过现有 peer/oncall vetting，通过后、<code>handleThreadReply()</code> 前写 ack。</li>
+  <li>probe-only 消息剥 token 后若为空或只剩固定 harmless 文案，<b>record ack and return</b>，不创建/恢复 CLI session。</li>
+  <li>接收侧 foreign-bot gate bootstrap 采用双 mention：probe post 同时 mention sender bot 自己和 clone 目标 bot。clone app 收到事件时，<code>updateBotOpenIdCrossRef()</code> 在 gate 前执行，会把 sender bot 的 receiver/clone app 视角 open_id 写进 <code>bot-openids-${cloneAppId}.json</code>，随后同一事件可通过 <code>isKnownPeerBot()</code>。</li>
+  <li>outbound mention open_id 必须是发送 app 视角的 sender-scoped open_id。新增 <code>resolveMentionOpenIdForSenderApp(senderLarkAppId, chatId, targetAppId/displayName)</code>。</li>
+  <li>解析顺序：优先 <code>bot-openids-${senderLarkAppId}.json</code>，其次 <code>observed-bots-${senderLarkAppId}-${chatId}.json</code>，可选 <code>listChatBotMembers()</code> 但必须带 provenance 且只接受 cross_ref / introduce / API 明确 sender-scoped 来源。</li>
+  <li>sender bot 自己的 mention 使用 sender app 自视角 self open_id；缺 sender self open_id、target sender-scoped open_id、receiver 事件 mentions，或 bootstrap 后仍不能通过 peer gate，均为 <code>direct_mention=unknown</code> 并阻断。</li>
+  <li>禁止 fallback 到 <code>bots-info.botOpenId</code> 或 clone <code>/bot/v3/info</code> 自报 open_id；remediation 指向 <code>/introduce</code>、真实人工 @、<code>botmux bots list</code> 或等价 chat-member 来源。</li>
+</ul>
+<pre lang="ts" caption="direct mention probe structured post contract"><code>const targetOpenId = resolveMentionOpenIdForSenderApp(senderLarkAppId, chatId, cloneAppId);
+const senderSelfOpenId = getBot(senderLarkAppId).botOpenId;
+// any missing -> direct_mention=unknown, block; do not fallback to clone self open_id
+const post = JSON.stringify({
+  zh_cn: {
+    content: [[
+      { tag: 'at', user_id: senderSelfOpenId, user_name: senderDisplayName },
+      { tag: 'text', text: ' ' },
+      { tag: 'at', user_id: targetOpenId, user_name: displayName },
+      { tag: 'text', text: ` [[direct-ack:${taskId}:${wakeId}]]` },
+    ]],
+  },
+});
+await sendMessage(
+  senderLarkAppId,
+  chatId,
+  post,
+  'post',
+);</code></pre>
+
+<h3>direct @ 测试要求</h3>
+<ul>
+  <li>bot-sent direct probe 不进入 user-message branch，必须在 bot-originated branch 写 ack。</li>
+  <li>非 oncall 群、unknown peer bot-sent mention：不能写 ack。</li>
+  <li>预期 CEO probe 但 clone app 缺 receiver-side cross-ref 且 probe 未包含 sender self mention：复现旧逻辑失败，gate 为 unknown。</li>
+  <li>双 mention bootstrap 后：同一事件先写 receiver-side cross-ref，再通过 foreign-bot gate，最后写 direct ack。</li>
+  <li>wrong-scope/self-scoped open_id 导致 <code>message.mentions</code> 缺失时，不写 ack，gate 为 <code>unknown</code>。</li>
+  <li>sender-scoped open_id 缺失时不发送 probe，直接 unknown 阻断并输出 bootstrap remediation。</li>
+  <li>真实 sender-scoped mention + vetted bot sender 写 direct ack。</li>
+  <li>probe-only 消息 record ack 后 return，不创建/恢复 CLI session。</li>
+</ul>
+
+<h2>4. 急急如律令与 preheat</h2>
+<ul>
+  <li><code>preheatConfirmOnline()</code> 失败进入 <code>urgent_summon=unknown/blocked</code>，不继续 <code>lateKickoff()</code>。</li>
+  <li>interactive 卡片先 raw/title 尝试，未命中则 <code>resolveNonsupportMessage()</code> 后再次 <code>summonMatchForBot()</code>。</li>
+  <li>只有 parse 命中本 bot 且 <code>canTalk()</code> 通过才路由。</li>
+</ul>
+
+<h2>5. restart remediation 生产 hook</h2>
+<ul>
+  <li>新增 <code>restartCloneDaemon(appId)</code>，clone-only 校验：appId 必须在 bots.json 且有 <code>claudeConfigDir</code>。</li>
+  <li>只重启该 clone PM2 app，前后校验其它 daemon pid 不变。</li>
+  <li><code>EnsureSpawnDeps</code> 增加 <code>restartCloneDaemon?</code> 与 <code>allowRuntimeRestart?</code>。</li>
+  <li>没有 runtime restart 授权时，remediation 标记为 skipped，状态 unknown 并阻断，不擅自重启。</li>
+</ul>
+
+<hr/>
+<h1>四、完整性交付流程</h1>
+<ol>
+  <li seq="auto">在 <code>pc.phase === 'in_chat'</code> 后、<code>addBotToSubTask()</code> 和 <code>lateKickoff()</code> 前执行 integrity gate。</li>
+  <li seq="auto">检查 name、avatar、description、strict scopes、in_chat、direct mention ack、urgent summon ack。</li>
+  <li seq="auto">如果 report 非 ok：保留 CEO spawn state，不 lateKickoff，不写 joined，不 clear state；上报 blocked/unknown 项和下一步。</li>
+  <li seq="auto">只有 report ok：先 <code>addBotToSubTask()</code>，再 <code>lateKickoff()</code>，再写 joined。</li>
+  <li seq="auto">全部 clone joined 后才回复“子群齐活”。</li>
+</ol>
+
+<h1>五、实施顺序</h1>
+<ol>
+  <li seq="auto">实现 direct ack parser/recording 单测，补直接 @ 生产证据路径。</li>
+  <li seq="auto">实现 <code>clone-integrity-gate.ts</code> report schema 和 strict scope 单测，锁定 unknown 阻断。</li>
+  <li seq="auto">修描述 preset 透传，无描述时阻断完整交付。</li>
+  <li seq="auto">修 interactive 急急如律令解析。</li>
+  <li seq="auto">接入 orchestration：成功才 lateKickoff/joined/clearState。</li>
+  <li seq="auto">接入 restart hook 的接口与单测；生产重启仍等待授权。</li>
+  <li seq="auto">跑 focused tests、<code>pnpm exec tsc --noEmit</code>、<code>git diff --check</code>。</li>
+</ol>
+
+<h1>六、不做范围</h1>
+<ul>
+  <li>不修改现有 subtask main/collab/observer 共享机制语义。</li>
+  <li>不把急急如律令从 base relay 改成 bot-to-bot mention。</li>
+  <li>不把 <code>clone-scope-provisioning</code> 的 fail-open subgroup gate 直接改成 fail-closed；新增 delivery gate 单独严格。</li>
+  <li>不在无授权情况下重启线上 botmux 或 clone daemon。</li>
+  <li>不承诺 post-scan 修改头像/描述；如果没有可用 API，就阻断而不是假装自愈。</li>
+</ul>

@@ -16,6 +16,8 @@
  */
 import type { CeoSpawnState, PendingCloneSeat } from './ceo-spawn-store.js';
 import type { PreheatTarget } from './ceo-preheat.js';
+import type { CloneIntegrityReport } from './clone-integrity-gate.js';
+import { formatCloneIntegrityReport } from './clone-integrity-gate.js';
 
 export interface SeatSpec {
   role: 'main' | 'collab' | 'observer';
@@ -90,7 +92,7 @@ export interface EnsureSpawnDeps {
    *  not the CEO). `cloneName` (when set) overrides『本体名（N号机）』as the new app's
    *  pre-filled Feishu name + bots.json displayName. ok+appId, or error
    *  (qr_delivery_failed / expired…). */
-  cloneInChat: (args: { targetChatId: string; rootMessageId: string; senderOpenId: string; sourceCliId: string; sourceBentiAppId: string; cloneName?: string }) => Promise<{ ok: boolean; appId?: string; error?: string }>;
+  cloneInChat: (args: { targetChatId: string; rootMessageId: string; senderOpenId: string; sourceCliId: string; sourceBentiAppId: string; cloneName?: string; sourceDescription?: string }) => Promise<{ ok: boolean; appId?: string; error?: string }>;
   /** Deploy gate: has 松松 approved starting this clone's daemon this round? */
   activationApproved?: (appId: string) => boolean;
   activate: (appId: string) => Promise<{ ok: boolean; error?: string }>;
@@ -116,6 +118,8 @@ export interface EnsureSpawnDeps {
   /** round-5 冷启动修复：对刚激活的分身做有界预热握手，确认其 daemon 真的在线（命中即回执）。
    *  生产注入真实实现（ceo-preheat.preheatConfirmOnline + owner 直发新 record）；测试可注入桩。 */
   preheatConfirmOnline: (target: PreheatTarget) => Promise<{ ok: boolean; wakeId: string; attempts: number }>;
+  /** Clone delivery gate: strict capability/self-check; unknown is not green. */
+  verifyCloneIntegrity: (target: { taskId: string; subgroupChatId: string; appId: string; bentiAppId: string; displayName?: string }) => Promise<CloneIntegrityReport>;
   getState: (key: string) => CeoSpawnState | null;
   putState: (state: CeoSpawnState) => void;
   clearState: (key: string) => void;
@@ -319,21 +323,29 @@ export async function ensureClonesAndSpawn(req: EnsureSpawnReq, deps: EnsureSpaw
   }
 
   if (pc.phase === 'in_chat') {
+    const report = await deps.verifyCloneIntegrity({
+      taskId: state.taskId,
+      subgroupChatId: state.subgroupChatId,
+      appId: pc.appId!,
+      bentiAppId: pc.bentiAppId,
+      displayName: pc.displayName,
+    });
+    if (!report.ok) {
+      await deps.reply(`❌ 分身完整性自检未通过，已阻断交付：${formatCloneIntegrityReport(report)}`);
+      return {
+        status: 'awaiting_clone_join',
+        taskId: state.taskId,
+        chatId: state.subgroupChatId,
+        message: `分身 ${pc.appId} 完整性自检未通过：${formatCloneIntegrityReport(report)}`,
+      };
+    }
     // Both idempotent (addBotToSubTask by larkAppId, lateKickoff by key) → a
     // re-entry after a partial failure補齐 without re-touching the chat add.
     await deps.addBotToSubTask(state.taskId, { appId: pc.appId!, displayName: pc.displayName, role: pc.role });
     if (pc.displayName) {
-      // round-5 冷启动修复：下发真任务 summon 前，先做一次**预热握手**确认这个刚激活的分身
-      // daemon 真的在线、能收到群推送并命中自己的名（堵住 round-4 那个 boot 订阅窗口——尤其
-      // reviewer 分身的首次真实唤醒会晚到 request_review，必须在那之前确认它在线）。
-      // 命中即回执是本轮最小可验证信号；耗尽 → 上报父群，但**不阻断** spawn 收尾（分身已在群+subtask，
-      // 仍可被后续 summon / 人工唤起），避免把整个建群流程卡死。
-      const pre = await deps.preheatConfirmOnline(
-        { taskId: state.taskId, subgroupChatId: state.subgroupChatId, appId: pc.appId!, displayName: pc.displayName },
-      );
-      if (!pre.ok) {
-        await deps.reply(`⚠️ 分身 ${pc.displayName}（${pc.appId}）预热 ${pre.attempts} 次仍未确认上线（wake=${pre.wakeId}）——它已在群+subtask，但首条自动唤醒可能不可靠，请留意是否需要手动 @ 唤起。`);
-      }
+      // Online/urgent receive has already been proven inside verifyCloneIntegrity.
+      // Do not run another preheat here: failing after addBotToSubTask would leave
+      // the clone in the subtask member table but not fully delivered.
       await deps.lateKickoff({ taskId: state.taskId, subgroupChatId: state.subgroupChatId, summonName: pc.displayName, appId: pc.appId! });
     } else {
       // fail closed: no displayName → do NOT enqueue a kickoff (it would fall back

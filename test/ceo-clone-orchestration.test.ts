@@ -11,7 +11,7 @@ const baseReq = (over: Partial<EnsureSpawnReq> = {}): EnsureSpawnReq => ({
 
 function deps(over: Partial<EnsureSpawnDeps> = {}): { d: EnsureSpawnDeps; calls: any; store: Map<string, CeoSpawnState> } {
   const store = new Map<string, CeoSpawnState>();
-  const calls = { spawn: 0, cloneInChat: 0, activate: 0, registerActivatedBot: 0, ensureCloneScopesProvisioned: 0, isInChat: 0, addBotToChat: 0, addBotToSubTask: 0, lateKickoff: 0, preheat: 0, replies: [] as string[], order: [] as string[], lateKickoffArgs: [] as any[], preheatArgs: [] as any[], cloneArgs: [] as any[], scopeGateArgs: [] as any[] };
+  const calls = { spawn: 0, cloneInChat: 0, activate: 0, registerActivatedBot: 0, ensureCloneScopesProvisioned: 0, verifyCloneIntegrity: 0, isInChat: 0, addBotToChat: 0, addBotToSubTask: 0, lateKickoff: 0, preheat: 0, replies: [] as string[], order: [] as string[], lateKickoffArgs: [] as any[], preheatArgs: [] as any[], cloneArgs: [] as any[], scopeGateArgs: [] as any[], integrityArgs: [] as any[] };
   const d: EnsureSpawnDeps = {
     getOwnerOpenId: () => OWNER,
     // default auto target = the claude 本体 (cli_main); pool has only the 本体 ready.
@@ -31,6 +31,7 @@ function deps(over: Partial<EnsureSpawnDeps> = {}): { d: EnsureSpawnDeps; calls:
     addBotToSubTask: async () => { calls.addBotToSubTask++; },
     lateKickoff: async (a) => { calls.lateKickoff++; calls.lateKickoffArgs.push(a); },
     preheatConfirmOnline: async (t) => { calls.preheat++; calls.preheatArgs.push(t); return { ok: true, wakeId: 'wake_test', attempts: 1 }; },
+    verifyCloneIntegrity: async (t) => { calls.verifyCloneIntegrity++; calls.integrityArgs.push(t); return { ok: true, checks: [] }; },
     getState: (k) => store.get(k) ?? null,
     putState: (s) => { store.set(s.key, JSON.parse(JSON.stringify(s))); },
     clearState: (k) => { store.delete(k); },
@@ -116,7 +117,7 @@ describe('ensureClonesAndSpawn (subgroup-first #5)', () => {
     expect(calls.lateKickoffArgs[0]).toMatchObject({ taskId: 'st_1', summonName: '克劳德（初号机）', appId: 'cli_new' });
   });
 
-  it('round-5: 预热在 lateKickoff 前对分身跑一次（带 taskId/appId/displayName），成功则不告警', async () => {
+  it('integrity gate passes before subtask registration; no second preheat after addBotToSubTask', async () => {
     let approved = false, activated = false;
     const { d, calls } = deps({
       activationApproved: () => approved,
@@ -127,14 +128,14 @@ describe('ensureClonesAndSpawn (subgroup-first #5)', () => {
     approved = true;
     const out = await ensureClonesAndSpawn(baseReq(), d);
     expect(out.status).toBe('spawned');
-    expect(calls.preheat).toBe(1);
-    expect(calls.preheatArgs[0]).toMatchObject({ taskId: 'st_1', appId: 'cli_new', displayName: '克劳德（初号机）', subgroupChatId: 'oc_sub' });
+    expect(calls.verifyCloneIntegrity).toBe(1);
+    expect(calls.preheat).toBe(0);
+    expect(calls.addBotToSubTask).toBe(1);
     expect(calls.lateKickoff).toBe(1);
-    // 成功上线 → 没有「未确认上线」告警
     expect(calls.replies.some((m: string) => m.includes('未确认上线'))).toBe(false);
   });
 
-  it('round-5: 预热耗尽未确认上线 → reply 告警，但不阻断（仍 lateKickoff + spawned）', async () => {
+  it('second preheat failure is impossible in orchestration: preheat dependency is not called after gate ok', async () => {
     let approved = false, activated = false;
     const { d, calls } = deps({
       activationApproved: () => approved,
@@ -145,9 +146,32 @@ describe('ensureClonesAndSpawn (subgroup-first #5)', () => {
     await ensureClonesAndSpawn(baseReq(), d);
     approved = true;
     const out = await ensureClonesAndSpawn(baseReq(), d);
-    expect(out.status).toBe('spawned');           // 不阻断收尾
-    expect(calls.lateKickoff).toBe(1);            // 仍下发真任务 summon
-    expect(calls.replies.some((m: string) => m.includes('未确认上线'))).toBe(true);
+    expect(out.status).toBe('spawned');
+    expect(calls.preheat).toBe(0);
+    expect(calls.addBotToSubTask).toBe(1);
+    expect(calls.lateKickoff).toBe(1);
+  });
+
+  it('clone integrity gate failure blocks before subtask registration and kickoff', async () => {
+    let approved = false, activated = false;
+    const { d, calls } = deps({
+      activationApproved: () => approved,
+      activate: async () => { calls.activate++; activated = true; return { ok: true }; },
+      botOpenIdReady: (id) => (id === 'cli_main' ? 'ou_main' : (id === 'cli_new' && activated ? 'ou_new' : undefined)),
+      verifyCloneIntegrity: async (t) => {
+        calls.verifyCloneIntegrity++;
+        calls.integrityArgs.push(t);
+        return { ok: false, checks: [{ item: 'direct_mention', status: 'blocked', detail: 'no ack' }] as any };
+      },
+    });
+    await ensureClonesAndSpawn(baseReq(), d);
+    approved = true;
+    const out = await ensureClonesAndSpawn(baseReq(), d);
+    expect(out.status).toBe('awaiting_clone_join');
+    expect(calls.verifyCloneIntegrity).toBe(1);
+    expect(calls.integrityArgs[0]).toMatchObject({ taskId: 'st_1', subgroupChatId: 'oc_sub', appId: 'cli_new', bentiAppId: 'cli_main' });
+    expect(calls.addBotToSubTask).toBe(0);
+    expect(calls.lateKickoff).toBe(0);
   });
 
   it('addBotToChat fails → awaiting_clone_join, store NOT mutated (no addBotToSubTask/lateKickoff)', async () => {

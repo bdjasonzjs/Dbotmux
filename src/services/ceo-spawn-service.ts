@@ -33,6 +33,8 @@ import { createSubtask, slug, djb2 } from './subtask-orchestrator.js';
 import { addBotToSubTask, enqueueCommand } from './subtask-store.js';
 import { sendAsOwner } from './base-relay.js';
 import { preheatConfirmOnline } from './ceo-preheat.js';
+import { runCloneIntegrityGate } from './clone-integrity-gate.js';
+import { resolveSenderScopedCloneOpenId } from './clone-mention-resolver.js';
 import { ensureClonesAndSpawn, type EnsureSpawnDeps, type EnsureSpawnReq, type EnsureSpawnOutcome, type AutoTarget } from './ceo-clone-orchestration.js';
 import { ceoSpawnKey, getCeoSpawnState, putCeoSpawnState, clearCeoSpawnState } from './ceo-spawn-store.js';
 import {
@@ -51,6 +53,9 @@ export interface CeoSpawnReq {
   /** scope-grant profile for the clone's auth link (块7 第三轮 #1): 'core' (默认,
    *  子群工作基础授权) or 'full' (与本体全量对等, owner 显式选择). */
   cloneScopeProfile?: CloneScopeProfile;
+  /** Explicit trusted description for newly cloned apps when the source config
+   *  has no description field. Without this, description integrity blocks. */
+  sourceDescription?: string;
 }
 
 /**
@@ -85,6 +90,11 @@ function readBotsInfo(dataDir: string): BotInfoLite[] {
     const arr = JSON.parse(readFileSync(fp, 'utf-8'));
     return Array.isArray(arr) ? arr : [];
   } catch { return []; }
+}
+
+function trustedDescriptionOf(bot: (BotConfig & { botDescription?: string }) | undefined): string | undefined {
+  const raw = bot?.description ?? bot?.botDescription;
+  return typeof raw === 'string' && raw.trim() ? raw.trim() : undefined;
 }
 
 export async function ceoSpawn(req: CeoSpawnReq): Promise<EnsureSpawnOutcome> {
@@ -174,13 +184,16 @@ export async function ceoSpawn(req: CeoSpawnReq): Promise<EnsureSpawnOutcome> {
       // fall back to bots.json config + bots-info name if the registry misses it.
       let sourceBot: BotConfig;
       let sourceDisplayName: string | undefined;
+      let sourceDescription: string | undefined;
       try {
         const b = getBot(sourceBentiAppId);
         sourceBot = b.config; sourceDisplayName = b.botName;
+        sourceDescription = trustedDescriptionOf(b.config as BotConfig & { botDescription?: string }) ?? req.sourceDescription;
       } catch {
         const cfg = loadBotConfigs().find(c => c.larkAppId === sourceBentiAppId);
         if (!cfg) return { ok: false, error: 'source_benti_not_found' };
         sourceBot = cfg;
+        sourceDescription = trustedDescriptionOf(cfg as BotConfig & { botDescription?: string }) ?? req.sourceDescription;
         const info = readBotsInfo(dataDir).find(e => e.larkAppId === sourceBentiAppId) as { botName?: string } | undefined;
         sourceDisplayName = info?.botName;
       }
@@ -189,6 +202,7 @@ export async function ceoSpawn(req: CeoSpawnReq): Promise<EnsureSpawnOutcome> {
           ceoAppId, chatId: session.chatId, targetChatId, rootMessageId, senderOpenId,
           sourceBot,
           sourceDisplayName, // 本体名 → 克隆『本体名（N号机）』(仅在无 cloneName 时生效)
+          sourceDescription,
           cloneName, // 自定义名：有则覆盖 N号机 作为预填 app 名 + bots.json displayName
 
           // bots-info botName per appId → legacy clone-count supplement (round-3 #2).
@@ -262,6 +276,37 @@ export async function ceoSpawn(req: CeoSpawnReq): Promise<EnsureSpawnOutcome> {
         return res.ok ? { ok: true } : { ok: false, error: res.error };
       },
     }, target),
+    verifyCloneIntegrity: async ({ taskId, subgroupChatId, appId, bentiAppId, displayName }) => {
+      const cloneCfg = readBotsJsonOrEmpty(botsJsonPath).find((b: any) => b?.larkAppId === appId) as BotConfig | undefined;
+      const sourceCfg = readBotsJsonOrEmpty(botsJsonPath).find((b: any) => b?.larkAppId === bentiAppId) as (BotConfig & { botDescription?: string }) | undefined;
+      const cloneMentionOpenId = resolveSenderScopedCloneOpenId(config.session.dataDir, ceoAppId, subgroupChatId, displayName);
+      return runCloneIntegrityGate({
+        taskId,
+        subgroupChatId,
+        senderAppId: ceoAppId,
+        appId,
+        appSecret: cloneCfg?.larkAppSecret ?? '',
+        displayName,
+        sourceDescription: trustedDescriptionOf(sourceCfg) ?? req.sourceDescription,
+        cloneMentionOpenId,
+        senderSelfOpenId: getBotOpenId(ceoAppId),
+      }, {
+        confirmUrgent: async (target) => {
+          if (!target.displayName) {
+            return { item: 'urgent_summon', status: 'blocked' as const, detail: 'missing displayName for urgent summon' };
+          }
+          const pre = await preheatConfirmOnline({
+            sendOwnerSummon: async (chatId, text) => {
+              const res = await sendAsOwner({ targetChatId: chatId, text, pollTimeoutMs: 3_000 });
+              return res.ok ? { ok: true } : { ok: false, error: res.error };
+            },
+          }, { ...target, displayName: target.displayName });
+          return pre.ok
+            ? { item: 'urgent_summon', status: 'pass' as const }
+            : { item: 'urgent_summon', status: 'blocked' as const, detail: `no urgent ack after ${pre.attempts} attempts (${pre.wakeId})` };
+        },
+      });
+    },
     getState: getCeoSpawnState,
     putState: putCeoSpawnState,
     clearState: clearCeoSpawnState,

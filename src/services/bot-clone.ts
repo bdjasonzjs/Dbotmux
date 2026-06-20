@@ -321,6 +321,10 @@ export interface CloneBotInput {
    *  compute the clone's『本体名（N号机）』displayName. Omit → no displayName.
    *  Ignored for naming when `cloneName` is set. */
   sourceDisplayName?: string;
+  /** Trustworthy source app description supplied by the clone entrypoint. It is
+   *  passed through to registerApp.appPreset.desc when non-empty; cloneBot never
+   *  guesses a description from /bot/v3/info. */
+  sourceDescription?: string;
   /** Custom Feishu name (块8). When set: `appPreset.name` and the written
    *  `displayName` both become this (overriding『本体名（N号机）』), independent of
    *  `sourceDisplayName`; and the clone does NOT join N号机 sibling numbering
@@ -403,16 +407,16 @@ export async function cloneBot(input: CloneBotInput, deps: CloneBotDeps = {}): P
   // is used ONLY for the preset — NOT for the bots.json write-back (蔻黛 blocker:
   // the device-flow scan can take minutes; reusing a stale snapshot to write
   // would clobber any bot registered meanwhile).
-  let appPreset: { name: string; avatar?: string } | undefined;
+  let appPreset: { name: string; avatar?: string; desc?: string } | undefined;
   if (cloneName) {
     // 块8: custom name pre-fills the app name directly — independent of
     // sourceDisplayName (蔻黛 B2: no dependency on the 本体 display name).
     const avatar = await fetchAvatar(input.sourceBot.larkAppId, input.sourceBot.larkAppSecret);
-    appPreset = buildClonePreset(cloneName, avatar);
+    appPreset = buildClonePreset(cloneName, avatar, input.sourceDescription);
   } else if (input.sourceDisplayName) {
     const preNaming = resolveCloneNaming(input.sourceDisplayName, toCountEntries(readBotsJsonOrEmpty(input.botsJsonPath)));
     const avatar = await fetchAvatar(input.sourceBot.larkAppId, input.sourceBot.larkAppSecret);
-    appPreset = buildClonePreset(preNaming.displayName, avatar);
+    appPreset = buildClonePreset(preNaming.displayName, avatar, input.sourceDescription);
   }
 
   const scan = await registerApp(appPreset ? { appPreset } : {});

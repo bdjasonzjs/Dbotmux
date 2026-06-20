@@ -84,6 +84,10 @@ describe('parseCeoSpawnArgs (CLI↔service field contract)', () => {
     expect(body.seats).toEqual(['auto:main', 'codex:collab']);
     expect(body.sessionId).toBe('s1');
   });
+  it('--source-description passthroughs trusted clone description source', () => {
+    const body = parseCeoSpawnArgs(['--goal', 'g', '--source-description', '本体描述']);
+    expect(body.sourceDescription).toBe('本体描述');
+  });
   it('missing value → throws', () => {
     expect(() => parseCeoSpawnArgs(['--goal'])).toThrow(/missing value/);
   });

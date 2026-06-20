@@ -1,0 +1,220 @@
+<title>botmux 克隆完整性门禁 E2E 验收方案</title>
+
+<callout emoji="✅" background-color="light-green" border-color="green">
+  <p><b>目标：</b>等修复代码被授权部署后，用真实克隆流程创建一个全新 bot，并在交付前确认完整性门禁 7 项全部为 <span text-color="green">pass</span>。任何一项为 fail、blocked 或 unknown，都不得宣布克隆成功。</p>
+</callout>
+
+<h1>验收边界</h1>
+
+<grid>
+  <column width-ratio="0.5">
+    <h2>本次要验证</h2>
+    <ul>
+      <li>部署后的修复代码，而不是本地 working tree。</li>
+      <li>真实创建一个全新克隆 bot，走 CEO 克隆编排入口。</li>
+      <li>完整性门禁逐项验证：scope、in_chat、direct@、urgent_summon、name、avatar、description。</li>
+      <li>门禁不全绿时，流程阻断，不写入可交付状态。</li>
+    </ul>
+  </column>
+  <column width-ratio="0.5">
+    <h2>本次不做</h2>
+    <ul>
+      <li>不在未部署代码上跑 E2E。</li>
+      <li>不绕过扫码、授权、加群、preheat、门禁等真实链路。</li>
+      <li>不手工补表伪造通过。</li>
+      <li>不由子任务 bot 自行部署、重启或创建生产克隆。</li>
+    </ul>
+  </column>
+</grid>
+
+<h1>前置条件</h1>
+
+<table>
+  <thead>
+    <tr>
+      <th background-color="light-gray">条件</th>
+      <th background-color="light-gray">要求</th>
+      <th background-color="light-gray">证据</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>部署授权</td>
+      <td>邹劲松明确授权 merge master、重建、重启 botmux。</td>
+      <td>主群授权消息、部署命令记录、部署后版本或 commit hash。</td>
+    </tr>
+    <tr>
+      <td>参与者在场</td>
+      <td>CEO bot 和邹劲松一起在场；邹劲松负责扫码和最终可见验收。</td>
+      <td>主群验收开始消息、扫码完成或授权完成记录。</td>
+    </tr>
+    <tr>
+      <td>克隆目标</td>
+      <td>从当前生产可用源 bot 克隆一个全新 bot，建议使用独立验收名：<code>克劳德E2E验收-YYYYMMDD-HHMM</code>。</td>
+      <td>新 app_id、displayName、创建时间、二维码授权记录。</td>
+    </tr>
+    <tr>
+      <td>描述输入</td>
+      <td>如果源配置里没有可信描述，CEO 克隆入口必须传入 <code>sourceDescription</code> 或 CLI <code>--source-description</code>。</td>
+      <td>克隆输入参数、preset 中 <code>desc</code> 非空。</td>
+    </tr>
+  </tbody>
+</table>
+
+<h1>执行流程</h1>
+
+<ol>
+  <li seq="auto">在主群拿到部署授权后，部署已 review 通过的修复代码，并记录部署版本。</li>
+  <li seq="auto">从 CEO 克隆编排入口发起全新 bot 克隆，不使用手工捷径。</li>
+  <li seq="auto">邹劲松扫码完成新应用授权，并按流程把新 bot 加入目标子任务群。</li>
+  <li seq="auto">克隆完整性门禁自动运行，先检查静态配置和 API 状态，再做 direct@ 与 urgent_summon 双活体验证。</li>
+  <li seq="auto">门禁输出 7 项结果。只有全部 pass，编排层才允许执行 <code>addBotToSubTask</code>、late kickoff、joined/spawned 成功状态。</li>
+  <li seq="auto">通过后在真实子任务群里做一次可见工作验证：直接 @ 新克隆、急急如律令唤新克隆，确认它能正常响应并处理任务。</li>
+  <li seq="auto">保存验收证据：门禁报告、消息 id、wake ack、subtask 成员表、部署版本和最终可见结果。</li>
+</ol>
+
+<h1>7 项门禁判据</h1>
+
+<table>
+  <colgroup>
+    <col span="1" width="120"/>
+    <col span="1" width="300"/>
+    <col span="1" width="320"/>
+    <col span="1" width="240"/>
+  </colgroup>
+  <thead>
+    <tr>
+      <th background-color="light-gray">项目</th>
+      <th background-color="light-gray">通过判据</th>
+      <th background-color="light-gray">预期证据</th>
+      <th background-color="light-gray">失败处理</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>scope</code></td>
+      <td>严格 capability probe 成功：<code>listGrantedTenantScopes</code> 返回可验证授权集合，且包含 <code>CLONE_CORE_SCOPES</code> 全部必需 scope。API 失败、空结果或不可验证一律不是绿。</td>
+      <td>门禁报告 <code>scope=pass</code>；授权 scope 列表；如缺 scope，报告明确 missing scopes 和 auth link。</td>
+      <td>缺 scope 或 unknown 时输出 blocked，不继续交付；等待补授权后重新跑门禁。</td>
+    </tr>
+    <tr>
+      <td><code>in_chat</code></td>
+      <td>新克隆已真实加入目标子任务群；加群后再次查询成员关系为 true。</td>
+      <td><code>addBotToChat</code> 成功记录、<code>isInChat</code> true、目标群 bot 成员可见。</td>
+      <td>自动补加群并复查；仍失败则 blocked，不写 subtask 成员表。</td>
+    </tr>
+    <tr>
+      <td><code>direct@</code></td>
+      <td>发送侧先解析 clone 在发送 app 视角下的 sender-scoped open_id，优先来自 <code>bot-openids-${senderAppId}.json</code> cross-ref，其次 observed-bots；发送结构化 post 双 mention；clone 接收事件的 <code>message.mentions[]</code> 命中 clone mention 和 direct token，并写入 wake ack。</td>
+      <td>门禁报告 <code>direct_mention=pass</code>；direct probe message_id；<code>wakeAcks</code> 中有 taskId、cloneAppId、wakeId；clone 接收日志显示 mention 来自 <code>message.mentions[]</code>。</td>
+      <td>sender-scoped open_id 缺失为 unknown 并阻断；ack 超时则尝试重连或重启该克隆守护，重试仍失败则 blocked。</td>
+    </tr>
+    <tr>
+      <td><code>urgent_summon</code></td>
+      <td>以 user/base relay 的真实急急如律令链路唤醒新克隆，clone 写入 wake ack。该项同时覆盖启动热身窗口：未收到真实 ack 不宣布 ready。</td>
+      <td>门禁报告 <code>urgent_summon=pass</code>；relay message_id；<code>wakeAcks</code> 中有 urgent wakeId；preheat 日志显示 clone online confirmed。</td>
+      <td>自动重发唤醒、重订阅或重启该克隆守护；仍无 ack 时 blocked，且不执行第二次 post-subtask preheat。</td>
+    </tr>
+    <tr>
+      <td><code>name</code></td>
+      <td>新克隆有非空 displayName，且等于本次预期验收名或克隆流程生成名。</td>
+      <td>门禁报告 <code>name=pass</code>；bots.json 或 app info 中 displayName 与预期一致。</td>
+      <td>缺失或不一致则 blocked，避免交付无法识别的 clone。</td>
+    </tr>
+    <tr>
+      <td><code>avatar</code></td>
+      <td>新克隆 app info 返回非空 <code>avatar_url</code>，头像已随源 bot 复制或设置成功。</td>
+      <td>门禁报告 <code>avatar=pass</code>；<code>/bot/v3/info</code> 中 <code>avatar_url</code> 非空；必要时补一张应用资料页截图。</td>
+      <td>如果接口支持补设则自动补设并复查；否则 blocked，不把无头像 clone 当成功。</td>
+    </tr>
+    <tr>
+      <td><code>description</code></td>
+      <td>克隆输入中存在可信 description，并在创建 preset 中写入 <code>desc</code>；不从 <code>/bot/v3/info</code> 猜测源描述。</td>
+      <td>门禁报告 <code>description=pass</code>；克隆参数 <code>sourceDescription</code> 或源配置 description 非空；preset <code>desc</code> 非空。</td>
+      <td>无可信描述则 blocked；由 CEO 流程补传 <code>sourceDescription</code> 后重跑。</td>
+    </tr>
+  </tbody>
+</table>
+
+<h1>门禁如何体现“不全绿不交付”</h1>
+
+<callout emoji="⚠️" background-color="light-yellow" border-color="yellow">
+  <p><b>阻断规则：</b>门禁结果只接受 <code>7/7 pass</code>。fail、blocked、unknown 都视为不合格；unknown 不能被当成成功或跳过。</p>
+</callout>
+
+<table>
+  <thead>
+    <tr>
+      <th background-color="light-gray">门禁结果</th>
+      <th background-color="light-gray">编排层行为</th>
+      <th background-color="light-gray">用户可见状态</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><span text-color="green">7/7 pass</span></td>
+      <td>允许执行 <code>addBotToSubTask</code>、late kickoff、joined/spawned、最终成功报告。</td>
+      <td>新克隆进入子任务群，直接 @ 和急急如律令都能触达并工作。</td>
+    </tr>
+    <tr>
+      <td><span text-color="red">任一项 fail/blocked/unknown</span></td>
+      <td>停止在门禁处；不得写入 subtask 成员表；不得 late kickoff；不得输出 spawned 成功；保留失败报告和补救建议。</td>
+      <td>用户只看到“克隆未交付/待补救”，不会拿到半成品 bot。</td>
+    </tr>
+  </tbody>
+</table>
+
+<h1>最终证据清单</h1>
+
+<checkbox done="false">部署版本：生产修复代码的 commit hash、部署时间、重启记录。</checkbox>
+<checkbox done="false">新克隆身份：app_id、displayName、创建时间、目标子任务群 chat_id、task_id。</checkbox>
+<checkbox done="false">门禁报告：scope、in_chat、direct_mention、urgent_summon、name、avatar、description 七项均为 pass。</checkbox>
+<checkbox done="false">direct@ 证据：probe message_id、sender-scoped open_id 来源、clone 接收事件 mentions、wake ack 记录。</checkbox>
+<checkbox done="false">urgent_summon 证据：relay message_id、preheat confirmed、wake ack 记录。</checkbox>
+<checkbox done="false">资料完整性证据：name、avatar_url、description/preset desc。</checkbox>
+<checkbox done="false">交付证据：subtask 成员表只在门禁通过后出现新 clone；late kickoff 和 joined/spawned 在 7/7 pass 后出现。</checkbox>
+<checkbox done="false">可见验收：邹劲松和 CEO 在真实群里看到新克隆能被直接 @、能被急急如律令唤起，并能执行一次实际任务。</checkbox>
+
+<h1>停止条件</h1>
+
+<ul>
+  <li>没有部署授权、没有扫码授权、没有主群验收窗口：不开始 E2E。</li>
+  <li>scope 查询失败或返回 unknown：停止，不能 fail-open。</li>
+  <li>sender-scoped clone open_id 缺失：direct@ 项 unknown，停止。</li>
+  <li>direct@ 或 urgent_summon 在 bounded retries 后仍无 wake ack：停止。</li>
+  <li>name、avatar、description 任一项缺失且无法自动补救：停止。</li>
+  <li>任何补救需要部署、重启或手工改生产数据：先回主群拿授权。</li>
+</ul>
+
+<h1>角色分工</h1>
+
+<table>
+  <thead>
+    <tr>
+      <th background-color="light-gray">角色</th>
+      <th background-color="light-gray">职责</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>CEO bot</td>
+      <td>在主群组织部署授权、发起真实克隆流程、协调邹劲松扫码和验收。</td>
+    </tr>
+    <tr>
+      <td>邹劲松</td>
+      <td>授权部署和重启；扫码授权新应用；在真实群里确认可见行为。</td>
+    </tr>
+    <tr>
+      <td>寇黛克斯</td>
+      <td>提供实现和 E2E 方案；验收时协助核对证据；未获授权前不部署、不重启、不自行跑 E2E。</td>
+    </tr>
+    <tr>
+      <td>审查员</td>
+      <td>如 E2E 失败需要改代码，继续按 review 流程审查新增 diff。</td>
+    </tr>
+  </tbody>
+</table>
+
+<hr/>
+
+<p><b>当前状态：</b>实现和代码 review 已完成；focused vitest 7 files/229 tests、tsc、git diff --check 已通过。下一步等待主群安排“部署后真实全流程重走”。</p>

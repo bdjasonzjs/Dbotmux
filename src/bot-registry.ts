@@ -43,6 +43,9 @@ export interface BotConfig {
    * pre-feature clones → falls back to botName everywhere (no behavior change).
    */
   displayName?: string;
+  /** Optional trustworthy app description used as the source for clone appPreset.desc.
+   *  It is operator-provided config, not inferred from /bot/v3/info. */
+  description?: string;
   /** The source 本体's base display name (e.g. "克劳德"), set on a clone so its
    *  siblings can be counted (`（N号机）` numbering) without reading Lark botName. */
   clonedFromName?: string;

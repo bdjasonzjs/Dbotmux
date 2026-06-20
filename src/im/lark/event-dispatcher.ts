@@ -549,11 +549,43 @@ export interface SummonMatch { body: string; wakeAck: { taskId: string; wakeId: 
 
 /** wake-ack 令牌：`[[wake-ack:taskId:wakeId]]`。预热 summon 嵌在正文里，命中后由路由层剥掉再喂 CLI。 */
 const WAKE_ACK_TOKEN_RE = /\s*\[\[wake-ack:([^:\]\s]+):([^:\]\s]+)\]\]\s*/;
+/** direct-ack 令牌：clone 完整性 gate 的直接 @ 探针回执。命中后必须只写 store，不进 CLI。 */
+const DIRECT_ACK_TOKEN_RE = /\s*\[\[direct-ack:([^:\]\s]+):([^:\]\s]+)\]\]\s*/;
 /** 纯函数：抽取并剥掉 wake-ack 令牌（不写 store）。无令牌 → 原样返回、wakeAck=null。 */
 function extractAndStripWakeToken(body: string): SummonMatch {
   const m = WAKE_ACK_TOKEN_RE.exec(body);
   if (!m) return { body, wakeAck: null };
   return { body: body.replace(WAKE_ACK_TOKEN_RE, ' ').trim(), wakeAck: { taskId: m[1]!, wakeId: m[2]! } };
+}
+
+export interface DirectAckMatch { body: string; wakeAck: { taskId: string; wakeId: string } | null; probeOnly: boolean; }
+
+/** 纯函数：抽取 direct-ack 令牌，并判断剥掉 token/开头 @mention 后是否只剩探针空壳。 */
+export function extractAndStripDirectAckToken(body: string, mentionsList: any[] = []): DirectAckMatch {
+  const m = DIRECT_ACK_TOKEN_RE.exec(body);
+  if (!m) return { body, wakeAck: null, probeOnly: false };
+  const stripped = body.replace(DIRECT_ACK_TOKEN_RE, ' ').trim();
+  const withoutLeadingMentions = stripLeadingMentions(stripped, mentionsList).trim();
+  return {
+    body: stripped,
+    wakeAck: { taskId: m[1]!, wakeId: m[2]! },
+    probeOnly: withoutLeadingMentions.length === 0,
+  };
+}
+
+function directAckMatchForBot(larkAppId: string, message: any): DirectAckMatch | null {
+  if (!isBotMentioned(larkAppId, message, undefined)) return null;
+  const text = extractMessageTextForRouting(message);
+  if (!text) return null;
+  const match = extractAndStripDirectAckToken(text, message?.mentions ?? []);
+  return match.wakeAck ? match : null;
+}
+
+function recordDirectAck(larkAppId: string, match: DirectAckMatch): void {
+  if (!match.wakeAck) return;
+  const { taskId, wakeId } = match.wakeAck;
+  void recordWakeAck(taskId, larkAppId, wakeId).catch(err =>
+    logger.debug(`[${larkAppId}] recordDirectAck failed (task=${taskId} wake=${wakeId}): ${err}`));
 }
 
 /** 这条消息是否点名本 daemon 的 bot（同步判定）。命中返 {干净 body, wakeAck}，否则 null。
@@ -958,6 +990,21 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
               return;
             }
           }
+          // Clone integrity direct-@ probe. A bot-sent probe is trusted only
+          // from an oncall-bound chat or a receiver-side known peer; an existing
+          // session alone must not let unknown bots write direct acks or route
+          // probe tokens into CLI.
+          const directAck = directAckMatchForBot(larkAppId, message);
+          const trustedDirectAckSender = isChatOncallBoundForAnyBot(chatId)
+            || isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId);
+          if (directAck && trustedDirectAckSender) {
+            recordDirectAck(larkAppId, directAck);
+            if (directAck.probeOnly) return;
+          }
+          if (directAck && !trustedDirectAckSender) {
+            logger.debug(`[${larkAppId}] dropping direct-ack token from unknown bot sender ${senderOpenId}`);
+            return;
+          }
           logger.info(`Bot-to-bot @mention detected (scope=${ctx.scope}): routing to handleThreadReply`);
           handlers.handleThreadReply(data, { ...ctx, chatId, messageId, chatType, larkAppId })
             .catch(err => logger.error(`Error handling bot @mention: ${err}`));
@@ -1146,6 +1193,12 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         } else if (!isAllowed) {
           logger.debug(`Ignoring p2p message from non-allowed user: ${senderOpenId}`);
           return;
+        }
+
+        const directAck = directAckMatchForBot(larkAppId, message);
+        if (directAck) {
+          recordDirectAck(larkAppId, directAck);
+          if (directAck.probeOnly) return;
         }
 
         const ctx: RoutingContext = { chatId, messageId, chatType, larkAppId, ...routing };
