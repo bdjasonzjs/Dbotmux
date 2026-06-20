@@ -26,6 +26,7 @@ export interface CloneIntegrityTarget {
   taskId: string;
   subgroupChatId: string;
   senderAppId: string;
+  sourceAppId?: string;
   appId: string;
   appSecret: string;
   displayName?: string;

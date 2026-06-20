@@ -26,6 +26,17 @@ import { isArchived as ctxIsArchived, unarchive as ctxUnarchive } from '../../se
 import { expandLetters } from '../../services/mailbox.js';
 import { recordWakeAck } from '../../services/subtask-store.js';
 
+function shortId(id: string | undefined | null, keep = 12): string {
+  if (!id) return '-';
+  return id.length <= keep ? id : id.slice(0, keep);
+}
+
+function redactedId(id: string | undefined | null): string {
+  if (!id) return '-';
+  if (id.length <= 10) return `${id.slice(0, 3)}***`;
+  return `${id.slice(0, 6)}***${id.slice(-4)}`;
+}
+
 // ─── Bot identity ─────────────────────────────────────────────────────────
 
 /** Set the bot's open_id. Callers should also call writeBotInfoFile() to persist. */
@@ -902,6 +913,15 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         const chatId = message.chat_id;
         const chatType = (message.chat_type === 'p2p' ? 'p2p' : 'group') as 'group' | 'p2p';
         const messageId = message.message_id;
+        if (message.message_type === 'interactive') {
+          const rawHadSummonTag = typeof message.content === 'string' && message.content.includes(URGENT_SUMMON_TAG);
+          logger.info(
+            `[${larkAppId}] top-of-handler interactive receipt ` +
+            `(msg=${shortId(messageId)} chat=${shortId(chatId)} senderType=${sender?.sender_type ?? '-'} ` +
+            `sender=${redactedId(sender?.sender_id?.open_id)} rawTag=${rawHadSummonTag ? 'yes' : 'no'} ` +
+            `mentions=${message.mentions?.length ?? 0})`,
+          );
+        }
 
         // P2/L1 main-bot mode: bump per-chat message metrics + mark
         // global digest stale. Best-effort try/catch — never block real
@@ -1029,17 +1049,23 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
 
         // 急急如律令 唤醒：纯文本/卡片(无真 @)以约定格式点名本 bot → 当成被 @ 一样
         // 路由响应，绕过多 bot 群的 @ 闸门。push 推全量群消息使这条事件能到达本 daemon。
-        // base 转发实测以 interactive 卡片发，真实文本要先 resolve——便宜预筛：原始
-        // content 串里没有 "急急如律令" 就跳过，避免给每条卡片白调一次 REST。
+        // Base relay 真机以 interactive 卡片发；WS 原始 payload 不稳定，可能只给
+        // user_dsl/占位结构，真正的「急急如律令：【bot】...」只存在于 REST
+        // resolved card text 里。因此不能只在 raw content 含 tag 时才 resolve。
+        // 为控制成本，只对已过 canTalk 的 interactive sender 做一次 resolve。
         // 安全闸：仍要求发送者 canTalk（松松是 owner 会过；陌生人不过）。
         {
           let summonMatch = summonMatchForBot(larkAppId, message);
           if (
             summonMatch === null &&
             message.message_type === 'interactive' &&
-            typeof message.content === 'string' &&
-            message.content.includes(URGENT_SUMMON_TAG)
+            isAllowed
           ) {
+            logger.info(
+              `[${larkAppId}] urgent interactive candidate received ` +
+              `(msg=${shortId(messageId)} chat=${shortId(chatId)} sender=${redactedId(senderOpenId)} ` +
+              `mentions=${message.mentions?.length ?? 0})`,
+            );
             try { await resolveNonsupportMessage(data, larkAppId); } catch (err) {
               logger.debug(`[${larkAppId}] 急急如律令 card resolve failed: ${err}`);
             }

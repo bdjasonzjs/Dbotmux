@@ -41,11 +41,13 @@ const mockListChatBotMembers = vi.fn(async () => [] as Array<{ openId: string; n
 const mockGetChatMode = vi.fn(async () => 'topic' as 'group' | 'topic' | 'p2p');
 const mockGetChatInfo = vi.fn(async () => ({ userCount: 1, botCount: 1 }));
 const mockReplyMessage = vi.fn(async () => 'msg-id');
+const mockGetMessageDetail = vi.fn(async () => null);
 vi.mock('../src/im/lark/client.js', () => ({
   getChatInfo: (...args: any[]) => mockGetChatInfo(...args),
   getChatMode: (...args: any[]) => mockGetChatMode(...args),
   listChatBotMembers: (...args: any[]) => mockListChatBotMembers(...args),
   replyMessage: (...args: any[]) => mockReplyMessage(...args),
+  getMessageDetail: (...args: any[]) => mockGetMessageDetail(...args),
 }));
 
 vi.mock('../src/utils/logger.js', () => ({
@@ -1995,6 +1997,7 @@ describe('im.message.receive_v1 — 急急如律令 summon routing', () => {
 
   beforeEach(() => {
     capturedHandlers = {};
+    vi.clearAllMocks();
     setupClaudeBot();
     handlers = makeHandlers();
     mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
@@ -2034,6 +2037,62 @@ describe('im.message.receive_v1 — 急急如律令 summon routing', () => {
     await capturedHandlers['im.message.receive_v1'](event);
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('does not REST-resolve an interactive card from a non-allowed sender', async () => {
+    setupClaudeBot({ allowed: ['ou_someone_else'] }); // SUMMON_USER 不在白名单
+    const event = {
+      message: {
+        message_id: 'msg-card-denied',
+        chat_id: 'chat-summon',
+        chat_type: 'group',
+        message_type: 'interactive',
+        content: JSON.stringify({ title: 'Base relay card', elements: [] }),
+        mentions: [],
+      },
+      sender: { sender_type: 'user', sender_id: { open_id: SUMMON_USER } },
+    };
+
+    await capturedHandlers['im.message.receive_v1'](event);
+
+    expect(mockGetMessageDetail).not.toHaveBeenCalled();
+    expect(mockRecordWakeAck).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('resolves owner/Base interactive card even when raw payload has no summon tag or @mention', async () => {
+    setupClaudeBot({ allowed: [SUMMON_USER] });
+    mockGetMessageDetail.mockResolvedValue({
+      items: [{
+        body: {
+          content: JSON.stringify({
+            elements: [[
+              { tag: 'text', text: '急急如律令：【克劳德】预热 [[wake-ack:st_card:wk_card]]' },
+            ]],
+          }),
+        },
+      }],
+    });
+    const event = {
+      message: {
+        message_id: 'msg-card-summon',
+        chat_id: 'chat-summon',
+        chat_type: 'group',
+        message_type: 'interactive',
+        content: JSON.stringify({ title: 'Base relay card', elements: [] }),
+        mentions: [],
+      },
+      sender: { sender_type: 'user', sender_id: { open_id: SUMMON_USER } },
+    };
+
+    await capturedHandlers['im.message.receive_v1'](event);
+
+    expect(mockGetMessageDetail).toHaveBeenCalled();
+    expect(mockRecordWakeAck).toHaveBeenCalledWith('st_card', MY_APP_ID, 'wk_card');
+    expect(handlers.handleNewTopic).toHaveBeenCalled();
+    expect(JSON.parse(event.message.content).text).toContain('预热');
+    expect(JSON.parse(event.message.content).text).not.toContain('[[wake-ack');
   });
 
   // 信箱 auto-expand 集成回归 (蔻黛克斯 code review P1)：B1 核心系统保证 —— 入口必须把哨兵

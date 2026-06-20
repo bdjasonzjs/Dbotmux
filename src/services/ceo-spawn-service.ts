@@ -32,6 +32,7 @@ import { bindOncall } from './oncall-store.js';
 import { activateBot, restartCloneBot } from './bot-activate.js';
 import { createSubtask, slug, djb2 } from './subtask-orchestrator.js';
 import { addBotToSubTask, enqueueCommand } from './subtask-store.js';
+import { buildEventSubDeepLink } from '../setup/verify-permissions.js';
 import { writeRelayRecord } from './base-relay.js';
 import { preheatConfirmOnline } from './ceo-preheat.js';
 import { runCloneIntegrityGate } from './clone-integrity-gate.js';
@@ -309,6 +310,7 @@ export async function ceoSpawn(req: CeoSpawnReq): Promise<EnsureSpawnOutcome> {
           taskId,
           subgroupChatId,
           senderAppId: ceoAppId,
+          sourceAppId: bentiAppId,
           appId,
           appSecret: cloneCfg?.larkAppSecret ?? '',
           displayName,
@@ -332,9 +334,14 @@ export async function ceoSpawn(req: CeoSpawnReq): Promise<EnsureSpawnOutcome> {
               return res.ok ? { ok: true, recordId: res.recordId } : { ok: false, error: res.error };
             },
           }, { ...target, displayName: target.displayName });
+          const eventConfigDetail =
+            `event_subscription=unverified(type=receive_event_config_unproven ` +
+            `sourceApp=${target.sourceAppId ?? bentiAppId} cloneApp=${target.appId} chat=${target.subgroupChatId} ` +
+            `task=${target.taskId} wake=${pre.wakeId} sourceEventConfig=${buildEventSubDeepLink(target.sourceAppId ?? bentiAppId)} ` +
+            `cloneEventConfig=${buildEventSubDeepLink(target.appId)})`;
           return pre.ok
             ? { item: 'urgent_summon', status: 'pass' as const, detail: `ack after ${pre.elapsedMs ?? '?'}ms (${pre.wakeId})` }
-            : { item: 'urgent_summon', status: 'blocked' as const, detail: `${pre.error ? `${pre.error}; ` : ''}no urgent ack after ${pre.attempts} attempts/${pre.elapsedMs ?? '?'}ms (${pre.wakeId}; records=${pre.recordIds?.join(',') || '-'})` };
+            : { item: 'urgent_summon', status: 'blocked' as const, detail: `${pre.error ? `${pre.error}; ` : ''}no urgent ack after ${pre.attempts} attempts/${pre.elapsedMs ?? '?'}ms (${pre.wakeId}; records=${pre.recordIds?.join(',') || '-'}); ${eventConfigDetail}` };
           },
         });
       };
