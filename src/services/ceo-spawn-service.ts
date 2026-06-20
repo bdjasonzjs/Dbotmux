@@ -78,7 +78,11 @@ async function postScopeAuthLink(ceoAppId: string, chatId: string, appId: string
     const imageKey = await uploadImage(ceoAppId, p);
     await sendMessage(ceoAppId, chatId, JSON.stringify({ image_key: imageKey }), 'image');
     await sendMessage(ceoAppId, chatId,
-      `👆 给分身 ${appId} 开通权限（${label}，共 ${scopes.length} 项）：点开链接 → 全选 → 确认。\n${url}`);
+      `👆 给分身 ${appId} 开通权限（${label}，共 ${scopes.length} 项），两步缺一不可：\n` +
+      `①【授权】点开链接 → 全选 → 确认授权。\n` +
+      `②【发布】⚠️敏感权限（如 im:message.group_msg「接收群消息」，决定克隆能否收急急如律令）开通后，` +
+      `还要去开发者后台「版本管理与发布」创建并发布一个新版本 + 管理员审批，权限才真正生效。` +
+      `**只做①不做②，克隆收不到急急如律令**（这是常见坑）。\n${url}`);
     return true;
   } finally {
     try { rmSync(dir, { recursive: true, force: true }); } catch { /* */ }

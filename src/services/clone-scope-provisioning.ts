@@ -59,7 +59,9 @@ function renderScopeWarning(bot: CloneScopeBot, missing: readonly string[], auth
   return [
     `⚠️ 分身 ${display} (${bot.larkAppId}${role}) 缺少子群工作必需权限，已阻断建群。`,
     `缺失/待确认 scope：${missingLine}${errorLine}`,
-    '请点开链接 → 全选 → 确认，完成授权后重试本次 subtask-start / ceo-spawn。',
+    '①【授权】点开链接 → 全选 → 确认授权。',
+    '②【发布】⚠️敏感权限（如 im:message.group_msg「接收群消息」）开通后，还要去开发者后台「版本管理与发布」创建并发布新版本 + 管理员审批，权限才生效。**只授权不发布，克隆收不到急急如律令**。',
+    '两步都做完后重试本次 subtask-start / ceo-spawn。',
     authUrl,
   ].join('\n');
 }
