@@ -1055,6 +1055,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
             // 走到这里 = 发送者已过安全闸（owner / base-relay owner 身份），回执才代表「可信唤醒穿到了本分身」。
             if (summonMatch.wakeAck) {
               const { taskId, wakeId } = summonMatch.wakeAck;
+              logger.info(`[${larkAppId}] urgent wake-ack received by clone (task=${taskId} wake=${wakeId} msg=${message.message_id ?? '-'} chat=${message.chat_id ?? '-'} sender=${senderOpenId ?? '-'})`);
               void recordWakeAck(taskId, larkAppId, wakeId).catch(err =>
                 logger.debug(`[${larkAppId}] recordWakeAck failed (task=${taskId} wake=${wakeId}): ${err}`));
             }

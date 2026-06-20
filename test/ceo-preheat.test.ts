@@ -3,6 +3,8 @@ import {
   buildPreheatSummon,
   preheatConfirmOnline,
   PREHEAT_MAX_ATTEMPTS,
+  PREHEAT_ATTEMPT_WINDOW_MS,
+  PREHEAT_POLL_INTERVAL_MS,
   type PreheatDeps,
   type PreheatTarget,
 } from '../src/services/ceo-preheat.js';
@@ -36,6 +38,8 @@ describe('buildPreheatSummon', () => {
 });
 
 describe('preheatConfirmOnline', () => {
+  const pollsPerAttempt = Math.ceil(PREHEAT_ATTEMPT_WINDOW_MS / PREHEAT_POLL_INTERVAL_MS);
+
   it('回执已出 → ok，attempts=1，只发一次', async () => {
     const { d, sent } = baseDeps({ ackSeen: () => true });
     const res = await preheatConfirmOnline(d, TARGET);
@@ -58,11 +62,23 @@ describe('preheatConfirmOnline', () => {
 
   it('第 2 attempt 才出回执 → ok、attempts=2', async () => {
     let polls = 0;
-    // 第 1 attempt 共轮询 10 次（皆 false），第 2 attempt 第 1 次轮询（第 11 次）变 true。
-    const { d } = baseDeps({ ackSeen: () => { polls += 1; return polls >= 11; } });
+    // 第 1 attempt 共轮询 pollsPerAttempt 次（皆 false），第 2 attempt 第 1 次轮询变 true。
+    const { d } = baseDeps({ ackSeen: () => { polls += 1; return polls >= pollsPerAttempt + 1; } });
     const res = await preheatConfirmOnline(d, TARGET);
     expect(res.ok).toBe(true);
     expect(res.attempts).toBe(2);
+  });
+
+  it('Base relay 慢回执在单 attempt 长窗口内到达 → 不误判 blocked', async () => {
+    let polls = 0;
+    const { d } = baseDeps({
+      sendOwnerSummon: async () => ({ ok: true, recordId: 'rec_1' }),
+      ackSeen: () => { polls += 1; return polls >= Math.floor(pollsPerAttempt / 2); },
+    });
+    const res = await preheatConfirmOnline(d, TARGET);
+    expect(res.ok).toBe(true);
+    expect(res.attempts).toBe(1);
+    expect(res.recordIds).toEqual(['rec_1']);
   });
 
   it('send 失败也不抛、继续按窗口轮询回执（poll 超时不当失败）', async () => {

@@ -32,7 +32,7 @@ import { bindOncall } from './oncall-store.js';
 import { activateBot } from './bot-activate.js';
 import { createSubtask, slug, djb2 } from './subtask-orchestrator.js';
 import { addBotToSubTask, enqueueCommand } from './subtask-store.js';
-import { sendAsOwner } from './base-relay.js';
+import { writeRelayRecord } from './base-relay.js';
 import { preheatConfirmOnline } from './ceo-preheat.js';
 import { runCloneIntegrityGate } from './clone-integrity-gate.js';
 import { resolveSenderScopedCloneOpenId } from './clone-mention-resolver.js';
@@ -273,13 +273,13 @@ export async function ceoSpawn(req: CeoSpawnReq): Promise<EnsureSpawnOutcome> {
         idempotencyKey: `late-kickoff-${taskId}-${appId}`, expectedTaskVersion: null,
       });
     },
-    // round-5 冷启动修复：预热握手。注入的 sendOwnerSummon **直发一条新 record** 的 owner summon
-    // （不复用 record，规避 base-relay 防刷屏幂等的「只 poll 不 upsert」）；短 poll 只为快确认/捕获
-    // upsert 错误，真正的成功信号是分身命中后写的 store 回执（preheatConfirmOnline 轮询）。
+    // round-5 冷启动修复：预热握手。注入的 sendOwnerSummon **只写一条新 record** 的 owner summon
+    // （不复用 record，规避 base-relay 防刷屏幂等的「只 poll 不 upsert」）；成功信号不是 Base 状态，
+    // 而是分身命中后写的 store 回执。Base relay 真机延迟可达几十秒，ack 窗口在 preheatConfirmOnline 内统一控制。
     preheatConfirmOnline: (target) => preheatConfirmOnline({
       sendOwnerSummon: async (chatId, text) => {
-        const res = await sendAsOwner({ targetChatId: chatId, text, pollTimeoutMs: 3_000 });
-        return res.ok ? { ok: true } : { ok: false, error: res.error };
+        const res = await writeRelayRecord({ targetChatId: chatId, text });
+        return res.ok ? { ok: true, recordId: res.recordId } : { ok: false, error: res.error };
       },
     }, target),
     verifyCloneIntegrity: async ({ taskId, subgroupChatId, appId, bentiAppId, displayName }) => {
@@ -310,13 +310,13 @@ export async function ceoSpawn(req: CeoSpawnReq): Promise<EnsureSpawnOutcome> {
           }
           const pre = await preheatConfirmOnline({
             sendOwnerSummon: async (chatId, text) => {
-              const res = await sendAsOwner({ targetChatId: chatId, text, pollTimeoutMs: 3_000 });
-              return res.ok ? { ok: true } : { ok: false, error: res.error };
+              const res = await writeRelayRecord({ targetChatId: chatId, text });
+              return res.ok ? { ok: true, recordId: res.recordId } : { ok: false, error: res.error };
             },
           }, { ...target, displayName: target.displayName });
           return pre.ok
-            ? { item: 'urgent_summon', status: 'pass' as const }
-            : { item: 'urgent_summon', status: 'blocked' as const, detail: `no urgent ack after ${pre.attempts} attempts (${pre.wakeId})` };
+            ? { item: 'urgent_summon', status: 'pass' as const, detail: `ack after ${pre.elapsedMs ?? '?'}ms (${pre.wakeId})` }
+            : { item: 'urgent_summon', status: 'blocked' as const, detail: `no urgent ack after ${pre.attempts} attempts/${pre.elapsedMs ?? '?'}ms (${pre.wakeId}; records=${pre.recordIds?.join(',') || '-'})` };
         },
       });
     },
