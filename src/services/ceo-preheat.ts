@@ -45,6 +45,11 @@ export interface PreheatDeps {
   relayDeliveryReady?: () => { ok: true } | { ok: false; error: string };
   /** 以 owner 身份发一条**新 record** 的 summon 到子群（直发，绝不复用 existingRecordId）。 */
   sendOwnerSummon: (chatId: string, text: string) => Promise<{ ok: boolean; recordId?: string; error?: string }>;
+  /** 以 bot 身份发一条**带克隆真 @mention** 的文本 summon 到子群。
+   * 真机实测（2026-06-21 克劳德 A/B）：克隆只授予了「被@消息」scope（group_at_msg），收不到无@的
+   * owner relay 卡片，但能收到任意 bot 对它发的「文本+真@mention」并触发 summon 匹配 + recordWakeAck。
+   * 提供本 dep + target.cloneOpenId 时，预热走这条**已验证可穿**的通道（不再依赖 owner relay 卡片）。 */
+  sendCloneMention?: (chatId: string, cloneOpenId: string, text: string) => Promise<{ ok: boolean; recordId?: string; error?: string }>;
   /** 可注入：sleep（测试用假实现）。 */
   sleep?: (ms: number) => Promise<void>;
   /** 可注入：wakeId 生成（测试可定）。默认随机。 */
@@ -58,6 +63,7 @@ export interface PreheatTarget {
   subgroupChatId: string;
   appId: string;       // 分身 larkAppId（= 回执里自报的 appId）
   displayName: string; // summon 点名用『本体名（N号机）』
+  cloneOpenId?: string; // 克隆真实 open_id；提供 + deps.sendCloneMention 时走 bot 文本@通道
 }
 
 const realSleep = (ms: number): Promise<void> => new Promise(r => setTimeout(r, ms));
@@ -78,6 +84,14 @@ export function buildPreheatSummon(displayName: string, taskId: string, wakeId: 
   return `急急如律令：【${displayName}】你已上线，本条仅确认分身在线、无需任何操作。[[wake-ack:${taskId}:${wakeId}]]（预热#${attempt}·${nonce}）`;
 }
 
+/** bot 文本 @mention 通道的 summon 正文：走 **direct-ack** 令牌（`[[direct-ack:...]]`）。
+ *  真 @mention 消息由 event-dispatcher 的 directAckMatchForBot 路径处理（非 summon 名字匹配路径），
+ *  其 recordDirectAck 调的是同一个 recordWakeAck(taskId,appId,wakeId)，故 hasWakeAck 一致命中。
+ *  正文需在剥掉 token + 开头 @mention 后**为空**（probeOnly），确保只写 store、不喂 CLI。 */
+export function buildCloneMentionWake(taskId: string, wakeId: string, attempt: number, nonce: string): string {
+  return `[[direct-ack:${taskId}:${wakeId}]]`;
+}
+
 /**
  * 对一个新激活分身做有界预热握手。收到回执 → {ok:true}；耗尽 → {ok:false, wakeId, attempts}。
  * 不抛（发送失败也按「本 attempt 没醒」继续重试），由编排层据返回值决定 askforhelp。
@@ -87,20 +101,32 @@ export async function preheatConfirmOnline(deps: PreheatDeps, target: PreheatTar
   const ackSeen = deps.ackSeen ?? hasWakeAck;
   const wakeId = (deps.genWakeId ?? (() => randomUUID().slice(0, 8)))();
   const { taskId, subgroupChatId, appId, displayName } = target;
+  const { cloneOpenId } = target;
   const startedAt = Date.now();
   const recordIds: string[] = [];
-  const relayReady = (deps.relayDeliveryReady ?? defaultRelayDeliveryReady)();
-  if (!relayReady.ok) {
-    logger.warn(`[ceo-preheat] urgent relay precondition failed (task=${taskId} app=${appId} wake=${wakeId}): ${relayReady.error}`);
-    return { ok: false, wakeId, attempts: 0, elapsedMs: Date.now() - startedAt, recordIds, error: relayReady.error };
+  // 优先走「bot→克隆文本@mention」通道：真机已验证克隆能收（group_at_msg scope），不需 owner relay
+  // 卡片那条克隆收不到的路。只有在没提供该通道时，才退回 owner relay + delivery 前置校验。
+  const useCloneMention = !!(cloneOpenId && deps.sendCloneMention);
+  if (!useCloneMention) {
+    const relayReady = (deps.relayDeliveryReady ?? defaultRelayDeliveryReady)();
+    if (!relayReady.ok) {
+      logger.warn(`[ceo-preheat] urgent relay precondition failed (task=${taskId} app=${appId} wake=${wakeId}): ${relayReady.error}`);
+      return { ok: false, wakeId, attempts: 0, elapsedMs: Date.now() - startedAt, recordIds, error: relayReady.error };
+    }
+  } else {
+    logger.info(`[ceo-preheat] urgent wake via bot text @mention (task=${taskId} app=${appId} wake=${wakeId} cloneOpenId=${cloneOpenId!.slice(0, 8)}***)`);
   }
 
   for (let attempt = 1; attempt <= PREHEAT_MAX_ATTEMPTS; attempt++) {
     const nonce = randomUUID().slice(0, 6);
-    const text = buildPreheatSummon(displayName, taskId, wakeId, attempt, nonce);
+    const text = useCloneMention
+      ? buildCloneMentionWake(taskId, wakeId, attempt, nonce)
+      : buildPreheatSummon(displayName, taskId, wakeId, attempt, nonce);
     const sendStartedAt = Date.now();
-    logger.info(`[ceo-preheat] relay urgent probe write start (attempt ${attempt}/${PREHEAT_MAX_ATTEMPTS}, task=${taskId} app=${appId} wake=${wakeId} chat=${subgroupChatId.slice(0, 12)})`);
-    const sent = await deps.sendOwnerSummon(subgroupChatId, text);
+    logger.info(`[ceo-preheat] urgent probe ${useCloneMention ? 'bot-mention' : 'owner-relay'} send start (attempt ${attempt}/${PREHEAT_MAX_ATTEMPTS}, task=${taskId} app=${appId} wake=${wakeId} chat=${subgroupChatId.slice(0, 12)})`);
+    const sent = useCloneMention
+      ? await deps.sendCloneMention!(subgroupChatId, cloneOpenId!, text)
+      : await deps.sendOwnerSummon(subgroupChatId, text);
     const sendElapsedMs = Date.now() - sendStartedAt;
     if (sent.recordId) recordIds.push(sent.recordId);
     if (!sent.ok) {

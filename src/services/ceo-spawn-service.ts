@@ -298,7 +298,25 @@ export async function ceoSpawn(req: CeoSpawnReq): Promise<EnsureSpawnOutcome> {
         const res = await writeRelayRecord({ targetChatId: chatId, text });
         return res.ok ? { ok: true, recordId: res.recordId } : { ok: false, error: res.error };
       },
-    }, target),
+      // 真机已验证：复用 direct_mention 那套双 @mention POST（@发送者自己 + @克隆）+ direct-ack 令牌，
+      // 绕过 bot-to-bot @ 抢路由 → directAck 记录路径 → recordWakeAck，克隆能收能回执。
+      sendCloneMention: async (chatId, cloneOpenId, text) => {
+        const senderSelf = getBotOpenId(ceoAppId);
+        if (!senderSelf) return { ok: false, error: 'missing sender self open_id for double-mention wake' };
+        try {
+          const post = JSON.stringify({ zh_cn: { title: 'urgent wake', content: [[
+            { tag: 'at', user_id: senderSelf, user_name: 'sender' },
+            { tag: 'text', text: ' ' },
+            { tag: 'at', user_id: cloneOpenId, user_name: 'clone' },
+            { tag: 'text', text: ` ${text}` },
+          ]] } });
+          const id = await sendMessage(ceoAppId, chatId, post, 'post');
+          return { ok: true, recordId: id };
+        } catch (err: any) {
+          return { ok: false, error: err?.message ?? String(err) };
+        }
+      },
+    }, { ...target, cloneOpenId: target.cloneOpenId ?? botReadyFresh(target.appId) }),
     verifyCloneIntegrity: async ({ taskId, subgroupChatId, appId, bentiAppId, displayName }) => {
       const runOnce = async () => {
         const botsNow = readBotsJsonOrEmpty(botsJsonPath);
@@ -328,12 +346,32 @@ export async function ceoSpawn(req: CeoSpawnReq): Promise<EnsureSpawnOutcome> {
           if (!target.displayName) {
             return { item: 'urgent_summon', status: 'blocked' as const, detail: 'missing displayName for urgent summon' };
           }
+          const urgentCloneOpenId = cloneSelfOpenId ?? cloneMentionOpenId ?? botReadyFresh(target.appId);
           const pre = await preheatConfirmOnline({
             sendOwnerSummon: async (chatId, text) => {
               const res = await writeRelayRecord({ targetChatId: chatId, text });
               return res.ok ? { ok: true, recordId: res.recordId } : { ok: false, error: res.error };
             },
-          }, { ...target, displayName: target.displayName });
+            // 真机已验证可穿的通道：复用 direct_mention 探针那套**双 @mention POST**（先 @发送者自己、
+            // 再 @克隆）+ direct-ack 令牌。双 @ 的「bootstrap」绕过 bot-to-bot @ 抢路由，落到 directAck
+            // 记录路径（recordDirectAck → 同一个 recordWakeAck），克隆（group_at_msg scope）能收并回执。
+            sendCloneMention: async (chatId, cloneOpenId, text) => {
+              const senderSelf = getBotOpenId(ceoAppId);
+              if (!senderSelf) return { ok: false, error: 'missing sender self open_id for double-mention wake' };
+              try {
+                const post = JSON.stringify({ zh_cn: { title: 'urgent wake', content: [[
+                  { tag: 'at', user_id: senderSelf, user_name: 'sender' },
+                  { tag: 'text', text: ' ' },
+                  { tag: 'at', user_id: cloneOpenId, user_name: 'clone' },
+                  { tag: 'text', text: ` ${text}` },
+                ]] } });
+                const id = await sendMessage(ceoAppId, chatId, post, 'post');
+                return { ok: true, recordId: id };
+              } catch (err: any) {
+                return { ok: false, error: err?.message ?? String(err) };
+              }
+            },
+          }, { ...target, displayName: target.displayName, cloneOpenId: urgentCloneOpenId });
           const eventConfigDetail =
             `event_subscription=unverified(type=receive_event_config_unproven ` +
             `sourceApp=${target.sourceAppId ?? bentiAppId} cloneApp=${target.appId} chat=${target.subgroupChatId} ` +
