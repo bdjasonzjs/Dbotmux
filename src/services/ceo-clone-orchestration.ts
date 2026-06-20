@@ -103,6 +103,8 @@ export interface EnsureSpawnDeps {
   registerActivatedBot: (appId: string) => Promise<{ ok: boolean; error?: string }>;
   /** Pull the activated clone into the subgroup chat (must succeed before store change). */
   addBotToChat: (chatId: string, appId: string) => Promise<{ ok: boolean; error?: string }>;
+  /** Bind the joined clone to subgroup oncall so owner/Base relay summon passes receiver auth. */
+  ensureCloneOncall: (chatId: string, appId: string) => Promise<{ ok: boolean; error?: string }>;
   /** Deterministic membership check — lets re-entry skip re-adding a clone that is
    *  already in the chat, so groups-store treating already-in-chat as failure can't
    *  strand the flow at awaiting_clone_join (蔻黛 blocker). */
@@ -317,6 +319,10 @@ export async function ensureClonesAndSpawn(req: EnsureSpawnReq, deps: EnsureSpaw
       if (!add.ok) {
         return { status: 'awaiting_clone_join', taskId: state.taskId, chatId: state.subgroupChatId, message: `把分身 ${pc.appId} 拉进子群失败（${add.error ?? 'unknown'}），可重试。` };
       }
+    }
+    const oncall = await deps.ensureCloneOncall(state.subgroupChatId, pc.appId!);
+    if (!oncall.ok) {
+      return { status: 'awaiting_clone_join', taskId: state.taskId, chatId: state.subgroupChatId, message: `分身 ${pc.appId} oncall 绑定失败（${oncall.error ?? 'unknown'}），可重试。` };
     }
     pc.phase = 'in_chat'; // persisted BEFORE store/kickoff so a failure there re-enters here, not at add
     deps.putState(state);

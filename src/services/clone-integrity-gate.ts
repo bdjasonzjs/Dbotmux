@@ -27,6 +27,7 @@ export interface CloneIntegrityTarget {
   displayName?: string;
   sourceDescription?: string;
   cloneMentionOpenId?: string;
+  cloneMentionCandidates?: Array<{ openId: string; source: string }>;
   senderSelfOpenId?: string;
 }
 
@@ -62,6 +63,20 @@ async function checkStrictScopes(
     return { item: 'scope', status: 'blocked', detail: `missing: ${missing.join(', ')}; auth=${buildAuthUrl(target.appId, missing)}` };
   }
   return { item: 'scope', status: 'pass' };
+}
+
+function scopeNeedsCapabilityProof(check: CloneIntegrityCheck): boolean {
+  return check.item === 'scope'
+    && check.status === 'unknown'
+    && check.detail === 'scope list returned empty grant set';
+}
+
+function scopeCapabilitiesProved(checks: CloneIntegrityCheck[]): boolean {
+  const mustBeGreen: IntegrityItem[] = ['membership', 'direct_mention', 'urgent_summon', 'name', 'avatar', 'description'];
+  return mustBeGreen.every(item => {
+    const check = checks.find(c => c.item === item);
+    return check?.status === 'pass' || check?.status === 'repaired';
+  });
 }
 
 async function fetchTenantToken(appId: string, appSecret: string): Promise<string | undefined> {
@@ -140,9 +155,8 @@ async function checkDescription(target: CloneIntegrityTarget, deps: CloneIntegri
     : { item: 'description', status: 'blocked', detail: 'clone application/v6 app info has no description' };
 }
 
-function buildDirectProbePost(target: CloneIntegrityTarget, wakeId: string): string {
+function buildDirectProbePost(target: CloneIntegrityTarget, wakeId: string, cloneMentionOpenId: string): string {
   if (!target.senderSelfOpenId) throw new Error('clone-integrity: missing senderSelfOpenId for bootstrap mention');
-  if (!target.cloneMentionOpenId) throw new Error('clone-integrity: missing sender-scoped clone mention open_id');
   const displayName = target.displayName ?? target.appId;
   return JSON.stringify({
     zh_cn: {
@@ -150,7 +164,7 @@ function buildDirectProbePost(target: CloneIntegrityTarget, wakeId: string): str
       content: [[
         { tag: 'at', user_id: target.senderSelfOpenId, user_name: 'sender' },
         { tag: 'text', text: ' ' },
-        { tag: 'at', user_id: target.cloneMentionOpenId, user_name: displayName },
+        { tag: 'at', user_id: cloneMentionOpenId, user_name: displayName },
         { tag: 'text', text: ` [[direct-ack:${target.taskId}:${wakeId}]]` },
       ]],
     },
@@ -161,26 +175,48 @@ async function checkDirectMention(
   target: CloneIntegrityTarget,
   deps: CloneIntegrityGateDeps,
 ): Promise<CloneIntegrityCheck> {
-  if (!target.cloneMentionOpenId) {
+  const candidates = [
+    target.cloneMentionOpenId ? { openId: target.cloneMentionOpenId, source: 'sender_scoped_cross_ref' } : undefined,
+    ...(target.cloneMentionCandidates ?? []),
+  ].filter((c): c is { openId: string; source: string } => !!c?.openId?.trim());
+  const seen = new Set<string>();
+  const uniqueCandidates = candidates.filter(c => {
+    if (seen.has(c.openId)) return false;
+    seen.add(c.openId);
+    return true;
+  });
+  if (uniqueCandidates.length === 0) {
     return { item: 'direct_mention', status: 'unknown', detail: 'missing sender-scoped clone open_id' };
   }
   if (!target.senderSelfOpenId) {
     return { item: 'direct_mention', status: 'unknown', detail: 'missing sender self open_id for double-mention bootstrap' };
   }
-  const wakeId = `direct-${deps.nowId?.() ?? randomUUID()}`;
   const sendPost = deps.sendPost ?? ((content, uuid) => sendMessage(target.senderAppId, target.subgroupChatId, content, 'post', uuid));
   const ackSeen = deps.ackSeen ?? hasWakeAck;
   const sleepMs = deps.sleepMs ?? wait;
-  try {
-    await sendPost(buildDirectProbePost(target, wakeId), `clone-direct-${target.taskId}-${target.appId}-${wakeId}`.slice(0, 50));
-  } catch (err: any) {
-    return { item: 'direct_mention', status: 'unknown', detail: `send failed: ${err?.message ?? err}` };
+  const attempted: string[] = [];
+  for (const candidate of uniqueCandidates) {
+    const wakeId = `direct-${deps.nowId?.() ?? randomUUID()}`;
+    try {
+      await sendPost(
+        buildDirectProbePost(target, wakeId, candidate.openId),
+        `clone-direct-${target.taskId}-${target.appId}-${wakeId}`.slice(0, 50),
+      );
+      attempted.push(candidate.source);
+    } catch (err: any) {
+      attempted.push(`${candidate.source}:send_failed:${err?.message ?? err}`);
+      continue;
+    }
+    for (let i = 0; i < 8; i++) {
+      if (ackSeen(target.taskId, target.appId, wakeId)) {
+        return candidate.source === 'sender_scoped_cross_ref'
+          ? { item: 'direct_mention', status: 'pass' }
+          : { item: 'direct_mention', status: 'repaired', detail: `ack via ${candidate.source}` };
+      }
+      await sleepMs(1_000);
+    }
   }
-  for (let i = 0; i < 8; i++) {
-    if (ackSeen(target.taskId, target.appId, wakeId)) return { item: 'direct_mention', status: 'pass' };
-    await sleepMs(1_000);
-  }
-  return { item: 'direct_mention', status: 'blocked', detail: `no direct ack: ${wakeId}` };
+  return { item: 'direct_mention', status: 'blocked', detail: `no direct ack via candidates: ${attempted.join(', ')}` };
 }
 
 export async function runCloneIntegrityGate(
@@ -194,11 +230,20 @@ export async function runCloneIntegrityGate(
   checks.push(await checkDescription(target, deps));
   checks.push({ item: 'membership', status: 'pass' });
   checks.push(await checkAvatar(target, deps));
-  checks.push(await checkStrictScopes(target, deps));
+  const scopeCheck = await checkStrictScopes(target, deps);
+  checks.push(scopeCheck);
   checks.push(await checkDirectMention(target, deps));
   checks.push(deps.confirmUrgent
     ? await deps.confirmUrgent(target)
     : { item: 'urgent_summon', status: 'unknown', detail: 'urgent probe dependency not configured' });
+  if (scopeNeedsCapabilityProof(scopeCheck) && scopeCapabilitiesProved(checks)) {
+    const idx = checks.indexOf(scopeCheck);
+    checks[idx] = {
+      item: 'scope',
+      status: 'repaired',
+      detail: 'scope.list returned empty grant set; required clone capabilities proved by app info, membership, direct @, and urgent summon probes',
+    };
+  }
 
   return { ok: checks.every(c => c.status === 'pass' || c.status === 'repaired'), checks };
 }

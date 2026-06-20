@@ -28,6 +28,7 @@ import { addBotToChat, isInChat } from './groups-store.js';
 import { cloneBotInChat, renderQrPng } from './bot-clone-chat.js';
 import { cloneGrantScopes, buildAuthUrl, type CloneScopeProfile } from './clone-auth-link.js';
 import { ensureCloneScopesProvisioned } from './clone-scope-provisioning.js';
+import { bindOncall } from './oncall-store.js';
 import { activateBot } from './bot-activate.js';
 import { createSubtask, slug, djb2 } from './subtask-orchestrator.js';
 import { addBotToSubTask, enqueueCommand } from './subtask-store.js';
@@ -245,6 +246,11 @@ export async function ceoSpawn(req: CeoSpawnReq): Promise<EnsureSpawnOutcome> {
       const r0 = res[0];
       return r0?.ok ? { ok: true } : { ok: false, error: r0?.error ?? 'add_failed' };
     },
+    ensureCloneOncall: async (chatId, appId) => {
+      const workingDir = session.workingDir ?? getBot(appId).config.workingDir ?? getBot(ceoAppId).config.workingDir ?? '~';
+      const bind = await bindOncall(appId, chatId, workingDir);
+      return bind.ok ? { ok: true } : { ok: false, error: `oncall_bind_failed:${bind.reason}` };
+    },
     isInChat: (chatId, appId) => isInChat(appId, chatId), // clone's own token checks its membership
     ensureCloneScopesProvisioned: async ({ chatId, appId, displayName, role }) => {
       await ensureCloneScopesProvisioned({
@@ -280,6 +286,7 @@ export async function ceoSpawn(req: CeoSpawnReq): Promise<EnsureSpawnOutcome> {
       const cloneCfg = readBotsJsonOrEmpty(botsJsonPath).find((b: any) => b?.larkAppId === appId) as BotConfig | undefined;
       const sourceCfg = readBotsJsonOrEmpty(botsJsonPath).find((b: any) => b?.larkAppId === bentiAppId) as (BotConfig & { botDescription?: string }) | undefined;
       const cloneMentionOpenId = resolveSenderScopedCloneOpenId(config.session.dataDir, ceoAppId, subgroupChatId, displayName);
+      const cloneSelfOpenId = botReady(appId);
       return runCloneIntegrityGate({
         taskId,
         subgroupChatId,
@@ -291,6 +298,10 @@ export async function ceoSpawn(req: CeoSpawnReq): Promise<EnsureSpawnOutcome> {
           ?? trustedDescriptionOf(cloneCfg as (BotConfig & { botDescription?: string }) | undefined)
           ?? req.sourceDescription,
         cloneMentionOpenId,
+        cloneMentionCandidates: cloneMentionOpenId ? [] : [
+          cloneSelfOpenId ? { openId: cloneSelfOpenId, source: 'clone_self_open_id_probe' } : undefined,
+          { openId: appId, source: 'clone_app_id_probe' },
+        ].filter((c): c is { openId: string; source: string } => !!c?.openId),
         senderSelfOpenId: getBotOpenId(ceoAppId),
       }, {
         confirmUrgent: async (target) => {

@@ -1,0 +1,72 @@
+<title>Clone Integrity Gate E2E-2 Fix Review 1</title>
+
+<callout emoji="❌" background-color="light-red" border-color="red">
+  <p><b>结论：</b>打回。发现 1 个 P1：oncall bind 放在 <code>addBotToChat</code> 依赖内部，拉群成功但 bind 失败后，下一次重试会因为 clone 已在群内而跳过 bind，导致 urgent 修复不可恢复。</p>
+</callout>
+
+<h1>Review Target</h1>
+<table>
+  <tbody>
+    <tr><td>Reviewer</td><td>Codex 初号机</td></tr>
+    <tr><td>Date</td><td>2026-06-20</td></tr>
+    <tr><td>Input</td><td><code>/data00/home/zoujinsong.jason/work/Dbotmux_wt/clone-integrity-gate/docs/clone-integrity-gate-e2e2-fix-review-request.md</code></td></tr>
+  </tbody>
+</table>
+
+<h1>Conclusion</h1>
+<p>Blocked. I found one P1 issue in the oncall-bind retry path.</p>
+<p>The direct mention candidate probing and empty-scope capability repair are defensible because they still require real runtime proof before becoming green. The oncall bind fix, however, is not retry-safe after the clone has already been added to the subgroup.</p>
+
+<hr/>
+
+<h1>Findings</h1>
+<h2>P1 - Oncall bind can be skipped forever after add succeeds but bind fails</h2>
+<table>
+  <thead>
+    <tr><th background-color="light-gray">Area</th><th background-color="light-gray">Evidence</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Bind location</td><td><code>src/services/ceo-spawn-service.ts:244-250</code></td></tr>
+    <tr><td>Retry skip</td><td><code>src/services/ceo-clone-orchestration.ts:315-321</code></td></tr>
+  </tbody>
+</table>
+<p>The implementation performs <code>bindOncall()</code> inside the <code>addBotToChat</code> dependency. If <code>addBotToChat()</code> succeeds at Lark level but <code>bindOncall()</code> fails, the dependency returns <code>{ ok: false }</code> and the orchestration stays at phase <code>registered</code>.</p>
+<p>On the next retry, <code>ensureClonesAndSpawn()</code> skips <code>addBotToChat</code> when <code>isInChat()</code> is already true. Because the clone is now already in the chat, this branch is skipped, so <code>bindOncall()</code> is never retried. The state then advances to <code>in_chat</code>, and urgent summon can still fail because the subgroup was never bound oncall for the clone.</p>
+<p>This violates the review request's stated behavior: "If the oncall bind fails, keep the clone out of subtask registration/kickoff and return a retryable <code>awaiting_clone_join</code> failure." It is retryable in status only, not in effect.</p>
+
+<h2>Required Fix</h2>
+<ul>
+  <li>Make oncall binding an explicit idempotent step that runs even when the clone is already in the subgroup.</li>
+  <li>For example, add an <code>ensureCloneOncallBound(chatId, appId)</code> dependency and call it after membership is confirmed, before <code>pc.phase = 'in_chat'</code>.</li>
+  <li>Alternatively, have the <code>registered</code> phase call bind after the <code>isInChat</code> check regardless of whether <code>addBotToChat</code> was needed.</li>
+</ul>
+
+<h2>Required Regression Test</h2>
+<ol>
+  <li seq="auto">First pass: <code>isInChat=false</code>, <code>addBotToChat</code> succeeds, <code>bindOncall</code> fails, returns <code>awaiting_clone_join</code>.</li>
+  <li seq="auto">Second pass: <code>isInChat=true</code>.</li>
+  <li seq="auto">Expected: bind is attempted again and delivery remains blocked until bind succeeds.</li>
+</ol>
+
+<h1>Non-blocking Notes</h1>
+<ul>
+  <li>Direct mention candidate probing with <code>clone_self_open_id_probe</code> / <code>clone_app_id_probe</code> is acceptable only because a candidate is never trusted by itself; it becomes <code>repaired</code> only after clone-side direct ack.</li>
+  <li>Empty <code>scope.list</code> repairing to <code>repaired</code> is acceptable only for the narrow "empty grant set" case and only after name, avatar, description, membership, direct mention, and urgent summon are all green.</li>
+</ul>
+
+<h1>Verification Re-run</h1>
+<table>
+  <thead>
+    <tr><th background-color="light-gray">Command</th><th background-color="light-gray">Result</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>pnpm vitest run test/event-dispatcher.test.ts test/clone-app-preset.test.ts test/bot-clone.test.ts test/clone-integrity-gate.test.ts test/clone-mention-resolver.test.ts test/ceo-clone-orchestration.test.ts test/ceo-spawn-wiring.test.ts</code></td><td>7 test files passed; 239 tests passed</td></tr>
+    <tr><td><code>pnpm exec tsc --noEmit</code></td><td>passed</td></tr>
+    <tr><td><code>git diff --check</code></td><td>passed</td></tr>
+  </tbody>
+</table>
+
+<h1>Residual Risk</h1>
+<callout emoji="⚠️" background-color="light-yellow" border-color="yellow">
+  <p>This review remains code/test review only. The live full clone E2E still needs to be rerun after this P1 is fixed and after deployment/restart authorization.</p>
+</callout>

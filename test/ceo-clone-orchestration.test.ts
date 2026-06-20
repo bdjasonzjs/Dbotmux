@@ -11,7 +11,7 @@ const baseReq = (over: Partial<EnsureSpawnReq> = {}): EnsureSpawnReq => ({
 
 function deps(over: Partial<EnsureSpawnDeps> = {}): { d: EnsureSpawnDeps; calls: any; store: Map<string, CeoSpawnState> } {
   const store = new Map<string, CeoSpawnState>();
-  const calls = { spawn: 0, cloneInChat: 0, activate: 0, registerActivatedBot: 0, ensureCloneScopesProvisioned: 0, verifyCloneIntegrity: 0, isInChat: 0, addBotToChat: 0, addBotToSubTask: 0, lateKickoff: 0, preheat: 0, replies: [] as string[], order: [] as string[], lateKickoffArgs: [] as any[], preheatArgs: [] as any[], cloneArgs: [] as any[], scopeGateArgs: [] as any[], integrityArgs: [] as any[] };
+  const calls = { spawn: 0, cloneInChat: 0, activate: 0, registerActivatedBot: 0, ensureCloneScopesProvisioned: 0, ensureCloneOncall: 0, verifyCloneIntegrity: 0, isInChat: 0, addBotToChat: 0, addBotToSubTask: 0, lateKickoff: 0, preheat: 0, replies: [] as string[], order: [] as string[], lateKickoffArgs: [] as any[], preheatArgs: [] as any[], cloneArgs: [] as any[], scopeGateArgs: [] as any[], oncallArgs: [] as any[], integrityArgs: [] as any[] };
   const d: EnsureSpawnDeps = {
     getOwnerOpenId: () => OWNER,
     // default auto target = the claude 本体 (cli_main); pool has only the 本体 ready.
@@ -28,6 +28,7 @@ function deps(over: Partial<EnsureSpawnDeps> = {}): { d: EnsureSpawnDeps; calls:
     ensureCloneScopesProvisioned: async (a) => { calls.ensureCloneScopesProvisioned++; calls.order.push('scopeGate'); calls.scopeGateArgs.push(a); },
     isInChat: async () => { calls.isInChat++; calls.order.push('isInChat'); return false; },
     addBotToChat: async () => { calls.addBotToChat++; return { ok: true }; },
+    ensureCloneOncall: async (chatId, appId) => { calls.ensureCloneOncall++; calls.order.push('oncall'); calls.oncallArgs.push({ chatId, appId }); return { ok: true }; },
     addBotToSubTask: async () => { calls.addBotToSubTask++; },
     lateKickoff: async (a) => { calls.lateKickoff++; calls.lateKickoffArgs.push(a); },
     preheatConfirmOnline: async (t) => { calls.preheat++; calls.preheatArgs.push(t); return { ok: true, wakeId: 'wake_test', attempts: 1 }; },
@@ -129,6 +130,7 @@ describe('ensureClonesAndSpawn (subgroup-first #5)', () => {
     const out = await ensureClonesAndSpawn(baseReq(), d);
     expect(out.status).toBe('spawned');
     expect(calls.verifyCloneIntegrity).toBe(1);
+    expect(calls.ensureCloneOncall).toBe(1);
     expect(calls.preheat).toBe(0);
     expect(calls.addBotToSubTask).toBe(1);
     expect(calls.lateKickoff).toBe(1);
@@ -169,6 +171,7 @@ describe('ensureClonesAndSpawn (subgroup-first #5)', () => {
     const out = await ensureClonesAndSpawn(baseReq(), d);
     expect(out.status).toBe('awaiting_clone_join');
     expect(calls.verifyCloneIntegrity).toBe(1);
+    expect(calls.ensureCloneOncall).toBe(1);
     expect(calls.integrityArgs[0]).toMatchObject({ taskId: 'st_1', subgroupChatId: 'oc_sub', appId: 'cli_new', bentiAppId: 'cli_main' });
     expect(calls.addBotToSubTask).toBe(0);
     expect(calls.lateKickoff).toBe(0);
@@ -185,8 +188,41 @@ describe('ensureClonesAndSpawn (subgroup-first #5)', () => {
     const out = await ensureClonesAndSpawn(baseReq(), d);
     expect(out.status).toBe('awaiting_clone_join');
     expect(calls.addBotToChat).toBe(1);
+    expect(calls.ensureCloneOncall).toBe(0);
     expect(calls.addBotToSubTask).toBe(0); // 守点4: no store change before chat add succeeds
     expect(calls.lateKickoff).toBe(0);
+  });
+
+  it('oncall bind failure after chat join is retryable even when re-entry sees clone already in chat', async () => {
+    let activated = false;
+    let inChat = false;
+    let oncallAttempts = 0;
+    const { d, calls } = deps({
+      activationApproved: () => true,
+      activate: async () => { calls.activate++; activated = true; return { ok: true }; },
+      botOpenIdReady: (id) => (id === 'cli_main' ? 'ou_main' : (id === 'cli_new' && activated ? 'ou_new' : undefined)),
+      isInChat: async () => { calls.isInChat++; return inChat; },
+      addBotToChat: async () => { calls.addBotToChat++; inChat = true; return { ok: true }; },
+      ensureCloneOncall: async (chatId, appId) => {
+        calls.ensureCloneOncall++;
+        calls.oncallArgs.push({ chatId, appId });
+        oncallAttempts++;
+        return oncallAttempts === 1 ? { ok: false, error: 'lock_busy' } : { ok: true };
+      },
+    });
+
+    const first = await ensureClonesAndSpawn(baseReq(), d);
+    expect(first.status).toBe('awaiting_clone_join');
+    expect(calls.addBotToChat).toBe(1);
+    expect(calls.ensureCloneOncall).toBe(1);
+    expect(calls.verifyCloneIntegrity).toBe(0);
+
+    const second = await ensureClonesAndSpawn(baseReq(), d);
+    expect(second.status).toBe('spawned');
+    expect(calls.addBotToChat).toBe(1); // already in chat, so no duplicate invite
+    expect(calls.ensureCloneOncall).toBe(2); // but bind is retried
+    expect(calls.verifyCloneIntegrity).toBe(1);
+    expect(calls.addBotToSubTask).toBe(1);
   });
 
   it('Phase B scope gate fails before addBotToChat → awaiting_clone_join, no chat add/store/kickoff', async () => {
@@ -279,8 +315,8 @@ describe('ensureClonesAndSpawn (subgroup-first #5)', () => {
     expect(calls.addBotToSubTask).toBe(1); // clone still joined the subtask
   });
 
-  // round-3 追加 (hot-register): registerActivatedBot runs after activate, before isInChat.
-  it('round-3: registerActivatedBot runs AFTER activate and BEFORE isInChat', async () => {
+  // round-3 追加 (hot-register): registerActivatedBot runs after activate, before membership/oncall gates.
+  it('round-3: registerActivatedBot runs AFTER activate and BEFORE membership/oncall gates', async () => {
     let activated = false;
     const { d, calls } = deps({
       activationApproved: () => true,
@@ -289,7 +325,7 @@ describe('ensureClonesAndSpawn (subgroup-first #5)', () => {
     });
     const out = await ensureClonesAndSpawn(baseReq(), d);
     expect(out.status).toBe('spawned');
-    expect(calls.order).toEqual(['activate', 'register', 'scopeGate', 'isInChat']);
+    expect(calls.order).toEqual(['activate', 'register', 'scopeGate', 'isInChat', 'oncall']);
   });
 
   it('round-3: registerActivatedBot failure → awaiting_clone_join (retryable), never reaches isInChat', async () => {

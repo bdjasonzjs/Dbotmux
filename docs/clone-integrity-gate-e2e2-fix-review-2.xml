@@ -1,0 +1,67 @@
+<title>Clone Integrity Gate E2E-2 Fix Review 2</title>
+
+<callout emoji="✅" background-color="light-green" border-color="green">
+  <p><b>结论：</b>本轮 review 通过，未发现新的 P0/P1。Review-1 的 oncall bind 重试 P1 已闭合。</p>
+</callout>
+
+<h1>Review Target</h1>
+<table>
+  <tbody>
+    <tr><td>Reviewer</td><td>Codex 初号机</td></tr>
+    <tr><td>Date</td><td>2026-06-20</td></tr>
+    <tr><td>Input</td><td><code>/data00/home/zoujinsong.jason/work/Dbotmux_wt/clone-integrity-gate/docs/clone-integrity-gate-e2e2-fix-review-request.md</code></td></tr>
+  </tbody>
+</table>
+
+<h1>Conclusion</h1>
+<p>Pass for this review round. I did not find any new P0/P1 blocker.</p>
+<p>Review-1 P1 is closed: oncall binding is now an explicit orchestration gate after membership confirmation and before <code>phase='in_chat'</code>. It is retried even when re-entry sees the clone is already in the subgroup, so a previous "invite succeeded, bind failed" state no longer strands urgent-summon readiness.</p>
+
+<h1>Checked Items</h1>
+<ul>
+  <li><code>src/services/ceo-clone-orchestration.ts</code></li>
+  <li><code>src/services/ceo-spawn-service.ts</code></li>
+  <li><code>src/services/clone-integrity-gate.ts</code></li>
+  <li><code>test/ceo-clone-orchestration.test.ts</code></li>
+  <li><code>test/clone-integrity-gate.test.ts</code></li>
+</ul>
+
+<hr/>
+
+<h1>Findings</h1>
+<callout emoji="✅" background-color="light-green" border-color="green">
+  <p>No blocking findings.</p>
+</callout>
+
+<h2>Review-1 P1 Closure</h2>
+<p>The fix moved oncall binding out of <code>addBotToChat()</code> and into <code>EnsureSpawnDeps.ensureCloneOncall()</code>.</p>
+<ol>
+  <li seq="auto">ensure scope provisioning;</li>
+  <li seq="auto">ensure membership, adding the clone only when <code>isInChat()</code> is false;</li>
+  <li seq="auto">always call <code>ensureCloneOncall()</code>;</li>
+  <li seq="auto">only then persist <code>pc.phase = 'in_chat'</code>.</li>
+</ol>
+<p>The new regression test <code>oncall bind failure after chat join is retryable even when re-entry sees clone already in chat</code> covers the failure mode I raised: first run invite succeeds and bind fails; second run skips duplicate invite but retries bind; after bind succeeds, integrity/subtask/kickoff proceed.</p>
+
+<h2>Direct Mention Candidate Probing</h2>
+<p>Acceptable for this round. The candidate values (<code>clone_self_open_id_probe</code>, <code>clone_app_id_probe</code>) are not treated as proof by themselves. They only turn <code>direct_mention</code> green after the clone writes the real direct ack for that candidate probe.</p>
+
+<h2>Empty Scope Grant Repair</h2>
+<p>Acceptable for this round. The repair path is restricted to <code>scope.list returned empty grant set</code> and only flips to <code>repaired</code> after all runtime capabilities are green: membership, direct mention, urgent summon, name, avatar, and description. Scope API failures and missing non-empty grants with explicit missing scopes still do not fail open.</p>
+
+<h1>Verification Re-run</h1>
+<table>
+  <thead>
+    <tr><th background-color="light-gray">Command</th><th background-color="light-gray">Result</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>pnpm vitest run test/event-dispatcher.test.ts test/clone-app-preset.test.ts test/bot-clone.test.ts test/clone-integrity-gate.test.ts test/clone-mention-resolver.test.ts test/ceo-clone-orchestration.test.ts test/ceo-spawn-wiring.test.ts</code></td><td>7 test files passed; 240 tests passed</td></tr>
+    <tr><td><code>pnpm exec tsc --noEmit</code></td><td>passed</td></tr>
+    <tr><td><code>git diff --check</code></td><td>passed</td></tr>
+  </tbody>
+</table>
+
+<h1>Residual Risk</h1>
+<callout emoji="⚠️" background-color="light-yellow" border-color="yellow">
+  <p>This review is still code/test review only. The live full clone E2E still needs to be rerun after deployment/restart authorization, with proof for description, scope/capability repair, subgroup membership, direct @, urgent summon, name, avatar, and actual work execution.</p>
+</callout>
