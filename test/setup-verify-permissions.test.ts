@@ -27,6 +27,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 import * as sdk from '@larksuiteoapi/node-sdk';
 import {
   validateCredentials,
+  checkCriticalScopesByApplicationInfo,
   listGrantedTenantScopes,
   checkRequiredScopes,
   applyScopesUnverified,
@@ -140,6 +141,62 @@ describe('validateCredentials', () => {
 });
 
 describe('checkRequiredScopes (helper, not in main path)', () => {
+  it('checkCriticalScopesByApplicationInfo uses application/v6 app info scopes as runtime proof', async () => {
+    fetchMock
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ code: 0, tenant_access_token: 't-xxx', expire: 7200 }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          code: 0,
+          data: {
+            app: {
+              scopes: [
+                ...BOTMUX_REQUIRED_SCOPES.filter(s => s.critical).map(s => ({ scope: s.name })),
+                { scope: 'extra:scope' },
+              ],
+            },
+          },
+        }),
+      });
+    const r = await checkCriticalScopesByApplicationInfo('cli_x', 'sec', 'feishu');
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.missingCritical).toEqual([]);
+      expect(r.granted).toContain('im:message');
+    }
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      expect.stringContaining('/open-apis/application/v6/applications/cli_x?lang=zh_cn'),
+      expect.any(Object),
+    );
+  });
+
+  it('checkCriticalScopesByApplicationInfo fails closed on missing critical scopes', async () => {
+    fetchMock
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ code: 0, tenant_access_token: 't-xxx', expire: 7200 }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ code: 0, data: { app: { scopes: [{ scope: 'im:message' }] } } }),
+      });
+    const r = await checkCriticalScopesByApplicationInfo('cli_x', 'sec', 'feishu');
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error).toBe('missing_critical');
+      if (r.error === 'missing_critical') {
+        expect(r.missingCritical.some(s => s.name === 'im:resource')).toBe(true);
+      }
+    }
+  });
+
   it('listGrantedTenantScopes maps scope.list grant_status fixture into granted names', async () => {
     scopeListMock.mockResolvedValue({
       code: 0,

@@ -43,6 +43,75 @@ export type ActivateBotResult =
   | { ok: true; appName: string; botIndex: number }
   | { ok: false; error: 'not_in_bots_json' | 'not_a_clone' | 'pid_read_failed' | 'start_failed' | 'existing_daemon_restarted'; message: string };
 
+export interface RestartCloneBotDeps {
+  /** Restart only the clone PM2 app (default: real `pm2 restart <appName>`). */
+  restartApp?: (appName: string) => void;
+  /** Read live `{appName: pid}` (default: real pm2 jlist). */
+  readDaemonPids?: () => Record<string, number>;
+}
+
+export type RestartCloneBotResult =
+  | { ok: true; appName: string; botIndex: number; oldPid?: number; newPid?: number }
+  | { ok: false; error: 'not_in_bots_json' | 'not_a_clone' | 'pid_read_failed' | 'restart_failed' | 'existing_daemon_restarted' | 'target_not_restarted'; message: string };
+
+function resolveCloneApp(appId: string, paths: ActivateBotPaths): { ok: true; appName: string; botIndex: number } | Extract<RestartCloneBotResult, { ok: false }> {
+  const bots = readBotsJsonOrEmpty(paths.botsJsonPath);
+  const idx = bots.findIndex((b: any) => b?.larkAppId === appId);
+  if (idx < 0) {
+    return { ok: false, error: 'not_in_bots_json', message: `appId ${appId} not found in bots.json (clone first)` };
+  }
+  if (!bots[idx]?.claudeConfigDir) {
+    return { ok: false, error: 'not_a_clone', message: `bot ${appId} is not a clone (no claudeConfigDir); refusing to touch a non-clone daemon` };
+  }
+  return { ok: true, appName: botProcessName(bots[idx], idx, paths.ecosystem.pm2Name), botIndex: idx };
+}
+
+export async function restartCloneBot(
+  appId: string,
+  paths: ActivateBotPaths,
+  deps: RestartCloneBotDeps = {},
+): Promise<RestartCloneBotResult> {
+  const resolved = resolveCloneApp(appId, paths);
+  if (!resolved.ok) return resolved;
+  const pm2Opts = { pkgRoot: paths.ecosystem.pkgRoot, pm2Home: paths.pm2Home };
+  const restartApp = deps.restartApp ?? ((name) => runPm2(['restart', name], { ...pm2Opts, inherit: false }));
+  const readPids = deps.readDaemonPids ?? (() => pm2ListAppPids(pm2Opts));
+
+  let pidsBefore: Record<string, number>;
+  try {
+    pidsBefore = readPids();
+  } catch (err: any) {
+    return { ok: false, error: 'pid_read_failed', message: `cannot read pm2 pids before restart (aborting): ${err?.message ?? err}` };
+  }
+
+  try {
+    restartApp(resolved.appName);
+  } catch (err: any) {
+    return { ok: false, error: 'restart_failed', message: `pm2 restart ${resolved.appName} failed: ${err?.message ?? err}` };
+  }
+
+  let pidsAfter: Record<string, number>;
+  try {
+    pidsAfter = readPids();
+  } catch (err: any) {
+    return { ok: false, error: 'pid_read_failed', message: `cannot verify pids after restart (failing closed): ${err?.message ?? err}` };
+  }
+
+  const restarted = Object.keys(pidsBefore).filter(
+    name => name !== resolved.appName && pidsAfter[name] !== pidsBefore[name],
+  );
+  if (restarted.length > 0) {
+    return { ok: false, error: 'existing_daemon_restarted', message: `existing daemon(s) restarted (forbidden): ${restarted.join(', ')}` };
+  }
+  const oldPid = pidsBefore[resolved.appName];
+  const newPid = pidsAfter[resolved.appName];
+  if (oldPid !== undefined && newPid === oldPid) {
+    return { ok: false, error: 'target_not_restarted', message: `clone daemon ${resolved.appName} pid did not change` };
+  }
+
+  return { ok: true, appName: resolved.appName, botIndex: resolved.botIndex, oldPid, newPid };
+}
+
 export async function activateBot(
   appId: string,
   paths: ActivateBotPaths,

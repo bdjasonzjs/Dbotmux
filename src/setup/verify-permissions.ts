@@ -179,6 +179,106 @@ export type ScopeCheckResult =
       message: string;
     };
 
+export type CriticalScopeCheckResult =
+  | {
+      ok: true;
+      granted: string[];
+      missingCritical: [];
+      missingOptional: RequiredScope[];
+    }
+  | {
+      ok: false;
+      error: 'missing_critical';
+      granted: string[];
+      missingCritical: RequiredScope[];
+      missingOptional: RequiredScope[];
+      message: string;
+    }
+  | {
+      ok: false;
+      error: 'invalid_credentials' | 'network' | 'unknown' | 'need_self_manage';
+      message: string;
+    };
+
+function normalizeApplicationScopes(data: any): string[] {
+  const scopesRaw: any[] =
+    data?.data?.app?.scopes
+    ?? data?.data?.application?.scopes
+    ?? data?.data?.scopes
+    ?? [];
+  if (!Array.isArray(scopesRaw)) return [];
+  return scopesRaw
+    .map(s => typeof s === 'string' ? s : (s?.scope ?? s?.scope_name))
+    .filter((s): s is string => typeof s === 'string' && s.trim().length > 0);
+}
+
+/**
+ * Critical runtime-scope checker backed by application/v6 app info.
+ *
+ * `application.scope.list` has returned an empty grant set for freshly cloned
+ * apps in production even when the daemon's runtime capabilities are granted.
+ * This helper matches the daemon boot-time proof path: read application/v6 app
+ * info, extract declared/granted scopes from the app payload, then compare only
+ * the critical botmux runtime scopes.
+ */
+export async function checkCriticalScopesByApplicationInfo(
+  appId: string,
+  appSecret: string,
+  brand: Brand = 'feishu',
+  opts: { fetchImpl?: typeof fetch; budgetMs?: number } = {},
+): Promise<CriticalScopeCheckResult> {
+  const budgetMs = opts.budgetMs ?? 10_000;
+  const fetchImpl = opts.fetchImpl ?? fetch;
+  const credential = await validateCredentials(appId, appSecret, brand, { budgetMs });
+  if (!credential.ok) {
+    return { ok: false, error: credential.error, message: credential.message };
+  }
+  const host = brand === 'lark' ? 'open.larksuite.com' : 'open.feishu.cn';
+  let body: any;
+  try {
+    const res = await fetchImpl(
+      `https://${host}/open-apis/application/v6/applications/${encodeURIComponent(appId)}?lang=zh_cn`,
+      {
+        headers: { Authorization: `Bearer ${credential.tenantAccessToken}` },
+        signal: AbortSignal.timeout(budgetMs),
+      },
+    );
+    body = await res.json();
+  } catch (err: any) {
+    return { ok: false, error: 'network', message: `application/v6 app info 调用失败: ${err?.code ?? err?.message ?? 'unknown'}` };
+  }
+
+  if (body?.code === 99991672) {
+    return {
+      ok: false,
+      error: 'need_self_manage',
+      message: '应用缺少 application:application:self_manage 权限, 无法读取 application/v6 app info scopes',
+    };
+  }
+  if (body?.code !== 0) {
+    return { ok: false, error: 'unknown', message: `application/v6 app info failed: code=${body?.code ?? '?'} msg=${body?.msg ?? ''}` };
+  }
+
+  const granted = normalizeApplicationScopes(body);
+  if (granted.length === 0) {
+    return { ok: false, error: 'unknown', message: 'application/v6 app info scopes array empty or shape unexpected' };
+  }
+  const grantedSet = new Set(granted);
+  const missingCritical = BOTMUX_REQUIRED_SCOPES.filter(s => s.critical && !grantedSet.has(s.name));
+  const missingOptional = BOTMUX_REQUIRED_SCOPES.filter(s => !s.critical && !grantedSet.has(s.name));
+  if (missingCritical.length === 0) {
+    return { ok: true, granted, missingCritical: [], missingOptional };
+  }
+  return {
+    ok: false,
+    error: 'missing_critical',
+    granted,
+    missingCritical,
+    missingOptional,
+    message: missingCritical.map(s => `${s.name} (${s.desc})`).join('、'),
+  };
+}
+
 /**
  * 列出应用已生效的 tenant scopes.
  *

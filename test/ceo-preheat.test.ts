@@ -19,6 +19,7 @@ const TARGET: PreheatTarget = {
 function baseDeps(over: Partial<PreheatDeps> = {}): { d: PreheatDeps; sent: string[] } {
   const sent: string[] = [];
   const d: PreheatDeps = {
+    relayDeliveryReady: () => ({ ok: true }),
     sendOwnerSummon: async (_chat, text) => { sent.push(text); return { ok: true }; },
     sleep: async () => { /* no real delay in tests */ },
     genWakeId: () => 'wake1',
@@ -85,5 +86,16 @@ describe('preheatConfirmOnline', () => {
     const { d } = baseDeps({ sendOwnerSummon: async () => ({ ok: false, error: 'upsert failed' }), ackSeen: () => true });
     const res = await preheatConfirmOnline(d, TARGET);
     expect(res.ok).toBe(true); // 回执才是成功信号，send 失败不阻断
+  });
+
+  it('Base automation delivery shape 未验证时 fail-closed，不用 Base record/可见卡片代替 clone ack', async () => {
+    const { d, sent } = baseDeps({
+      relayDeliveryReady: () => ({ ok: false, error: 'automation still sends interactive card' }),
+    });
+    const res = await preheatConfirmOnline(d, TARGET);
+    expect(res.ok).toBe(false);
+    expect(res.attempts).toBe(0);
+    expect(res.error).toContain('interactive card');
+    expect(sent).toEqual([]);
   });
 });

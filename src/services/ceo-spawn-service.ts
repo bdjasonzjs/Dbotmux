@@ -29,7 +29,7 @@ import { cloneBotInChat, renderQrPng } from './bot-clone-chat.js';
 import { cloneGrantScopes, buildAuthUrl, type CloneScopeProfile } from './clone-auth-link.js';
 import { ensureCloneScopesProvisioned } from './clone-scope-provisioning.js';
 import { bindOncall } from './oncall-store.js';
-import { activateBot } from './bot-activate.js';
+import { activateBot, restartCloneBot } from './bot-activate.js';
 import { createSubtask, slug, djb2 } from './subtask-orchestrator.js';
 import { addBotToSubTask, enqueueCommand } from './subtask-store.js';
 import { writeRelayRecord } from './base-relay.js';
@@ -134,6 +134,20 @@ export async function ceoSpawn(req: CeoSpawnReq): Promise<EnsureSpawnOutcome> {
   } catch (err: any) {
     logger.warn(`[ceo-spawn] pm2 pid read failed (clones treated not-ready): ${err?.message ?? err}`);
   }
+  const readReadySnapshot = (): ReadySnapshot => {
+    let freshPids: Record<string, number> = {};
+    try {
+      freshPids = pm2ListAppPids({ pkgRoot: paths.pkgRoot, pm2Home: paths.pm2Home });
+    } catch (err: any) {
+      logger.warn(`[ceo-spawn] pm2 pid read failed (clones treated not-ready): ${err?.message ?? err}`);
+    }
+    return {
+      botsInfo: readBotsInfo(dataDir),
+      pidsByApp: freshPids,
+      bots: readBotsJsonOrEmpty(botsJsonPath),
+      pm2Name: paths.ecosystem.pm2Name,
+    };
+  };
   const snap: ReadySnapshot = {
     botsInfo: readBotsInfo(dataDir), pidsByApp,
     bots: readBotsJsonOrEmpty(botsJsonPath), pm2Name: paths.ecosystem.pm2Name,
@@ -142,6 +156,8 @@ export async function ceoSpawn(req: CeoSpawnReq): Promise<EnsureSpawnOutcome> {
     !!readBotsJsonOrEmpty(botsJsonPath).find((b: any) => b?.larkAppId === appId)?.claudeConfigDir;
   const botReady = (appId: string): string | undefined =>
     appId === ceoAppId ? (getBotOpenId(ceoAppId) ?? owner) : resolveReady(appId, snap);
+  const botReadyFresh = (appId: string): string | undefined =>
+    appId === ceoAppId ? (getBotOpenId(ceoAppId) ?? owner) : resolveReady(appId, readReadySnapshot());
 
   // ── Round-4 bot-agnostic resolvers (registry-driven, zero engine list) ──
   /** Clone-isolation tier from cliId's adapter (Round-4 coco): 'full'/'state-only'
@@ -283,28 +299,30 @@ export async function ceoSpawn(req: CeoSpawnReq): Promise<EnsureSpawnOutcome> {
       },
     }, target),
     verifyCloneIntegrity: async ({ taskId, subgroupChatId, appId, bentiAppId, displayName }) => {
-      const cloneCfg = readBotsJsonOrEmpty(botsJsonPath).find((b: any) => b?.larkAppId === appId) as BotConfig | undefined;
-      const sourceCfg = readBotsJsonOrEmpty(botsJsonPath).find((b: any) => b?.larkAppId === bentiAppId) as (BotConfig & { botDescription?: string }) | undefined;
-      const cloneMentionOpenId = resolveSenderScopedCloneOpenId(config.session.dataDir, ceoAppId, subgroupChatId, displayName);
-      const cloneSelfOpenId = botReady(appId);
-      return runCloneIntegrityGate({
-        taskId,
-        subgroupChatId,
-        senderAppId: ceoAppId,
-        appId,
-        appSecret: cloneCfg?.larkAppSecret ?? '',
-        displayName,
-        sourceDescription: trustedDescriptionOf(sourceCfg)
-          ?? trustedDescriptionOf(cloneCfg as (BotConfig & { botDescription?: string }) | undefined)
-          ?? req.sourceDescription,
-        cloneMentionOpenId,
-        cloneMentionCandidates: cloneMentionOpenId ? [] : [
-          cloneSelfOpenId ? { openId: cloneSelfOpenId, source: 'clone_self_open_id_probe' } : undefined,
-          { openId: appId, source: 'clone_app_id_probe' },
-        ].filter((c): c is { openId: string; source: string } => !!c?.openId),
-        senderSelfOpenId: getBotOpenId(ceoAppId),
-      }, {
-        confirmUrgent: async (target) => {
+      const runOnce = async () => {
+        const botsNow = readBotsJsonOrEmpty(botsJsonPath);
+        const cloneCfg = botsNow.find((b: any) => b?.larkAppId === appId) as BotConfig | undefined;
+        const sourceCfg = botsNow.find((b: any) => b?.larkAppId === bentiAppId) as (BotConfig & { botDescription?: string }) | undefined;
+        const cloneMentionOpenId = resolveSenderScopedCloneOpenId(config.session.dataDir, ceoAppId, subgroupChatId, displayName);
+        const cloneSelfOpenId = botReadyFresh(appId);
+        return runCloneIntegrityGate({
+          taskId,
+          subgroupChatId,
+          senderAppId: ceoAppId,
+          appId,
+          appSecret: cloneCfg?.larkAppSecret ?? '',
+          displayName,
+          sourceDescription: trustedDescriptionOf(sourceCfg)
+            ?? trustedDescriptionOf(cloneCfg as (BotConfig & { botDescription?: string }) | undefined)
+            ?? req.sourceDescription,
+          cloneMentionOpenId,
+          cloneMentionCandidates: [
+            cloneSelfOpenId ? { openId: cloneSelfOpenId, source: 'ready_real_open_id_probe' } : undefined,
+            { openId: appId, source: 'clone_app_id_probe' },
+          ].filter((c): c is { openId: string; source: string } => !!c?.openId),
+          senderSelfOpenId: getBotOpenId(ceoAppId),
+        }, {
+          confirmUrgent: async (target) => {
           if (!target.displayName) {
             return { item: 'urgent_summon', status: 'blocked' as const, detail: 'missing displayName for urgent summon' };
           }
@@ -316,9 +334,29 @@ export async function ceoSpawn(req: CeoSpawnReq): Promise<EnsureSpawnOutcome> {
           }, { ...target, displayName: target.displayName });
           return pre.ok
             ? { item: 'urgent_summon', status: 'pass' as const, detail: `ack after ${pre.elapsedMs ?? '?'}ms (${pre.wakeId})` }
-            : { item: 'urgent_summon', status: 'blocked' as const, detail: `no urgent ack after ${pre.attempts} attempts/${pre.elapsedMs ?? '?'}ms (${pre.wakeId}; records=${pre.recordIds?.join(',') || '-'})` };
-        },
-      });
+            : { item: 'urgent_summon', status: 'blocked' as const, detail: `${pre.error ? `${pre.error}; ` : ''}no urgent ack after ${pre.attempts} attempts/${pre.elapsedMs ?? '?'}ms (${pre.wakeId}; records=${pre.recordIds?.join(',') || '-'})` };
+          },
+        });
+      };
+      const first = await runOnce();
+      const direct = first.checks.find(c => c.item === 'direct_mention');
+      if (direct?.status !== 'blocked') return first;
+      const restart = await restartCloneBot(appId, { ecosystem: paths.ecosystem, pm2Home: paths.pm2Home, botsJsonPath });
+      if (!restart.ok) {
+        logger.warn(`[ceo-spawn] clone deafness remediation restart failed for ${appId}: ${restart.error} ${restart.message}`);
+        return {
+          ok: false,
+          checks: first.checks.map(c => c.item === 'direct_mention'
+            ? { ...c, detail: `${c.detail ?? ''}; clone restart remediation failed: ${restart.error}:${restart.message}` }
+            : c),
+        };
+      }
+      logger.info(`[ceo-spawn] clone deafness remediation restarted ${restart.appName} for ${appId} (pid ${restart.oldPid ?? '-'} -> ${restart.newPid ?? '-'})`);
+      const reg = await hotRegisterClone(appId, { loadBotConfigs, registerBot });
+      if (!reg.ok) {
+        logger.warn(`[ceo-spawn] hot register after clone restart failed for ${appId}: ${reg.error ?? 'unknown'}`);
+      }
+      return runOnce();
     },
     getState: getCeoSpawnState,
     putState: putCeoSpawnState,

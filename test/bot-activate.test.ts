@@ -2,7 +2,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { activateBot, type ActivateBotDeps, type ActivateBotPaths } from '../src/services/bot-activate.js';
+import { activateBot, restartCloneBot, type ActivateBotDeps, type ActivateBotPaths } from '../src/services/bot-activate.js';
 import type { EcosystemPaths } from '../src/core/pm2-ecosystem.js';
 
 const tmps: string[] = [];
@@ -144,5 +144,59 @@ describe('activateBot', () => {
     const appNames = eco.apps.map((a: any) => a.name);
     expect(appNames).not.toContain('botmux-claude-clone');
     expect(appNames).toContain('botmux-0'); // 本体 still there
+  });
+});
+
+describe('restartCloneBot', () => {
+  it('restarts only the clone daemon and leaves other pids unchanged', async () => {
+    const { paths } = setup();
+    const restarted: string[] = [];
+    let calls = 0;
+    const res = await restartCloneBot('cli_clone', paths, {
+      restartApp: (name) => { restarted.push(name); },
+      readDaemonPids: () => {
+        calls += 1;
+        return {
+          'botmux-0': 100,
+          'botmux-claude-clone': calls === 1 ? 201 : 301,
+        };
+      },
+    });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(restarted).toEqual(['botmux-claude-clone']);
+    expect(res.oldPid).toBe(201);
+    expect(res.newPid).toBe(301);
+  });
+
+  it('refuses to restart a non-clone daemon', async () => {
+    const { paths } = setup();
+    let touched = false;
+    const res = await restartCloneBot('cli_main', paths, {
+      restartApp: () => { touched = true; },
+      readDaemonPids: () => { touched = true; return {}; },
+    });
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+    expect(res.error).toBe('not_a_clone');
+    expect(touched).toBe(false);
+  });
+
+  it('fails closed if any existing daemon pid changes during clone restart', async () => {
+    const { paths } = setup();
+    let calls = 0;
+    const res = await restartCloneBot('cli_clone', paths, {
+      restartApp: () => { /* restart target */ },
+      readDaemonPids: () => {
+        calls += 1;
+        return {
+          'botmux-0': calls === 1 ? 100 : 999,
+          'botmux-claude-clone': calls === 1 ? 201 : 301,
+        };
+      },
+    });
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+    expect(res.error).toBe('existing_daemon_restarted');
   });
 });

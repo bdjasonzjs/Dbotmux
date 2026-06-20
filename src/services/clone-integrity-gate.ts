@@ -1,7 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import { CLONE_CORE_SCOPES, buildAuthUrl } from './clone-auth-link.js';
 import { hasWakeAck } from './subtask-store.js';
-import { listGrantedTenantScopes } from '../setup/verify-permissions.js';
+import {
+  checkCriticalScopesByApplicationInfo,
+  listGrantedTenantScopes,
+  type CriticalScopeCheckResult,
+} from '../setup/verify-permissions.js';
 import { sendMessage } from '../im/lark/client.js';
 
 export type IntegrityItem = 'scope' | 'membership' | 'direct_mention' | 'urgent_summon' | 'name' | 'avatar' | 'description';
@@ -32,6 +36,7 @@ export interface CloneIntegrityTarget {
 }
 
 export interface CloneIntegrityGateDeps {
+  checkCriticalScopes?: (appId: string, appSecret: string) => Promise<CriticalScopeCheckResult>;
   listScopes?: (appId: string, appSecret: string) => ReturnType<typeof listGrantedTenantScopes>;
   fetchBotInfo?: (appId: string, appSecret: string) => Promise<{ avatarUrl?: string; name?: string; description?: string } | null>;
   sendPost?: (content: string, uuid: string) => Promise<string>;
@@ -49,34 +54,31 @@ async function checkStrictScopes(
   target: CloneIntegrityTarget,
   deps: CloneIntegrityGateDeps,
 ): Promise<CloneIntegrityCheck> {
+  const checkCriticalScopes = deps.checkCriticalScopes
+    ?? ((appId, appSecret) => checkCriticalScopesByApplicationInfo(appId, appSecret, 'feishu'));
+  const critical = await checkCriticalScopes(target.appId, target.appSecret);
+  if (critical.ok) {
+    return { item: 'scope', status: 'pass', detail: `critical scopes granted via application/v6 (${critical.granted.length} app scopes)` };
+  }
+  if (critical.error === 'missing_critical') {
+    const missing = critical.missingCritical.map(s => s.name);
+    return { item: 'scope', status: 'blocked', detail: `missing critical: ${missing.join(', ')}; auth=${buildAuthUrl(target.appId, missing)}` };
+  }
+
   const listScopes = deps.listScopes ?? ((appId, appSecret) => listGrantedTenantScopes(appId, appSecret, 'feishu'));
   const result = await listScopes(target.appId, target.appSecret);
   if (!result.ok) {
-    return { item: 'scope', status: 'unknown', detail: result.message };
+    return { item: 'scope', status: 'unknown', detail: `application/v6 critical scope check inconclusive: ${critical.message}; scope.list failed: ${result.message}` };
   }
   if (result.granted.length === 0) {
-    return { item: 'scope', status: 'unknown', detail: 'scope list returned empty grant set' };
+    return { item: 'scope', status: 'unknown', detail: `application/v6 critical scope check inconclusive: ${critical.message}; scope.list returned empty grant set` };
   }
   const granted = new Set(result.granted);
   const missing = CLONE_CORE_SCOPES.filter(s => !granted.has(s));
   if (missing.length > 0) {
     return { item: 'scope', status: 'blocked', detail: `missing: ${missing.join(', ')}; auth=${buildAuthUrl(target.appId, missing)}` };
   }
-  return { item: 'scope', status: 'pass' };
-}
-
-function scopeNeedsCapabilityProof(check: CloneIntegrityCheck): boolean {
-  return check.item === 'scope'
-    && check.status === 'unknown'
-    && check.detail === 'scope list returned empty grant set';
-}
-
-function scopeCapabilitiesProved(checks: CloneIntegrityCheck[]): boolean {
-  const mustBeGreen: IntegrityItem[] = ['membership', 'direct_mention', 'urgent_summon', 'name', 'avatar', 'description'];
-  return mustBeGreen.every(item => {
-    const check = checks.find(c => c.item === item);
-    return check?.status === 'pass' || check?.status === 'repaired';
-  });
+  return { item: 'scope', status: 'pass', detail: 'scope.list returned all clone core scopes after application/v6 was inconclusive' };
 }
 
 async function fetchTenantToken(appId: string, appSecret: string): Promise<string | undefined> {
@@ -207,7 +209,7 @@ async function checkDirectMention(
       attempted.push(`${candidate.source}:send_failed:${err?.message ?? err}`);
       continue;
     }
-    for (let i = 0; i < 8; i++) {
+    for (let i = 0; i < 30; i++) {
       if (ackSeen(target.taskId, target.appId, wakeId)) {
         return candidate.source === 'sender_scoped_cross_ref'
           ? { item: 'direct_mention', status: 'pass' }
@@ -236,14 +238,6 @@ export async function runCloneIntegrityGate(
   checks.push(deps.confirmUrgent
     ? await deps.confirmUrgent(target)
     : { item: 'urgent_summon', status: 'unknown', detail: 'urgent probe dependency not configured' });
-  if (scopeNeedsCapabilityProof(scopeCheck) && scopeCapabilitiesProved(checks)) {
-    const idx = checks.indexOf(scopeCheck);
-    checks[idx] = {
-      item: 'scope',
-      status: 'repaired',
-      detail: 'scope.list returned empty grant set; required clone capabilities proved by app info, membership, direct @, and urgent summon probes',
-    };
-  }
 
   return { ok: checks.every(c => c.status === 'pass' || c.status === 'repaired'), checks };
 }

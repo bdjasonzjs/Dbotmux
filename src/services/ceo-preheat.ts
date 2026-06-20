@@ -39,6 +39,10 @@ export const PREHEAT_ATTEMPT_WINDOW_MS = 60_000;
 export const PREHEAT_POLL_INTERVAL_MS = 1_000;
 
 export interface PreheatDeps {
+  /** Fail-closed precondition: urgent relay automation must deliver a real event
+   * to the clone, not merely create a Base record or visible card. Production
+   * defaults to an explicit env gate; tests may inject ok. */
+  relayDeliveryReady?: () => { ok: true } | { ok: false; error: string };
   /** 以 owner 身份发一条**新 record** 的 summon 到子群（直发，绝不复用 existingRecordId）。 */
   sendOwnerSummon: (chatId: string, text: string) => Promise<{ ok: boolean; recordId?: string; error?: string }>;
   /** 可注入：sleep（测试用假实现）。 */
@@ -58,6 +62,15 @@ export interface PreheatTarget {
 
 const realSleep = (ms: number): Promise<void> => new Promise(r => setTimeout(r, ms));
 
+function defaultRelayDeliveryReady(): { ok: true } | { ok: false; error: string } {
+  const mode = process.env.BOTMUX_URGENT_RELAY_DELIVERY_MODE;
+  if (mode === 'clone_event_text_mention') return { ok: true };
+  return {
+    ok: false,
+    error: 'urgent relay Base automation delivery mode is not verified as clone_event_text_mention; Base record/visible card is not a clone wake-ack',
+  };
+}
+
 /** 拼一条预热 summon：`急急如律令：【displayName】<benign 正文> [[wake-ack:taskId:wakeId]]（预热#N·nonce）`。
  *  - wake 令牌嵌正文，命中后由分身 daemon 剥掉再喂 CLI（不进模型上下文）。
  *  - attempt + nonce 进文案，保证每次重发**内容不同** → Base 自动化/飞书不按同内容误 dedup。 */
@@ -69,13 +82,18 @@ export function buildPreheatSummon(displayName: string, taskId: string, wakeId: 
  * 对一个新激活分身做有界预热握手。收到回执 → {ok:true}；耗尽 → {ok:false, wakeId, attempts}。
  * 不抛（发送失败也按「本 attempt 没醒」继续重试），由编排层据返回值决定 askforhelp。
  */
-export async function preheatConfirmOnline(deps: PreheatDeps, target: PreheatTarget): Promise<{ ok: boolean; wakeId: string; attempts: number; elapsedMs?: number; recordIds?: string[] }> {
+export async function preheatConfirmOnline(deps: PreheatDeps, target: PreheatTarget): Promise<{ ok: boolean; wakeId: string; attempts: number; elapsedMs?: number; recordIds?: string[]; error?: string }> {
   const sleep = deps.sleep ?? realSleep;
   const ackSeen = deps.ackSeen ?? hasWakeAck;
   const wakeId = (deps.genWakeId ?? (() => randomUUID().slice(0, 8)))();
   const { taskId, subgroupChatId, appId, displayName } = target;
   const startedAt = Date.now();
   const recordIds: string[] = [];
+  const relayReady = (deps.relayDeliveryReady ?? defaultRelayDeliveryReady)();
+  if (!relayReady.ok) {
+    logger.warn(`[ceo-preheat] urgent relay precondition failed (task=${taskId} app=${appId} wake=${wakeId}): ${relayReady.error}`);
+    return { ok: false, wakeId, attempts: 0, elapsedMs: Date.now() - startedAt, recordIds, error: relayReady.error };
+  }
 
   for (let attempt = 1; attempt <= PREHEAT_MAX_ATTEMPTS; attempt++) {
     const nonce = randomUUID().slice(0, 6);
