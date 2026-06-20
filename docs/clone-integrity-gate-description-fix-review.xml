@@ -1,0 +1,95 @@
+<title>克隆完整性门禁：描述复制 E2E 打回修复说明</title>
+
+<callout emoji="✅" background-color="light-green" border-color="green">
+  <p><b>结论：</b>已修复 E2E 暴露的“新克隆仍无描述”问题。描述来源改为 clone 时读取飞书应用信息 API；完整性门禁现在会读取 clone 自身应用描述，描述缺失或读取失败均阻断交付。</p>
+</callout>
+
+<h1>背景</h1>
+
+<p>真实 E2E 在部署后的修复代码上克隆全新 bot，发现新克隆仍无描述。根因是实现只从源 bot 的 bots.json <code>description</code> 字段取描述，而克劳德本体 bots.json 没有该字段；实际描述只存在飞书开放平台应用配置里。</p>
+
+<h1>OpenAPI 定位</h1>
+
+<table>
+  <thead>
+    <tr>
+      <th background-color="light-gray">接口</th>
+      <th background-color="light-gray">用途</th>
+      <th background-color="light-gray">关键字段</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>GET /open-apis/bot/v3/info</code></td>
+      <td>保留用于读取机器人头像、名称、open_id。</td>
+      <td>不返回描述。</td>
+    </tr>
+    <tr>
+      <td><code>GET /open-apis/application/v6/applications/:app_id?lang=zh_cn</code></td>
+      <td>新增用于读取源应用和 clone 应用的应用描述。</td>
+      <td><code>data.app.description</code>，兜底 <code>data.app.i18n[].description</code>。</td>
+    </tr>
+  </tbody>
+</table>
+
+<h1>代码改动</h1>
+
+<table>
+  <thead>
+    <tr>
+      <th background-color="light-gray">文件</th>
+      <th background-color="light-gray">改动</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>src/services/clone-app-preset.ts</code></td>
+      <td>新增 <code>fetchSourceAppDescription</code>，用 source app 的 tenant token 调 application v6 app info，fail-soft 返回 description 或 undefined；继续保留 avatar 的 <code>/bot/v3/info</code> 路径。</td>
+    </tr>
+    <tr>
+      <td><code>src/services/bot-clone.ts</code></td>
+      <td>clone 构建 appPreset 前优先使用显式 <code>sourceDescription</code>，否则从飞书 source app 读取描述；读取到的描述写入 <code>appPreset.desc</code>，并落到 clone config 的 <code>description</code> 供后续门禁使用。</td>
+    </tr>
+    <tr>
+      <td><code>src/services/clone-integrity-gate.ts</code></td>
+      <td>门禁 description 项不再只看“预期描述存在”，而是读取 clone 自身 application v6 app info：source description 缺失、clone description 读取失败或为空，都判 blocked。</td>
+    </tr>
+    <tr>
+      <td><code>src/services/ceo-spawn-service.ts</code></td>
+      <td>完整性门禁的 sourceDescription 来源增加 clone config description，避免 source bots.json 没字段时丢失 clone 阶段已读取到的飞书描述。</td>
+    </tr>
+    <tr>
+      <td><code>test/clone-app-preset.test.ts</code> / <code>test/bot-clone.test.ts</code> / <code>test/clone-integrity-gate.test.ts</code></td>
+      <td>补充 description API 读取、i18n fallback、fail-soft、appPreset.desc、clone config description、clone description 缺失阻断等覆盖。</td>
+    </tr>
+  </tbody>
+</table>
+
+<h1>门禁行为</h1>
+
+<callout emoji="⚠️" background-color="light-yellow" border-color="yellow">
+  <p><b>关键约束：</b>描述项现在必须同时满足“源描述已被可信读取/传入”和“clone 应用信息可读且 description 非空”。任一不满足，<code>runCloneIntegrityGate</code> 返回 <code>ok=false</code>，编排层不得交付。</p>
+</callout>
+
+<ul>
+  <li>source app 描述读取失败：clone 创建阶段 fail-soft，但门禁 description blocked。</li>
+  <li>clone app 描述读取失败：description blocked。</li>
+  <li>clone app description 为空：description blocked。</li>
+  <li>description API 失败不会污染 avatar 判断；avatar 仍由 <code>/bot/v3/info</code> 独立证明。</li>
+</ul>
+
+<h1>验证</h1>
+
+<checkbox done="true">Focused vitest：7 files / 236 tests passed。</checkbox>
+<checkbox done="true"><code>pnpm exec tsc --noEmit</code> passed。</checkbox>
+<checkbox done="true"><code>git diff --check</code> passed。</checkbox>
+<checkbox done="false">真实 E2E 未由子任务自行执行；需 CEO 部署后重新克隆全新 bot 验证 7 项门禁全绿。</checkbox>
+
+<h1>红线状态</h1>
+
+<ul>
+  <li>未 commit。</li>
+  <li>未 push。</li>
+  <li>未部署。</li>
+  <li>未重启 botmux。</li>
+</ul>

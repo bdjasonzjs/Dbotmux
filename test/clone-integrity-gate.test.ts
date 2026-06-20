@@ -18,7 +18,7 @@ describe('runCloneIntegrityGate', () => {
   it('treats unverifiable scope as unknown and blocks delivery', async () => {
     const report = await runCloneIntegrityGate(target, {
       listScopes: async () => ({ ok: false, error: 'network', message: 'timeout' }),
-      fetchBotInfo: async () => ({ avatarUrl: 'https://x/a.png' }),
+      fetchBotInfo: async () => ({ avatarUrl: 'https://x/a.png', description: 'clone desc' }),
       sendPost: async () => 'om_1',
       ackSeen: () => true,
       sleepMs: async () => {},
@@ -32,7 +32,7 @@ describe('runCloneIntegrityGate', () => {
     let sent = '';
     const report = await runCloneIntegrityGate(target, {
       listScopes: async () => ({ ok: true, granted: [...CLONE_CORE_SCOPES] }),
-      fetchBotInfo: async () => ({ avatarUrl: 'https://x/a.png' }),
+      fetchBotInfo: async () => ({ avatarUrl: 'https://x/a.png', description: 'clone desc' }),
       sendPost: async (content) => { sent = content; return 'om_1'; },
       ackSeen: (_taskId, _appId, wakeId) => wakeId.startsWith('direct-fixed'),
       sleepMs: async () => {},
@@ -52,7 +52,7 @@ describe('runCloneIntegrityGate', () => {
   it('marks missing sender-scoped clone open_id as unknown instead of guessing', async () => {
     const report = await runCloneIntegrityGate({ ...target, cloneMentionOpenId: undefined }, {
       listScopes: async () => ({ ok: true, granted: [...CLONE_CORE_SCOPES] }),
-      fetchBotInfo: async () => ({ avatarUrl: 'https://x/a.png' }),
+      fetchBotInfo: async () => ({ avatarUrl: 'https://x/a.png', description: 'clone desc' }),
       sleepMs: async () => {},
       confirmUrgent: async () => ({ item: 'urgent_summon', status: 'pass' }),
     });
@@ -63,7 +63,20 @@ describe('runCloneIntegrityGate', () => {
   it('marks missing trusted description as blocked', async () => {
     const report = await runCloneIntegrityGate({ ...target, sourceDescription: undefined }, {
       listScopes: async () => ({ ok: true, granted: [...CLONE_CORE_SCOPES] }),
-      fetchBotInfo: async () => ({ avatarUrl: 'https://x/a.png' }),
+      fetchBotInfo: async () => ({ avatarUrl: 'https://x/a.png', description: 'clone desc' }),
+      sendPost: async () => 'om_1',
+      ackSeen: () => true,
+      sleepMs: async () => {},
+      confirmUrgent: async () => ({ item: 'urgent_summon', status: 'pass' }),
+    });
+    expect(report.ok).toBe(false);
+    expect(report.checks.find(c => c.item === 'description')).toMatchObject({ status: 'blocked' });
+  });
+
+  it('blocks when clone app description cannot be read or is empty', async () => {
+    const report = await runCloneIntegrityGate(target, {
+      listScopes: async () => ({ ok: true, granted: [...CLONE_CORE_SCOPES] }),
+      fetchBotInfo: async () => ({ avatarUrl: 'https://x/a.png', description: '' }),
       sendPost: async () => 'om_1',
       ackSeen: () => true,
       sleepMs: async () => {},

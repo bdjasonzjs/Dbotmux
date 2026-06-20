@@ -28,7 +28,7 @@ import type { BotConfig } from '../bot-registry.js';
 import { botProcessName, normalizeBotProcessName, normalizeBotConfig } from '../setup/bot-config-editor.js';
 import { readBotsJsonOrEmpty, writeBotsJsonAtomic } from '../setup/bots-store.js';
 import { tryRegisterApp, type RegisterAppOptions, type RegisterAppResult } from '../setup/register-app.js';
-import { fetchSourceBotAvatar, buildClonePreset } from './clone-app-preset.js';
+import { fetchSourceAppDescription, fetchSourceBotAvatar, buildClonePreset } from './clone-app-preset.js';
 import { validateCloneName } from './clone-name.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliId, CloneHomeSpec } from '../adapters/cli/types.js';
@@ -174,6 +174,9 @@ export interface BuildCloneConfigOpts {
   displayName?: string;
   /** Source 本体's base display name, stored for sibling counting. */
   clonedFromName?: string;
+  /** Trusted source app description copied into Feishu appPreset.desc and the
+   *  clone's local config for later integrity verification. */
+  description?: string;
   /** Clone home dir name (from the engine's CloneHomeSpec, e.g. '.claude' / '.codex').
    *  Defaults to '.claude' for byte-equivalence with pre-Round-4 claude clones. */
   homeDirName?: string;
@@ -206,6 +209,7 @@ export function buildCloneConfig(
   // (source display name was available) — absence → falls back to botName.
   if (opts.displayName) clone.displayName = opts.displayName;
   if (opts.clonedFromName) clone.clonedFromName = opts.clonedFromName;
+  if (opts.description?.trim()) clone.description = opts.description.trim();
 
   // Copied (persona / behaviour / owner) — only when present on the source.
   if (sourceBot.cliPathOverride) clone.cliPathOverride = sourceBot.cliPathOverride;
@@ -350,6 +354,9 @@ export interface CloneBotDeps {
   /** Injectable source-bot avatar fetch (块7 #2). Defaults to fetchSourceBotAvatar
    *  (/bot/v3/info, fail-soft). Lets tests avoid the network. */
   fetchSourceAvatar?: (appId: string, appSecret: string) => Promise<string | undefined>;
+  /** Injectable source app description fetch. Defaults to application v6 app
+   *  metadata; fail-soft in clone creation, fail-closed in integrity gate. */
+  fetchSourceDescription?: (appId: string, appSecret: string) => Promise<string | undefined>;
 }
 
 /**
@@ -395,12 +402,21 @@ export async function cloneBot(input: CloneBotInput, deps: CloneBotDeps = {}): P
   }
   const registerApp = deps.registerApp ?? tryRegisterApp;
   const fetchAvatar = deps.fetchSourceAvatar ?? fetchSourceBotAvatar;
+  const fetchDescription = deps.fetchSourceDescription ?? fetchSourceAppDescription;
   // Build clone-count entries from a bots.json snapshot, enriched with bots-info
   // botName (legacy-count supplement, round-3 #2). isClone = has claudeConfigDir.
   const toCountEntries = (bots: any[]) => bots.map(b => ({
     clonedFromName: b?.clonedFromName, displayName: b?.displayName,
     botName: input.botNamesByAppId?.[b?.larkAppId], isClone: !!b?.claudeConfigDir,
   }));
+
+  let sourceDescription: string | undefined;
+  async function resolveSourceDescription(): Promise<string | undefined> {
+    if (sourceDescription !== undefined) return sourceDescription;
+    sourceDescription = input.sourceDescription?.trim()
+      || await fetchDescription(input.sourceBot.larkAppId, input.sourceBot.larkAppSecret);
+    return sourceDescription;
+  }
 
   // #2: appPreset must be passed INTO the scan (registerApp pre-fills the new
   // app's name/avatar), so it's computed from a PRE-scan snapshot. This snapshot
@@ -411,12 +427,14 @@ export async function cloneBot(input: CloneBotInput, deps: CloneBotDeps = {}): P
   if (cloneName) {
     // 块8: custom name pre-fills the app name directly — independent of
     // sourceDisplayName (蔻黛 B2: no dependency on the 本体 display name).
+    const desc = await resolveSourceDescription();
     const avatar = await fetchAvatar(input.sourceBot.larkAppId, input.sourceBot.larkAppSecret);
-    appPreset = buildClonePreset(cloneName, avatar, input.sourceDescription);
+    appPreset = buildClonePreset(cloneName, avatar, desc);
   } else if (input.sourceDisplayName) {
     const preNaming = resolveCloneNaming(input.sourceDisplayName, toCountEntries(readBotsJsonOrEmpty(input.botsJsonPath)));
+    const desc = await resolveSourceDescription();
     const avatar = await fetchAvatar(input.sourceBot.larkAppId, input.sourceBot.larkAppSecret);
-    appPreset = buildClonePreset(preNaming.displayName, avatar, input.sourceDescription);
+    appPreset = buildClonePreset(preNaming.displayName, avatar, desc);
   }
 
   const scan = await registerApp(appPreset ? { appPreset } : {});
@@ -451,7 +469,7 @@ export async function cloneBot(input: CloneBotInput, deps: CloneBotDeps = {}): P
   const clone = buildCloneConfig(
     input.sourceBot,
     { appId: scan.appId, appSecret: scan.appSecret, userOpenId: scan.userOpenId },
-    { slug, configDir: input.configDir, displayName: naming?.displayName, clonedFromName: naming?.clonedFromName, homeDirName: cloneHomeSpec.dirName },
+    { slug, configDir: input.configDir, displayName: naming?.displayName, clonedFromName: naming?.clonedFromName, description: sourceDescription, homeDirName: cloneHomeSpec.dirName },
   );
   const claudeConfigDir = clone.claudeConfigDir!;
 

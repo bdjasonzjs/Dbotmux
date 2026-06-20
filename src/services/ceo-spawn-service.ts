@@ -287,7 +287,9 @@ export async function ceoSpawn(req: CeoSpawnReq): Promise<EnsureSpawnOutcome> {
         appId,
         appSecret: cloneCfg?.larkAppSecret ?? '',
         displayName,
-        sourceDescription: trustedDescriptionOf(sourceCfg) ?? req.sourceDescription,
+        sourceDescription: trustedDescriptionOf(sourceCfg)
+          ?? trustedDescriptionOf(cloneCfg as (BotConfig & { botDescription?: string }) | undefined)
+          ?? req.sourceDescription,
         cloneMentionOpenId,
         senderSelfOpenId: getBotOpenId(ceoAppId),
       }, {

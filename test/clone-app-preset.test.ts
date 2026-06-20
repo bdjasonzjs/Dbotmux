@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { buildClonePreset, fetchSourceBotAvatar } from '../src/services/clone-app-preset.js';
+import { buildClonePreset, fetchSourceAppDescription, fetchSourceBotAvatar } from '../src/services/clone-app-preset.js';
 
 describe('buildClonePreset (块7 #2 守点4)', () => {
   it('name always set; desc omitted when no trusted source description is provided', () => {
@@ -62,5 +62,46 @@ describe('fetchSourceBotAvatar (fail-soft, 守点5)', () => {
     await fetchSourceBotAvatar('cli', 'sec', f as any);
     expect(f.mock.calls[0][1].signal).toBeInstanceOf(AbortSignal);
     expect(f.mock.calls[1][1].signal).toBeInstanceOf(AbortSignal);
+  });
+});
+
+describe('fetchSourceAppDescription (application/v6, fail-soft)', () => {
+  const jsonRes = (body: any) => ({ json: async () => body }) as any;
+  function fetchSeq(...responses: any[]): any {
+    let i = 0;
+    return vi.fn(async () => responses[i++]);
+  }
+
+  it('returns data.app.description from application v6 app info', async () => {
+    const f = fetchSeq(
+      jsonRes({ code: 0, tenant_access_token: 't' }),
+      jsonRes({ code: 0, data: { app: { description: ' 源应用描述 ' } } }),
+    );
+    expect(await fetchSourceAppDescription('cli_source', 'sec', f)).toBe('源应用描述');
+    expect(f.mock.calls[1][0]).toContain('/open-apis/application/v6/applications/cli_source?lang=zh_cn');
+  });
+
+  it('falls back to zh_cn i18n description', async () => {
+    const f = fetchSeq(
+      jsonRes({ code: 0, tenant_access_token: 't' }),
+      jsonRes({ code: 0, data: { app: { description: '', i18n: [
+        { i18n_key: 'en_us', description: 'English desc' },
+        { i18n_key: 'zh_cn', description: '中文描述' },
+      ] } } }),
+    );
+    expect(await fetchSourceAppDescription('cli_source', 'sec', f)).toBe('中文描述');
+  });
+
+  it('token or app info failure returns undefined', async () => {
+    expect(await fetchSourceAppDescription('cli_source', 'sec', fetchSeq(jsonRes({ code: 1 })))).toBeUndefined();
+    expect(await fetchSourceAppDescription('cli_source', 'sec', fetchSeq(
+      jsonRes({ code: 0, tenant_access_token: 't' }),
+      jsonRes({ code: 210508, msg: 'insufficient permission' }),
+    ))).toBeUndefined();
+  });
+
+  it('fetch throws returns undefined', async () => {
+    const f = vi.fn(async () => { throw new Error('network down'); });
+    expect(await fetchSourceAppDescription('cli_source', 'sec', f as any)).toBeUndefined();
   });
 });

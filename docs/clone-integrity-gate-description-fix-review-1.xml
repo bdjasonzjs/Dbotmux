@@ -1,0 +1,53 @@
+<title>Clone Integrity Gate Description Fix Review 1</title>
+
+<callout emoji="✅" background-color="light-green" border-color="green">
+  <p><b>结论：</b>描述复制 E2E 打回修复 review 通过，未发现新的 P0/P1 blocker。</p>
+</callout>
+
+<h1>Review Target</h1>
+<table>
+  <tbody>
+    <tr><td>Reviewer</td><td>Codex 初号机</td></tr>
+    <tr><td>Date</td><td>2026-06-20</td></tr>
+    <tr><td>Input</td><td>描述复制 E2E 打回修复说明：<code>https://bytedance.larkoffice.com/docx/Chu0dFfr3o2uTpx2zNWcbkx3nvd</code></td></tr>
+    <tr><td>Local source</td><td><code>/data00/home/zoujinsong.jason/work/Dbotmux_wt/clone-integrity-gate/docs/clone-integrity-gate-description-fix-review.xml</code></td></tr>
+  </tbody>
+</table>
+
+<h1>Conclusion</h1>
+<p>Pass for this description-fix review. I did not find a new P0/P1 blocker.</p>
+<ul>
+  <li>clone creation can read the source app description from <code>application/v6/applications/:app_id?lang=zh_cn</code>;</li>
+  <li>that description is passed into <code>appPreset.desc</code>;</li>
+  <li>the cloned bot config records the trusted description for later gate input;</li>
+  <li>the integrity gate now checks the clone app's own application metadata and blocks when clone description is missing or unreadable.</li>
+</ul>
+
+<hr/>
+
+<h1>Findings</h1>
+<callout emoji="✅" background-color="light-green" border-color="green">
+  <p>No blocking findings.</p>
+</callout>
+
+<h2>P2 - Gate proves "has a description", not exact source-description equality</h2>
+<p><code>src/services/clone-integrity-gate.ts:132-140</code> requires both a trusted <code>sourceDescription</code> and a non-empty clone app description. It does not compare the clone app description with the trusted source description.</p>
+<p>I am not marking this as P1 because the approved checklist says <code>有描述</code>, and the app-creation <code>appPreset</code> is explicitly prefill/owner-editable rather than a forced setter. Exact equality could incorrectly block a legitimate owner edit during scan. The copy path itself is covered by tests in <code>test/bot-clone.test.ts</code>.</p>
+<p>If the final acceptance definition is tightened to "byte-for-byte copied source description", add a separate comparison item/test. For the current gate wording, this is acceptable.</p>
+
+<h1>Verification Re-run</h1>
+<table>
+  <thead>
+    <tr><th background-color="light-gray">Command</th><th background-color="light-gray">Result</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>pnpm vitest run test/event-dispatcher.test.ts test/clone-app-preset.test.ts test/bot-clone.test.ts test/clone-integrity-gate.test.ts test/clone-mention-resolver.test.ts test/ceo-clone-orchestration.test.ts test/ceo-spawn-wiring.test.ts</code></td><td>7 test files passed; 236 tests passed</td></tr>
+    <tr><td><code>pnpm exec tsc --noEmit</code></td><td>passed</td></tr>
+    <tr><td><code>git diff --check</code></td><td>passed</td></tr>
+  </tbody>
+</table>
+
+<h1>Residual Risk</h1>
+<callout emoji="⚠️" background-color="light-yellow" border-color="yellow">
+  <p>This review is still code/test review only. The live full clone E2E after authorized deploy/restart remains required: description, scope, group membership, direct @, urgent summon, name, avatar, and actual work execution must all be verified on a fresh clone.</p>
+</callout>

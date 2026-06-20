@@ -106,6 +106,13 @@ describe('buildCloneConfig', () => {
     expect(clone.allowedUsers).toBeUndefined();
   });
 
+  it('copies trusted description into clone config when provided', () => {
+    const clone = buildCloneConfig(source, { appId: 'cli_new', appSecret: 'S' }, {
+      slug: 's', configDir: '/c', description: '  源应用描述  ',
+    });
+    expect(clone.description).toBe('源应用描述');
+  });
+
   it('does NOT copy source Lark identity or chat bindings', () => {
     const clone = buildCloneConfig(source, { appId: 'cli_new', appSecret: 'NEW_SECRET', userOpenId: 'ou_x' }, {
       slug: 'claude-clone', configDir: '/home/u/.botmux',
@@ -397,7 +404,7 @@ describe('cloneBot', () => {
     const { configDir, srcHome, botsJsonPath } = dirs();
     const res = await cloneBot(
       { sourceBot: source(), configDir, botsJsonPath, sourceClaudeHome: srcHome, sourceDisplayName: '克劳德' },
-      { registerApp: scan(okScan) },
+      { registerApp: scan(okScan), fetchSourceDescription: async () => undefined },
     );
     expect(res.ok).toBe(true);
     const bots = JSON.parse(readFileSync(botsJsonPath, 'utf-8'));
@@ -421,7 +428,7 @@ describe('cloneBot', () => {
     let captured: any;
     const res = await cloneBot(
       { sourceBot: source(), configDir, botsJsonPath, sourceClaudeHome: srcHome, sourceDisplayName: '克劳德' },
-      { registerApp: async (opts) => { captured = opts; return okScan; }, fetchSourceAvatar: async () => 'https://x/a.png' },
+      { registerApp: async (opts) => { captured = opts; return okScan; }, fetchSourceAvatar: async () => 'https://x/a.png', fetchSourceDescription: async () => undefined },
     );
     expect(res.ok).toBe(true);
     expect(captured.appPreset).toEqual({ name: '克劳德（初号机）', avatar: 'https://x/a.png' });
@@ -435,6 +442,24 @@ describe('cloneBot', () => {
       { registerApp: async (opts) => { captured = opts; return okScan; }, fetchSourceAvatar: async () => undefined },
     );
     expect(captured.appPreset).toEqual({ name: '克劳德（初号机）', desc: '本体描述' });
+    const bots = JSON.parse(readFileSync(botsJsonPath, 'utf-8'));
+    expect(bots[1].description).toBe('本体描述');
+  });
+
+  it('#2: source description is fetched from Feishu app info when input lacks one', async () => {
+    const { configDir, srcHome, botsJsonPath } = dirs();
+    let captured: any;
+    await cloneBot(
+      { sourceBot: source(), configDir, botsJsonPath, sourceClaudeHome: srcHome, sourceDisplayName: '克劳德' },
+      {
+        registerApp: async (opts) => { captured = opts; return okScan; },
+        fetchSourceAvatar: async () => undefined,
+        fetchSourceDescription: async () => '开放平台描述',
+      },
+    );
+    expect(captured.appPreset).toEqual({ name: '克劳德（初号机）', desc: '开放平台描述' });
+    const bots = JSON.parse(readFileSync(botsJsonPath, 'utf-8'));
+    expect(bots[1].description).toBe('开放平台描述');
   });
 
   it('#2: avatar fetch returns undefined → appPreset has name only when no trusted desc', async () => {
@@ -442,7 +467,7 @@ describe('cloneBot', () => {
     let captured: any;
     await cloneBot(
       { sourceBot: source(), configDir, botsJsonPath, sourceClaudeHome: srcHome, sourceDisplayName: '克劳德' },
-      { registerApp: async (opts) => { captured = opts; return okScan; }, fetchSourceAvatar: async () => undefined },
+      { registerApp: async (opts) => { captured = opts; return okScan; }, fetchSourceAvatar: async () => undefined, fetchSourceDescription: async () => undefined },
     );
     expect(captured.appPreset).toEqual({ name: '克劳德（初号机）' });
   });
@@ -453,7 +478,7 @@ describe('cloneBot', () => {
     let captured: any;
     const res = await cloneBot(
       { sourceBot: source(), configDir, botsJsonPath, sourceClaudeHome: srcHome, sourceDisplayName: '克劳德', cloneName: '评审甲' },
-      { registerApp: async (opts) => { captured = opts; return okScan; }, fetchSourceAvatar: async () => 'https://x/a.png' },
+      { registerApp: async (opts) => { captured = opts; return okScan; }, fetchSourceAvatar: async () => 'https://x/a.png', fetchSourceDescription: async () => undefined },
     );
     expect(res.ok).toBe(true);
     expect(captured.appPreset).toEqual({ name: '评审甲', avatar: 'https://x/a.png' });
@@ -467,7 +492,7 @@ describe('cloneBot', () => {
     let captured: any;
     const res = await cloneBot(
       { sourceBot: source(), configDir, botsJsonPath, sourceClaudeHome: srcHome, cloneName: '评审甲' },
-      { registerApp: async (opts) => { captured = opts; return okScan; }, fetchSourceAvatar: async () => undefined },
+      { registerApp: async (opts) => { captured = opts; return okScan; }, fetchSourceAvatar: async () => undefined, fetchSourceDescription: async () => undefined },
     );
     expect(res.ok).toBe(true);
     expect(captured.appPreset).toEqual({ name: '评审甲' });
@@ -504,6 +529,7 @@ describe('cloneBot', () => {
           return okScan;
         },
         fetchSourceAvatar: async () => undefined,
+        fetchSourceDescription: async () => undefined,
       },
     );
     expect(res.ok).toBe(true);

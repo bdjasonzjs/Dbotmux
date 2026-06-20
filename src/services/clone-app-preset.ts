@@ -11,8 +11,10 @@
  *  - name is ALWAYS set (= the computed display name).
  *  - avatar only when the source bot's avatar_url is a present, non-empty string.
  *  - desc is set only when the clone caller supplies a trustworthy source
- *    description; /bot/v3/info exposes no trustworthy app description, and we
- *    must not write a system-guessed string that looks like a real description.
+ *    description OR we can read the source app description from
+ *    /application/v6/applications/:app_id. /bot/v3/info exposes no app
+ *    description, and we must not write a system-guessed string that looks like
+ *    a real description.
  *  - Source info is read via a SEPARATE /bot/v3/info fetch (NOT by extending the
  *    daemon's probeBotOpenId), so existing open_id/app_name parsing is untouched.
  *  - The fetch is FAIL-SOFT: any error → undefined avatar, never throws (a clone
@@ -26,9 +28,29 @@ export interface ClonePreset {
 
 type FetchImpl = typeof fetch;
 
-/** Short timeout for the avatar fetch (蔻黛 non-blocking): fail-soft covers
- *  errors but not a HANG; a stuck /bot/v3/info must not delay the QR. */
+/** Short timeout for source metadata fetches (蔻黛 non-blocking): fail-soft
+ *  covers errors but not a HANG; a stuck Feishu API must not delay the QR
+ *  forever. */
 const AVATAR_FETCH_TIMEOUT_MS = 8000;
+const APP_INFO_FETCH_TIMEOUT_MS = 8000;
+
+async function fetchTenantAccessToken(
+  appId: string,
+  appSecret: string,
+  fetchImpl: FetchImpl,
+  timeoutMs: number,
+): Promise<string | undefined> {
+  const tokenRes = await fetchImpl('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ app_id: appId, app_secret: appSecret }),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  const tokenData: any = await tokenRes.json();
+  return tokenData?.code === 0 && tokenData?.tenant_access_token
+    ? tokenData.tenant_access_token
+    : undefined;
+}
 
 /**
  * Fetch the source bot's avatar URL via /bot/v3/info. Returns the avatar_url
@@ -41,16 +63,10 @@ export async function fetchSourceBotAvatar(
   fetchImpl: FetchImpl = fetch,
 ): Promise<string | undefined> {
   try {
-    const tokenRes = await fetchImpl('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ app_id: appId, app_secret: appSecret }),
-      signal: AbortSignal.timeout(AVATAR_FETCH_TIMEOUT_MS),
-    });
-    const tokenData: any = await tokenRes.json();
-    if (tokenData?.code !== 0 || !tokenData?.tenant_access_token) return undefined;
+    const token = await fetchTenantAccessToken(appId, appSecret, fetchImpl, AVATAR_FETCH_TIMEOUT_MS);
+    if (!token) return undefined;
     const botRes = await fetchImpl('https://open.feishu.cn/open-apis/bot/v3/info/', {
-      headers: { Authorization: `Bearer ${tokenData.tenant_access_token}` },
+      headers: { Authorization: `Bearer ${token}` },
       signal: AbortSignal.timeout(AVATAR_FETCH_TIMEOUT_MS),
     });
     const botData: any = await botRes.json();
@@ -59,6 +75,39 @@ export async function fetchSourceBotAvatar(
     return typeof avatar === 'string' && avatar.trim() ? avatar : undefined;
   } catch {
     return undefined; // fail-soft: avatar inheritance is best-effort
+  }
+}
+
+/**
+ * Fetch the source app's configured description from application v6.
+ *
+ * /bot/v3/info does not return descriptions; the app metadata API does. This
+ * remains fail-soft for clone creation: callers decide whether a missing
+ * description is acceptable. The integrity gate is stricter and blocks delivery
+ * when it cannot prove the clone has a real description.
+ */
+export async function fetchSourceAppDescription(
+  appId: string,
+  appSecret: string,
+  fetchImpl: FetchImpl = fetch,
+): Promise<string | undefined> {
+  try {
+    const token = await fetchTenantAccessToken(appId, appSecret, fetchImpl, APP_INFO_FETCH_TIMEOUT_MS);
+    if (!token) return undefined;
+    const appRes = await fetchImpl(`https://open.feishu.cn/open-apis/application/v6/applications/${encodeURIComponent(appId)}?lang=zh_cn`, {
+      headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(APP_INFO_FETCH_TIMEOUT_MS),
+    });
+    const appData: any = await appRes.json();
+    if (appData?.code !== 0) return undefined;
+    const desc = appData?.data?.app?.description;
+    if (typeof desc === 'string' && desc.trim()) return desc.trim();
+    const i18n = Array.isArray(appData?.data?.app?.i18n) ? appData.data.app.i18n : [];
+    const zh = i18n.find((entry: any) => entry?.i18n_key === 'zh_cn');
+    const fallback = (zh ?? i18n[0])?.description;
+    return typeof fallback === 'string' && fallback.trim() ? fallback.trim() : undefined;
+  } catch {
+    return undefined; // fail-soft: caller/gate decides whether to block
   }
 }
 
