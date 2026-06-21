@@ -1478,6 +1478,35 @@ ipcRoute('POST', '/api/taskteam-create', async (req, res) => {
   }
 });
 
+// ── 任务小组 · 管理面 IPC（批5，§5）：配置 CRUD + template/instance 导入导出。纯新增、与 subtask IPC 独立。
+const TASKTEAM_ADMIN_ROUTES: Array<[string, string]> = [
+  ['/api/taskteam-config-list', 'listTaskTeamConfig'],
+  ['/api/taskteam-role-upsert', 'adminUpsertRole'],
+  ['/api/taskteam-rule-upsert', 'adminUpsertRule'],
+  ['/api/taskteam-type-upsert', 'adminUpsertType'],
+  ['/api/taskteam-org-upsert', 'adminUpsertOrg'],
+  ['/api/taskteam-template-export', 'adminExportTemplate'],
+  ['/api/taskteam-template-import', 'adminImportTemplate'],
+  ['/api/taskteam-snapshot-export', 'adminExportSnapshot'],
+  ['/api/taskteam-snapshot-restore', 'adminRestoreSnapshot'],
+];
+for (const [taskteamAdminPath, taskteamAdminFn] of TASKTEAM_ADMIN_ROUTES) {
+  ipcRoute('POST', taskteamAdminPath, async (req, res) => {
+    let body: unknown = {};
+    try { body = (await readJsonBody(req)) ?? {}; }
+    catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+    try {
+      const admin = await import('./services/taskteam-admin.js');
+      const fn = (admin as Record<string, (b: unknown) => unknown>)[taskteamAdminFn];
+      const result = await fn(body);
+      return jsonRes(res, 200, { ok: true, result });
+    } catch (err: any) {
+      const status = err && err.name === 'HttpError' ? err.status : 500;
+      return jsonRes(res, status, { ok: false, error: String(err?.message ?? err) });
+    }
+  });
+}
+
 // 2026-05-29: 关闭一个在跟的子群任务 (主体确认完事 / 松松说关) → closeWatch
 // → 移出主体在跟列表。低风险 (只改 watch 状态), 不走 authzCheck。
 ipcRoute('POST', '/api/subtask-close', async (req, res) => {

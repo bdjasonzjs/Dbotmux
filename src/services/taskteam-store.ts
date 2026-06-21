@@ -199,3 +199,11 @@ const ACTIVE_TEAM_STATUSES: ReadonlySet<TaskTeamStatus> = new Set([
 export function listActiveTaskTeams(): TaskTeamInstance[] {
   return readTaskTeams().teams.filter(t => ACTIVE_TEAM_STATUSES.has(t.status));
 }
+
+// 批5 InstanceSnapshot 恢复：整体替换实例集（同环境备份恢复用）
+export async function replaceTaskTeams(teams: TaskTeamInstance[]): Promise<TaskTeamInstanceFile> {
+  return mutate(store => {
+    store.teams = teams;
+    return { result: store, dirty: true };
+  });
+}

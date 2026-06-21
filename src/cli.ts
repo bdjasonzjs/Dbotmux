@@ -3426,6 +3426,22 @@ switch (command) {
     await cmdSubtaskOrch(command.replace('subtask-', ''), process.argv.slice(3));
     break;
   }
+  // 任务小组 CLI 命令族（批5，§5）——纯新增、与 subtask 分支独立
+  case 'taskteam-config-list':
+  case 'taskteam-role-upsert':
+  case 'taskteam-rule-upsert':
+  case 'taskteam-type-upsert':
+  case 'taskteam-org-upsert':
+  case 'taskteam-template-export':
+  case 'taskteam-template-import':
+  case 'taskteam-snapshot-export':
+  case 'taskteam-snapshot-restore':
+  case 'taskteam-create':
+  case 'taskteam-event': {
+    const { cmdTaskTeam } = await import('./cli/taskteam-cli.js');
+    await cmdTaskTeam(command.replace('taskteam-', ''), process.argv.slice(3));
+    break;
+  }
   case 'progress-report': {
     const { cmdProgressReport } = await import('./cli/progress-report.js');
     await cmdProgressReport(process.argv.slice(3));
