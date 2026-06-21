@@ -68,7 +68,7 @@ export function renderBoardResult(result: LoadResult<{ teams: TeamInstance[] }>)
 export function renderTaskTeamPage(root: HTMLElement): (() => void) | undefined {
   root.innerHTML = `
     <section class="page task-team-page">
-      <h2>${escapeHtml(t('nav.taskTeam'))}</h2>
+      <h2>${escapeHtml(t('nav.taskTeam'))} <a href="#/task-team/builder" class="tt-link">⚙ ${escapeHtml(t('taskTeam.openBuilder'))}</a></h2>
       <div class="tt-section"><h3>${escapeHtml(t('taskTeam.org'))}</h3><div id="tt-org">…</div></div>
       <div class="tt-section"><h3>${escapeHtml(t('taskTeam.board'))}</h3><div id="tt-board">…</div></div>
       <div class="tt-section"><h3>${escapeHtml(t('taskTeam.usage'))}</h3><p class="muted">${escapeHtml(t('taskTeam.usageNote'))}</p></div>

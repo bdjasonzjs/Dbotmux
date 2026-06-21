@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { buildOrgTree } from '../src/dashboard/task-team-api.js';
 import { fetchTaskTeamJson } from '../src/dashboard/web/task-team-data.js';
+import { buildRolePayload, buildRulePayload, buildTypePayload, postAdmin } from '../src/dashboard/web/taskteam-builder-data.js';
 import type { TaskTeamConfigFile, TaskTeamInstance } from '../src/services/taskteam-schema.js';
 
 describe('buildOrgTree (§8.2 org tree)', () => {
@@ -60,5 +61,53 @@ describe('buildOrgTree (§8.2 org tree)', () => {
     } as unknown as TaskTeamConfigFile;
     const tree = buildOrgTree(config, []);
     expect(tree[0].departments[0].teams).toEqual([]);
+  });
+});
+
+describe('taskteam-builder-data (§7 form→schema, no JSON)', () => {
+  it('buildRolePayload assembles role + envelope; splits actions/io; optional model/seat/observer', () => {
+    const { role } = buildRolePayload({
+      roleId: 'tt_role_x', name: 'X', responsibility: 'r', activationTrigger: 'submit', visibility: 'review-only',
+      actions: 'submit, review-pass', fromRoleIds: 'tt_role_a', toRoleIds: 'tt_role_b', model: 'haiku', seatEngine: 'coco', isObserver: true,
+    });
+    expect(role).toMatchObject({
+      roleId: 'tt_role_x', visibility: 'review-only', actions: ['submit', 'review-pass'],
+      io: { from: [{ roleId: 'tt_role_a' }], to: [{ roleId: 'tt_role_b' }] }, model: { model: 'haiku' }, seatHint: { engine: 'coco' }, isObserver: true,
+    });
+  });
+
+  it('buildRolePayload defaults trigger and omits empty optionals', () => {
+    const { role } = buildRolePayload({ roleId: 'r', name: 'n', responsibility: '', activationTrigger: '', visibility: 'full', actions: '' });
+    expect(role.activation.trigger).toBe('team-started');
+    expect(role).not.toHaveProperty('model');
+    expect(role).not.toHaveProperty('seatHint');
+    expect(role).not.toHaveProperty('isObserver');
+  });
+
+  it('buildRulePayload keeps optional when fields only when set', () => {
+    const { rule } = buildRulePayload({ ruleId: 'tt_rule_0', whenEvent: 'submit', whenStatus: 'running', whenFromSlotId: '', whoSlot: 'tt_slot_arch', do: 'request-review' });
+    expect(rule).toMatchObject({ ruleId: 'tt_rule_0', when: { event: 'submit', status: 'running' }, whoSlot: 'tt_slot_arch', do: 'request-review' });
+    expect(rule.when).not.toHaveProperty('fromSlotId');
+  });
+
+  it('buildTypePayload parses slotId:roleId[:label] and policy', () => {
+    const { teamType } = buildTypePayload({
+      typeId: 'tt_type_x', name: 'X', slots: 'tt_slot_dev:tt_role_dev, tt_slot_arch:tt_role_arch:主审',
+      rules: 'tt_rule_0', reviewRounds: 2, reviewQuorum: 1, maxRework: 3, escalateAfterStallMs: 1000, reviewOrder: 'tt_slot_arch',
+    });
+    expect(teamType.roleSlots).toEqual([
+      { slotId: 'tt_slot_dev', roleId: 'tt_role_dev' },
+      { slotId: 'tt_slot_arch', roleId: 'tt_role_arch', label: '主审' },
+    ]);
+    expect(teamType.policy).toMatchObject({ reviewRounds: 2, reviewQuorum: 1, maxRework: 3, reviewOrder: ['tt_slot_arch'] });
+  });
+
+  it('postAdmin: ok / non-2xx with detail / throw — surfaces errors, not silent', async () => {
+    const ok = await postAdmin('/p', { role: {} }, async () => ({ ok: true, status: 200, text: async () => '' }));
+    expect(ok).toEqual({ ok: true });
+    const e400 = await postAdmin('/p', {}, async () => ({ ok: false, status: 400, text: async () => 'missing role' }));
+    expect(e400).toEqual({ ok: false, error: 'HTTP 400：missing role' });
+    const thrown = await postAdmin('/p', {}, async () => { throw new Error('down'); });
+    expect(thrown.ok).toBe(false);
   });
 });
