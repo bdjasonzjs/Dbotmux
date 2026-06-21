@@ -1444,6 +1444,93 @@ ipcRoute('POST', '/api/spawn-subtask', async (req, res) => {
   }
 });
 
+// ── 任务小组 · IPC 事件入口（批3，§3.1 入口①，纯新增、与 subtask IPC 分支独立）。
+// CLI/dashboard 薄壳打到这里 → 驱动层 applyTeamEvent/createTaskTeam → 只落 store + 写 outbox，
+// 异步投递交 taskteam dispatcher cron。CLI 命令族本身属批5。
+ipcRoute('POST', '/api/taskteam-event', async (req, res) => {
+  let body: { teamId?: string; event?: { type?: string } };
+  try { body = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (!body.teamId || !body.event?.type) return jsonRes(res, 400, { ok: false, error: 'missing teamId/event.type' });
+  try {
+    const { applyTeamEvent } = await import('./services/taskteam-runtime.js');
+    const { defaultRuntimeDeps } = await import('./services/taskteam-deps.js');
+    const result = await applyTeamEvent(defaultRuntimeDeps(), body.teamId as never, body.event as never);
+    return jsonRes(res, 200, { ok: true, status: result.instance.status, enqueued: result.enqueued.length });
+  } catch (err: any) {
+    const status = err && err.name === 'HttpError' ? err.status : 500;
+    return jsonRes(res, status, { ok: false, error: String(err?.message ?? err) });
+  }
+});
+
+ipcRoute('POST', '/api/taskteam-create', async (req, res) => {
+  let body: never;
+  try { body = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  try {
+    const { createTaskTeam } = await import('./services/taskteam-runtime.js');
+    const { defaultCreateTaskTeamDeps } = await import('./services/taskteam-deps.js');
+    const team = await createTaskTeam(defaultCreateTaskTeamDeps(), body);
+    return jsonRes(res, 200, { ok: true, teamId: team.teamId, chatId: team.chatId, status: team.status });
+  } catch (err: any) {
+    const status = err && err.name === 'HttpError' ? err.status : 500;
+    return jsonRes(res, status, { ok: false, error: String(err?.message ?? err) });
+  }
+});
+
+// ── 任务小组 · 管理面 IPC（批5，§5）：配置 CRUD + template/instance 导入导出。纯新增、与 subtask IPC 独立。
+const TASKTEAM_ADMIN_ROUTES: Array<[string, string]> = [
+  ['/api/taskteam-config-list', 'listTaskTeamConfig'],
+  ['/api/taskteam-role-upsert', 'adminUpsertRole'],
+  ['/api/taskteam-rule-upsert', 'adminUpsertRule'],
+  ['/api/taskteam-type-upsert', 'adminUpsertType'],
+  ['/api/taskteam-org-upsert', 'adminUpsertOrg'],
+  ['/api/taskteam-template-export', 'adminExportTemplate'],
+  ['/api/taskteam-template-import', 'adminImportTemplate'],
+  ['/api/taskteam-snapshot-export', 'adminExportSnapshot'],
+  ['/api/taskteam-snapshot-restore', 'adminRestoreSnapshot'],
+];
+for (const [taskteamAdminPath, taskteamAdminFn] of TASKTEAM_ADMIN_ROUTES) {
+  ipcRoute('POST', taskteamAdminPath, async (req, res) => {
+    let body: unknown = {};
+    try { body = (await readJsonBody(req)) ?? {}; }
+    catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+    try {
+      const admin = await import('./services/taskteam-admin.js');
+      const fn = (admin as unknown as Record<string, (b: unknown) => unknown>)[taskteamAdminFn];
+      const result = await fn(body);
+      return jsonRes(res, 200, { ok: true, result });
+    } catch (err: any) {
+      // P2：调用方 payload 错误（缺字段 / 错 kind / 跨 app）映射 400，区别于服务端 500
+      const name = err?.name;
+      const status =
+        name === 'HttpError' ? err.status
+          : name === 'TaskTeamBadRequestError' || name === 'TaskTeamTemplateError' || name === 'TaskTeamScopeError' ? 400
+            : 500;
+      return jsonRes(res, status, { ok: false, error: String(err?.message ?? err) });
+    }
+  });
+}
+
+// 任务小组 · 新手引导 IPC（批8，§9）——纯新增。body: { availableBots, creatorLarkAppId, companyId?, goal? }
+ipcRoute('POST', '/api/taskteam-onboard', async (req, res) => {
+  let body: { availableBots?: unknown; creatorLarkAppId?: string } = {};
+  try { body = (await readJsonBody(req)) ?? {}; }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (!Array.isArray(body.availableBots) || !body.creatorLarkAppId) {
+    return jsonRes(res, 400, { ok: false, error: 'missing availableBots[]/creatorLarkAppId' });
+  }
+  try {
+    const { runOnboarding } = await import('./services/taskteam-onboard.js');
+    const { defaultOnboardDeps } = await import('./services/taskteam-deps.js');
+    const result = await runOnboarding(defaultOnboardDeps(), body as never);
+    return jsonRes(res, 200, { ok: true, result });
+  } catch (err: any) {
+    const status = err && err.name === 'HttpError' ? err.status : 500;
+    return jsonRes(res, status, { ok: false, error: String(err?.message ?? err) });
+  }
+});
+
 // 2026-05-29: 关闭一个在跟的子群任务 (主体确认完事 / 松松说关) → closeWatch
 // → 移出主体在跟列表。低风险 (只改 watch 状态), 不走 authzCheck。
 ipcRoute('POST', '/api/subtask-close', async (req, res) => {
@@ -3171,6 +3258,59 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     process.on('SIGTERM', () => clearInterval(digestHandle));
     process.on('SIGINT', () => clearInterval(digestHandle));
     logger.info(`[subtask-digest] cron registered (every ${SUBTASK_DIGEST_TICK_MS / 1000}s scan, per-task INTERVAL gate) on coco daemon`);
+
+    // ── 任务小组 · observer cron（批3，§3.1）：复制 subtask-observer 范式，独立 tick/guard。
+    //    廉价 gate 无新动静零模型调用；与 subtask observer cron 平行、对 subtask 调度零侵入。
+    const TASKTEAM_OBSERVE_TICK_MS = 60 * 1000;
+    let taskteamObserveTickInFlight = false;
+    const taskteamObserveHandle = setInterval(async () => {
+      if (taskteamObserveTickInFlight) { logger.info('[taskteam-observer] previous tick in flight — skip'); return; }
+      taskteamObserveTickInFlight = true;
+      try {
+        const { runTaskTeamObserverTick } = await import('./services/taskteam-observer.js');
+        const { defaultObserverDeps } = await import('./services/taskteam-deps.js');
+        const { makeTaskTeamObserveExecutors } = await import('./services/taskteam-observe-executors.js');
+        const { resolveBotIdent } = await import('./core/main-bot-playbook.js');
+        const observerApp = resolveBotIdent('tilly').larkAppId;
+        const stats = await runTaskTeamObserverTick(new Date(), defaultObserverDeps(), makeTaskTeamObserveExecutors(observerApp));
+        if (stats.detected + stats.events + stats.errors > 0) {
+          logger.info(`[taskteam-observer] tick: scanned=${stats.scanned} gatedOut=${stats.gatedOut} detected=${stats.detected} events=${stats.events} errors=${stats.errors}`);
+        }
+      } catch (err) {
+        logger.error(`[taskteam-observer] tick failed: ${err}`);
+      } finally {
+        taskteamObserveTickInFlight = false;
+      }
+    }, TASKTEAM_OBSERVE_TICK_MS);
+    process.on('SIGTERM', () => clearInterval(taskteamObserveHandle));
+    process.on('SIGINT', () => clearInterval(taskteamObserveHandle));
+    logger.info(`[taskteam-observer] cron registered (every ${TASKTEAM_OBSERVE_TICK_MS / 1000}s, cheap gate) on coco daemon`);
+
+    // ── 任务小组 · dispatcher cron（批3，§3.1 / B3）：复制 outbox-dispatcher 范式，独立 store/lease/cron。
+    //    claim→发飞书→sent(message_id)→退避重试→failed；与 subtask outbox-dispatcher 完全隔离。
+    const TASKTEAM_DISPATCH_TICK_MS = 20 * 1000;
+    let taskteamDispatchTickInFlight = false;
+    const taskteamDispatchHandle = setInterval(async () => {
+      if (taskteamDispatchTickInFlight) { logger.info('[taskteam-dispatcher] previous tick in flight — skip'); return; }
+      taskteamDispatchTickInFlight = true;
+      try {
+        const { runTaskTeamDispatcherTick } = await import('./services/taskteam-dispatcher.js');
+        const { makeTaskTeamDispatchExecutors } = await import('./services/taskteam-dispatch-executors.js');
+        const { resolveBotIdent } = await import('./core/main-bot-playbook.js');
+        const senderApp = resolveBotIdent('tilly').larkAppId;
+        const stats = await runTaskTeamDispatcherTick(new Date(), makeTaskTeamDispatchExecutors(senderApp));
+        if (stats.sent + stats.retried + stats.failed + stats.leaseLost > 0) {
+          logger.info(`[taskteam-dispatcher] tick: claimed=${stats.claimed} sent=${stats.sent} retried=${stats.retried} failed=${stats.failed} skipped=${stats.skipped} leaseLost=${stats.leaseLost}`);
+        }
+      } catch (err) {
+        logger.error(`[taskteam-dispatcher] tick failed: ${err}`);
+      } finally {
+        taskteamDispatchTickInFlight = false;
+      }
+    }, TASKTEAM_DISPATCH_TICK_MS);
+    process.on('SIGTERM', () => clearInterval(taskteamDispatchHandle));
+    process.on('SIGINT', () => clearInterval(taskteamDispatchHandle));
+    logger.info(`[taskteam-dispatcher] cron registered (every ${TASKTEAM_DISPATCH_TICK_MS / 1000}s, claim/lease + retry) on coco daemon`);
   }
 
   logger.info('Daemon is running. Press Ctrl+C to stop.');

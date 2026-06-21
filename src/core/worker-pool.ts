@@ -793,6 +793,8 @@ function doForkWorker(ds: DaemonSession, prompt: string, resume = false, followu
     botOpenId: bot.botOpenId,
     locale: botLocale(botCfg),
     claudeConfigDir: botCfg.claudeConfigDir,
+    // 批4 §6.1：per-role 模型微调（任务小组角色 bot 主路径）；缺省 undefined → init 与今天逐字节一致
+    modelOverrides: ds.session.modelOverride,
   };
   // Install handlers and mark this worker current BEFORE send, so a fast
   // exit/error/ready can't slip through unhandled (which would leak the boot
@@ -1550,6 +1552,8 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     botOpenId: bot.botOpenId,
     locale: botLocale(botCfg),
     claudeConfigDir: adoptedClaudeConfigDir,
+    // 批4 §6.1：restart/adopt 后保留 per-role 模型微调；缺省 undefined → 与今天逐字节一致
+    modelOverrides: ds.session.modelOverride,
     adoptMode: true,
     adoptTmuxTarget: adopted.tmuxTarget,
     adoptPaneCols: adopted.paneCols,

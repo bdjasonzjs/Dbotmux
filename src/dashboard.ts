@@ -27,6 +27,7 @@ import { DaemonRegistry } from './dashboard/registry.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
 import { pickCreatorForGroup } from './dashboard/operator-selector.js';
 import { handleWorkflowApi, jsonRes } from './dashboard/workflow-api.js';
+import { handleTaskTeamApi } from './dashboard/task-team-api.js';
 import { readJsonBody } from './core/dashboard-ipc-server.js';
 import { getRunsDir } from './workflows/runs-dir.js';
 import { BotOnboardingManager } from './dashboard/bot-onboarding.js';
@@ -814,6 +815,11 @@ const server = createServer(async (req, res) => {
       runsDir: getRunsDir(),
       proxyToDaemon,
     })) {
+      return;
+    }
+
+    // 任务小组 Dashboard 后端 API（批6，§8.3）——纯新增、只读 taskteam store
+    if (await handleTaskTeamApi(req, res, url)) {
       return;
     }
 

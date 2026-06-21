@@ -169,11 +169,17 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     },
     resolvedBin: bin,
 
-    buildArgs({ sessionId, resume, resumeSessionId, workingDir, cliHome }) {
+    supportsModelOverride: true,
+    supportsReasoningEffort: true,
+    buildArgs({ sessionId, resume, resumeSessionId, workingDir, cliHome, model, reasoningEffort }) {
       const baseArgs = [
         '--dangerously-bypass-approvals-and-sandbox',
         '--no-alt-screen',
       ];
+      // 批4 §6.1：per-role 模型微调，走 codex -c 配置覆盖（对 fresh/resume 都生效）；
+      // 缺省 model/reasoningEffort=undefined → 不加任何 -c（与今天逐字节一致）。
+      if (model) baseArgs.push('-c', `model="${model}"`);
+      if (reasoningEffort) baseArgs.push('-c', `model_reasoning_effort="${reasoningEffort}"`);
       // Codex app-server can keep its own cwd at $HOME; -C pins fresh agent roots.
       const freshArgs = workingDir
         ? [...baseArgs, '-C', workingDir]
