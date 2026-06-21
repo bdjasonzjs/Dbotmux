@@ -182,8 +182,15 @@ async function tickOne(t: SubTask, now: Date, exec: ObserverExecutors): Promise<
     () => staleHelpCommandIds(t.taskId),
     // B 方案 + 超时兜底: observing 路径再判 need_help 时是否该上报 —— 相对上次 help 有新实质进展
     // (新证据 / 诉求变化)，**或** 距上次投出已超 2h 仍没人响应 (兜底重报)。
+    //
+    // paused(已求助·待人) 是更强静音态：不把"新消息/催办噪声"当新证据重报，只允许
+    // ① 2h heartbeat、② blocker 归一化后确有变化。显式 askforhelp 不走 observer，仍由 orchestrator
+    // 手动 enqueue report_help。
     () => {
       const prev = latestHelpReport(t.taskId);
+      if (t.status === 'paused') {
+        return hasBlockedHelpProgress(prev, judged.summary) || shouldStaleRereport(prev, now);
+      }
       // parentResponded: 父群已对上次求助下发过 supplement → observing 路径不再因"新证据"重复上报 (见 hasNewHelpProgress)。
       return hasNewHelpProgress(prev, analyzedMessageIds, judged.summary, prev?.respondedBySupplement ?? false)
         || shouldStaleRereport(prev, now);
@@ -316,6 +323,14 @@ export function hasNewHelpProgress(
   return askChanged;             // ② 诉求实质变化才算新进展，否则同一 blocker → 静默
 }
 
+/** paused(已求助·待人) 下的被动求助升级判断。
+ *  与 hasNewHelpProgress 的差异：彻底忽略 analyzedMessageIds，避免催办噪声/普通聊天被当作"新证据"
+ *  反复刷父群；只允许 blocker 文本归一化后真的变化。2h heartbeat 由 shouldStaleRereport 单独负责。 */
+export function hasBlockedHelpProgress(prev: PrevHelpReport | null, curSummary: string): boolean {
+  if (!prev) return true;
+  return normalizeAsk(curSummary) !== normalizeAsk(prev.summary);
+}
+
 /**
  * 超时兜底重报 (松松)：「已上报过的别重复，除非真的隔了很久(两三小时)还没人响应再上报。」
  * 无新进展时，若**同时**满足 → 兜底重报一次：
@@ -397,8 +412,22 @@ function planCommitBase(
     // 不再 done (有新工作/blocker) → 回退 + supersede 旧 done
     const stale = pendingDoneCmdIds();
     const supersedeCommandIds = stale.length ? stale : undefined;
-    if (signal === 'need_help') return { report: helpReport, statusTo: 'reported_help', supersedeCommandIds };
+    if (signal === 'need_help') return { report: helpReport, statusTo: 'paused', supersedeCommandIds };
     return { statusTo: 'observing', supersedeCommandIds };
+  }
+
+  if (status === 'paused') {
+    if (signal === 'done') return { report: doneReport, statusTo: 'reported_done' };
+    if (signal === 'need_help') {
+      const hd = helpDelivery();
+      if (hd === 'sent_unacked_expired' || hd === 'failed' || hd === 'none') {
+        const stale = staleHelpCmdIds();
+        return { report: helpReport, supersedeCommandIds: stale.length ? stale : undefined };
+      }
+      if (!observingHelpHasNewProgress()) return {};
+      return { report: helpReport };
+    }
+    return {};
   }
 
   if (status === 'reported_help') {
@@ -422,7 +451,7 @@ function planCommitBase(
     // 只有相对上次 help **有新实质进展** (新证据消息 / 诉求实质变化) 才再 enqueue + 转 reported_help；
     // 否则静默 (只记观测、推进 cursor)，不重复惊动父群。首次上报 prev=null → 恒 true，照常发。
     if (!observingHelpHasNewProgress()) return {};
-    return { report: helpReport, statusTo: 'reported_help' };
+    return { report: helpReport, statusTo: 'paused' };
   }
   if (signal === 'done') return { report: doneReport, statusTo: 'reported_done' };
   return {}; // normal → 只记观测 + 推进 cursor

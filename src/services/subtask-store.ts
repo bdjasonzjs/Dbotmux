@@ -206,13 +206,15 @@ const ALLOWED_TRANSITIONS: Record<SubTaskStatus, SubTaskStatus[]> = {
   // review Blocker 2: help 期间子群自己解决 → 直接 done；done 后冒新 blocker → 直接 help
   reported_help: ['reported_done', 'observing', 'finished', 'paused', 'error', 'stopped'],
   reported_done: ['reported_help', 'observing', 'finished', 'paused', 'error', 'stopped'],
-  paused: ['observing', 'finished', 'stopped'],
+  // paused = 已求助·待人：observer 仍可做 2h heartbeat / 真 blocker 变化判断，
+  // 但不再按新消息数或普通 summary 抖动重复刷 report_help。
+  paused: ['observing', 'reported_help', 'reported_done', 'finished', 'stopped'],
   error: ['observing', 'stopped'],
   finished: [],
   stopped: [],
 };
 
-export const ACTIVE_STATUSES: SubTaskStatus[] = ['observing', 'reported_help', 'reported_done'];
+export const ACTIVE_STATUSES: SubTaskStatus[] = ['observing', 'reported_help', 'reported_done', 'paused'];
 
 export function isTransitionAllowed(from: SubTaskStatus, to: SubTaskStatus): boolean {
   if (from === to) return true;

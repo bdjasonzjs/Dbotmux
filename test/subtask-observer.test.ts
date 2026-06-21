@@ -19,7 +19,7 @@ import {
   type SubTaskBot, type HelpDelivery,
 } from '../src/services/subtask-store.js';
 import {
-  runObserverTick, planCommit, hasNewHelpProgress, shouldStaleRereport,
+  runObserverTick, planCommit, hasNewHelpProgress, hasBlockedHelpProgress, shouldStaleRereport,
   MIN_OBSERVE_INTERVAL_MS, STALE_REREPORT_MS,
   type ObserverExecutors, type JudgeResult, type PrevHelpReport,
 } from '../src/services/subtask-observer.js';
@@ -68,10 +68,10 @@ beforeEach(() => {
 // ─── planCommit 纯决策 ──────────────────────────────────────────────────────
 describe('planCommit', () => {
   const noDone = () => [];
-  it('observing + need_help → 报 help + reported_help', () => {
+  it('observing + need_help → 报 help + paused(已求助·待人)', () => {
     const p = planCommit('observing', 'need_help', 'm2', noDone);
     expect(p.report?.commandType).toBe('report_help');
-    expect(p.statusTo).toBe('reported_help');
+    expect(p.statusTo).toBe('paused');
   });
   it('observing + done → 报 done + reported_done', () => {
     expect(planCommit('observing', 'done', 'm2', noDone).statusTo).toBe('reported_done');
@@ -117,9 +117,9 @@ describe('planCommit', () => {
   it('reported_done + 仍 done → 不动', () => {
     expect(planCommit('reported_done', 'done', 'm3', () => ['cmd_old'])).toEqual({});
   });
-  it('reported_done + need_help → 回 reported_help + supersede 旧 done', () => {
+  it('reported_done + need_help → 回 paused + supersede 旧 done', () => {
     const p = planCommit('reported_done', 'need_help', 'm3', () => ['cmd_old']);
-    expect(p.statusTo).toBe('reported_help');
+    expect(p.statusTo).toBe('paused');
     expect(p.report?.commandType).toBe('report_help');
     expect(p.supersedeCommandIds).toEqual(['cmd_old']);
   });
@@ -135,11 +135,31 @@ describe('planCommit', () => {
   it('observing+need_help · 有新进展 (默认/首次) → 照常报 help', () => {
     const p = planCommit('observing', 'need_help', 'm5', noDone, noDelivery, noStale, () => true);
     expect(p.report?.commandType).toBe('report_help');
-    expect(p.statusTo).toBe('reported_help');
+    expect(p.statusTo).toBe('paused');
   });
   it('observing+need_help · 无新进展 (同一未变 blocker) → 静默, 不报不转', () => {
     const p = planCommit('observing', 'need_help', 'm5', noDone, noDelivery, noStale, () => false);
     expect(p).toEqual({});
+  });
+  it('paused+need_help · 无心跳/无 blocker 变化 → 静默, 不报不转', () => {
+    const p = planCommit('paused', 'need_help', 'm5', noDone, noDelivery, noStale, () => false);
+    expect(p).toEqual({});
+  });
+  it('paused+need_help · 2h 心跳或 blocker 变化 → 上报但保持 paused', () => {
+    const p = planCommit('paused', 'need_help', 'm5', noDone, noDelivery, noStale, () => true);
+    expect(p.report?.commandType).toBe('report_help');
+    expect(p.statusTo).toBeUndefined();
+  });
+  it('paused+need_help · 旧 help failed → 补发 + supersede 旧 help', () => {
+    const p = planCommit('paused', 'need_help', 'm5', noDone, () => 'failed', () => ['cmd_old_help'], () => false);
+    expect(p.report?.commandType).toBe('report_help');
+    expect(p.statusTo).toBeUndefined();
+    expect(p.supersedeCommandIds).toEqual(['cmd_old_help']);
+  });
+  it('paused+done → 报 done + reported_done', () => {
+    const p = planCommit('paused', 'done', 'm5', noDone);
+    expect(p.report?.commandType).toBe('report_done');
+    expect(p.statusTo).toBe('reported_done');
   });
 });
 
@@ -173,6 +193,17 @@ describe('hasNewHelpProgress', () => {
   });
   it('父群已响应 + prev=null(首次) → 仍发', () => {
     expect(hasNewHelpProgress(null, ['m1'], '卡住了', true)).toBe(true);
+  });
+});
+
+describe('hasBlockedHelpProgress', () => {
+  it('paused 下忽略新消息证据，只认 blocker 归一化变化', () => {
+    const prev = mkPrev({ summary: '卡在 X', sourceMessageIds: ['m1'] });
+    expect(hasBlockedHelpProgress(prev, '卡在 X')).toBe(false);
+    expect(hasBlockedHelpProgress(prev, '现在卡在 Y 了')).toBe(true);
+  });
+  it('prev=null → 首次仍允许上报', () => {
+    expect(hasBlockedHelpProgress(null, '卡住了')).toBe(true);
   });
 });
 
@@ -214,13 +245,13 @@ describe('shouldStaleRereport', () => {
 
 // ─── runObserverTick 集成 ───────────────────────────────────────────────────
 describe('runObserverTick', () => {
-  it('observing + need_help → reported_help + help 命令 + cursor 推进', async () => {
+  it('observing + need_help → paused + help 命令 + cursor 推进', async () => {
     const t = await mkObserving();
     const exec = mkExec({ judged: { signal: 'need_help', summary: '卡住了' } });
     const stats = await runObserverTick(new Date(), exec);
     expect(stats.committed).toBe(1);
     const after = getSubTask(t.taskId)!;
-    expect(after.status).toBe('reported_help');
+    expect(after.status).toBe('paused');
     expect(after.committedCursor).toBe('m2'); // = readToCursor (newest)
     const cmds = listCommands(t.taskId);
     expect(cmds).toHaveLength(1);
@@ -286,13 +317,13 @@ describe('runObserverTick', () => {
     expect(fresh.supersededBy).toBeNull();                  // 新的生效
   });
 
-  it('reported_done recheck：有新活动且 need_help → 回 reported_help + supersede 旧 done', async () => {
+  it('reported_done recheck：有新活动且 need_help → 回 paused + supersede 旧 done', async () => {
     const t = await mkObserving();
     const done = await commitObservationTransaction({ taskId: t.taskId, readFromCursor: null, readToCursor: 'm1', analyzedMessageIds: ['m1'], summary: '完成', signal: 'done', report: { commandType: 'report_done', idempotencyKey: 'd1' }, statusTo: 'reported_done' });
     const doneCmd = done!.command!.cmdId;
     const exec = mkExec({ messages: [{ id: 'm2', rendered: '又出问题' }], judged: { signal: 'need_help', summary: '又出问题' } });
     await runObserverTick(new Date(Date.now() + 2 * MIN_OBSERVE_INTERVAL_MS), exec);
-    expect(getSubTask(t.taskId)!.status).toBe('reported_help');
+    expect(getSubTask(t.taskId)!.status).toBe('paused');
     expect(getCommand(doneCmd)!.supersededBy).not.toBeNull(); // 旧 done 被 supersede
   });
 
@@ -353,12 +384,12 @@ describe('runObserverTick', () => {
   // ── B 方案集成: supplement 重开 observing 后, 同一未变 blocker 不重复上报 ──
   it('B：help 上报 → supplement 切回 observing → 同一 blocker 无新进展 → 不重复 enqueue', async () => {
     const t = await mkObserving();
-    // ① observing+need_help → reported_help + help#1 (覆盖证据 m1,m2)
+    // ① observing+need_help → paused + help#1 (覆盖证据 m1/m2)
     const exec1 = mkExec({ messages: [{ id: 'm1', rendered: '卡在 X' }, { id: 'm2', rendered: '需拍板' }], judged: { signal: 'need_help', summary: '卡在 X 需要拍板' } });
     await runObserverTick(new Date(), exec1);
-    expect(getSubTask(t.taskId)!.status).toBe('reported_help');
+    expect(getSubTask(t.taskId)!.status).toBe('paused');
     expect(listCommands(t.taskId).filter(c => c.commandType === 'report_help')).toHaveLength(1);
-    // ② 主 bot supplement → reported_help 切回 observing (模拟 orchestrator.supplementSubtask 的转移)
+    // ② 主 bot supplement → paused 切回 observing (模拟 orchestrator.supplementSubtask 的转移)
     await transitionStatus(t.taskId, 'observing');
     // ③ 同一 blocker: 没有上次 help (m1/m2) 之外的新证据 + 诉求归一化相同 → 静默不重复上报
     const exec2 = mkExec({ messages: [{ id: 'm2', rendered: '需拍板' }], judged: { signal: 'need_help', summary: '卡在 X，需要拍板' } });
@@ -377,7 +408,7 @@ describe('runObserverTick', () => {
     // 新证据 m3 (上次 help 没覆盖过) → 有新进展 → 再上报
     const exec2 = mkExec({ messages: [{ id: 'm3', rendered: '新情况: 又冒新 blocker' }], judged: { signal: 'need_help', summary: '又冒新 blocker' } });
     await runObserverTick(new Date(Date.now() + 2 * MIN_OBSERVE_INTERVAL_MS), exec2);
-    expect(getSubTask(t.taskId)!.status).toBe('reported_help');                                // 再次转 reported_help
+    expect(getSubTask(t.taskId)!.status).toBe('paused');                                       // 再次进入已求助·待人
     expect(listCommands(t.taskId).filter(c => c.commandType === 'report_help')).toHaveLength(2); // 补发了第二条
   });
 
@@ -414,6 +445,32 @@ describe('runObserverTick', () => {
     expect(listCommands(t.taskId).filter(c => c.commandType === 'report_help')).toHaveLength(1);
   });
 
+  it('paused：父群不在期间 + 同 blocker + 催办噪声新消息 → 不刷屏', async () => {
+    const t = await mkObserving();
+    const base = Date.now();
+    const exec1 = mkExec({ messages: [{ id: 'm1', rendered: '卡在 X' }], judged: { signal: 'need_help', summary: '卡在 X' } });
+    await runObserverTick(new Date(base), exec1);
+    expect(getSubTask(t.taskId)!.status).toBe('paused');
+    expect(listCommands(t.taskId).filter(c => c.commandType === 'report_help')).toHaveLength(1);
+
+    const exec2 = mkExec({ messages: [{ id: 'm2', rendered: '催办：有进展吗？' }], judged: { signal: 'need_help', summary: '卡在 X' } });
+    await runObserverTick(new Date(base + 2 * MIN_OBSERVE_INTERVAL_MS), exec2);
+    expect(getSubTask(t.taskId)!.status).toBe('paused');
+    expect(listCommands(t.taskId).filter(c => c.commandType === 'report_help')).toHaveLength(1);
+  });
+
+  it('paused：blocker 实质变化 → 仍升级重报', async () => {
+    const t = await mkObserving();
+    const base = Date.now();
+    await runObserverTick(new Date(base), mkExec({ messages: [{ id: 'm1', rendered: '卡在 X' }], judged: { signal: 'need_help', summary: '卡在 X' } }));
+    expect(getSubTask(t.taskId)!.status).toBe('paused');
+
+    const exec2 = mkExec({ messages: [{ id: 'm2', rendered: '改为卡在 Y' }], judged: { signal: 'need_help', summary: '现在卡在 Y 了' } });
+    await runObserverTick(new Date(base + 2 * MIN_OBSERVE_INTERVAL_MS), exec2);
+    expect(getSubTask(t.taskId)!.status).toBe('paused');
+    expect(listCommands(t.taskId).filter(c => c.commandType === 'report_help')).toHaveLength(2);
+  });
+
   // ── 超时兜底重报集成 (松松追加): 无新进展但隔很久没人响应 → 兜底再报一次 ──
   /** 跑 ①help → supplement 切回 observing，并把 help 标成"已投出 sentAt=base"。返 {t, base, helpCmdId}。 */
   async function setupStaleHelp() {
@@ -443,7 +500,22 @@ describe('runObserverTick', () => {
     // now = base + 2h + buffer → 超阈值；help 仍未 ack/未 supplement
     await runObserverTick(new Date(base + STALE_REREPORT_MS + 5 * 60_000), exec2);
     expect(listCommands(t.taskId).filter(c => c.commandType === 'report_help')).toHaveLength(2); // 兜底补发
-    expect(getSubTask(t.taskId)!.status).toBe('reported_help');
+    expect(getSubTask(t.taskId)!.status).toBe('paused');
+  });
+
+  it('paused 兜底：超 2h 无响应 → 心跳重报一次', async () => {
+    const t = await mkObserving();
+    const base = Date.now();
+    await runObserverTick(new Date(base), mkExec({ messages: [{ id: 'm1', rendered: '卡在 X' }], judged: { signal: 'need_help', summary: '卡在 X' } }));
+    const helpCmdId = listCommands(t.taskId).filter(c => c.commandType === 'report_help')[0].cmdId;
+    await updateCommand(helpCmdId, { deliveryStatus: 'sent', sentAt: new Date(base).toISOString() });
+
+    await runObserverTick(
+      new Date(base + STALE_REREPORT_MS + 5 * 60_000),
+      mkExec({ messages: [{ id: 'm2', rendered: '仍卡在 X' }], judged: { signal: 'need_help', summary: '卡在 X' } }),
+    );
+    expect(getSubTask(t.taskId)!.status).toBe('paused');
+    expect(listCommands(t.taskId).filter(c => c.commandType === 'report_help')).toHaveLength(2);
   });
 
   // bug 修复 (2026-05-31 蔻黛克斯 review): 响应 = 重新起算 2h，而非永久关闭兜底。
@@ -454,7 +526,7 @@ describe('runObserverTick', () => {
     const exec2 = mkExec({ messages: [{ id: 'm2', rendered: '需拍板' }], judged: { signal: 'need_help', summary: '卡在 X，需要拍板' } });
     await runObserverTick(new Date(base + STALE_REREPORT_MS + 5 * 60_000), exec2);
     expect(listCommands(t.taskId).filter(c => c.commandType === 'report_help')).toHaveLength(2); // 兜底补发
-    expect(getSubTask(t.taskId)!.status).toBe('reported_help');
+    expect(getSubTask(t.taskId)!.status).toBe('paused');
   });
 
   it('兜底④：父群**刚**响应过 (ack 在重检前 5min) → 不重报 (给执行者推进时间, 不刚回应就刷屏)', async () => {

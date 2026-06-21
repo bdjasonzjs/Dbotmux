@@ -674,6 +674,21 @@ describe('reportProgress', () => {
     expect(listCommands(t.taskId).filter(c => c.commandType === 'report_help')).toHaveLength(2);
   });
 
+  it('paused 已求助·待人 + 显式 askforhelp/report → 仍 emit 新 help', async () => {
+    const t = await mkTask();
+    await transitionStatus(t.taskId, 'paused');
+    subSession();
+    const old = await enqueueCommand({
+      taskId: t.taskId, direction: 'child_to_parent', targetChatId: 'oc_main',
+      commandType: 'report_help', payload: { summary: '卡在 X' }, idempotencyKey: 'old-help',
+    });
+    await ackCommand(old.cmdId);
+    const r = await reportProgress({ sessionId: 'sess_sub', taskId: t.taskId, type: 'need_help', summary: '显式新求助：卡在 Y' });
+    expect(r.cmdId).not.toBe(old.cmdId);
+    expect(getSubTask(t.taskId)!.status).toBe('paused');
+    expect(listCommands(t.taskId).filter(c => c.commandType === 'report_help')).toHaveLength(2);
+  });
+
   it('task 已 finished → 拒绝 need_help, 不入队', async () => {
     const t = await mkTask();
     await transitionStatus(t.taskId, 'finished');
@@ -840,6 +855,17 @@ describe('supplementSubtask', () => {
     expect(cmd.commandType).toBe('supplement');
     expect(cmd.direction).toBe('parent_to_child');
     expect(cmd.payload.content).toBe('用这个 token');
+  });
+
+  it('paused 已求助·待人 → observing + parent→child supplement 命令', async () => {
+    const t = await mkTask();
+    await transitionStatus(t.taskId, 'paused');
+    mainSession();
+    const v = getSubTask(t.taskId)!.version;
+    const res = await supplementSubtask({ sessionId: 'sess_main', taskId: t.taskId, content: '外部介入：补充信息', expectedVersion: v });
+    expect(res.status).toBe('observing');
+    expect(getSubTask(t.taskId)!.status).toBe('observing');
+    expect(getCommand(res.cmdId)!.commandType).toBe('supplement');
   });
 
   it('P1: 不传 expectedVersion 且非 force → 400', async () => {

@@ -1113,7 +1113,7 @@ export async function supplementSubtask(req: SupplementSubtaskReq): Promise<{ ta
   try {
     result = await transitionAndEnqueueCommand({
       taskId: req.taskId, expectedVersion: req.force ? undefined : req.expectedVersion,
-      resolveTo: cur => (cur === 'reported_help' ? 'observing' : null), // help 被回应 → observing；其它状态不动
+      resolveTo: cur => (cur === 'reported_help' || cur === 'paused' ? 'observing' : null), // help 被回应 → observing；其它状态不动
       command: {
         direction: 'parent_to_child', targetChatId: task.chatId,
         commandType: 'supplement', payload: { content: req.content, targetRole },

@@ -35,10 +35,10 @@ const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 const BOTS_JSON_PATH = join(homedir(), '.botmux', 'bots.json');
 const REGISTRY_DIR = join(homedir(), '.botmux', 'data', 'dashboard-daemons');
 
-// 巡检视图 age-aware（迭代2 A1）：reported_help 是「粘性」状态，报了不会自动消。
+// 巡检视图 age-aware（迭代2 A1）：reported_help/paused 是「粘性」求助态，报了不会自动消。
 // 超过本阈值仍未被(重新)发起的求助归为「陈旧求助」，不计入顶部红色 Needs-you。
 // 阈值默认 24h，env BOTMUX_STALE_HELP_HOURS 可调（与 BOTMUX_MAX_* 命名一致）。
-// 新鲜度基准用 SubTask.updatedAt（= 进 reported_help 的转移时刻；停滞自动 escalate 只刷
+// 新鲜度基准用 SubTask.updatedAt（= 进 reported_help/paused 的转移时刻；停滞自动 escalate 只刷
 // updatedAt 不刷 lastExecutorActivityAt，故 updatedAt 才是「这条求助最后被实质发起」的正确锚点）。
 const STALE_HELP_DEFAULT_HOURS = 24;
 function staleHelpThresholdMs(): number {
@@ -586,12 +586,12 @@ const server = createServer(async (req, res) => {
           subtaskStatus: st?.status,                        // SubTaskStatus | undefined
           subtaskGoal: st?.compactSummary || st?.goal || undefined,
           subtaskDepth: st?.depth,
-          // 迭代2 A1: age-aware「陈旧求助」。新鲜度基准 = updatedAt（进 reported_help 的
+          // 迭代2 A1: age-aware「陈旧求助」。新鲜度基准 = updatedAt（进 reported_help/paused 的
           // 转移时刻；停滞 escalate 只刷 updatedAt 不刷 lastExecutorActivityAt，故 updatedAt
           // 才是「这条求助最后被实质发起」的正确锚点）。仅对执行群求助判陈旧——经理群另走
           // A2 专属展示，不在此判 needs-you。
           subtaskUpdatedAt: st?.updatedAt,
-          subtaskHelpStale: !!(st && st.status === 'reported_help' && st.reportingMode !== 'manager'
+          subtaskHelpStale: !!(st && (st.status === 'reported_help' || st.status === 'paused') && st.reportingMode !== 'manager'
             && st.updatedAt && (Date.now() - new Date(st.updatedAt).getTime()) > staleHelpMs),
           // 迭代2 A2: 经理群「下次汇报倒计时」基准时刻（digest 窗口游标）。
           subtaskLastDigestAt: st?.lastDigestAt ?? null,

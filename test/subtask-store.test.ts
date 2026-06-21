@@ -129,6 +129,7 @@ describe('状态机（含 review Blocker 2 路径）', () => {
   });
   it('ACTIVE_STATUSES 不含终态', () => {
     expect(ACTIVE_STATUSES).toContain('reported_done');
+    expect(ACTIVE_STATUSES).toContain('paused');
     expect(ACTIVE_STATUSES).not.toContain('finished');
   });
 });

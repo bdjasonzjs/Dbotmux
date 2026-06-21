@@ -25,10 +25,10 @@
 
 - **群类型三分**（kindOf）：`main`(=rootChatId 主群) / `manager`(reportingMode=manager 经理群) / `executor`(叶子执行群) / `plain`。主群+经理群=组织层，卡片带「组织层·不计预算」标 + 不同图标/顶边色。
 - **状态映射**（inspectStatusOf，用真实 SubTaskStatus）：
-  - `reported_help` / `error` / `activation_failed` / 未答@ping → 🔴 需要人介入（severity 3，置顶、红色）
+  - `reported_help` / `paused`（已求助·待人）/ `error` / `activation_failed` / 未答@ping → 🔴 需要人介入（severity 3，置顶、红色）
   - `reported_done` → 🟢 完成待确认（**仍在 active 区**，severity 2）
   - `observing` / `creating` → 🟡 进行中
-  - `finished` / `paused` / `stopped` → 归档区
+  - `finished` / `stopped` → 归档区
   - 无 subtask 记录 → 回落 metrics 状态
 - **drill-down**：默认折叠，点 ▸ 逐级展开经理群+子群；首次自动展开「主群 + 通往🔴的路径」，让需介入的群一眼可见。
 - **active vs archived 分区**：含活节点的根树进「进行中」区；纯完成/归档的根树进底部可折叠「已归档/已完成」区。
