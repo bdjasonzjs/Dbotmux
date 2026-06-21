@@ -39,7 +39,7 @@
 
 ## 验证命令
 
-- `pnpm vitest run test/taskteam-stores.test.ts test/taskteam-engine.test.ts` → 12/12 通过（批1 5 + 批2 7）。
+- `pnpm vitest run test/taskteam-stores.test.ts test/taskteam-engine.test.ts` → 15/15 通过（批1 5 + 批2 10）。
 - `pnpm tsc --noEmit` → exit 0。
 
 ## 两层 review 裁决与整改
@@ -64,4 +64,6 @@
 
 整改后复验：`vitest` 15/15（批1 5 + 批2 10）；`tsc --noEmit` exit 0；`git diff --check` 通过；红线#1 未破。
 
-待办：唤审查员（蔻黛克斯）复审 P1/P2；无 P1 后 request-review 给 CEO（验收文档写飞书 docx）。
+## 批2 关闭
+
+两层 review（架构通过 + 细节 P1/P2/M1 全关）闭环、无遗留 P1/P2；CEO 关已过（验收 docx `S3CLduA4sorRc6xqHEpc7fGtn2b` 对齐 commit `66b4b13d`）。批2 配置引擎正式收下，进入批3（运行时 + 驱动层）。
