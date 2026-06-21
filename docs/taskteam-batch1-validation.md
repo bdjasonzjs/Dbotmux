@@ -60,4 +60,6 @@
 
 整改后复验：`vitest` 5/5；`tsc --noEmit` exit 0；`git diff --check` 通过；红线#1 未破。
 
-待办：唤审查员（蔻黛克斯）复审 release 侧 CAS；无 P1 后 request-review 给 CEO（届时验收文档写成飞书 docx）。
+## 批1 关闭
+
+两层 review（架构 A1–A3 + 细节 P1-1/P1-2/complete-CAS/release-CAS/P2）全部闭环、无遗留 P1/P2；CEO 关已过（抽查 worktree 地面真相 + 验收 docx `SCaydyBJooW7WNxZ2iuc3hnXnyd` 对齐 commit `039c1341`）。批1 数据层正式收下，进入批2。
