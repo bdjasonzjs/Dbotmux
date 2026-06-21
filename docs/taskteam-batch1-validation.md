@@ -30,4 +30,13 @@
 - **A2（forward-looking，已留接口）**：原 `failed` 是终态、`retryCount` 卡在 1，与 §2.1 retry 矛盾。新增 `TaskTeamAction.nextAttemptAt` 退避字段 + `releaseTaskTeamActionForRetry(actionId, {lastError, backoffMs})`：投递失败可回 `pending`、`retryCount+1`、按退避到点，`listPendingTaskTeamActions` 在到点前不取；`acked` 绝不回退重投；达上限由批3 dispatcher 改调 `completeTaskTeamAction(status:'failed')` 落终态（本层只给能力、不内置策略）。终态不再额外加 `retryCount`，计数归 retry 路径所有。新增断言：retry 退避取数 + failed 终态 + acked 不回退。
 - **A3（minor，已改）**：seed 原把「细节 review 通过」直接映射成 developer `finish`，越过验收门。按设计 4.4（验收是完成唯一依据）改为 developer `report`（交付待验收）；`finish` 仅由 owner 验收事件触发，seed 不再有自动 finish 规则。新增断言：detail-pass 规则 `do==='report'` 且 seed 无 `finish` 规则。
 
-待办：等审查员（蔻黛克斯）细节 review docx 出来后一并处理其意见，两层 review 均无 P1 后再 request-review 给 CEO。
+## 细节 review 整改（P1-1 / P1-2 + P2，审查员蔻黛克斯 docx `WETQdsydoooHrAxgorXcUvhMnHQ`）
+
+- **P1-1（已修）角色行为 vs 投递命令混用**：`TaskTeamAction.actionType` 此前复用角色动作集 `TaskTeamActionType`，缺 §3 要求 outbox 承载的 `kickoff/request-review/nudge` 等投递命令，导致 seed `submit→architect` 写成 `review-pass`（把"请架构师 review"表达成"review 已通过"）。已新增独立类型 `TaskTeamDeliveryCommand`（kickoff/request-review/nudge/escalate/report/finish）：`TaskTeamAction.actionType` 与 `CollabRule.do` 改用它；角色能力 `TaskTeamRole.actions` 仍用 `TaskTeamActionType`。seed 规则改为：submit→request-review(架构师)、架构 pass→request-review(审查员)、detail pass→report(待验收)、reject→nudge(返工)、stall→escalate(上报)。
+- **P1-2（已修）终态边界守卫**：① `completeTaskTeamAction` 增终态守卫——`acked/failed` 不可被跨状态改写（同状态幂等放行，跨状态抛 `TaskTeamActionTerminalError`）。② `releaseTaskTeamActionForRetry` 收紧为**仅 `claimed` 可退避重投**，并支持传入 `dispatchAttemptId` 校验持有者（迟到回调/已被重领的旧 attempt 一律忽略）；`sent/acked/failed/pending` 一律不动，杜绝复活终态 / 重投已发送。
+- **P2-1（已修）claim 也守退避**：`claimTaskTeamAction` 对 `pending` 增 `nextAttemptAt` 门禁，退避窗未到不可直接 claim（不再只靠 `listPending` 过滤）。
+- **P2-2（已修）三 store corrupt 备份断言**：单测覆盖 config/instance/outbox 三者损坏时各自抛专属 Corrupt 错误且生成 `*.corrupt-*` 备份文件。
+
+整改后复验：`vitest` 5/5 通过；`tsc --noEmit` exit 0；`git diff --check` 通过；红线#1 仍未破（仅新增 taskteam 文件）。
+
+待办：唤审查员（蔻黛克斯）复审 P1-1/P1-2；两层 review 均无 P1 后再 request-review 给 CEO。

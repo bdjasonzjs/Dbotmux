@@ -8,7 +8,7 @@ import type {
   TaskTeamAction,
   TaskTeamActionId,
   TaskTeamActionStatus,
-  TaskTeamActionType,
+  TaskTeamDeliveryCommand,
   TaskTeamId,
   TaskTeamOutboxFile,
   TaskTeamRoleInstanceId,
@@ -30,6 +30,16 @@ export class TaskTeamActionNotFoundError extends Error {
     this.name = 'TaskTeamActionNotFoundError';
   }
 }
+
+// P1-2：终态（acked/failed）不可被改写成其它状态
+export class TaskTeamActionTerminalError extends Error {
+  constructor(public actionId: TaskTeamActionId, public from: TaskTeamActionStatus, public to: TaskTeamActionStatus) {
+    super(`TaskTeam action ${actionId} is terminal (${from}); refusing transition to ${to}`);
+    this.name = 'TaskTeamActionTerminalError';
+  }
+}
+
+const TERMINAL_STATUSES: ReadonlySet<TaskTeamActionStatus> = new Set(['acked', 'failed']);
 
 function fp(): string {
   return join(config.session.dataDir, STORE_FILE);
@@ -91,7 +101,7 @@ function genId(prefix: string): string {
 
 export async function enqueueTaskTeamAction(opts: {
   teamId: TaskTeamId;
-  actionType: TaskTeamActionType;
+  actionType: TaskTeamDeliveryCommand;
   idempotencyKey: string;
   sourceRoleInstanceId?: TaskTeamRoleInstanceId;
   targetRoleInstanceId?: TaskTeamRoleInstanceId;
@@ -146,6 +156,10 @@ export async function claimTaskTeamAction(actionId: TaskTeamActionId, leaseMs: n
     const cur = store.actions[idx];
     if (!['pending', 'claimed'].includes(cur.status)) return { result: null, dirty: false };
     const now = new Date();
+    // P2-1：退避窗未到的 pending 不可被直接 claim（不只靠 listPending 过滤）
+    if (cur.status === 'pending' && cur.nextAttemptAt && new Date(cur.nextAttemptAt).getTime() > now.getTime()) {
+      return { result: null, dirty: false };
+    }
     if (cur.status === 'claimed' && cur.leaseExpiresAt && new Date(cur.leaseExpiresAt).getTime() > now.getTime()) {
       return { result: null, dirty: false };
     }
@@ -169,12 +183,17 @@ export async function completeTaskTeamAction(
     const idx = store.actions.findIndex(a => a.actionId === actionId);
     if (idx < 0) throw new TaskTeamActionNotFoundError(actionId);
     const cur = store.actions[idx];
+    // P1-2：终态守卫——acked/failed 不可被改写；同状态幂等放行，跨状态拒绝
+    if (TERMINAL_STATUSES.has(cur.status)) {
+      if (patch.status === cur.status) return { result: cur, dirty: false };
+      throw new TaskTeamActionTerminalError(actionId, cur.status, patch.status);
+    }
     const next: TaskTeamAction = {
       ...cur,
       status: patch.status,
       deliveredMessageId: patch.deliveredMessageId ?? cur.deliveredMessageId,
       lastError: patch.lastError ?? null,
-      // 终态（sent/acked/failed）不再动 retryCount——重试计数归 releaseTaskTeamActionForRetry 所有
+      // 终态不再动 retryCount——重试计数归 releaseTaskTeamActionForRetry 所有
       leaseExpiresAt: null,
       nextAttemptAt: null,
       dispatchAttemptId: null,
@@ -186,19 +205,27 @@ export async function completeTaskTeamAction(
 }
 
 /**
- * A2 retry 出路（留给批3 dispatcher）：投递失败但仍可重试时，把 action 放回 pending，
- * retryCount+1，按 backoffMs 设退避到点；listPending 在到点前不取。达 maxRetries 由 dispatcher
- * 改调 completeTaskTeamAction(status:'failed') 落终态——本层只提供能力、不内置策略。
+ * A2 retry 出路（留给批3 dispatcher）：投递失败但仍在飞行中（claimed）时，把 action 放回 pending，
+ * retryCount+1，按 backoffMs 设退避到点；listPending/claim 在到点前都不取。
+ * P1-2 状态机守卫：
+ *  - 仅 `claimed` 可 release——`sent/acked/failed/pending` 一律不动（绝不复活终态、不重投已发送）。
+ *  - 若传入 `dispatchAttemptId`，必须与当前持有者一致才放行——挡迟到回调 / 已被他人重领的旧 attempt。
+ * 达 maxRetries 时由 dispatcher 改调 completeTaskTeamAction(status:'failed') 落终态——本层只给能力、不内置策略。
  */
 export async function releaseTaskTeamActionForRetry(
   actionId: TaskTeamActionId,
-  opts: { lastError?: string | null; backoffMs?: number } = {},
+  opts: { dispatchAttemptId?: string | null; lastError?: string | null; backoffMs?: number } = {},
 ): Promise<TaskTeamAction | null> {
   return mutate(store => {
     const idx = store.actions.findIndex(a => a.actionId === actionId);
     if (idx < 0) return { result: null, dirty: false };
     const cur = store.actions[idx];
-    if (cur.status === 'acked') return { result: cur, dirty: false }; // 已终结成功，绝不回退重投
+    // 仅在飞行中（claimed）才可退避重投；终态 / pending 保持不变
+    if (cur.status !== 'claimed') return { result: cur, dirty: false };
+    // 迟到回调 / 已被他人重领：attempt 不匹配则忽略
+    if (opts.dispatchAttemptId && cur.dispatchAttemptId !== opts.dispatchAttemptId) {
+      return { result: cur, dirty: false };
+    }
     const now = Date.now();
     const next: TaskTeamAction = {
       ...cur,

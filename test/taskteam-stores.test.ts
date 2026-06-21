@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { TaskTeamRoleInstance } from '../src/services/taskteam-schema.js';
@@ -112,16 +112,16 @@ describe('taskteam batch 1 stores', () => {
 
     const first = await outboxStore.enqueueTaskTeamAction({
       teamId: 'tt_team_demo',
-      actionType: 'review-pass',
+      actionType: 'request-review',
       sourceRoleInstanceId: 'tt_ri_arch',
       targetSlotId: 'tt_slot_detail_reviewer_main',
-      idempotencyKey: 'demo:review-pass:1',
-      payload: { summary: 'architecture passed' },
+      idempotencyKey: 'demo:request-review:1',
+      payload: { summary: 'please review' },
     });
     const second = await outboxStore.enqueueTaskTeamAction({
       teamId: 'tt_team_demo',
-      actionType: 'review-pass',
-      idempotencyKey: 'demo:review-pass:1',
+      actionType: 'request-review',
+      idempotencyKey: 'demo:request-review:1',
     });
 
     expect(second.actionId).toBe(first.actionId);
@@ -140,59 +140,76 @@ describe('taskteam batch 1 stores', () => {
     expect(sent.deliveredMessageId).toBe('om_demo');
   });
 
-  it('exposes a retry release path with backoff and keeps failed terminal (A2)', async () => {
+  it('enforces retry-release and terminal-state boundaries (A2 / P1-2)', async () => {
     const { outboxStore } = await freshStores();
+    const {
+      enqueueTaskTeamAction: enqueue,
+      claimTaskTeamAction: claim,
+      completeTaskTeamAction: complete,
+      releaseTaskTeamActionForRetry: release,
+      listPendingTaskTeamActions: listPending,
+      TaskTeamActionTerminalError,
+    } = outboxStore;
 
-    const action = await outboxStore.enqueueTaskTeamAction({
-      teamId: 'tt_team_demo',
-      actionType: 'report',
-      idempotencyKey: 'demo:retry:1',
-    });
-    const claimed = await outboxStore.claimTaskTeamAction(action.actionId, 60_000);
+    // —— claimed → release(retry)：仅同一 dispatch attempt 放行；退避 listPending/claim 都守 ——
+    const a = await enqueue({ teamId: 'tt_team_demo', actionType: 'request-review', idempotencyKey: 'k:retry' });
+    const claimed = await claim(a.actionId, 60_000);
     expect(claimed?.status).toBe('claimed');
+    const attemptId = claimed!.dispatchAttemptId;
 
-    // 失败但可重试 → 回 pending、retryCount+1、按 backoff 设退避到点
-    const released = await outboxStore.releaseTaskTeamActionForRetry(action.actionId, {
-      lastError: 'lark send failed',
-      backoffMs: 10_000,
-    });
+    // 迟到回调 / 错误 attempt → 不放行（保持 claimed、retryCount 不变）
+    const stale = await release(a.actionId, { dispatchAttemptId: 'tt_dispatch_bogus', backoffMs: 10_000 });
+    expect(stale?.status).toBe('claimed');
+    expect(stale?.retryCount).toBe(0);
+
+    // 正确 attempt → 退避重投
+    const released = await release(a.actionId, { dispatchAttemptId: attemptId, lastError: 'lark send failed', backoffMs: 10_000 });
     expect(released?.status).toBe('pending');
     expect(released?.retryCount).toBe(1);
     expect(released?.lastError).toBe('lark send failed');
     expect(released?.leaseExpiresAt).toBeNull();
-
-    // 退避窗内不取，到点后才取
     const baseMs = new Date(released!.nextAttemptAt!).getTime();
-    expect(outboxStore.listPendingTaskTeamActions(new Date(baseMs - 1_000)).length).toBe(0);
-    expect(outboxStore.listPendingTaskTeamActions(new Date(baseMs + 1_000)).length).toBe(1);
+    expect(listPending(new Date(baseMs - 1_000)).length).toBe(0);
+    expect(await claim(a.actionId, 60_000)).toBeNull(); // P2-1：claim 也守退避窗
+    expect(listPending(new Date(baseMs + 1_000)).length).toBe(1);
 
-    // 达上限由 dispatcher 落终态 failed —— 终态后不再出现在 pending
-    const failed = await outboxStore.completeTaskTeamAction(action.actionId, {
-      status: 'failed',
-      lastError: 'gave up after retries',
-    });
-    expect(failed.status).toBe('failed');
-    expect(failed.retryCount).toBe(1); // 终态不再额外加计数
-    expect(outboxStore.listPendingTaskTeamActions(new Date(baseMs + 999_999)).length).toBe(0);
+    // —— sent 不可被 release 复活；sent→acked 合法；acked 终态守卫 ——
+    const b = await enqueue({ teamId: 'tt_team_demo', actionType: 'report', idempotencyKey: 'k:sent' });
+    await claim(b.actionId, 60_000);
+    expect((await complete(b.actionId, { status: 'sent', deliveredMessageId: 'om_b' })).status).toBe('sent');
+    expect((await release(b.actionId, { backoffMs: 5_000 }))?.status).toBe('sent'); // 不复活已发送
+    expect((await complete(b.actionId, { status: 'acked' })).status).toBe('acked');
+    await expect(complete(b.actionId, { status: 'failed' })).rejects.toThrow(TaskTeamActionTerminalError); // 终态跨状态改写被拒
+    expect((await complete(b.actionId, { status: 'acked' })).status).toBe('acked'); // 同状态幂等放行
+    expect((await release(b.actionId, { backoffMs: 1_000 }))?.status).toBe('acked'); // acked 不可 release
 
-    // 已 acked 的 action 绝不被回退重投
-    const ackAction = await outboxStore.enqueueTaskTeamAction({
-      teamId: 'tt_team_demo',
-      actionType: 'report',
-      idempotencyKey: 'demo:retry:2',
-    });
-    await outboxStore.completeTaskTeamAction(ackAction.actionId, { status: 'acked' });
-    const reReleased = await outboxStore.releaseTaskTeamActionForRetry(ackAction.actionId, { backoffMs: 5_000 });
-    expect(reReleased?.status).toBe('acked');
+    // —— failed 终态：不复活、不可改写、不再额外加 retryCount ——
+    const c = await enqueue({ teamId: 'tt_team_demo', actionType: 'nudge', idempotencyKey: 'k:failed' });
+    await claim(c.actionId, 60_000);
+    const cFailed = await complete(c.actionId, { status: 'failed', lastError: 'gave up' });
+    expect(cFailed.status).toBe('failed');
+    expect(cFailed.retryCount).toBe(0);
+    expect((await release(c.actionId, { backoffMs: 1_000 }))?.status).toBe('failed');
+    await expect(complete(c.actionId, { status: 'sent' })).rejects.toThrow(TaskTeamActionTerminalError);
+    expect(listPending(new Date(baseMs + 999_999)).length).toBe(1); // 只有退避到点的 a 可取，b/c 终态不在
   });
 
-  it('backs up corrupt config instead of treating it as empty', async () => {
-    const { configStore } = await freshStores();
-    writeFileSync(join(tempDir, 'taskteam-config.json'), '{not-json', 'utf-8');
+  it('backs up corrupt stores instead of treating them as empty (P2-2)', async () => {
+    const { configStore, teamStore, outboxStore } = await freshStores();
+    const corruptBackupExists = (base: string) =>
+      readdirSync(tempDir).some(f => f.startsWith(`${base}.corrupt-`));
 
+    writeFileSync(join(tempDir, 'taskteam-config.json'), '{not-json', 'utf-8');
     expect(() => configStore.readTaskTeamConfig()).toThrow(configStore.TaskTeamConfigStoreCorruptError);
-    const backups = readFileSync(join(tempDir, 'taskteam-config.json'), 'utf-8');
-    expect(backups).toBe('{not-json');
-    expect(existsSync(join(tempDir, 'taskteam-config.json'))).toBe(true);
+    expect(readFileSync(join(tempDir, 'taskteam-config.json'), 'utf-8')).toBe('{not-json');
+    expect(corruptBackupExists('taskteam-config.json')).toBe(true);
+
+    writeFileSync(join(tempDir, 'taskteams.json'), '{bad', 'utf-8');
+    expect(() => teamStore.readTaskTeams()).toThrow(teamStore.TaskTeamStoreCorruptError);
+    expect(corruptBackupExists('taskteams.json')).toBe(true);
+
+    writeFileSync(join(tempDir, 'taskteam-outbox.json'), 'not-json]', 'utf-8');
+    expect(() => outboxStore.readTaskTeamOutbox()).toThrow(outboxStore.TaskTeamOutboxStoreCorruptError);
+    expect(corruptBackupExists('taskteam-outbox.json')).toBe(true);
   });
 });

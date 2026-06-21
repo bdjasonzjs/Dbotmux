@@ -206,13 +206,18 @@ export function defaultTaskTeamSeed(): Omit<TaskTeamConfigFile, 'version' | 'upd
         isObserver: true,
       },
     ],
+    // do = 投递命令（P1-1）：角色 submit/review-pass 是触发事件(when.event)，引擎产出 request-review/nudge/report 等命令
     rules: [
-      { ruleId: rules[0], when: { event: 'submit', status: 'running' }, whoSlot: 'tt_slot_architect_main', do: 'review-pass' },
-      { ruleId: rules[1], when: { event: 'review-pass', status: 'reviewing', fromSlotId: 'tt_slot_architect_main' }, whoSlot: 'tt_slot_detail_reviewer_main', do: 'review-pass' },
-      // A3：细节 review 通过 ≠ 自动完成；交付转\"待验收\"由 developer report，finish 仅由 owner 验收事件触发（设计 4.4）
+      // 开发者提交 → 给架构师席投递 review 请求（不是"review 已通过"）
+      { ruleId: rules[0], when: { event: 'submit', status: 'running' }, whoSlot: 'tt_slot_architect_main', do: 'request-review' },
+      // 架构师通过 → 给审查员席投递 review 请求
+      { ruleId: rules[1], when: { event: 'review-pass', status: 'reviewing', fromSlotId: 'tt_slot_architect_main' }, whoSlot: 'tt_slot_detail_reviewer_main', do: 'request-review' },
+      // A3：细节 review 通过 ≠ 自动完成；投递"待验收"report 给开发者席，finish 仅由 owner 验收事件触发（设计 4.4）
       { ruleId: rules[2], when: { event: 'review-pass', status: 'reviewing', fromSlotId: 'tt_slot_detail_reviewer_main' }, whoSlot: 'tt_slot_developer_main', do: 'report' },
-      { ruleId: rules[3], when: { event: 'review-reject', status: 'reviewing' }, whoSlot: 'tt_slot_developer_main', do: 'rework' },
-      { ruleId: rules[4], when: { event: 'stall', status: 'running' }, whoSlot: 'tt_slot_observer_main', do: 'report' },
+      // 任一层驳回 → nudge 开发者席返工（rework 是开发者的角色行为，投递命令是 nudge）
+      { ruleId: rules[3], when: { event: 'review-reject', status: 'reviewing' }, whoSlot: 'tt_slot_developer_main', do: 'nudge' },
+      // 卡顿 → 盯梢席 escalate 上报卡点
+      { ruleId: rules[4], when: { event: 'stall', status: 'running' }, whoSlot: 'tt_slot_observer_main', do: 'escalate' },
     ],
     teamTypes: [
       {

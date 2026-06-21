@@ -10,6 +10,7 @@ export type TaskTeamDepartmentId = `tt_dept_${string}`;
 export type TaskTeamActionId = `tt_action_${string}`;
 
 export type TaskTeamVisibility = 'full' | 'review-only' | 'progress-only';
+// 角色行为 / 事件 verdict（§2.3.1 固定动作集）——角色能做哪些动作、产生哪些 TeamEvent
 export type TaskTeamActionType =
   | 'submit'
   | 'review-pass'
@@ -19,6 +20,16 @@ export type TaskTeamActionType =
   | 'escalate'
   | 'report'
   | 'consult'
+  | 'finish';
+
+// outbox 投递命令（§3：引擎决策产出、写入 outbox 的"命令"）——与角色行为分离（P1-1）
+// 角色 submit 触发的是"请架构师 review"=request-review，而非"review 已通过"=review-pass
+export type TaskTeamDeliveryCommand =
+  | 'kickoff'
+  | 'request-review'
+  | 'nudge'
+  | 'escalate'
+  | 'report'
   | 'finish';
 
 export type TaskTeamStatus =
@@ -78,9 +89,9 @@ export interface TaskTeamTriggerCondition {
 
 export interface TaskTeamCollabRule {
   ruleId: TaskTeamRuleId;
-  when: TaskTeamTriggerCondition;
-  whoSlot: TaskTeamSlotId;
-  do: TaskTeamActionType;
+  when: TaskTeamTriggerCondition; // when.event 是触发的角色行为 / 生命周期事件
+  whoSlot: TaskTeamSlotId; // 投递目标席位
+  do: TaskTeamDeliveryCommand; // 引擎命中规则时产出的投递命令（非角色行为）
 }
 
 export interface TaskTeamCollabPolicy {
@@ -160,7 +171,7 @@ export interface TaskTeamInstance {
 export interface TaskTeamAction {
   actionId: TaskTeamActionId;
   teamId: TaskTeamId;
-  actionType: TaskTeamActionType;
+  actionType: TaskTeamDeliveryCommand; // outbox 承载投递命令（P1-1）
   sourceRoleInstanceId?: TaskTeamRoleInstanceId;
   targetRoleInstanceId?: TaskTeamRoleInstanceId;
   targetSlotId?: TaskTeamSlotId;
