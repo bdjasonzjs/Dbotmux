@@ -42,6 +42,12 @@ export interface OnboardingPlan {
 
 const CHEAP_ENGINE_RE = /coco|trae|tilly|haiku/i;
 
+// 可用 onboarding bot（P1）：建可投递示例小组前，每席位的 bot 必须有非空 larkAppId + botName + creator-app 视角
+// 真实 botOpenId（用于 <at user_id=...> 触达）。缺字段的对象不计入 available，不进入 ready/create。
+export function isUsableOnboardingBot(b: OnboardingBot | undefined | null): b is OnboardingBot & { botOpenId: string } {
+  return !!b && typeof b.larkAppId === 'string' && !!b.larkAppId && typeof b.botName === 'string' && !!b.botName && typeof b.botOpenId === 'string' && !!b.botOpenId;
+}
+
 /**
  * 规划新手引导：选示例小组类型（config 有就用、否则 seed 两层 review），把席位分给可用 bot，
  * Observer 优先拿便宜引擎 bot（§7 省钱），算出 bot 缺口「已 available 还差 short」。纯函数。
@@ -65,8 +71,9 @@ export function planOnboarding(opts: {
     observer: isObserver(slot.roleId),
   }));
 
-  // 分配 bot：先给 Observer 席分便宜引擎 bot（§7 省钱），再把其余 bot 按序分给非 observer 席
-  const pool = [...opts.availableBots];
+  // 只用「可用 bot」参与分配 / ready / 缺口（P1）——malformed（缺 larkAppId/botName/botOpenId）不计入 available
+  const usable = opts.availableBots.filter(isUsableOnboardingBot);
+  const pool: OnboardingBot[] = [...usable];
   const takeCheap = (): OnboardingBot | undefined => {
     const i = pool.findIndex(b => CHEAP_ENGINE_RE.test(b.botName));
     return i >= 0 ? pool.splice(i, 1)[0] : pool.shift();
@@ -79,9 +86,9 @@ export function planOnboarding(opts: {
   }
 
   const needed = seats.length;
-  const available = Math.min(opts.availableBots.length, needed);
-  const short = Math.max(0, needed - opts.availableBots.length);
-  const ready = seats.every(s => !!s.assignedBot);
+  const available = Math.min(usable.length, needed);
+  const short = Math.max(0, needed - usable.length);
+  const ready = seats.every(s => isUsableOnboardingBot(s.assignedBot));
 
   const steps: OnboardingStep[] = [
     { id: 'invite', label: '头回私聊邀请（CEO=私聊 bot）', status: 'manual' },
@@ -139,16 +146,24 @@ export async function runOnboarding(
     };
   }
 
-  const roleInstances: TaskTeamRoleInstance[] = plan.seats.map((seat, i) => ({
-    roleInstanceId: `tt_ri_onboard_${i}` as TaskTeamRoleInstance['roleInstanceId'],
-    slotId: seat.slotId as TaskTeamRoleInstance['slotId'],
-    roleId: seat.roleId as TaskTeamRoleInstance['roleId'],
-    binding: {
-      bindingId: `tt_binding_onboard_${i}` as never,
-      botOpenId: seat.assignedBot!.botOpenId ?? seat.assignedBot!.larkAppId,
-      larkAppId: seat.assignedBot!.larkAppId,
-    },
-  }));
+  // plan.ready 已保证每席位的 assignedBot 是 usable（含真实 botOpenId）；不再用 larkAppId 顶替 botOpenId
+  const roleInstances: TaskTeamRoleInstance[] = plan.seats.map((seat, i) => {
+    const bot = seat.assignedBot!;
+    if (!isUsableOnboardingBot(bot)) {
+      // 兜底守卫：不应到达（ready 已校验），但绝不用 larkAppId 顶替 botOpenId
+      throw new Error(`onboard seat ${seat.slotId} has no usable bot (missing botOpenId)`);
+    }
+    return {
+      roleInstanceId: `tt_ri_onboard_${i}` as TaskTeamRoleInstance['roleInstanceId'],
+      slotId: seat.slotId as TaskTeamRoleInstance['slotId'],
+      roleId: seat.roleId as TaskTeamRoleInstance['roleId'],
+      binding: {
+        bindingId: `tt_binding_onboard_${i}` as never,
+        botOpenId: bot.botOpenId,
+        larkAppId: bot.larkAppId,
+      },
+    };
+  });
 
   const created = await deps.createSampleTeam({
     typeId: plan.sampleTypeId,

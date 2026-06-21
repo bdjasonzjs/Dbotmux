@@ -37,6 +37,18 @@
 2. 克隆补齐走 ceo-spawn 扫码激活（交互式，仅 owner 可用）——本批规划缺口 + 提示，不自动触发克隆。
 3. availableBots 由调用方（CLI/dashboard）传入；从 bot-registry 自动盘点可作后续接线。
 
+## 两层 review 裁决与整改
+
+**架构 review：通过 ✓**（§9 引导编排 / 复用隔离）。
+
+**细节 review（docx `JIwSdkjIpoBfGHxKkh0cNRsFnDd`）：1 个 P1，已整改**
+
+| 项 | 内容 | 处理 |
+|-|-|-|
+| **P1** | `availableBots` 只按数组长度/对象存在参与 ready，未校验 bot 身份字段——传 4 个只有 botName、缺 larkAppId/botOpenId 的对象，runOnboarding 仍 ready=true 且建群，roleInstances 无真实 bot 身份；缺 botOpenId 还会用 larkAppId 顶替（`<at user_id=...>` 语义不成立） | 定义 **`isUsableOnboardingBot`**（非空 larkAppId + botName + 真实 botOpenId）；planOnboarding 只用 usable bot 参与分配/ready/缺口——malformed 不计入 available（计入 short），**不进入 ready/create**。runOnboarding 组 roleInstances 用 `bot.botOpenId`（**不再 larkAppId 顶替**）+ 兜底守卫。新增单测：足量但缺字段→不 ready/不 createSampleTeam；缺 botOpenId→不可用计入缺口；usable→roleInstance.botOpenId 是真实 ou_*（无 cli_* 顶替）。 |
+
+整改后复验：`vitest` 64/64（批8 onboard 7）；`tsc --noEmit` exit 0；`git diff --check` 通过；红线#1 未破。
+
 ## 下一步
 
 批8 旁挂完成。批7 + 批8 两层 review 均过后，攒一起 request-review 给 CEO 关。之后剩批4（worker 协议，单独严格 CEO 关）+ 批9（Workflow 撤销，独立分支 + 二次确认）。
