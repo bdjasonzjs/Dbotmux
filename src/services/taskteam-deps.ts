@@ -4,7 +4,7 @@
 import { join } from 'node:path';
 import { config } from '../config.js';
 import { withFileLock } from '../utils/file-lock.js';
-import { readTaskTeamConfig } from './taskteam-config-store.js';
+import { readTaskTeamConfig, seedDefaultTaskTeamConfig } from './taskteam-config-store.js';
 import {
   applyTeamDecisionState,
   createTaskTeam as persistTaskTeam,
@@ -13,8 +13,10 @@ import {
 } from './taskteam-store.js';
 import { enqueueTaskTeamAction } from './taskteam-outbox-store.js';
 import { createGroupWithBots } from './group-creator.js';
+import { createTaskTeam as runtimeCreateTaskTeam } from './taskteam-runtime.js';
 import type { CreateTaskTeamDeps, TaskTeamRuntimeDeps } from './taskteam-runtime.js';
 import type { TaskTeamObserverDeps } from './taskteam-observer.js';
+import type { OnboardingDeps } from './taskteam-onboard.js';
 import type { TaskTeamId } from './taskteam-schema.js';
 
 // per-team 跨进程串行化锁。锁文件路径独立于 store 文件（taskteams.json / taskteam-outbox.json），
@@ -56,6 +58,24 @@ export function defaultCreateTaskTeamDeps(): CreateTaskTeamDeps {
       return { chatId: res.chatId };
     },
     persistTeam: opts => persistTaskTeam(opts),
+  };
+}
+
+export function defaultOnboardDeps(): OnboardingDeps {
+  return {
+    ensureSeed: async () => {
+      await seedDefaultTaskTeamConfig();
+    },
+    getConfig: () => readTaskTeamConfig(),
+    createSampleTeam: params =>
+      runtimeCreateTaskTeam(defaultCreateTaskTeamDeps(), {
+        typeId: params.typeId as never,
+        companyId: params.companyId as never,
+        goal: params.goal,
+        acceptance: params.acceptance,
+        roleInstances: params.roleInstances,
+        creatorLarkAppId: params.creatorLarkAppId,
+      }),
   };
 }
 

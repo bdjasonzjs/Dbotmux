@@ -1512,6 +1512,25 @@ for (const [taskteamAdminPath, taskteamAdminFn] of TASKTEAM_ADMIN_ROUTES) {
   });
 }
 
+// 任务小组 · 新手引导 IPC（批8，§9）——纯新增。body: { availableBots, creatorLarkAppId, companyId?, goal? }
+ipcRoute('POST', '/api/taskteam-onboard', async (req, res) => {
+  let body: { availableBots?: unknown; creatorLarkAppId?: string } = {};
+  try { body = (await readJsonBody(req)) ?? {}; }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (!Array.isArray(body.availableBots) || !body.creatorLarkAppId) {
+    return jsonRes(res, 400, { ok: false, error: 'missing availableBots[]/creatorLarkAppId' });
+  }
+  try {
+    const { runOnboarding } = await import('./services/taskteam-onboard.js');
+    const { defaultOnboardDeps } = await import('./services/taskteam-deps.js');
+    const result = await runOnboarding(defaultOnboardDeps(), body as never);
+    return jsonRes(res, 200, { ok: true, result });
+  } catch (err: any) {
+    const status = err && err.name === 'HttpError' ? err.status : 500;
+    return jsonRes(res, status, { ok: false, error: String(err?.message ?? err) });
+  }
+});
+
 // 2026-05-29: 关闭一个在跟的子群任务 (主体确认完事 / 松松说关) → closeWatch
 // → 移出主体在跟列表。低风险 (只改 watch 状态), 不走 authzCheck。
 ipcRoute('POST', '/api/subtask-close', async (req, res) => {

@@ -17,6 +17,7 @@ const ROUTES: Record<string, string> = {
   'snapshot-restore': '/api/taskteam-snapshot-restore',
   create: '/api/taskteam-create',
   event: '/api/taskteam-event',
+  onboard: '/api/taskteam-onboard',
 };
 
 // 结构化对象（--json/--file 解析结果）要包进的 IPC envelope key（与 admin/daemon body 合约一致）。

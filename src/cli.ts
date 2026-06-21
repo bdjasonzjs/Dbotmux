@@ -3437,7 +3437,8 @@ switch (command) {
   case 'taskteam-snapshot-export':
   case 'taskteam-snapshot-restore':
   case 'taskteam-create':
-  case 'taskteam-event': {
+  case 'taskteam-event':
+  case 'taskteam-onboard': {
     const { cmdTaskTeam } = await import('./cli/taskteam-cli.js');
     await cmdTaskTeam(command.replace('taskteam-', ''), process.argv.slice(3));
     break;
