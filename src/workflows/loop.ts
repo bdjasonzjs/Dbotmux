@@ -46,7 +46,6 @@ import {
   completeRunSucceeded,
   dispatchGate,
   dispatchWork,
-  requireObserverRuntimeDriver,
   type AbortCancelReason,
   type WorkflowRuntimeContext,
 } from './runtime.js';
@@ -83,7 +82,6 @@ export async function runLoop(
   ctx: WorkflowRuntimeContext,
   options: RunLoopOptions = {},
 ): Promise<RunLoopResult> {
-  const driver = requireObserverRuntimeDriver(ctx, 'runLoop');
   const maxTicks = options.maxTicks ?? 1000;
   let ticks = 0;
   let snapshot: Snapshot = replay(await ctx.log.readAll());
@@ -122,9 +120,7 @@ export async function runLoop(
       await resume({
         log: ctx.log,
         runId: ctx.log.runId,
-        def: ctx.def,
         daemonId: 'runloop',
-        driver,
         reconcilers: ctx.reconcilers ?? new Map(),
         loadEffectInput: ctx.loadEffectInput,
         now: ctx.now,

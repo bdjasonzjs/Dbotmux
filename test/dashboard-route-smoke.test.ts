@@ -14,7 +14,6 @@ import { computeRevisionId, parseWorkflowDefinition } from '../src/workflows/def
 import { EventLog } from '../src/workflows/events/append.js';
 import { createRun } from '../src/workflows/run-init.js';
 import { runLoop } from '../src/workflows/loop.js';
-import { defaultObserverDriver } from '../src/workflows/observer-driver.js';
 import type { WorkerSpawnFn } from '../src/workflows/runtime.js';
 
 const TOKEN = 'test-dashboard-token';
@@ -258,7 +257,6 @@ async function seedWaitingRun(runId: string): Promise<void> {
   await runLoop({
     log,
     def: WAIT_DEF,
-    driver: defaultObserverDriver(WAIT_DEF, 'dashboard-route-smoke-test'),
     spawnSubagent: unusedSpawn,
   });
 }

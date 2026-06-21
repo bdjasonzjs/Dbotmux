@@ -18,7 +18,6 @@ import {
 } from '../src/workflows/runtime.js';
 import { runLoop } from '../src/workflows/loop.js';
 import { requestCancel } from '../src/workflows/cancel.js';
-import { defaultObserverDriver } from '../src/workflows/observer-driver.js';
 
 const RUN_ID = 'cancel-responsiveness-test';
 const noopResolver: BotResolver = () => ({});
@@ -62,15 +61,7 @@ async function bootstrap(
     initiator: 'tester',
     botResolver: noopResolver,
   });
-  return {
-    log,
-    ctx: {
-      log,
-      def,
-      driver: defaultObserverDriver(def, 'cancel-responsiveness-test'),
-      spawnSubagent: spawn,
-    },
-  };
+  return { log, ctx: { log, def, spawnSubagent: spawn } };
 }
 
 describe('cancel responsiveness — orchestrator + runtime', () => {
@@ -112,12 +103,7 @@ describe('cancel responsiveness — orchestrator + runtime', () => {
         session: { sessionId: `s-${input.activityId}`, botName: input.botName, startedAt: 0 },
       };
     };
-    const ctx: WorkflowRuntimeContext = {
-      log,
-      def,
-      driver: defaultObserverDriver(def, 'cancel-responsiveness-test'),
-      spawnSubagent: spawn,
-    };
+    const ctx: WorkflowRuntimeContext = { log, def, spawnSubagent: spawn };
     await runLoop(ctx);
     const events = await log.readAll();
     const types = events.map((e) => e.type);

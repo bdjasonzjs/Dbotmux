@@ -16,7 +16,6 @@ import {
   type WorkerSpawnFn,
 } from '../src/workflows/runtime.js';
 import { runLoop } from '../src/workflows/loop.js';
-import { defaultObserverDriver } from '../src/workflows/observer-driver.js';
 
 const RUN_ID = 'parallel-loop-test';
 const noopResolver: BotResolver = () => ({});
@@ -65,15 +64,7 @@ async function bootstrap(
     initiator: 'tester',
     botResolver: noopResolver,
   });
-  return {
-    log,
-    ctx: {
-      log,
-      def,
-      driver: defaultObserverDriver(def, 'parallel-test'),
-      spawnSubagent: spawn,
-    },
-  };
+  return { log, ctx: { log, def, spawnSubagent: spawn } };
 }
 
 describe('runLoop — parallel dispatch', () => {

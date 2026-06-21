@@ -8,7 +8,6 @@ import { EventLog } from '../src/workflows/events/append.js';
 import { scanColdWorkflowRuns } from '../src/workflows/cold-scan.js';
 import { createRun } from '../src/workflows/run-init.js';
 import { runLoop } from '../src/workflows/loop.js';
-import { defaultObserverDriver } from '../src/workflows/observer-driver.js';
 import type { WorkerSpawnFn } from '../src/workflows/runtime.js';
 
 let runsDir: string;
@@ -74,7 +73,6 @@ describe('scanColdWorkflowRuns', () => {
     await runLoop({
       log: terminal,
       def,
-      driver: defaultObserverDriver(def, 'cold-scan-test'),
       spawnSubagent: successSpawn,
     });
 

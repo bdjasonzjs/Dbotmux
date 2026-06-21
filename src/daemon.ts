@@ -110,11 +110,10 @@ import {
   isTerminalRunStatus,
 } from './workflows/cancel-run.js';
 import { requestCancel } from './workflows/cancel.js';
-import { resolveReviewDecision, resolveWait } from './workflows/wait.js';
+import { resolveWait } from './workflows/wait.js';
 import { replay } from './workflows/events/replay.js';
 import { isValidRunId, readRunSnapshot } from './workflows/ops-projection.js';
 import { AttemptResumeManager } from './workflows/attempt-resume.js';
-import { defaultObserverDriver } from './workflows/observer-driver.js';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -987,24 +986,15 @@ async function resolveDashboardWait(
   }
 
   try {
-    const activity = snapshot.activities.get(target.activityId);
-    const ownerNodeId = activity?.ownerNodeId;
-    const ownerNode = ownerNodeId ? entry.ctx.def.nodes[ownerNodeId] : undefined;
-    const resolved = ownerNode?.type === 'semantic' && ownerNode.kind === 'reviewDecision'
-      ? await resolveReviewDecision(entry.ctx.log, {
-          activityId: target.activityId,
-          attemptId: target.attemptId,
-          resolution,
-          by: 'dashboard',
-          comment,
-        })
-      : await resolveWait(entry.ctx.log, {
-          activityId: target.activityId,
-          attemptId: target.attemptId,
-          resolution,
-          by: 'dashboard',
-          comment,
-        });
+    // §10 撤销：语义节点（reviewDecision）已随引擎撤销移除，humanGate 一律走
+    // 通用 resolveWait（DAG 流水线 gate 的标准解锁路径）。
+    const resolved = await resolveWait(entry.ctx.log, {
+      activityId: target.activityId,
+      attemptId: target.attemptId,
+      resolution,
+      by: 'dashboard',
+      comment,
+    });
     const after = replay(await entry.ctx.log.readAll());
     // Fire-and-forget re-drive — same pattern as Lark card path
     // (workflowApprovalResolved hook).  Don't await; the dashboard caller
@@ -1047,7 +1037,6 @@ async function attachColdWorkflowRuns(ownerLarkAppId: string): Promise<void> {
       makeContext: (run, log) => ({
         log,
         def: run.def,
-        driver: defaultObserverDriver(run.def, 'daemon-cold-attach'),
         spawnSubagent: workflowSpawnFn(),
         hostExecutors: createDefaultHostExecutorRegistry(),
         reconcilers: createDefaultProviderReconcilers(),
@@ -1617,7 +1606,6 @@ ipcRoute('POST', '/api/workflows/definitions/:id/run', async (req, res, params) 
       makeRuntimeContext: (log, def, spawnSubagent) => ({
         log,
         def,
-        driver: defaultObserverDriver(def, 'dashboard-trigger'),
         spawnSubagent,
         hostExecutors: createDefaultHostExecutorRegistry(),
         reconcilers: createDefaultProviderReconcilers(),

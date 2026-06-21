@@ -21,7 +21,6 @@ import {
 } from '../src/workflows/definition.js';
 import { createRun } from '../src/workflows/run-init.js';
 import { runLoop } from '../src/workflows/loop.js';
-import { defaultObserverDriver } from '../src/workflows/observer-driver.js';
 import type { WorkerSpawnFn } from '../src/workflows/runtime.js';
 import type { CatalogEntry } from '../src/workflows/catalog.js';
 
@@ -429,7 +428,7 @@ describe('dashboard workflow API routes', () => {
         definition: {
           workflowId: '../escape',
           version: 1,
-          nodes: { a: { type: 'semantic', kind: 'milestone' } },
+          nodes: { a: { type: 'subagent', bot: 'codex', prompt: 'A' } },
         },
       }),
     });
@@ -442,11 +441,9 @@ describe('dashboard workflow API routes', () => {
     const def = parseWorkflowDefinition({
       workflowId: 'editable',
       version: 1,
-      roles: { owner: { id: 'owner', kind: 'custom', label: 'Owner' } },
-      flow: { start: 'a', transitions: [{ id: 'a-b', from: 'a', to: 'b', label: 'next' }] },
       nodes: {
-        a: { type: 'subagent', bot: 'codex', prompt: 'A', roleId: 'owner' },
-        b: { type: 'semantic', kind: 'report', roleId: 'owner', output: { ok: true } },
+        a: { type: 'subagent', bot: 'codex', prompt: 'A' },
+        b: { type: 'subagent', bot: 'codex', prompt: 'B', depends: ['a'] },
       },
     });
     catalogDefs.set('editable', {
@@ -461,13 +458,13 @@ describe('dashboard workflow API routes', () => {
       body: JSON.stringify({ definition: def }),
     });
     expect(validate.status).toBe(200);
-    expect(await validate.json()).toMatchObject({ ok: true, workflowId: 'editable', nodeCount: 2, transitionCount: 1 });
+    expect(await validate.json()).toMatchObject({ ok: true, workflowId: 'editable', nodeCount: 2 });
 
     const updated = parseWorkflowDefinition({
       ...def,
       nodes: {
         ...def.nodes,
-        b: { type: 'semantic', kind: 'report', roleId: 'owner', description: 'Updated report', output: { ok: true } },
+        b: { type: 'subagent', bot: 'codex', prompt: 'B', depends: ['a'], description: 'Updated report' },
       },
     });
     const put = await fetch(`${baseUrl}/api/workflows/definitions/editable`, {
@@ -739,7 +736,6 @@ async function seedWaitingRun(
   await runLoop({
     log,
     def,
-    driver: defaultObserverDriver(def, 'dashboard-workflow-api-test'),
     spawnSubagent: unusedSpawn,
   });
 }
@@ -755,7 +751,6 @@ async function seedSucceededRun(runId: string, def: WorkflowDefinition): Promise
   await runLoop({
     log,
     def,
-    driver: defaultObserverDriver(def, 'dashboard-workflow-api-test'),
     spawnSubagent: async () => ({ kind: 'success', output: { ok: true } }),
   });
 }

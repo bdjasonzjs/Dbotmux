@@ -13,7 +13,6 @@ import {
 import { loadEffectInputSidecar } from '../../workflows/effect-input.js';
 import type { WorkflowDefinition } from '../../workflows/definition.js';
 import { coerceWorkflowParamsFromStrings as coerceWorkflowParams } from '../../workflows/params.js';
-import { defaultObserverDriver } from '../../workflows/observer-driver.js';
 // Re-export from the shared params module so existing IM tests + callers keep
 // the same import path. New code should pull from `src/workflows/params.ts`.
 export { coerceWorkflowParams };
@@ -190,7 +189,6 @@ export async function executeWorkflowCommand(
     const ctx: WorkflowRuntimeContext = {
       log,
       def,
-      driver: defaultObserverDriver(def, 'im-workflow-command'),
       spawnSubagent,
       hostExecutors: createDefaultHostExecutorRegistry(),
       reconcilers: createDefaultProviderReconcilers(),
