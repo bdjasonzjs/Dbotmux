@@ -9,11 +9,29 @@ import type { TeamEvent } from './taskteam-engine.js';
 import type { TaskTeamId, TaskTeamInstance } from './taskteam-schema.js';
 import { logger } from '../utils/logger.js';
 
+/** detect 判读结果：判读出的 TeamEvent[] + 推进到的 cursor（detect 实际读到的最后一条边界）。 */
+export interface TaskTeamDetectResult {
+  events: TeamEvent[];
+  cursor: string | null;
+}
+
+/**
+ * cursor 永久失效（cursor 消息被删 / 翻到群尾仍找不到）——重试无用。
+ * detect 抛此错 → tick 跳到最新位点避免永久卡死（区别于瞬时失败的"持 cursor 重试"）。
+ */
+export class TaskTeamCursorInvalidError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'TaskTeamCursorInvalidError';
+  }
+}
+
 export interface TaskTeamObserverExecutors {
   // 廉价 gate（无 LLM）：自 cursor 以来子群是否有新动静 + 最新位点
   peek(chatId: string, cursor: string | null): Promise<{ hasNew: boolean; cursor: string | null }>;
-  // 仅在有新动静时调：判读出 TeamEvent[]（可空）——可能费模型，executor 决定引擎/成本
-  detect(instance: TaskTeamInstance, cursor: string | null): Promise<TeamEvent[]>;
+  // 仅在有新动静时调：判读出 TeamEvent[] + 已读边界 cursor。可能费模型，executor 决定引擎/成本。
+  // 瞬时失败（IO/LLM/parse）→ 抛错（tick 持 cursor 重试）；cursor 失效 → 抛 TaskTeamCursorInvalidError。
+  detect(instance: TaskTeamInstance, cursor: string | null): Promise<TaskTeamDetectResult>;
 }
 
 export interface TaskTeamObserverDeps extends TaskTeamRuntimeDeps {
@@ -47,18 +65,35 @@ export async function runTaskTeamObserverTick(
         continue;
       }
       stats.detected += 1;
-      const events = await exec.detect(team, cursor);
-      for (const ev of events) {
+
+      let result;
+      try {
+        result = await exec.detect(team, cursor);
+      } catch (err) {
+        if (err instanceof TaskTeamCursorInvalidError) {
+          // cursor 失效（消息被删 / 翻到群尾找不到）：重试无用 → 跳到最新位点，避免永久卡死。
+          if (peeked.cursor && peeked.cursor !== cursor) {
+            await deps.advanceCursor(team.teamId, peeked.cursor);
+          }
+          stats.errors += 1;
+          logger.warn(`[taskteam-observer] tick ${team.teamId} cursor invalid, skipped to latest: ${err}`);
+          continue;
+        }
+        // 瞬时失败（IO / LLM / parse）：不推进 cursor，下轮重读重试（不丢消息窗口）。
+        throw err;
+      }
+
+      for (const ev of result.events) {
         await applyTeamEvent(deps, team.teamId, ev);
         stats.events += 1;
       }
-      // 推进 cursor（即便无事件也推进，避免重复 detect 同段消息）
-      if (peeked.cursor && peeked.cursor !== cursor) {
-        await deps.advanceCursor(team.teamId, peeked.cursor);
+      // 推进 cursor 到 detect **实际读到的边界**（非 peek 最新）——busy 群 >FETCH_LIMIT 时多 tick 渐进 drain，不跳窗。
+      if (result.cursor && result.cursor !== cursor) {
+        await deps.advanceCursor(team.teamId, result.cursor);
       }
     } catch (err) {
       stats.errors += 1;
-      logger.warn(`[taskteam-observer] tick ${team.teamId} failed: ${err}`);
+      logger.warn(`[taskteam-observer] tick ${team.teamId} failed (cursor held for retry): ${err}`);
     }
   }
   return stats;

@@ -278,7 +278,7 @@ describe('runTaskTeamObserverTick', () => {
     let detectCalls = 0;
     const exec: TaskTeamObserverExecutors = {
       peek: async () => ({ hasNew: false, cursor: 'om_last' }),
-      detect: async () => { detectCalls += 1; return []; },
+      detect: async () => { detectCalls += 1; return { events: [], cursor: null }; },
     };
     const stats = await runTaskTeamObserverTick(new Date(), deps, exec);
     expect(stats.gatedOut).toBe(1);
@@ -292,7 +292,8 @@ describe('runTaskTeamObserverTick', () => {
     const { deps, cursorById } = observerDeps(fix, [team]);
     const exec: TaskTeamObserverExecutors = {
       peek: async () => ({ hasNew: true, cursor: 'om_new' }),
-      detect: async () => [teamEvent('stall')],
+      // 新合约：detect 返回 { events, cursor=已读边界 }；tick 推进到该 cursor（非 peek 最新）。
+      detect: async () => ({ events: [teamEvent('stall')], cursor: 'om_new' }),
     };
     const stats = await runTaskTeamObserverTick(new Date(), deps, exec);
     expect(stats.detected).toBe(1);
