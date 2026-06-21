@@ -54,4 +54,12 @@ describe('taskteam-admin (batch5 §5)', () => {
     expect(r).toMatchObject({ ok: true });
     expect(admin.listTaskTeamConfig().roles.map(x => x.roleId)).toContain('tt_role_x');
   });
+
+  it('rejects malformed payload with TaskTeamBadRequestError (P2 → 400)', async () => {
+    const { admin } = await fresh();
+    await expect(admin.adminUpsertRole({})).rejects.toThrow(admin.TaskTeamBadRequestError);
+    await expect(admin.adminUpsertRole({ role: { name: 'no id' } } as never)).rejects.toThrow(/roleId/);
+    await expect(admin.adminImportTemplate({})).rejects.toThrow(admin.TaskTeamBadRequestError);
+    await expect(admin.adminRestoreSnapshot({})).rejects.toThrow(admin.TaskTeamBadRequestError);
+  });
 });

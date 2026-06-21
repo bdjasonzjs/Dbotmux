@@ -37,10 +37,23 @@
 - `pnpm tsc --noEmit` → exit 0。
 - `git diff --check` → 通过。
 
-## 待 review 标注
+## 两层 review 裁决与整改
 
-1. CLI 结构化负载用 `--json` / `--file`（角色/规则/模板对象较大，逐 flag 不现实）——是否需要更细粒度 flag 由 review 判断。
-2. open_id scope 的真实 resolver（通讯录可见性查询）属 create/onboard 接线点；本批提供纯校验 + 注入接口，create 流程接 resolver 的接线随建群路径细化。
+**架构 review：通过 ✓ 无 P1**——H3 分享边界"优秀"（assertNoRuntimeIdentity 深扫、闭环验证批1 A1）；H2 primitive 接受、wiring 作延后跟踪项；红线#1 亲核 daemon +29/0、cli +16/0 纯 additive。
+
+**细节 review（docx `FTeIdFi06oLSCJxGgVhcSl9YnIb`）：P1+P2，已整改**
+
+| 项 | 内容 | 处理 |
+|-|-|-|
+| **P1** | CLI help 发裸对象，但 admin/daemon 读 `body.role`/`bundle`/`snapshot`/`event` —— 按 help 用 role/rule/type/org-upsert、template-import、snapshot-restore、event 都不命中服务层 schema（单测只测 admin 直调，覆盖不到 CLI→IPC 断层） | **方案 A：CLI 按 verb 包 envelope**。抽出纯函数 `buildTaskTeamRequest(verb,argv)`：role→{role}、rule→{rule}、type→{teamType}、org→{org}、template-import→{bundle}、snapshot-restore→{snapshot}、event→{teamId,event}、create→裸 body。新增 `taskteam-cli.test.ts`（6）覆盖每类命令的 CLI→IPC body 合约。 |
+| **P2** | IPC/admin 缺 shape 校验，错误 payload 落 500 而非 400 | admin 增 `TaskTeamBadRequestError` + requireObject/requireId 校验；daemon IPC route 把 `TaskTeamBadRequestError`/`TaskTeamTemplateError`/`TaskTeamScopeError` 映射 400（区别服务端 500）。新增单测：缺 role/bundle/snapshot → BadRequest。 |
+| M1（架构 minor） | assertNoRuntimeIdentity 用黑名单，未来 schema 新增身份字段可能漏 | 记录在案：当前黑名单覆盖已知 app-scoped 字段；改白名单（仅放行已知可分享键）更强但维护成本高（每个 schema 字段需登记）。本批保留黑名单 + 本注记，作后续优化项，不阻断。 |
+
+整改后复验：`vitest` 47/47（批1 5 + 批2 10 + 批3 15 + 批5 17）；`tsc --noEmit` exit 0；`git diff --check` 通过；红线#1 未破。
+
+## 待 review 标注（保留）
+
+- open_id scope 的真实 resolver（通讯录可见性查询）属 create/onboard 接线点；本批提供纯校验 + 注入接口，create 流程接 resolver 的接线随建群路径细化（H2 延后 wiring，架构已认可）。
 
 ## 下一步
 

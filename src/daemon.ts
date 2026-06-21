@@ -1497,11 +1497,16 @@ for (const [taskteamAdminPath, taskteamAdminFn] of TASKTEAM_ADMIN_ROUTES) {
     catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
     try {
       const admin = await import('./services/taskteam-admin.js');
-      const fn = (admin as Record<string, (b: unknown) => unknown>)[taskteamAdminFn];
+      const fn = (admin as unknown as Record<string, (b: unknown) => unknown>)[taskteamAdminFn];
       const result = await fn(body);
       return jsonRes(res, 200, { ok: true, result });
     } catch (err: any) {
-      const status = err && err.name === 'HttpError' ? err.status : 500;
+      // P2：调用方 payload 错误（缺字段 / 错 kind / 跨 app）映射 400，区别于服务端 500
+      const name = err?.name;
+      const status =
+        name === 'HttpError' ? err.status
+          : name === 'TaskTeamBadRequestError' || name === 'TaskTeamTemplateError' || name === 'TaskTeamScopeError' ? 400
+            : 500;
       return jsonRes(res, status, { ok: false, error: String(err?.message ?? err) });
     }
   });
