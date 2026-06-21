@@ -39,16 +39,15 @@ export const PREHEAT_ATTEMPT_WINDOW_MS = 60_000;
 export const PREHEAT_POLL_INTERVAL_MS = 1_000;
 
 export interface PreheatDeps {
-  /** Fail-closed precondition: urgent relay automation must deliver a real event
-   * to the clone, not merely create a Base record or visible card. Production
-   * defaults to an explicit env gate; tests may inject ok. */
+  /** Fail-closed precondition for owner/Base relay. Clone delivery gate callers
+   * should inject the already-proven application/v6 grant_status precondition;
+   * the default env gate remains only a legacy fail-closed guard. */
   relayDeliveryReady?: () => { ok: true } | { ok: false; error: string };
   /** 以 owner 身份发一条**新 record** 的 summon 到子群（直发，绝不复用 existingRecordId）。 */
   sendOwnerSummon: (chatId: string, text: string) => Promise<{ ok: boolean; recordId?: string; error?: string }>;
   /** 以 bot 身份发一条**带克隆真 @mention** 的文本 summon 到子群。
-   * 真机实测（2026-06-21 克劳德 A/B）：克隆只授予了「被@消息」scope（group_at_msg），收不到无@的
-   * owner relay 卡片，但能收到任意 bot 对它发的「文本+真@mention」并触发 summon 匹配 + recordWakeAck。
-   * 提供本 dep + target.cloneOpenId 时，预热走这条**已验证可穿**的通道（不再依赖 owner relay 卡片）。 */
+   * 仅用于 direct_mention 修复/诊断；不能作为 urgent_summon 的 pass 证据。
+   * urgent_summon 必须走 owner/Base relay + clone-side wake-ack。 */
   sendCloneMention?: (chatId: string, cloneOpenId: string, text: string) => Promise<{ ok: boolean; recordId?: string; error?: string }>;
   /** 可注入：sleep（测试用假实现）。 */
   sleep?: (ms: number) => Promise<void>;
@@ -63,7 +62,7 @@ export interface PreheatTarget {
   subgroupChatId: string;
   appId: string;       // 分身 larkAppId（= 回执里自报的 appId）
   displayName: string; // summon 点名用『本体名（N号机）』
-  cloneOpenId?: string; // 克隆真实 open_id；提供 + deps.sendCloneMention 时走 bot 文本@通道
+  cloneOpenId?: string; // 克隆真实 open_id；仅诊断/直接@场景提供 + deps.sendCloneMention
 }
 
 const realSleep = (ms: number): Promise<void> => new Promise(r => setTimeout(r, ms));
@@ -104,8 +103,8 @@ export async function preheatConfirmOnline(deps: PreheatDeps, target: PreheatTar
   const { cloneOpenId } = target;
   const startedAt = Date.now();
   const recordIds: string[] = [];
-  // 优先走「bot→克隆文本@mention」通道：真机已验证克隆能收（group_at_msg scope），不需 owner relay
-  // 卡片那条克隆收不到的路。只有在没提供该通道时，才退回 owner relay + delivery 前置校验。
+  // sendCloneMention 是显式诊断/直接@通道。clone 交付门禁里的 urgent_summon 不注入它，
+  // 只用 owner/Base relay + grant-status precondition + clone-side wake-ack 作为成功证据。
   const useCloneMention = !!(cloneOpenId && deps.sendCloneMention);
   if (!useCloneMention) {
     const relayReady = (deps.relayDeliveryReady ?? defaultRelayDeliveryReady)();

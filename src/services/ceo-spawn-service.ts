@@ -32,10 +32,10 @@ import { bindOncall } from './oncall-store.js';
 import { activateBot, restartCloneBot } from './bot-activate.js';
 import { createSubtask, slug, djb2 } from './subtask-orchestrator.js';
 import { addBotToSubTask, enqueueCommand } from './subtask-store.js';
-import { buildEventSubDeepLink } from '../setup/verify-permissions.js';
 import { writeRelayRecord } from './base-relay.js';
 import { preheatConfirmOnline } from './ceo-preheat.js';
 import { runCloneIntegrityGate } from './clone-integrity-gate.js';
+import { confirmCloneUrgentSummon } from './clone-urgent-gate.js';
 import { resolveSenderScopedCloneOpenId } from './clone-mention-resolver.js';
 import { ensureClonesAndSpawn, type EnsureSpawnDeps, type EnsureSpawnReq, type EnsureSpawnOutcome, type AutoTarget } from './ceo-clone-orchestration.js';
 import { ceoSpawnKey, getCeoSpawnState, putCeoSpawnState, clearCeoSpawnState } from './ceo-spawn-store.js';
@@ -346,45 +346,12 @@ export async function ceoSpawn(req: CeoSpawnReq): Promise<EnsureSpawnOutcome> {
           ].filter((c): c is { openId: string; source: string } => !!c?.openId),
           senderSelfOpenId: getBotOpenId(ceoAppId),
         }, {
-          confirmUrgent: async (target) => {
-          if (!target.displayName) {
-            return { item: 'urgent_summon', status: 'blocked' as const, detail: 'missing displayName for urgent summon' };
-          }
-          const urgentCloneOpenId = cloneSelfOpenId ?? cloneMentionOpenId ?? botReadyFresh(target.appId);
-          const pre = await preheatConfirmOnline({
+          confirmUrgent: async (target) => confirmCloneUrgentSummon(target, {
             sendOwnerSummon: async (chatId, text) => {
               const res = await writeRelayRecord({ targetChatId: chatId, text });
               return res.ok ? { ok: true, recordId: res.recordId } : { ok: false, error: res.error };
             },
-            // 真机已验证可穿的通道：复用 direct_mention 探针那套**双 @mention POST**（先 @发送者自己、
-            // 再 @克隆）+ direct-ack 令牌。双 @ 的「bootstrap」绕过 bot-to-bot @ 抢路由，落到 directAck
-            // 记录路径（recordDirectAck → 同一个 recordWakeAck），克隆（group_at_msg scope）能收并回执。
-            sendCloneMention: async (chatId, cloneOpenId, text) => {
-              const senderSelf = getBotOpenId(ceoAppId);
-              if (!senderSelf) return { ok: false, error: 'missing sender self open_id for double-mention wake' };
-              try {
-                const post = JSON.stringify({ zh_cn: { title: 'urgent wake', content: [[
-                  { tag: 'at', user_id: senderSelf, user_name: 'sender' },
-                  { tag: 'text', text: ' ' },
-                  { tag: 'at', user_id: cloneOpenId, user_name: 'clone' },
-                  { tag: 'text', text: ` ${text}` },
-                ]] } });
-                const id = await sendMessage(ceoAppId, chatId, post, 'post');
-                return { ok: true, recordId: id };
-              } catch (err: any) {
-                return { ok: false, error: err?.message ?? String(err) };
-              }
-            },
-          }, { ...target, displayName: target.displayName, cloneOpenId: urgentCloneOpenId });
-          const eventConfigDetail =
-            `event_subscription=unverified(type=receive_event_config_unproven ` +
-            `sourceApp=${target.sourceAppId ?? bentiAppId} cloneApp=${target.appId} chat=${target.subgroupChatId} ` +
-            `task=${target.taskId} wake=${pre.wakeId} sourceEventConfig=${buildEventSubDeepLink(target.sourceAppId ?? bentiAppId)} ` +
-            `cloneEventConfig=${buildEventSubDeepLink(target.appId)})`;
-          return pre.ok
-            ? { item: 'urgent_summon', status: 'pass' as const, detail: `ack after ${pre.elapsedMs ?? '?'}ms (${pre.wakeId})` }
-            : { item: 'urgent_summon', status: 'blocked' as const, detail: `${pre.error ? `${pre.error}; ` : ''}no urgent ack after ${pre.attempts} attempts/${pre.elapsedMs ?? '?'}ms (${pre.wakeId}; records=${pre.recordIds?.join(',') || '-'}); ${eventConfigDetail}` };
-          },
+          }),
         });
       };
       const first = await runOnce();

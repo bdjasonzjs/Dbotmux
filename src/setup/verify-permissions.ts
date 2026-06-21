@@ -7,7 +7,7 @@
  *
  * 仅作为可选 helper, **未启用于 setup / start 主链路**:
  * - {@link listGrantedTenantScopes} —— 调 `application.v6.scope.list` 把
- *   grant_status===2 归一为 granted scope name. clone provisioning 用它在
+ *   grant_status===1 归一为 granted scope name. clone provisioning 用它在
  *   建群前 fail-closed；setup/start 主链路仍只提示, 不因此阻断启动.
  * - {@link checkRequiredScopes} —— 基于 listGrantedTenantScopes 比对 botmux
  *   需要的 scope. setup/start 主链路仍未启用阻断.
@@ -200,6 +200,22 @@ export type CriticalScopeCheckResult =
       message: string;
     };
 
+export const TENANT_SCOPE_GRANT_STATUS_GRANTED = 1;
+
+export interface TenantScopeGrant {
+  scopeName: string;
+  grantStatus: number;
+  scopeType?: string;
+}
+
+export type TenantScopeGrantStatusResult =
+  | { ok: true; scopes: TenantScopeGrant[]; byName: Map<string, TenantScopeGrant> }
+  | { ok: false; error: 'need_self_manage' | 'network' | 'unknown'; message: string };
+
+export function isTenantScopeGranted(scope: TenantScopeGrant | undefined): boolean {
+  return scope?.grantStatus === TENANT_SCOPE_GRANT_STATUS_GRANTED;
+}
+
 function normalizeApplicationScopes(data: any): string[] {
   const scopesRaw: any[] =
     data?.data?.app?.scopes
@@ -284,19 +300,15 @@ export async function checkCriticalScopesByApplicationInfo(
  *
  * scope.list 返回 shape (SDK type):
  *   `{ data: { scopes: [{ scope_name, grant_status, scope_type }] } }`
- * grant_status 在本仓库统一按:
- *   1 = 已申请未生效, 2 = 已生效.
- * 该解释有可复现单测 fixture 锁定；调用方必须在不可检查时 fail closed
- * 或降级为显眼提示, 不能把 unknown 当 granted.
+ * grant_status 在本仓库统一按 CEO 2026-06-21 真机实测:
+ *   1 = 已授予 / 已生效.
+ * 非 1 不得作为 clone delivery gate 的 granted 证据。
  */
-export async function listGrantedTenantScopes(
+export async function listTenantScopeGrantStatuses(
   appId: string,
   appSecret: string,
   brand: Brand = 'feishu',
-): Promise<
-  | { ok: true; granted: string[] }
-  | { ok: false; error: 'need_self_manage' | 'network' | 'unknown'; message: string }
-> {
+): Promise<TenantScopeGrantStatusResult> {
   const domain = brand === 'lark' ? Lark.Domain.Lark : Lark.Domain.Feishu;
   const client = new Lark.Client({ appId, appSecret, domain, loggerLevel: Lark.LoggerLevel.error });
 
@@ -320,12 +332,38 @@ export async function listGrantedTenantScopes(
   }
 
   const scopes = resp?.data?.scopes ?? [];
-  // grant_status === 2 → granted (待 spike 确认这是正确映射)
-  const grantedNames: string[] = scopes
-    .filter((s: any) => s?.grant_status === 2 && typeof s?.scope_name === 'string')
-    .map((s: any) => s.scope_name);
+  if (!Array.isArray(scopes)) {
+    return { ok: false, error: 'unknown', message: 'scope.list returned non-array scopes' };
+  }
+  const normalized: TenantScopeGrant[] = scopes
+    .filter((s: any) => typeof s?.scope_name === 'string')
+    .map((s: any) => ({
+      scopeName: s.scope_name,
+      grantStatus: Number(s.grant_status),
+      scopeType: typeof s.scope_type === 'string' ? s.scope_type : undefined,
+    }));
+  const byName = new Map<string, TenantScopeGrant>();
+  for (const scope of normalized) byName.set(scope.scopeName, scope);
 
-  return { ok: true, granted: grantedNames };
+  return { ok: true, scopes: normalized, byName };
+}
+
+export async function listGrantedTenantScopes(
+  appId: string,
+  appSecret: string,
+  brand: Brand = 'feishu',
+): Promise<
+  | { ok: true; granted: string[] }
+  | { ok: false; error: 'need_self_manage' | 'network' | 'unknown'; message: string }
+> {
+  const listed = await listTenantScopeGrantStatuses(appId, appSecret, brand);
+  if (!listed.ok) return listed;
+  return {
+    ok: true,
+    granted: listed.scopes
+      .filter(scope => isTenantScopeGranted(scope))
+      .map(scope => scope.scopeName),
+  };
 }
 
 /**
