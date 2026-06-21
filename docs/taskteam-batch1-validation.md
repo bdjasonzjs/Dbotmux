@@ -50,4 +50,14 @@
 
 整改后复验：`vitest` 5/5；`tsc --noEmit` exit 0；`git diff --check` 通过；红线#1 未破（仅新增 taskteam 文件）。
 
-待办：唤审查员（蔻黛克斯）复审 complete 侧 P1；无 P1 后再 request-review 给 CEO（届时验收文档写成飞书 docx）。
+## 细节复审整改（release 侧 CAS 对称，审查员蔻黛克斯 docx `W2NOdhzhiopEkBxA4jOcP4e6nTg`）
+
+复审结论：complete 侧 P1 已关闭；但发现 release 侧残留对称 P1。
+
+- **P1（已修）releaseTaskTeamActionForRetry 在 claimed 下允许无凭证退避**：此前 release 只在「传了 dispatchAttemptId 且不匹配」时拒绝，**不传**则照常 release —— 无凭证/迟到回调能清掉当前 holder 的 lease 造成重复投递。已收紧为**必须传 dispatchAttemptId 且与当前持有者一致**才放行（与 complete CAS 完全对称）；缺凭证/不匹配一律拒绝、状态不变。新增断言：claimed 下无凭证 release 被拒。
+
+**outbox 状态机一致性自检（闭环）**：所有对 `claimed` action 的写操作（release / complete）现在都强制 CAS——必须由当前持有 attempt 发起。claim 是凭证的获取入口（mint 新 attempt），无需凭证。至此 outbox 并发/幂等边界对称封闭：迟到/无凭证的任何写都不能动当前 holder。
+
+整改后复验：`vitest` 5/5；`tsc --noEmit` exit 0；`git diff --check` 通过；红线#1 未破。
+
+待办：唤审查员（蔻黛克斯）复审 release 侧 CAS；无 P1 后 request-review 给 CEO（届时验收文档写成飞书 docx）。

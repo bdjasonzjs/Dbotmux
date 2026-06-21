@@ -235,9 +235,10 @@ export async function completeTaskTeamAction(
 /**
  * A2 retry 出路（留给批3 dispatcher）：投递失败但仍在飞行中（claimed）时，把 action 放回 pending，
  * retryCount+1，按 backoffMs 设退避到点；listPending/claim 在到点前都不取。
- * P1-2 状态机守卫：
+ * P1-2 / P1 状态机守卫（与 complete CAS 对称）：
  *  - 仅 `claimed` 可 release——`sent/acked/failed/pending` 一律不动（绝不复活终态、不重投已发送）。
- *  - 若传入 `dispatchAttemptId`，必须与当前持有者一致才放行——挡迟到回调 / 已被他人重领的旧 attempt。
+ *  - **必须传入 `dispatchAttemptId` 且与当前持有者一致**才放行——无凭证 / 迟到回调 / 已被他人重领的旧 attempt
+ *    一律拒绝（返回 cur 不变），否则会清掉当前 holder 的 lease 造成重复投递。
  * 达 maxRetries 时由 dispatcher 改调 completeTaskTeamAction(status:'failed') 落终态——本层只给能力、不内置策略。
  */
 export async function releaseTaskTeamActionForRetry(
@@ -250,8 +251,8 @@ export async function releaseTaskTeamActionForRetry(
     const cur = store.actions[idx];
     // 仅在飞行中（claimed）才可退避重投；终态 / pending 保持不变
     if (cur.status !== 'claimed') return { result: cur, dirty: false };
-    // 迟到回调 / 已被他人重领：attempt 不匹配则忽略
-    if (opts.dispatchAttemptId && cur.dispatchAttemptId !== opts.dispatchAttemptId) {
+    // CAS（与 complete 对称）：无凭证 / attempt 不匹配（迟到回调、已被他人重领）一律拒绝
+    if (!opts.dispatchAttemptId || cur.dispatchAttemptId !== opts.dispatchAttemptId) {
       return { result: cur, dirty: false };
     }
     const now = Date.now();

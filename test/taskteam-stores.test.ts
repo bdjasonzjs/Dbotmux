@@ -164,6 +164,11 @@ describe('taskteam batch 1 stores', () => {
     expect(stale?.status).toBe('claimed');
     expect(stale?.retryCount).toBe(0);
 
+    // 无凭证 release（claimed 下）→ 拒绝（与 complete CAS 对称，否则清掉当前 holder lease）
+    const noCred = await release(a.actionId, { backoffMs: 10_000 });
+    expect(noCred?.status).toBe('claimed');
+    expect(noCred?.retryCount).toBe(0);
+
     // 正确 attempt → 退避重投
     const released = await release(a.actionId, { dispatchAttemptId: attemptId, lastError: 'lark send failed', backoffMs: 10_000 });
     expect(released?.status).toBe('pending');
