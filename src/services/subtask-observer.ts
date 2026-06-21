@@ -87,6 +87,14 @@ export function effectiveNudgeCount(t: SubTask, anchorMs: number): number {
   return sameEpisode ? (t.nudgeCount ?? 0) : 0;
 }
 
+/** 经理群是「汇报制」、事件驱动：没事就静默（等子群上报 / CEO 派活），静默=正常空闲、不是「停滞」。
+ *  stall 逻辑（距上次活动超时→nudge/escalate）只适用于「有限任务的执行者」；拿它戳经理 = observer
+ *  监督式行为漏进汇报制经理群（会误发「任务搞定没有？」，2026-06-21 bug）。故经理豁免 stall-nudge/
+ *  escalate。真「经理挂了」的存活检测应另起一套、基于「收到指令/上报却迟迟未行动」而非「超时静默」。 */
+export function managerExemptFromStall(t: SubTask): boolean {
+  return t.reportingMode === 'manager';
+}
+
 export function planStallNudge(t: SubTask, now: Date, lastInitiatingCmdAt: string | null = null): StallAction {
   if (t.status !== 'observing') return { kind: 'none' };       // 只在执行者本应继续的态唤
   const anchorMs = episodeAnchorMs(t, lastInitiatingCmdAt);
@@ -230,6 +238,8 @@ async function tickOne(t: SubTask, now: Date, exec: ObserverExecutors): Promise<
  */
 async function handleStall(t: SubTask, now: Date): Promise<boolean> {
   if (t.status === 'paused') return handlePausedHeartbeat(t, now);
+
+  if (managerExemptFromStall(t)) return false;
 
   // blocker2 fix: 最近一条非 nudge 发起命令时间 (kickoff/supplement/request_review)——
   // sentAt 优先 (已投出)，否则 createdAt (pending)。排除 nudge 自身。

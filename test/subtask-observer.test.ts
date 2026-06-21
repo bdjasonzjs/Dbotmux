@@ -20,6 +20,7 @@ import {
 } from '../src/services/subtask-store.js';
 import {
   runObserverTick, planCommit, hasNewHelpProgress, hasBlockedHelpProgress, shouldStaleRereport,
+  managerExemptFromStall,
   MIN_OBSERVE_INTERVAL_MS, STALE_REREPORT_MS,
   type ObserverExecutors, type JudgeResult, type PrevHelpReport,
 } from '../src/services/subtask-observer.js';
@@ -577,5 +578,20 @@ describe('runObserverTick', () => {
     expect(after.status).toBe('observing');                   // 未转 reported_help
     expect(listCommands(t.taskId).filter(c => c.commandType === 'report_help')).toHaveLength(0); // 不上报
     expect(exec.judge).not.toHaveBeenCalled();                // 纯回声不进 judge
+  });
+});
+
+// 2026-06-21 bug：汇报制经理群收到 observer 的「任务搞定没有？」stall-nudge（observer 监督式
+// 漏进汇报制）。根因：handleStall 的 stall 逻辑（超时→nudge/escalate）未豁免 reportingMode=manager。
+// 经理是事件驱动、静默=正常空闲，不该被 stall-nudge。
+describe('managerExemptFromStall: 经理群豁免 observer stall-nudge', () => {
+  it('reportingMode=manager → 豁免（不发 stall-nudge/escalate）', () => {
+    expect(managerExemptFromStall({ reportingMode: 'manager' } as any)).toBe(true);
+  });
+  it('reportingMode=executor → 不豁免（正常走 stall 逻辑）', () => {
+    expect(managerExemptFromStall({ reportingMode: 'executor' } as any)).toBe(false);
+  });
+  it('reportingMode 缺省（旧任务）→ 不豁免（字节兼容旧 executor 行为）', () => {
+    expect(managerExemptFromStall({} as any)).toBe(false);
   });
 });
