@@ -64,20 +64,37 @@ describe('claude-code path resolvers — default == ~/.claude (zero behaviour ch
   });
 });
 
-describe('claude-code path resolvers — custom claudeHome routes under it (clone)', () => {
+// Corrected 2026-06-21 (was the block-4a "unconditional clone-home routing"
+// assertion — wrong direction): the current claude writes projects/ + sessions/
+// under $HOME/.claude regardless of CLAUDE_CONFIG_DIR, so resolvers prefer the
+// configured (clone) home only when the file is genuinely there, else fall back to
+// the default. See git log / project memory for the ping-pong history.
+describe('claude-code path resolvers — clone home fail-safe (present → clone, absent → default)', () => {
   const SID = '11111111-2222-3333-4444-555555555555';
-  const CLONE = '/home/u/.botmux/clones/cli_x/.claude';
+  const tmps: string[] = [];
+  afterEach(() => { while (tmps.length) { try { rmSync(tmps.pop()!, { recursive: true, force: true }); } catch { /* */ } } });
 
-  it('claudeJsonlPathForSession routes under the clone home', () => {
-    const p = claudeJsonlPathForSession(SID, '/tmp', CLONE);
-    expect(p.startsWith(join(CLONE, 'projects') + '/')).toBe(true);
-    expect(p.endsWith(`${SID}.jsonl`)).toBe(true);
-    // and must NOT leak into the default home
-    expect(p.startsWith(HOME_CLAUDE)).toBe(false);
+  it('claudePidStatePath returns the clone home when the pid-state really exists there', () => {
+    const clone = mkdtempSync(join(tmpdir(), 'clonehome-'));
+    tmps.push(clone);
+    mkdirSync(join(clone, 'sessions'), { recursive: true });
+    writeFileSync(join(clone, 'sessions', '4242.json'), '{}');
+    expect(claudePidStatePath(4242, clone)).toBe(join(clone, 'sessions', '4242.json'));
   });
 
-  it('claudePidStatePath routes under the clone home', () => {
-    expect(claudePidStatePath(4242, CLONE)).toBe(join(CLONE, 'sessions', '4242.json'));
+  it('claudePidStatePath falls back to default $HOME/.claude when absent under the clone home', () => {
+    const clone = mkdtempSync(join(tmpdir(), 'clonehome-'));
+    tmps.push(clone);
+    expect(claudePidStatePath(4242, clone)).toBe(join(HOME_CLAUDE, 'sessions', '4242.json'));
+  });
+
+  it('claudeJsonlPathForSession falls back to default $HOME/.claude when absent under the clone home', () => {
+    const clone = mkdtempSync(join(tmpdir(), 'clonehome-'));
+    tmps.push(clone);
+    const p = claudeJsonlPathForSession(SID, '/tmp', clone);
+    expect(p.startsWith(HOME_CLAUDE)).toBe(true);
+    expect(p.startsWith(clone)).toBe(false);
+    expect(p.endsWith(`${SID}.jsonl`)).toBe(true);
   });
 });
 

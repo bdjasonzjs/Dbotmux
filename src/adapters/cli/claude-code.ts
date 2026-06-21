@@ -21,13 +21,45 @@ function realpathCwd(cwd: string): string {
   try { return realpathSync(cwd); } catch { return cwd; }
 }
 
+function defaultClaudeHome(): string { return join(homedir(), '.claude'); }
+
+/** Project-relative jsonl path (`projects/<cwd-hash>/<sessionId>.jsonl`). */
+function jsonlRel(sessionId: string, cwd: string): string {
+  return join('projects', realpathCwd(cwd).replace(/[^A-Za-z0-9-]/g, '-'), `${sessionId}.jsonl`);
+}
+
+/** Resolve a claude state file (projects/ transcript or sessions/ pid-state) to the
+ *  home that actually holds it. Returns the winning home so callers that read pairs
+ *  (pid-state + jsonl) can keep them on the SAME home.
+ *
+ *  Why (2026-06-21 root cause, after two wrong guesses — see git log): the current
+ *  Claude Code writes its `projects/` + `sessions/` under **$HOME/.claude**, NOT under
+ *  CLAUDE_CONFIG_DIR. A clone launched with CLAUDE_CONFIG_DIR=<clone>/.claude (and an
+ *  independent <clone>/.claude/projects dir) still wrote `<sessionId>.jsonl` to
+ *  $HOME/.claude/projects. The worker threaded the clone's configured home into the
+ *  resolvers (Round-4 "block-4a" deliberately routed to clone home), so for clones the
+ *  resolved path pointed at an always-empty dir → confirmSubmit/bridge never found the
+ *  turn → every inbound message false-warned "没能确认提交 / 卡输入框".
+ *
+ *  Fail-safe + version-robust: prefer the configured (clone) home if the file is really
+ *  there (covers a future/other claude that DOES honor CLAUDE_CONFIG_DIR), else fall
+ *  back to the default $HOME/.claude where the current claude actually writes. Main bots
+ *  are unaffected: their configured home already IS $HOME/.claude. */
+function resolveExistingHome(claudeHome: string, rel: string): { path: string; home: string } {
+  const configured = join(claudeHome, rel);
+  if (existsSync(configured)) return { path: configured, home: claudeHome };
+  const dft = defaultClaudeHome();
+  return { path: join(dft, rel), home: dft };
+}
+
 /** Resolve the JSONL transcript path Claude Code writes user/assistant turns to.
  *  Claude Code's project-hash scheme replaces every non-[A-Za-z0-9-] char with `-`
  *  (observed: `/foo/life_workspace` → `-foo-life-workspace`; `/`, `.`, `_` all become `-`).
- *  Always operates on realpath(cwd) — see realpathCwd above. */
+ *  Always operates on realpath(cwd) — see realpathCwd above.
+ *  Home is resolved fail-safe (configured-if-present else default $HOME/.claude) — see
+ *  resolveExistingHome for the clone CLAUDE_CONFIG_DIR rationale. */
 export function claudeJsonlPathForSession(sessionId: string, cwd: string, claudeHome: string = resolveClaudeHome()): string {
-  const projectHash = realpathCwd(cwd).replace(/[^A-Za-z0-9-]/g, '-');
-  return join(claudeHome, 'projects', projectHash, `${sessionId}.jsonl`);
+  return resolveExistingHome(claudeHome, jsonlRel(sessionId, cwd)).path;
 }
 
 /** Substrings that indicate Claude Code received our submit. We accept either:
@@ -91,7 +123,9 @@ const SESSION_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-
  *  sessionId" answer as "no spawn-time rotation observed", not "no
  *  rotation at all" — the latter requires fingerprint corroboration. */
 export function claudePidStatePath(pid: number, claudeHome: string = resolveClaudeHome()): string {
-  return join(claudeHome, 'sessions', `${pid}.json`);
+  // claude writes sessions/<pid>.json under $HOME/.claude too (same home as projects/,
+  // not CLAUDE_CONFIG_DIR) — resolve fail-safe so clone pid-state is found. */
+  return resolveExistingHome(claudeHome, join('sessions', `${pid}.json`)).path;
 }
 
 /** Linux-only: read /proc/<pid>/stat field 22 (starttime). Returns null when
@@ -120,9 +154,13 @@ function readProcStarttime(pid: number): string | null {
  *  fall back to fingerprint detection. */
 export function resolveJsonlFromPid(pid: number, expectedCwd: string, claudeHome: string = resolveClaudeHome()): { path: string; cliSessionId: string } | null {
   if (!Number.isInteger(pid) || pid <= 0) return null;
+  // Resolve the pid-state to the home that actually holds it; claude writes the
+  // matching projects/ transcript to that SAME home, so the jsonl must follow it
+  // (not blindly route under the configured/clone home — that's the block-4a trap).
+  const pidState = resolveExistingHome(claudeHome, join('sessions', `${pid}.json`));
   let parsed: any;
   try {
-    parsed = JSON.parse(readFileSync(claudePidStatePath(pid, claudeHome), 'utf8'));
+    parsed = JSON.parse(readFileSync(pidState.path, 'utf8'));
   } catch {
     return null;
   }
@@ -151,7 +189,7 @@ export function resolveJsonlFromPid(pid: number, expectedCwd: string, claudeHome
   }
   if (!procStartVerified && realpathCwd(parsed.cwd) !== realpathCwd(expectedCwd)) return null;
   return {
-    path: claudeJsonlPathForSession(parsed.sessionId, parsed.cwd, claudeHome),
+    path: join(pidState.home, jsonlRel(parsed.sessionId, parsed.cwd)),
     cliSessionId: parsed.sessionId,
   };
 }
