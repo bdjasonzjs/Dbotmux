@@ -3246,8 +3246,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         const { resolveBotIdent } = await import('./core/main-bot-playbook.js');
         const senderApp = resolveBotIdent('tilly').larkAppId;
         const stats = await runTaskTeamDispatcherTick(new Date(), makeTaskTeamDispatchExecutors(senderApp));
-        if (stats.sent + stats.retried + stats.failed > 0) {
-          logger.info(`[taskteam-dispatcher] tick: claimed=${stats.claimed} sent=${stats.sent} retried=${stats.retried} failed=${stats.failed} skipped=${stats.skipped}`);
+        if (stats.sent + stats.retried + stats.failed + stats.leaseLost > 0) {
+          logger.info(`[taskteam-dispatcher] tick: claimed=${stats.claimed} sent=${stats.sent} retried=${stats.retried} failed=${stats.failed} skipped=${stats.skipped} leaseLost=${stats.leaseLost}`);
         }
       } catch (err) {
         logger.error(`[taskteam-dispatcher] tick failed: ${err}`);

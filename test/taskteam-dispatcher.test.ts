@@ -69,6 +69,23 @@ describe('runTaskTeamDispatcherTick', () => {
     const { dispatcher } = await fresh();
     const exec = { send: async () => ({ ok: true }) };
     const stats = await dispatcher.runTaskTeamDispatcherTick(new Date(), exec);
-    expect(stats).toMatchObject({ claimed: 0, sent: 0, failed: 0, retried: 0, skipped: 0 });
+    expect(stats).toMatchObject({ claimed: 0, sent: 0, failed: 0, retried: 0, skipped: 0, leaseLost: 0 });
+  });
+
+  it('CAS lost on lease steal → counted leaseLost, not sent (P2)', async () => {
+    const { outbox, dispatcher } = await fresh();
+    const a = await outbox.enqueueTaskTeamAction({ teamId: 'tt_team_a', actionType: 'kickoff', idempotencyKey: 'k5' });
+    // send 期间本 attempt 的 lease(1ms) 过期，被另一 attempt 重领 → 本 attempt 的 complete 被 CAS 拒
+    const exec = {
+      send: async () => {
+        await new Promise(r => setTimeout(r, 20));
+        await outbox.claimTaskTeamAction(a.actionId, 60_000); // 偷锁
+        return { ok: true, messageId: 'om_x' };
+      },
+    };
+    const stats = await dispatcher.runTaskTeamDispatcherTick(new Date(), exec, { leaseMs: 1, maxRetry: 5, baseBackoffMs: 1000, concurrency: 1 });
+    expect(stats.leaseLost).toBe(1);
+    expect(stats.sent).toBe(0);
+    expect(outbox.readTaskTeamOutbox().actions[0].status).toBe('claimed'); // 仍归偷锁者，未被误写 sent
   });
 });

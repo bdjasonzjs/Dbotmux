@@ -1,6 +1,9 @@
 // 任务小组 · 驱动/观测依赖的默认 wiring（把注入接口接到批1 store + 批2 引擎 + group-creator）。
 // 这层是 IO 边界：纯逻辑（runtime/dispatcher/observer tick）都用注入接口、可单测；此处只做接线。
 
+import { join } from 'node:path';
+import { config } from '../config.js';
+import { withFileLock } from '../utils/file-lock.js';
 import { readTaskTeamConfig } from './taskteam-config-store.js';
 import {
   applyTeamDecisionState,
@@ -14,8 +17,15 @@ import type { CreateTaskTeamDeps, TaskTeamRuntimeDeps } from './taskteam-runtime
 import type { TaskTeamObserverDeps } from './taskteam-observer.js';
 import type { TaskTeamId } from './taskteam-schema.js';
 
+// per-team 跨进程串行化锁。锁文件路径独立于 store 文件（taskteams.json / taskteam-outbox.json），
+// 避免与 store 自身 mutate 的 withFileLock 同路径重入死锁。
+function withTeamLock<T>(teamId: TaskTeamId, fn: () => Promise<T>): Promise<T> {
+  return withFileLock(join(config.session.dataDir, `taskteam-lock-${teamId}`), fn);
+}
+
 export function defaultRuntimeDeps(): TaskTeamRuntimeDeps {
   return {
+    withTeamLock,
     loadConfig: () => {
       const c = readTaskTeamConfig();
       return { roles: c.roles, rules: c.rules, teamTypes: c.teamTypes };
@@ -48,8 +58,9 @@ export function defaultObserverDeps(): TaskTeamObserverDeps {
   return {
     ...defaultRuntimeDeps(),
     listActiveTeams: () => listActiveTaskTeams(),
+    // cursor 推进也走 per-team 锁，避免与 applyTeamEvent 的状态提交 last-writer-wins 互相覆盖
     advanceCursor: async (teamId: TaskTeamId, cursor: string) => {
-      await applyTeamDecisionState(teamId, { cursor });
+      await withTeamLock(teamId, () => applyTeamDecisionState(teamId, { cursor }));
     },
   };
 }

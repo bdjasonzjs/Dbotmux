@@ -29,6 +29,9 @@ export interface TaskTeamRuntimeConfig {
 
 // 注入依赖（默认 wire 批1 store；测试可传内存假实现）
 export interface TaskTeamRuntimeDeps {
+  // P1：per-team 串行化锁——整个 read→decide→enqueue→advance 在锁内，杜绝并发丢票 / 崩溃重放孤儿。
+  // 默认实现走跨进程文件锁；测试可传 keyed mutex 或 passthrough。
+  withTeamLock<T>(teamId: TaskTeamId, fn: () => Promise<T>): Promise<T>;
   loadConfig(): TaskTeamRuntimeConfig;
   getTeam(teamId: TaskTeamId): TaskTeamInstance | null;
   applyState(
@@ -68,37 +71,43 @@ export async function applyTeamEvent(
   teamId: TaskTeamId,
   event: TeamEvent,
 ): Promise<ApplyTeamEventResult> {
-  const instance = deps.getTeam(teamId);
-  if (!instance) throw new TaskTeamRuntimeError(`taskteam ${teamId} not found`);
-  const cfg = deps.loadConfig();
-  const type = cfg.teamTypes.find(t => t.typeId === instance.typeId);
-  if (!type) throw new TaskTeamRuntimeError(`taskteam type ${instance.typeId} not found for ${teamId}`);
+  // P1：整个 read→decide→enqueue→advance 在 per-team 锁内串行化，且 enqueue 先于状态提交：
+  //  · 并发事件（如两 reviewer 同时 review-pass）串行执行，后者读到前者已提交的票 → 不丢票、quorum 正常收敛；
+  //  · 崩溃/失败重放：状态未提交则锁内重读"未推进状态"→ 重算出相同决策 → 幂等 enqueue 去重 → 再提交，
+  //    不丢 request-review/report、也不产孤儿命令（锁内无并发改态，决策不漂移）。
+  return deps.withTeamLock(teamId, async () => {
+    const instance = deps.getTeam(teamId);
+    if (!instance) throw new TaskTeamRuntimeError(`taskteam ${teamId} not found`);
+    const cfg = deps.loadConfig();
+    const type = cfg.teamTypes.find(t => t.typeId === instance.typeId);
+    if (!type) throw new TaskTeamRuntimeError(`taskteam type ${instance.typeId} not found for ${teamId}`);
 
-  const decision = decideTeamActions({ instance, type, roles: cfg.roles, rules: cfg.rules, event });
+    const decision = decideTeamActions({ instance, type, roles: cfg.roles, rules: cfg.rules, event });
 
-  // 1. 状态增量（status / reviewState）原子落库——引擎已确定性算好，含审轮票数累计
-  let updated = instance;
-  if (decision.nextStatus !== undefined || decision.reviewState !== undefined) {
-    updated = await deps.applyState(teamId, { status: decision.nextStatus, reviewState: decision.reviewState });
-  }
+    // 1. 先幂等 enqueue 每条投递命令（idempotencyKey 引擎给定 → outbox 去重；replay 安全）
+    const enqueued: TaskTeamAction[] = [];
+    for (const a of decision.actions) {
+      enqueued.push(
+        await deps.enqueue({
+          teamId,
+          actionType: a.actionType,
+          idempotencyKey: a.idempotencyKey,
+          sourceRoleInstanceId: a.sourceRoleInstanceId,
+          targetRoleInstanceId: a.targetRoleInstanceId,
+          targetSlotId: a.targetSlotId,
+          payload: a.payload,
+        }),
+      );
+    }
 
-  // 2. enqueue 每条投递命令（idempotencyKey 引擎给定 → outbox 幂等去重防重投）
-  const enqueued: TaskTeamAction[] = [];
-  for (const a of decision.actions) {
-    enqueued.push(
-      await deps.enqueue({
-        teamId,
-        actionType: a.actionType,
-        idempotencyKey: a.idempotencyKey,
-        sourceRoleInstanceId: a.sourceRoleInstanceId,
-        targetRoleInstanceId: a.targetRoleInstanceId,
-        targetSlotId: a.targetSlotId,
-        payload: a.payload,
-      }),
-    );
-  }
+    // 2. 再原子提交状态增量（status / reviewState，含审轮票数累计）
+    let updated = instance;
+    if (decision.nextStatus !== undefined || decision.reviewState !== undefined) {
+      updated = await deps.applyState(teamId, { status: decision.nextStatus, reviewState: decision.reviewState });
+    }
 
-  return { instance: updated, decision, enqueued };
+    return { instance: updated, decision, enqueued };
+  });
 }
 
 // 角色行为 / 生命周期事件的便捷构造（事件入口用）

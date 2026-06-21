@@ -72,11 +72,24 @@ function fixture() {
   return { roles, rules, type, instance };
 }
 
-// 内存假 deps：模拟 store(单实例) + outbox(幂等去重)
-function memDeps(fix: ReturnType<typeof fixture>) {
+// 按 key 串行化的 mutex（模拟 per-team 锁），用于复现/防住并发丢票
+function keyedMutex() {
+  const tails = new Map<string, Promise<unknown>>();
+  return <T>(key: string, fn: () => Promise<T>): Promise<T> => {
+    const prev = tails.get(key) ?? Promise.resolve();
+    const run = prev.then(fn, fn);
+    tails.set(key, run.then(() => {}, () => {}));
+    return run;
+  };
+}
+
+// 内存假 deps：模拟 store(单实例) + outbox(幂等去重) + per-team 锁
+function memDeps(fix: { roles: TaskTeamRole[]; rules: TaskTeamCollabRule[]; type: TaskTeamType; instance: TaskTeamInstance }) {
   let team = fix.instance;
   const enqueued: TaskTeamAction[] = [];
+  const withTeamLock = keyedMutex();
   const deps: TaskTeamRuntimeDeps = {
+    withTeamLock,
     loadConfig: () => ({ roles: fix.roles, rules: fix.rules, teamTypes: [fix.type] }),
     getTeam: () => team,
     applyState: async (_teamId, patch) => {
@@ -137,6 +150,62 @@ describe('applyTeamEvent (driver)', () => {
     const fix = fixture();
     const { deps } = memDeps(fix);
     await expect(applyTeamEvent({ ...deps, getTeam: () => null }, 'tt_team_x', teamEvent('submit'))).rejects.toThrow(/not found/);
+  });
+
+  it('serializes concurrent review-pass so no vote is lost (P1)', async () => {
+    // quorum=2、两审查员同 role；两 review-pass 并发不应 last-writer-wins 丢票
+    const roles = [role('tt_role_dev', '开发者'), role('tt_role_rev', '审查员', { visibility: 'review-only' })];
+    const rules: TaskTeamCollabRule[] = [
+      { ruleId: 'tt_rule_pass', when: { event: 'review-pass', status: 'reviewing', fromSlotId: 'tt_slot_r1' }, whoSlot: 'tt_slot_dev', do: 'report' },
+    ];
+    const type: TaskTeamType = {
+      typeId: 'tt_type_q',
+      name: 'q',
+      roleSlots: [
+        { slotId: 'tt_slot_dev', roleId: 'tt_role_dev' },
+        { slotId: 'tt_slot_r1', roleId: 'tt_role_rev' },
+        { slotId: 'tt_slot_r2', roleId: 'tt_role_rev' },
+      ],
+      rules: rules.map(r => r.ruleId),
+      policy: { reviewRounds: 1, reviewQuorum: 2, maxRework: 2, escalateAfterStallMs: 1000, reviewOrder: ['tt_slot_r1', 'tt_slot_r2'] },
+    };
+    const instance: TaskTeamInstance = {
+      ...fixture().instance,
+      typeId: 'tt_type_q',
+      status: 'reviewing',
+      reviewState: { round: 1, reworkCount: 0, votes: [] },
+      roleInstances: [ri('tt_ri_dev', 'tt_slot_dev', 'tt_role_dev'), ri('tt_ri_r1', 'tt_slot_r1', 'tt_role_rev'), ri('tt_ri_r2', 'tt_slot_r2', 'tt_role_rev')],
+    };
+    const { deps, enqueued, getTeam } = memDeps({ roles, rules, type, instance });
+
+    await Promise.all([
+      applyTeamEvent(deps, 'tt_team_x', teamEvent('review-pass', { fromRoleInstanceId: 'tt_ri_r1', fromSlotId: 'tt_slot_r1' })),
+      applyTeamEvent(deps, 'tt_team_x', teamEvent('review-pass', { fromRoleInstanceId: 'tt_ri_r2', fromSlotId: 'tt_slot_r2' })),
+    ]);
+    expect(getTeam().status).toBe('awaiting-acceptance'); // 两票都在 → quorum 达成 → report
+    expect(enqueued.some(a => a.actionType === 'report')).toBe(true);
+  });
+
+  it('replay after a crash between enqueue and state-commit loses no command (P1)', async () => {
+    const fix = fixture();
+    const base = memDeps(fix);
+    let failOnce = true;
+    const deps: TaskTeamRuntimeDeps = {
+      ...base.deps,
+      applyState: async (teamId, patch) => {
+        if (failOnce) { failOnce = false; throw new Error('crash after enqueue, before state commit'); }
+        return base.deps.applyState(teamId, patch);
+      },
+    };
+    const ev = teamEvent('submit', { fromRoleInstanceId: 'tt_ri_dev', fromSlotId: 'tt_slot_dev' });
+    // 崩溃：enqueue 成功、applyState 抛错 → 状态未推进
+    await expect(applyTeamEvent(deps, 'tt_team_x', ev)).rejects.toThrow(/crash/);
+    expect(base.getTeam().status).toBe('running');
+    expect(base.enqueued).toHaveLength(1);
+    // 重放：状态仍 running → 重算同决策 → enqueue 去重 → 提交成功
+    const r = await applyTeamEvent(deps, 'tt_team_x', ev);
+    expect(r.instance.status).toBe('reviewing');
+    expect(base.enqueued).toHaveLength(1); // 无重复命令
   });
 });
 

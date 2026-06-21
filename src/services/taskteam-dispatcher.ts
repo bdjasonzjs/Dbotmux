@@ -28,6 +28,7 @@ export interface TaskTeamDispatchStats {
   retried: number;
   failed: number;
   skipped: number;
+  leaseLost: number; // P2：claim 后回写时 CAS 被拒（lease 已被他人重领）——不计入 sent/retried/failed
 }
 
 export interface TaskTeamDispatchConfig {
@@ -49,7 +50,7 @@ export async function runTaskTeamDispatcherTick(
   exec: TaskTeamDispatchExecutors,
   config: TaskTeamDispatchConfig = DEFAULT_DISPATCH_CONFIG,
 ): Promise<TaskTeamDispatchStats> {
-  const stats: TaskTeamDispatchStats = { claimed: 0, sent: 0, retried: 0, failed: 0, skipped: 0 };
+  const stats: TaskTeamDispatchStats = { claimed: 0, sent: 0, retried: 0, failed: 0, skipped: 0, leaseLost: 0 };
   const pending = listPendingTaskTeamActions(now);
   if (pending.length === 0) return stats;
 
@@ -88,30 +89,35 @@ async function dispatchOne(
   }
 
   if (res.ok) {
-    // ack 边界 = 飞书发送成功（拿到 message_id）（P2-1）；CAS 凭 attemptId 防迟到覆盖
-    await completeTaskTeamAction(claimed.actionId, {
+    // ack 边界 = 飞书发送成功（拿到 message_id）（P2-1）；CAS 凭 attemptId 防迟到覆盖。
+    // P2：检查回写结果——null = lease 已被他人重领，本次回写被 CAS 拒，不能误报为 sent。
+    const done = await completeTaskTeamAction(claimed.actionId, {
       status: 'sent',
       deliveredMessageId: res.messageId ?? null,
       dispatchAttemptId: attemptId,
     });
-    stats.sent += 1;
+    if (done) stats.sent += 1;
+    else stats.leaseLost += 1;
     return;
   }
 
   if (res.retriable !== false && claimed.retryCount < config.maxRetry) {
     const backoffMs = config.baseBackoffMs * 2 ** claimed.retryCount; // 指数退避
-    await releaseTaskTeamActionForRetry(claimed.actionId, {
+    const released = await releaseTaskTeamActionForRetry(claimed.actionId, {
       dispatchAttemptId: attemptId,
       lastError: res.error ?? 'send failed',
       backoffMs,
     });
-    stats.retried += 1;
+    // 仅当确实由本 attempt 释放（回 pending 且 retryCount+1）才计 retried；否则 lease 已被重领
+    if (released && released.status === 'pending' && released.retryCount > claimed.retryCount) stats.retried += 1;
+    else stats.leaseLost += 1;
   } else {
-    await completeTaskTeamAction(claimed.actionId, {
+    const done = await completeTaskTeamAction(claimed.actionId, {
       status: 'failed',
       lastError: res.error ?? 'send failed',
       dispatchAttemptId: attemptId,
     });
-    stats.failed += 1;
+    if (done) stats.failed += 1;
+    else stats.leaseLost += 1;
   }
 }

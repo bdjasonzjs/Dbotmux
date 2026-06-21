@@ -52,6 +52,26 @@
 - `git diff --check` → 通过。
 - 红线#1：未改 `subtask-store.ts` / 任何 `subtask-*` / `subtasks.json`；daemon.ts 85+/0-。
 
+## 两层 review 裁决与整改
+
+**架构 review（架构师席，`TASK-TEAM-arch-review-batch3-r1.md`）：通过 ✓ 无 P1**——亲核 daemon.ts numstat 纯 additive、零改 subtask 分支、新文件不 import subtask-store、两 cron 单 daemon 拥有；§3.1 三入口 + §4 隔离 + observer detect 占位诚实性均认可。2 条非阻断 minor 见下。
+
+**细节 review（审查员席，docx `IqE3d8JNao1QmoxzmVXc7g6Ln2e`）：P1+P2，已整改**
+
+| 项 | 内容 | 处理 |
+|-|-|-|
+| **P1** | `applyTeamEvent` 非原子/串行化 apply 单元：状态先落库、outbox 后 enqueue。① 崩溃重放：状态已推进则同事件重放不再命中原规则 → 丢 request-review/report；② 并发审票：两 reviewer 同时 review-pass blind-replace → last-writer-wins 丢票、quorum 永不达成 | **重构 applyTeamEvent**：整个 read→decide→enqueue→advance 收敛进注入的 **per-team 锁**（默认跨进程文件锁 `taskteam-lock-<teamId>`，独立于 store 文件防重入死锁），且 **enqueue 先于状态提交**。并发事件串行化 → 不丢票；崩溃重放从"未推进状态"重算同决策 → 幂等 enqueue 去重 → 再提交 → 不丢命令、无孤儿（锁内无并发改态、决策不漂移）。observer advanceCursor 也走同锁。新增 2 单测：并发 review-pass 不丢票（quorum 达成 report）、enqueue 后崩溃重放无重复/无丢失。 |
+| **P2** | dispatcher 忽略 `complete`/`release` 的 CAS 返回值，lease 竞争时把回写失败误统计为 sent/retried/failed | complete/release 检查返回值：CAS 被拒（返回 null / 未真正释放）记入新增 `leaseLost` 统计，不误报 sent/retried/failed；daemon 日志带 leaseLost。新增单测：lease 被偷 → leaseLost、不误写 sent。 |
+
+**架构非阻断 minor**
+
+| 项 | 内容 | 处理 |
+|-|-|-|
+| M1 | createTaskTeam 建群先于落库，落库失败有孤儿群风险 | 记录在案：当前接受（建群成功率高、孤儿群可人工/后续回收清理）；彻底事务化建群↔落库属后续，不阻断本批。 |
+| M2 | observer detect 占位需在验证记录显式列为 §7 延后 scope | 已在本文「主动标注的边界 1」显式声明，确认。 |
+
+整改后复验：`vitest` 29/29（批1 5 + 批2 10 + 批3 14）；`tsc --noEmit` exit 0；`git diff --check` 通过；红线#1 未破。
+
 ## 下一步
 
-待两层 review + CEO 关后，批4：per-role 模型透传（独立 commit + 回归断言）。
+待审查员复审 P1/P2 + CEO 关后，批4：per-role 模型透传（独立 commit + 回归断言）。
