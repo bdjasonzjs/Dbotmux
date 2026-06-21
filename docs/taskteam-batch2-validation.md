@@ -39,9 +39,26 @@
 - `pnpm vitest run test/taskteam-stores.test.ts test/taskteam-engine.test.ts` → 12/12 通过（批1 5 + 批2 7）。
 - `pnpm tsc --noEmit` → exit 0。
 
-## 待 review 确认点（已主动标注，供架构师/审查员判断）
+## 两层 review 裁决与整改
 
-1. 规则「角色粒度匹配 + 席位粒度投递/投票」的拆分是否符合方案 B2 意图。
-2. 返回富 `TeamDecision`（而非裸 `TeamAction[]`）是否接受。
-3. `quorum = min(reviewQuorum, cohort)` 的封顶语义是否符合预期。
-4. maxRework 兜底 `escalateToObservers` 的目标选择（isObserver 角色）。
+**架构 review（架构师席，r1 `TASK-TEAM-arch-review-batch2-r1.md`）：通过 ✓**
+- 纯函数 / §12.1 config 驱动 / 角色粒度匹配+席位寻址 / cohort quorum 封顶 / 状态机出口——均认可。
+- **偏离裁决**：返回 `TeamDecision{actions,nextStatus?,reviewState?}` 而非 §3 裸 `TeamAction[]`——**批准且"比 §3 字面更优"**（审轮推进本就要算 reviewState，属纯核心；裸 TeamAction[] 会把决策劈两半）。无架构级 P1。
+
+**细节 review（审查员席，docx `MrcWdio2joRebaxWy65cydunnjg`）：P1+P2，已整改**
+
+| 项 | 内容 | 处理 |
+|-|-|-|
+| P1 | `decideTeamActions` 未按 `type.rules` 限定规则集，跨 team type 同形规则会污染当前决策 | 已加 `scopedRules = rules.filter(r => type.rules.includes(r.ruleId))`，后续 match 只基于 scopedRules。新增单测：传入 foreign 规则不被命中 |
+| P2 | `accept` 无状态门禁，非待验收态也能直接 done | 已限定 `status==='awaiting-acceptance'` 才 done，否则空 decision。新增单测：running 态 accept 无效、awaiting 态 accept→done |
+
+**架构非阻断 minor（一并处理）**
+
+| 项 | 内容 | 处理 |
+|-|-|-|
+| M1 | quorum 达成但无路由规则会静默吞票 | 已加守卫：达标但 `emit` 为空时不推进/不清票，保留票与状态以暴露 config 缺规则。新增单测覆盖 |
+| M2 | `rework` 事件无规则走空 actions | 设计如此（rework 是开发者角色行为，无需投递命令）；此处注明，不改码 |
+
+整改后复验：`vitest` 15/15（批1 5 + 批2 10）；`tsc --noEmit` exit 0；`git diff --check` 通过；红线#1 未破。
+
+待办：唤审查员（蔻黛克斯）复审 P1/P2；无 P1 后 request-review 给 CEO（验收文档写飞书 docx）。

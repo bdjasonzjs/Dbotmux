@@ -85,8 +85,11 @@ export function decideTeamActions(input: DecideTeamActionsInput): TeamDecision {
     return byRole.length ? byRole : instance.roleInstances.filter(ri => ri.slotId === slotId);
   };
 
+  // 规则作用域（P1）：只认本 type.rules 声明的规则——防跨 team type 同形规则污染当前 team 决策
+  const typeRuleIds = new Set<string>(type.rules);
+  const scopedRules = rules.filter(rule => typeRuleIds.has(rule.ruleId));
   // 规则匹配：event.type 相等 + status 命中（若指定）+ fromSlot 按 role 命中（若指定）
-  const matched = rules.filter(rule => {
+  const matched = scopedRules.filter(rule => {
     if (rule.when.event !== event.type) return false;
     if (rule.when.status !== undefined && rule.when.status !== instance.status) return false;
     if (rule.when.fromSlotId !== undefined && roleOfSlot(rule.when.fromSlotId) !== roleOfSlot(event.fromSlotId)) return false;
@@ -137,7 +140,8 @@ export function decideTeamActions(input: DecideTeamActionsInput): TeamDecision {
     }
 
     case 'accept': {
-      // owner 验收 → 完成（emit 配置里任何 accept→finish 规则；无则仅置 done）
+      // owner 验收 → 完成；仅「待验收」态有效（P2 状态门禁），其它状态视为无效事件不动
+      if (instance.status !== 'awaiting-acceptance') return { actions: [] };
       return { actions: emit(matched, round), nextStatus: 'done' };
     }
 
@@ -176,6 +180,10 @@ export function decideTeamActions(input: DecideTeamActionsInput): TeamDecision {
       }
       // 达标推进：命中的 review-pass 规则路由到下一步（request-review 下一审 / report 待验收）
       const acts = emit(matched, round);
+      // M1 守卫：quorum 达成但无路由规则 → 不静默推进/吞票，保留票与状态以暴露 config 缺规则
+      if (acts.length === 0) {
+        return { actions: [], reviewState: { round, reworkCount, votes } };
+      }
       const startsNextReview = acts.some(a => a.actionType === 'request-review');
       const reportsAcceptance = acts.some(a => a.actionType === 'report');
       const nextStatus: TaskTeamStatus | undefined = startsNextReview

@@ -191,6 +191,7 @@ describe('decideTeamActions', () => {
     const type: TaskTeamType = {
       ...fix.type,
       roleSlots: [...fix.type.roleSlots, { slotId: 'tt_slot_sec', roleId: 'tt_role_security' }],
+      rules: rules.map(r => r.ruleId), // type.rules 跟着 config 走（含新插入规则）
     };
     const instance: TaskTeamInstance = {
       ...fix.instance,
@@ -279,5 +280,37 @@ describe('decideTeamActions', () => {
     const d2 = decide(fix, inst, event);
     expect(d1).toEqual(d2);
     expect(JSON.stringify(inst)).toBe(snapshot); // 入参未被修改
+  });
+
+  it('scopes rules to type.rules — foreign team-type rules do not pollute (P1)', () => {
+    const fix = twoLayerFixture();
+    // 外部 team type 的同形规则：同 event/status，但 ruleId 不在 fix.type.rules
+    const foreignRule: TaskTeamCollabRule = { ruleId: 'tt_rule_foreign', when: { event: 'submit', status: 'running' }, whoSlot: 'tt_slot_obs', do: 'nudge' };
+    const inst: TaskTeamInstance = { ...fix.instance, status: 'running' };
+    const d = decideTeamActions({ instance: inst, type: fix.type, roles: fix.roles, rules: [...fix.rules, foreignRule], event: { type: 'submit', fromRoleInstanceId: 'tt_ri_dev', fromSlotId: 'tt_slot_dev' } });
+    // 只命中本 type.rules 的 tt_rule_0（request-review 架构师），不命中 foreign 的 nudge
+    expect(d.actions).toEqual([
+      expect.objectContaining({ actionType: 'request-review', targetRoleInstanceId: 'tt_ri_arch' }),
+    ]);
+  });
+
+  it('accept only finalizes from awaiting-acceptance (P2)', () => {
+    const fix = twoLayerFixture();
+    const running: TaskTeamInstance = { ...fix.instance, status: 'running' };
+    expect(decide(fix, running, { type: 'accept' })).toEqual({ actions: [] }); // 非待验收态 → 无效事件
+    const awaiting: TaskTeamInstance = { ...fix.instance, status: 'awaiting-acceptance' };
+    expect(decide(fix, awaiting, { type: 'accept' }).nextStatus).toBe('done');
+  });
+
+  it('does not silently swallow a met quorum with no routing rule (M1)', () => {
+    const fix = twoLayerFixture();
+    // 去掉 detail-pass 的路由规则，制造"审查员 pass 达 quorum 但无下一步规则"
+    const rules = fix.rules.filter(r => r.ruleId !== 'tt_rule_2');
+    const type = { ...fix.type, rules: rules.map(r => r.ruleId) };
+    const inst: TaskTeamInstance = { ...fix.instance, status: 'reviewing', reviewState: { round: 2, reworkCount: 0, votes: [] } };
+    const d = decideTeamActions({ instance: inst, type, roles: fix.roles, rules, event: { type: 'review-pass', fromRoleInstanceId: 'tt_ri_detail', fromSlotId: 'tt_slot_detail' } });
+    expect(d.actions).toEqual([]); // 不静默产命令
+    expect(d.nextStatus).toBeUndefined(); // 不推进状态
+    expect(d.reviewState?.votes.map(v => v.byInstanceId)).toEqual(['tt_ri_detail']); // 保留票，可观测
   });
 });
