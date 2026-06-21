@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { buildOrgTree } from '../src/dashboard/task-team-api.js';
 import { fetchTaskTeamJson } from '../src/dashboard/web/task-team-data.js';
-import { buildRolePayload, buildRulePayload, buildTypePayload, postAdmin } from '../src/dashboard/web/taskteam-builder-data.js';
+import { buildRolePayload, buildRulePayload, buildTypePayload, postAdmin, TaskTeamBuilderError } from '../src/dashboard/web/taskteam-builder-data.js';
 import type { TaskTeamConfigFile, TaskTeamInstance } from '../src/services/taskteam-schema.js';
 
 describe('buildOrgTree (§8.2 org tree)', () => {
@@ -100,6 +100,13 @@ describe('taskteam-builder-data (§7 form→schema, no JSON)', () => {
       { slotId: 'tt_slot_arch', roleId: 'tt_role_arch', label: '主审' },
     ]);
     expect(teamType.policy).toMatchObject({ reviewRounds: 2, reviewQuorum: 1, maxRework: 3, reviewOrder: ['tt_slot_arch'] });
+  });
+
+  it('buildTypePayload rejects malformed slot syntax (missing roleId) — does not produce bad roleSlot (P2)', () => {
+    const base = { typeId: 'tt_type_x', name: 'X', rules: '', reviewRounds: 1, reviewQuorum: 1, maxRework: 1, escalateAfterStallMs: 0, reviewOrder: '' };
+    expect(() => buildTypePayload({ ...base, slots: 'tt_slot_dev' })).toThrow(TaskTeamBuilderError);
+    expect(() => buildTypePayload({ ...base, slots: 'tt_slot_dev:' })).toThrow(/slotId:roleId/);
+    expect(() => buildTypePayload({ ...base, slots: 'tt_slot_dev:tt_role_dev, :tt_role_x' })).toThrow(TaskTeamBuilderError);
   });
 
   it('postAdmin: ok / non-2xx with detail / throw — surfaces errors, not silent', async () => {

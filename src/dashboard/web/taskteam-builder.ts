@@ -70,8 +70,15 @@ export function renderTaskTeamBuilderPage(root: HTMLElement): (() => void) | und
   void loadConfigPreview(root);
 
   const onSave = async (build: () => { payload: Record<string, unknown>; path: string }) => {
-    const { payload, path } = build();
-    const res = await postAdmin(path, payload, saveFetch);
+    // 表单解析校验失败（如席位语法错）→ 显示错误态、不调用 admin（P2）
+    let built: { payload: Record<string, unknown>; path: string };
+    try {
+      built = build();
+    } catch (err) {
+      setStatus(root, `${t('taskTeam.saveFailed')}：${err instanceof Error ? err.message : String(err)}`, false);
+      return;
+    }
+    const res = await postAdmin(built.path, built.payload, saveFetch);
     setStatus(root, res.ok ? t('taskTeam.saved') : `${t('taskTeam.saveFailed')}：${res.error}`, res.ok);
     if (res.ok) void loadConfigPreview(root);
   };

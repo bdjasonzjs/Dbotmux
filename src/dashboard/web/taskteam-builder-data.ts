@@ -10,6 +10,13 @@ import type {
   TaskTeamVisibility,
 } from '../../services/taskteam-schema.js';
 
+export class TaskTeamBuilderError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'TaskTeamBuilderError';
+  }
+}
+
 function splitList(s: string | undefined): string[] {
   return (s ?? '').split(',').map(x => x.trim()).filter(Boolean);
 }
@@ -87,6 +94,10 @@ export interface TypeForm {
 export function buildTypePayload(form: TypeForm): { teamType: TaskTeamType } {
   const roleSlots = splitList(form.slots).map(entry => {
     const [slotId, roleId, label] = entry.split(':').map(s => s.trim());
+    // P2：席位语法本地形态校验——必须非空 slotId + roleId，避免缺 roleId 的坏 roleSlot 落库
+    if (!slotId || !roleId) {
+      throw new TaskTeamBuilderError(`席位格式应为 slotId:roleId[:label]，无效项：「${entry}」`);
+    }
     return {
       slotId: slotId as TaskTeamType['roleSlots'][number]['slotId'],
       roleId: roleId as TaskTeamType['roleSlots'][number]['roleId'],

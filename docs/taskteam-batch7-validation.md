@@ -35,6 +35,18 @@
 2. builder-data（纯组装 + postAdmin）有单测；DOM 页按现有 dashboard 页范式无单测（与 task-team.ts/overview 等一致）。
 3. 旧 workflow-builder 的撤销/降级在批9 处理，本批只新增任务小组配置器、不动 workflow 既有页。
 
+## 两层 review 裁决与整改
+
+**架构 review：通过 ✓ 无 P1**（§7/§8.2 配置器接线 / 落 schema / 隔离）。
+
+**细节 review（docx `Ifmwd2pGhojrbQxgvL6c96cJnde`）：无 P1，1 个 P2，已整改**
+
+| 项 | 内容 | 处理 |
+|-|-|-|
+| **P2** | `buildTypePayload` 对 slots 的 `slotId:roleId[:label]` 无形态校验——`tt_slot_dev` / `tt_slot_dev:` 会组出缺 roleId 的坏 roleSlot；批5 admin 只校验 typeId，坏配置会落库 | ① **配置器表单边界**：`buildTypePayload` 每个 slot entry 校验非空 slotId + roleId，失败抛 `TaskTeamBuilderError`；页面 `onSave` 捕获 → 显示错误态、**不调用 admin**。② **防御纵深**：`adminUpsertType` 增 roleSlots 校验（每项非空 slotId+roleId，否则 400），坏配置经任何路径（CLI/直接 IPC）都进不了 store。新增单测：buildTypePayload 缺 roleId → throw；adminUpsertType 坏 roleSlots → 400、合法放行。 |
+
+整改后复验：`vitest` 57/57（批7 dashboard builder 6 + admin +1）；`tsc --noEmit` exit 0；`dashboard:bundle` 成功；红线#1 未破。
+
 ## 下一步
 
 批7 旁挂完成。与批8（新手引导）两层 review 均过后，攒一起 request-review 给 CEO 关。

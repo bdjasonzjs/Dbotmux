@@ -64,6 +64,17 @@ export async function adminUpsertRule(body: { rule?: TaskTeamCollabRule }): Prom
 export async function adminUpsertType(body: { teamType?: TaskTeamType }): Promise<{ ok: true; typeId: string }> {
   const teamType = requireObject(body, 'teamType');
   requireId(teamType, 'typeId', 'teamType');
+  // 防坏配置落库（批7 P2 防御纵深）：roleSlots 每项必须有非空 slotId + roleId
+  const slots = (teamType as { roleSlots?: unknown }).roleSlots;
+  if (slots !== undefined) {
+    if (!Array.isArray(slots)) throw new TaskTeamBadRequestError(`'teamType.roleSlots' must be an array`);
+    for (const s of slots) {
+      const slot = s as { slotId?: unknown; roleId?: unknown };
+      if (!slot || typeof slot !== 'object' || typeof slot.slotId !== 'string' || !slot.slotId || typeof slot.roleId !== 'string' || !slot.roleId) {
+        throw new TaskTeamBadRequestError(`each 'teamType.roleSlots' entry requires non-empty slotId + roleId`);
+      }
+    }
+  }
   const t = await upsertTaskTeamType(teamType as unknown as TaskTeamType);
   return { ok: true, typeId: t.typeId };
 }

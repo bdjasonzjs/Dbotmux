@@ -62,4 +62,15 @@ describe('taskteam-admin (batch5 §5)', () => {
     await expect(admin.adminImportTemplate({})).rejects.toThrow(admin.TaskTeamBadRequestError);
     await expect(admin.adminRestoreSnapshot({})).rejects.toThrow(admin.TaskTeamBadRequestError);
   });
+
+  it('adminUpsertType rejects roleSlots missing slotId/roleId (批7 P2 防御纵深)', async () => {
+    const { admin } = await fresh();
+    const goodPolicy = { reviewRounds: 1, reviewQuorum: 1, maxRework: 1, escalateAfterStallMs: 0, reviewOrder: [] };
+    await expect(
+      admin.adminUpsertType({ teamType: { typeId: 'tt_type_x', name: 'X', roleSlots: [{ slotId: 'tt_slot_dev' }], rules: [], policy: goodPolicy } } as never),
+    ).rejects.toThrow(admin.TaskTeamBadRequestError);
+    // 合法 roleSlots 放行
+    const ok = await admin.adminUpsertType({ teamType: { typeId: 'tt_type_y', name: 'Y', roleSlots: [{ slotId: 'tt_slot_dev', roleId: 'tt_role_dev' }], rules: [], policy: goodPolicy } } as never);
+    expect(ok).toMatchObject({ ok: true, typeId: 'tt_type_y' });
+  });
 });
