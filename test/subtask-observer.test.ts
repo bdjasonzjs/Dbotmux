@@ -21,7 +21,7 @@ import {
 import {
   runObserverTick, planCommit, hasNewHelpProgress, hasBlockedHelpProgress, shouldStaleRereport,
   managerExemptFromStall,
-  MIN_OBSERVE_INTERVAL_MS, STALE_REREPORT_MS,
+  MIN_OBSERVE_INTERVAL_MS, STALE_REREPORT_MS, STALL_AFTER_MS,
   type ObserverExecutors, type JudgeResult, type PrevHelpReport,
 } from '../src/services/subtask-observer.js';
 
@@ -593,5 +593,64 @@ describe('managerExemptFromStall: 经理群豁免 observer stall-nudge', () => {
   });
   it('reportingMode 缺省（旧任务）→ 不豁免（字节兼容旧 executor 行为）', () => {
     expect(managerExemptFromStall({} as any)).toBe(false);
+  });
+});
+
+// 2026-06-21 bug：子群提交 request_review 后状态仍停 observing → observer 每 STALL_AFTER_MS 催一次
+// 「任务搞定没有?」刷屏（实例被催 20 次）。根因：request_review 不改状态、不是 stall 豁免态。
+// 修复：handleStall 里「最近一条主动命令是 request_review」→ 交付待审、不催执行者；超 2h 才重 surface 给 reviewer。
+describe('交付待审豁免 stall-nudge（治 request_review 后"做完没有?"刷屏）', () => {
+  async function seedReview(t: SubTask, sentAt: string) {
+    const c = await enqueueCommand({
+      taskId: t.taskId, direction: 'parent_to_child', targetChatId: t.chatId,
+      commandType: 'request_review', payload: { summary: 'https://docx/abc', targetRole: 'collab' } as any,
+      idempotencyKey: 'rr-1',
+    });
+    await updateCommand(c.cmdId, { sentAt });
+    return c;
+  }
+
+  it('最近一条主动命令是 request_review + 无新消息 + 已超停滞阈 → 不催执行者（无 nudge）', async () => {
+    const t = await mkObserving();
+    const now = new Date();
+    await seedReview(t, now.toISOString());
+    // 距停滞阈很久仍无新消息：旧逻辑会发 nudge；交付待审应静默
+    const later = new Date(now.getTime() + STALL_AFTER_MS + 5 * 60_000);
+    await runObserverTick(later, mkExec({ messages: [] }));
+    expect(listCommands(t.taskId).filter(c => c.commandType === 'nudge')).toHaveLength(0);
+    expect(getSubTask(t.taskId)!.status).toBe('observing'); // 状态不变、不 escalate
+  });
+
+  it('控制组：最近一条主动命令是 supplement（非 request_review）+ 超停滞阈 → 照常 nudge', async () => {
+    const t = await mkObserving();
+    const now = new Date();
+    const supp = await enqueueCommand({
+      taskId: t.taskId, direction: 'parent_to_child', targetChatId: t.chatId,
+      commandType: 'supplement', payload: { content: '继续' } as any, idempotencyKey: 'supp-1',
+    });
+    await updateCommand(supp.cmdId, { sentAt: now.toISOString() });
+    const later = new Date(now.getTime() + STALL_AFTER_MS + 5 * 60_000);
+    await runObserverTick(later, mkExec({ messages: [] }));
+    expect(listCommands(t.taskId).filter(c => c.commandType === 'nudge')).toHaveLength(1);
+  });
+
+  it('request_review 超 2h（STALE_REREPORT_MS）仍未闭环 → 重新 surface 给 reviewer（不催执行者）', async () => {
+    const t = await mkObserving();
+    const now = new Date();
+    await seedReview(t, new Date(now.getTime() - STALE_REREPORT_MS - 60_000).toISOString());
+    await runObserverTick(now, mkExec({ messages: [] }));
+    const reviews = listCommands(t.taskId).filter(c => c.commandType === 'request_review');
+    expect(reviews).toHaveLength(2); // 原 request_review + 兜底重 surface
+    expect(reviews.some(c => c.idempotencyKey.startsWith('review-revive-'))).toBe(true);
+    expect(listCommands(t.taskId).filter(c => c.commandType === 'nudge')).toHaveLength(0); // 绝不催执行者
+  });
+
+  it('request_review 超 2h 兜底只重 surface 一次（幂等防 respam）', async () => {
+    const t = await mkObserving();
+    const now = new Date();
+    await seedReview(t, new Date(now.getTime() - STALE_REREPORT_MS - 60_000).toISOString());
+    await runObserverTick(now, mkExec({ messages: [] }));
+    await runObserverTick(new Date(now.getTime() + 2 * MIN_OBSERVE_INTERVAL_MS), mkExec({ messages: [] }));
+    expect(listCommands(t.taskId).filter(c => c.commandType === 'request_review')).toHaveLength(2); // 没再多发
   });
 });

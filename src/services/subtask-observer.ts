@@ -16,9 +16,9 @@ import { logger } from '../utils/logger.js';
 import {
   listSubTasks, listObservations, listCommands, commitObservationTransaction,
   helpReportDelivery, staleHelpCommandIds, latestHelpReport,
-  enqueueNudgeAndUpdateStats, escalateStalledTask,
+  enqueueNudgeAndUpdateStats, escalateStalledTask, enqueueCommand,
   CursorConflictError, InvalidCursorCommitError, VersionConflictError, OBSERVER_STATUSES,
-  type SubTask, type SubTaskStatus, type Signal, type HelpDelivery,
+  type SubTask, type SubTaskStatus, type Signal, type HelpDelivery, type OutboxCommand,
 } from './subtask-store.js';
 
 export interface JudgeContext {
@@ -241,13 +241,28 @@ async function handleStall(t: SubTask, now: Date): Promise<boolean> {
 
   if (managerExemptFromStall(t)) return false;
 
-  // blocker2 fix: 最近一条非 nudge 发起命令时间 (kickoff/supplement/request_review)——
+  // blocker2 fix: 最近一条非 nudge 发起命令 (kickoff/supplement/request_review)——
   // sentAt 优先 (已投出)，否则 createdAt (pending)。排除 nudge 自身。
   const initiating = listCommands(t.taskId).filter(c =>
     c.direction === 'parent_to_child' && c.commandType !== 'nudge' && c.supersededBy == null);
-  const lastInitiatingCmdAt = initiating.length
-    ? initiating.map(c => c.sentAt ?? c.createdAt).sort().at(-1)!
+  const latestInitiating = initiating.length
+    ? initiating
+        .map(c => ({ c, at: c.sentAt ?? c.createdAt }))
+        .sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0))
+        .at(-1)!.c
     : null;
+
+  // 交付待审豁免（治"做完没有?"刷屏）：最近一条主动命令是 request_review —— 执行者已交付、正等
+  // reviewer 评审，这是「待审」而非「停滞」，**绝不催执行者**（observing 下 planStallNudge 本会每
+  // STALL_AFTER_MS 催一次）。仅在评审超 STALE_REREPORT_MS(2h) 仍未闭环时，**重新 surface 评审请求给
+  // reviewer**（不催执行者）。镜像 paused→handlePausedHeartbeat 的「待外部·静音 + 2h 兜底」语义。
+  // 后续若父群下发 supplement / 执行者重新进入 need_help→paused，latestInitiating 不再是 request_review，
+  // 豁免自然解除，停滞门控恢复。
+  if (latestInitiating?.commandType === 'request_review') {
+    return handleReviewHeartbeat(t, now, latestInitiating);
+  }
+
+  const lastInitiatingCmdAt = latestInitiating ? (latestInitiating.sentAt ?? latestInitiating.createdAt) : null;
   const action = planStallNudge(t, now, lastInitiatingCmdAt);
   if (action.kind === 'none') return false;
   // round2 blocker fix: 用 episode anchor (而非旧 baseline) 作 idempotency episode，
@@ -310,6 +325,32 @@ async function handlePausedHeartbeat(t: SubTask, now: Date): Promise<boolean> {
   } catch (err) {
     if (err instanceof CursorConflictError || err instanceof InvalidCursorCommitError || err instanceof VersionConflictError) {
       logger.info(`[subtask-observer] ${t.taskId} paused heartbeat conflict, skip this tick: ${(err as Error).message}`);
+      return false;
+    }
+    throw err;
+  }
+}
+
+/** 交付待审（执行者已 request_review、在等 reviewer）无新消息时的兜底：评审在 STALE_REREPORT_MS(2h)
+ *  内 → 静默不催执行者（return false）；超 2h 评审仍未闭环 → 重新 surface 评审请求给 reviewer（不催
+ *  执行者）。idempotencyKey 绑该条 request_review 的 cmdId → 每条评审请求只兜底重发一次（防 respam），
+ *  与 handlePausedHeartbeat 的 baseline-keyed 一次性兜底语义一致。 */
+async function handleReviewHeartbeat(t: SubTask, now: Date, reviewCmd: OutboxCommand): Promise<boolean> {
+  const baseline = reviewCmd.sentAt ?? reviewCmd.createdAt;
+  if (now.getTime() - new Date(baseline).getTime() <= STALE_REREPORT_MS) return false; // 待审中，不催执行者
+  try {
+    await enqueueCommand({
+      taskId: t.taskId, direction: 'parent_to_child', targetChatId: t.chatId,
+      commandType: 'request_review',
+      payload: { ...reviewCmd.payload, targetRole: 'collab' },
+      idempotencyKey: `review-revive-${t.taskId}-${reviewCmd.cmdId}`,
+      expectedTaskVersion: t.version,
+    });
+    logger.info(`[subtask-observer] ${t.taskId} 评审超 ${STALE_REREPORT_MS}ms 未闭环→重新 surface 给 reviewer (不催执行者)`);
+    return true;
+  } catch (err) {
+    if (err instanceof VersionConflictError) {
+      logger.info(`[subtask-observer] ${t.taskId} review heartbeat version conflict, skip this tick`);
       return false;
     }
     throw err;
