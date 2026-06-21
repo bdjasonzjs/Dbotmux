@@ -111,7 +111,15 @@ export interface CliAdapter {
      *  buildArgs (e.g. codex resume-fallback scanning history.jsonl) MUST use this,
      *  not a hardcoded global ~/.codex — else a clone reads the 本体's home. */
     cliHome?: string;
+    /** 任务小组 per-role 模型微调（批4，§6.1）——可选；不传则与今天逐字节一致。
+     *  仅在 supportsModelOverride / supportsReasoningEffort 为真的 adapter 翻成 CLI 参数。 */
+    model?: string;
+    reasoningEffort?: string;
   }): string[];
+
+  /** §6.2 能力矩阵：该 adapter 是否支持 per-spawn model / 推理档位透传。缺省 = 不支持（忽略 override）。 */
+  readonly supportsModelOverride?: boolean;
+  readonly supportsReasoningEffort?: boolean;
 
   /** When true, the adapter passes the initial prompt via CLI args (e.g. -i).
    *  The worker skips queuing the prompt for stdin write. */

@@ -2699,6 +2699,9 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
     botOpenId: cfg.botOpenId,
     locale: cfg.locale,
     cliHome: sessionCliHome,
+    // 批4 §6.1：per-role 模型微调透传；cfg.modelOverrides 缺省 undefined → adapter 不加任何参数（逐字节不变）
+    model: cfg.modelOverrides?.model,
+    reasoningEffort: cfg.modelOverrides?.reasoningEffort,
   });
 
   // Extra args from env (CLI_DISABLE_DEFAULT_ARGS is removed — adapters own their defaults)

@@ -397,13 +397,16 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
       return `claude --resume ${cliSessionId ?? sessionId}`;
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, botName, botOpenId, locale }) {
+    supportsModelOverride: true,
+    buildArgs({ sessionId, resume, resumeSessionId, botName, botOpenId, locale, model }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', resumeSessionId ?? sessionId);
       } else {
         args.push('--session-id', sessionId);
       }
+      // 批4 §6.1：per-role 模型微调；缺省 model=undefined → 不加 --model（与今天逐字节一致）
+      if (model) args.push('--model', model);
       args.push('--dangerously-skip-permissions');
       // Suppress the first-run "--dangerously-skip-permissions" risk-acceptance
       // screen for this spawn only. In a fresh $HOME that has never accepted it,
