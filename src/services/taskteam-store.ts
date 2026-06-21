@@ -162,3 +162,40 @@ export async function recordTaskTeamVote(teamId: TaskTeamId, vote: TaskTeamRevie
     return { result: next, dirty: true };
   });
 }
+
+// 批3 驱动层：把引擎 TeamDecision 的状态增量（status / reviewState）原子落库。
+// 纯新增函数，不改动既有 store 行为（批1 已关，仅追加）。
+export async function applyTeamDecisionState(
+  teamId: TaskTeamId,
+  patch: { status?: TaskTeamStatus; reviewState?: TaskTeamInstance['reviewState']; progress?: string; cursor?: string },
+): Promise<TaskTeamInstance> {
+  return mutate(store => {
+    const idx = store.teams.findIndex(t => t.teamId === teamId);
+    if (idx < 0) throw new TaskTeamNotFoundError(teamId);
+    const cur = store.teams[idx];
+    const next: TaskTeamInstance = {
+      ...cur,
+      status: patch.status ?? cur.status,
+      reviewState: patch.reviewState ?? cur.reviewState,
+      progress: patch.progress ?? cur.progress,
+      cursor: patch.cursor ?? cur.cursor,
+      version: cur.version + 1,
+      updatedAt: new Date().toISOString(),
+    };
+    store.teams[idx] = next;
+    return { result: next, dirty: true };
+  });
+}
+
+// 批3 观测层：列出活跃（非终态）实例供 observer cron 扫描
+const ACTIVE_TEAM_STATUSES: ReadonlySet<TaskTeamStatus> = new Set([
+  'forming',
+  'running',
+  'reviewing',
+  'blocked',
+  'awaiting-acceptance',
+]);
+
+export function listActiveTaskTeams(): TaskTeamInstance[] {
+  return readTaskTeams().teams.filter(t => ACTIVE_TEAM_STATUSES.has(t.status));
+}
