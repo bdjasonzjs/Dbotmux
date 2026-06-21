@@ -4,7 +4,7 @@
 import { sendMessage } from '../im/lark/client.js';
 import { getTaskTeam } from './taskteam-store.js';
 import type { TaskTeamDispatchExecutors, TaskTeamSendResult } from './taskteam-dispatcher.js';
-import type { TaskTeamAction, TaskTeamInstance } from './taskteam-schema.js';
+import type { TaskTeamAction, TaskTeamId, TaskTeamInstance } from './taskteam-schema.js';
 
 const COMMAND_LABEL: Record<string, string> = {
   kickoff: '开工',
@@ -37,6 +37,9 @@ export function makeTaskTeamDispatchExecutors(senderLarkAppId: string): TaskTeam
       } catch (err) {
         return { ok: false, error: String(err), retriable: true };
       }
+    },
+    teamVersion(teamId: TaskTeamId): number | null {
+      return getTaskTeam(teamId)?.version ?? null;
     },
   };
 }

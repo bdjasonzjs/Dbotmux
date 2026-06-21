@@ -9,7 +9,7 @@ import {
   listPendingTaskTeamActions,
   releaseTaskTeamActionForRetry,
 } from './taskteam-outbox-store.js';
-import type { TaskTeamAction } from './taskteam-schema.js';
+import type { TaskTeamAction, TaskTeamId } from './taskteam-schema.js';
 
 export interface TaskTeamSendResult {
   ok: boolean;
@@ -20,6 +20,9 @@ export interface TaskTeamSendResult {
 
 export interface TaskTeamDispatchExecutors {
   send(action: TaskTeamAction): Promise<TaskTeamSendResult>;
+  // 半提交守卫（批3 P1）：返回 action 所属 team 的当前版本；null=team 不存在。
+  // team.version < action.expectedTeamVersion → 状态尚未提交 → 暂不投递。
+  teamVersion(teamId: TaskTeamId): number | null;
 }
 
 export interface TaskTeamDispatchStats {
@@ -29,6 +32,7 @@ export interface TaskTeamDispatchStats {
   failed: number;
   skipped: number;
   leaseLost: number; // P2：claim 后回写时 CAS 被拒（lease 已被他人重领）——不计入 sent/retried/failed
+  held: number; // P1：状态未提交（半提交）→ 本 tick 暂不投递
 }
 
 export interface TaskTeamDispatchConfig {
@@ -50,8 +54,17 @@ export async function runTaskTeamDispatcherTick(
   exec: TaskTeamDispatchExecutors,
   config: TaskTeamDispatchConfig = DEFAULT_DISPATCH_CONFIG,
 ): Promise<TaskTeamDispatchStats> {
-  const stats: TaskTeamDispatchStats = { claimed: 0, sent: 0, retried: 0, failed: 0, skipped: 0, leaseLost: 0 };
-  const pending = listPendingTaskTeamActions(now);
+  const stats: TaskTeamDispatchStats = { claimed: 0, sent: 0, retried: 0, failed: 0, skipped: 0, leaseLost: 0, held: 0 };
+  // 半提交守卫：状态跃迁尚未提交（team.version < expectedTeamVersion）的命令本 tick 不投递（held）
+  const pending = listPendingTaskTeamActions(now).filter(action => {
+    if (action.expectedTeamVersion == null) return true;
+    const version = exec.teamVersion(action.teamId);
+    if (version == null || version < action.expectedTeamVersion) {
+      stats.held += 1;
+      return false;
+    }
+    return true;
+  });
   if (pending.length === 0) return stats;
 
   // 有界并发 lane（仿 subtask outbox-dispatcher），claim 的乐观锁保证同一 action 不被两 lane 同时拿

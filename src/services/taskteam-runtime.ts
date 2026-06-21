@@ -46,6 +46,7 @@ export interface TaskTeamRuntimeDeps {
     targetRoleInstanceId?: TaskTeamAction['targetRoleInstanceId'];
     targetSlotId?: TaskTeamAction['targetSlotId'];
     payload?: Record<string, unknown>;
+    expectedTeamVersion?: number | null;
   }): Promise<TaskTeamAction>;
 }
 
@@ -84,6 +85,12 @@ export async function applyTeamEvent(
 
     const decision = decideTeamActions({ instance, type, roles: cfg.roles, rules: cfg.rules, event });
 
+    // 半提交守卫：若决策含状态跃迁，命令绑定"提交后的 team.version"（= 当前 +1，锁内无并发改态故确定）。
+    // dispatcher 在 team.version 达到该值前不投递；崩溃在 enqueue 与 advance 之间时，命令虽落库但不可投递，
+    // 待重放再次 advance 到该版本才解锁——既不丢命令也不会半提交投递。无状态跃迁的命令即时可投递（null）。
+    const hasStateChange = decision.nextStatus !== undefined || decision.reviewState !== undefined;
+    const expectedTeamVersion = hasStateChange ? instance.version + 1 : null;
+
     // 1. 先幂等 enqueue 每条投递命令（idempotencyKey 引擎给定 → outbox 去重；replay 安全）
     const enqueued: TaskTeamAction[] = [];
     for (const a of decision.actions) {
@@ -96,13 +103,14 @@ export async function applyTeamEvent(
           targetRoleInstanceId: a.targetRoleInstanceId,
           targetSlotId: a.targetSlotId,
           payload: a.payload,
+          expectedTeamVersion,
         }),
       );
     }
 
-    // 2. 再原子提交状态增量（status / reviewState，含审轮票数累计）
+    // 2. 再原子提交状态增量（status / reviewState，含审轮票数累计）——提交后 team.version = expectedTeamVersion，命令解锁可投
     let updated = instance;
-    if (decision.nextStatus !== undefined || decision.reviewState !== undefined) {
+    if (hasStateChange) {
       updated = await deps.applyState(teamId, { status: decision.nextStatus, reviewState: decision.reviewState });
     }
 

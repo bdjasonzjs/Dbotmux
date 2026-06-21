@@ -121,6 +121,7 @@ export async function enqueueTaskTeamAction(opts: {
   targetRoleInstanceId?: TaskTeamRoleInstanceId;
   targetSlotId?: TaskTeamSlotId;
   payload?: Record<string, unknown>;
+  expectedTeamVersion?: number | null; // 半提交守卫（批3 P1）；缺省 null = 即时可投递
 }): Promise<TaskTeamAction> {
   return mutate(store => {
     const existing = store.actions.find(a => a.idempotencyKey === opts.idempotencyKey);
@@ -139,6 +140,7 @@ export async function enqueueTaskTeamAction(opts: {
       retryCount: 0,
       leaseExpiresAt: null,
       nextAttemptAt: null,
+      expectedTeamVersion: opts.expectedTeamVersion ?? null,
       dispatchAttemptId: null,
       deliveredMessageId: null,
       lastError: null,

@@ -70,8 +70,17 @@
 | M1 | createTaskTeam 建群先于落库，落库失败有孤儿群风险 | 记录在案：当前接受（建群成功率高、孤儿群可人工/后续回收清理）；彻底事务化建群↔落库属后续，不阻断本批。 |
 | M2 | observer detect 占位需在验证记录显式列为 §7 延后 scope | 已在本文「主动标注的边界 1」显式声明，确认。 |
 
-整改后复验：`vitest` 29/29（批1 5 + 批2 10 + 批3 14）；`tsc --noEmit` exit 0；`git diff --check` 通过；红线#1 未破。
+**细节复审（docx `XMVwd0XzFovnv4xbyrKc9hjMnPg`）：P2 闭环、P1 半闭——补半提交一致性边界**
+
+| 项 | 内容 | 处理 |
+|-|-|-|
+| P1（剩余） | enqueue 先于状态提交，`applyState` 失败时留下"命令已可投递、状态未推进"的半提交——dispatcher 不校验 status 会把 request-review 发出去，reviewer 回 review-pass 被 status gate 吞掉、流程卡住（与首轮"状态推进但命令丢失"对称的另一半） | **加版本化半提交守卫**：`TaskTeamAction` 增 `expectedTeamVersion`；含状态跃迁的命令绑定"提交后版本"（当前+1，锁内确定）。dispatcher 在 `team.version >= expectedTeamVersion` 前不投递（计入新增 `held` 统计）。enqueue 仍先于 advance（命令不丢），但**提交前不可投递**（无半提交错误路由）；崩溃在 enqueue 与 advance 之间 → 命令落库但 held，重放再 advance 到该版本才解锁 → 既不丢命令也不半提交投递。无状态跃迁命令 `expectedTeamVersion=null` 即时可投。新增单测：team.version<expectedTeamVersion → held 不投、达到后解锁投。 |
+| 非阻断 note | withTeamLock 用 IPC 传入 teamId 拼锁文件路径，建议校验前缀/禁路径穿越 | 已加 `tt_team_` 前缀 + 安全字符正则校验，非法 teamId 直接 reject。 |
+
+整改后复验：`vitest` 30/30（批1 5 + 批2 10 + 批3 15）；`tsc --noEmit` exit 0；`git diff --check` 通过；红线#1 未破（daemon +87/0）。
+
+> 一致性边界总结：apply 单元 = per-team 锁内 enqueue(绑 expectedTeamVersion)→advance；命令投递 = dispatcher 校验 team.version 达标才投。二者构成"命令落库后、状态提交前不可投递"的可恢复一致性边界，杜绝任一中途失败造成的丢命令 / 半提交错误路由。
 
 ## 下一步
 
-待审查员复审 P1/P2 + CEO 关后，批4：per-role 模型透传（独立 commit + 回归断言）。
+待审查员复审 + CEO 关后，批4：per-role 模型透传（独立 commit + 回归断言）。

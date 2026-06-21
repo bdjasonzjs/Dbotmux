@@ -19,7 +19,12 @@ import type { TaskTeamId } from './taskteam-schema.js';
 
 // per-team 跨进程串行化锁。锁文件路径独立于 store 文件（taskteams.json / taskteam-outbox.json），
 // 避免与 store 自身 mutate 的 withFileLock 同路径重入死锁。
+// teamId 经 tt_team_ 前缀 + 安全字符校验，杜绝异常/恶意 teamId 把锁文件路径跑偏（路径穿越）。
+const TEAM_ID_RE = /^tt_team_[A-Za-z0-9_-]+$/;
 function withTeamLock<T>(teamId: TaskTeamId, fn: () => Promise<T>): Promise<T> {
+  if (!TEAM_ID_RE.test(teamId)) {
+    return Promise.reject(new Error(`invalid teamId for lock path: ${JSON.stringify(teamId)}`));
+  }
   return withFileLock(join(config.session.dataDir, `taskteam-lock-${teamId}`), fn);
 }
 

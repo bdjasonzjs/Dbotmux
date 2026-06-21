@@ -181,6 +181,10 @@ export interface TaskTeamAction {
   retryCount: number;
   leaseExpiresAt: string | null;
   nextAttemptAt: string | null; // 退避到点前 dispatcher 不取（A2：批3 retry 出路）
+  // 半提交守卫（批3 P1）：本命令对应的状态跃迁提交后 team.version 才会达到此值；
+  // dispatcher 在 team.version >= expectedTeamVersion 前不投递 → 杜绝"命令已可投递但状态未推进"。
+  // null = 无需门控（决策无状态跃迁，命令即时可投递）。
+  expectedTeamVersion: number | null;
   dispatchAttemptId: string | null;
   deliveredMessageId: string | null;
   lastError: string | null;

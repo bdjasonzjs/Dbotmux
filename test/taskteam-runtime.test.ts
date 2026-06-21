@@ -112,6 +112,7 @@ function memDeps(fix: { roles: TaskTeamRole[]; rules: TaskTeamCollabRule[]; type
         retryCount: 0,
         leaseExpiresAt: null,
         nextAttemptAt: null,
+        expectedTeamVersion: opts.expectedTeamVersion ?? null,
         dispatchAttemptId: null,
         deliveredMessageId: null,
         lastError: null,
@@ -202,6 +203,9 @@ describe('applyTeamEvent (driver)', () => {
     await expect(applyTeamEvent(deps, 'tt_team_x', ev)).rejects.toThrow(/crash/);
     expect(base.getTeam().status).toBe('running');
     expect(base.enqueued).toHaveLength(1);
+    // 半提交守卫：命令绑定 expectedTeamVersion=2，但 team 仍 version 1 → dispatcher 不会投递
+    expect(base.enqueued[0].expectedTeamVersion).toBe(2);
+    expect(base.getTeam().version).toBe(1);
     // 重放：状态仍 running → 重算同决策 → enqueue 去重 → 提交成功
     const r = await applyTeamEvent(deps, 'tt_team_x', ev);
     expect(r.instance.status).toBe('reviewing');
