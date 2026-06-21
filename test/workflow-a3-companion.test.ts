@@ -30,7 +30,6 @@ import {
 } from '../src/workflows/events/idempotency.js';
 import { runLoop } from '../src/workflows/loop.js';
 import { workActivityId } from '../src/workflows/orchestrator.js';
-import { defaultObserverDriver } from '../src/workflows/observer-driver.js';
 import { createRun } from '../src/workflows/run-init.js';
 import type { WorkerSpawnFn } from '../src/workflows/runtime.js';
 
@@ -83,7 +82,6 @@ describe('feishu-reply-demo workflow — A3 forward path (mocked client)', () =>
     const ctx = {
       log,
       def,
-      driver: defaultObserverDriver(def, 'a3-companion-test'),
       spawnSubagent: spawnNotInvoked,
       hostExecutors: createDefaultHostExecutorRegistry(),
       reconcilers: createDefaultProviderReconcilers(),
@@ -237,7 +235,6 @@ describe('feishu-reply-demo workflow — A3 R0 recovery (combined reconciler)', 
       {
         log,
         def,
-        driver: defaultObserverDriver(def, 'a3-companion-test'),
         spawnSubagent: spawnNotInvoked,
         reconcilers: createDefaultProviderReconcilers(),
         loadEffectInput: (aid, atid) => loadEffectInputSidecar(log, aid, atid),

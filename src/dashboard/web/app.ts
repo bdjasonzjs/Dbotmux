@@ -7,7 +7,6 @@ import { renderGroupsPage } from './groups.js';
 import { renderBotDefaultsPage } from './bot-defaults.js';
 import { renderWorkflowsPage } from './workflows.js';
 import { renderWorkflowCatalogPage } from './workflow-catalog.js';
-import { renderWorkflowBuilderPage } from './workflow-builder.js';
 import { renderTopologyPage } from './topology.js';
 import { renderTaskTeamPage } from './task-team.js';
 import { renderTaskTeamBuilderPage } from './taskteam-builder.js';
@@ -29,13 +28,13 @@ function route() {
   // so the top nav has a single "Workflows (beta)" entry.  Legacy
   // `#/workflows-catalog[*]` URLs are kept working for any external links
   // that may have been pasted before the move.
+  // §10 撤销：productized workflow builder（flow/roles/semantic 图编辑器）已随
+  // 引擎撤销移除，UI 临时降级 DAG-only —— builder 子路由回落到 catalog/列表视图，
+  // 待任务小组配置器接上 taskteam schema 后再切数据源。
   if (
-    hash.startsWith('#/workflows/builder')
-  ) {
-    pageDispose = renderWorkflowBuilderPage(root);
-  } else if (
     hash.startsWith('#/workflows/catalog') ||
-    hash.startsWith('#/workflows-catalog')
+    hash.startsWith('#/workflows-catalog') ||
+    hash.startsWith('#/workflows/builder')
   ) {
     pageDispose = renderWorkflowCatalogPage(root);
   } else if (hash.startsWith('#/workflows')) pageDispose = renderWorkflowsPage(root);

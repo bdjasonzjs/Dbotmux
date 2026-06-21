@@ -70,44 +70,9 @@ describe('parseWorkflowDefinition', () => {
     const def = parseWorkflowDefinition(tripPlannerFixture());
     expect(def.workflowId).toBe('trip-planner');
     expect(Object.keys(def.nodes)).toEqual(['weather', 'plan', 'book_plan']);
-    expect(def.roles?.__observer_driver?.kind).toBe('observer');
     const bookPlan = def.nodes.book_plan!;
     expect(bookPlan.type).toBe('subagent');
     expect(bookPlan.humanGate?.stage).toBe('before');
-  });
-
-  it('preserves an explicit observer role instead of replacing it', () => {
-    const def = parseWorkflowDefinition({
-      workflowId: 'wf-observer',
-      version: 1,
-      roles: {
-        monitor: { id: 'monitor', kind: 'observer', label: 'Monitor' },
-      },
-      nodes: {
-        only: { type: 'subagent', bot: 'b1', prompt: 'x' },
-      },
-    });
-    expect(def.roles?.monitor?.kind).toBe('observer');
-    expect(def.roles?.__observer_driver).toBeUndefined();
-  });
-
-  it('rejects reserved default observer id when already used by a non-observer role', () => {
-    expect(() =>
-      parseWorkflowDefinition({
-        workflowId: 'wf-reserved-observer-id',
-        version: 1,
-        roles: {
-          __observer_driver: {
-            id: '__observer_driver',
-            kind: 'developer',
-            label: 'Developer',
-          },
-        },
-        nodes: {
-          only: { type: 'subagent', bot: 'b1', prompt: 'x' },
-        },
-      }),
-    ).toThrow(/reserved for the default observer driver/);
   });
 
   it('rejects subagent missing required `bot`', () => {

@@ -40,7 +40,6 @@ import type { WorkflowDefinition } from './definition.js';
 import type { EventLog } from './events/append.js';
 import type { Snapshot } from './events/replay.js';
 import { workActivityId } from './orchestrator.js';
-import { latestFlowOutput } from './stateflow.js';
 
 export class BindingError extends Error {
   constructor(message: string) {
@@ -136,9 +135,8 @@ export async function resolveOutputRef(
     );
   }
 
-  const outputRef = ctx.def.flow
-    ? latestFlowOutput(ctx.snapshot, nodeId)?.outputRef
-    : ctx.snapshot.outputs.get(workActivityId(ctx.snapshot.run.runId, nodeId));
+  const actId = workActivityId(ctx.snapshot.run.runId, nodeId);
+  const outputRef = ctx.snapshot.outputs.get(actId);
   if (!outputRef) {
     throw new BindingError(
       `$ref '${ref}' references node '${nodeId}' which has not produced a successful output yet`,

@@ -31,7 +31,6 @@
 
 import type { EventLog } from './events/append.js';
 import type { OutputRef } from './events/payloads.js';
-import { writeJsonBlob } from './blob.js';
 import type {
   ActivityFailedEvent,
   ActivitySucceededEvent,
@@ -103,15 +102,7 @@ export type ExpireWaitInput = {
 
 export type ResolveWaitResult = {
   resolutionEvent: WaitResolvedEvent;
-  terminalEvent?: ActivitySucceededEvent | ActivityFailedEvent;
-};
-
-export type ResolveReviewDecisionInput = {
-  activityId: string;
-  attemptId: string;
-  resolution: Extract<WaitResolution, 'approved' | 'rejected'>;
-  by: string;
-  comment?: string;
+  terminalEvent: ActivitySucceededEvent | ActivityFailedEvent;
 };
 
 export type ExpireWaitResult = {
@@ -204,34 +195,6 @@ export async function resolveWait(
   });
 
   return { resolutionEvent, terminalEvent };
-}
-
-/**
- * Close a reviewDecision wait as business output, not gate failure.
- *
- * Normal humanGate rejection means "do not execute this node" and writes
- * activityFailed. A semantic reviewDecision is different: rejection is a
- * valid Reviewer decision that the configured flow must branch on. This
- * helper preserves the same waitResolved audit event, then writes
- * activitySucceeded with a JSON output containing the decision.
- */
-export async function resolveReviewDecision(
-  log: EventLog,
-  input: ResolveReviewDecisionInput,
-): Promise<ResolveWaitResult> {
-  const resolutionEvent = (await log.append({
-    runId: log.runId,
-    type: 'waitResolved',
-    actor: 'human',
-    payload: {
-      activityId: input.activityId,
-      resolution: input.resolution,
-      by: input.by,
-      comment: input.comment,
-    },
-  })) as WaitResolvedEvent;
-
-  return { resolutionEvent };
 }
 
 // ─── expireWait ────────────────────────────────────────────────────────────

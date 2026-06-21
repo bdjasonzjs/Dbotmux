@@ -49,7 +49,6 @@ import {
   extractEventContext,
   listRuns,
 } from '../workflows/ops-projection.js';
-import { defaultObserverDriver } from '../workflows/observer-driver.js';
 
 // Local arg parsers — mirror cli.ts shape; deliberately not exported.
 function argValue(args: string[], ...flags: string[]): string | undefined {
@@ -212,7 +211,6 @@ async function cmdWorkflowRun(rest: string[]): Promise<void> {
   const ctx: WorkflowRuntimeContext = {
     log,
     def,
-    driver: defaultObserverDriver(def, 'cli-workflow-run'),
     spawnSubagent,
     hostExecutors: createDefaultHostExecutorRegistry(),
     reconcilers: createDefaultProviderReconcilers(),
@@ -347,7 +345,6 @@ async function cmdWorkflowResume(rest: string[]): Promise<void> {
   const ctx: WorkflowRuntimeContext = {
     log,
     def: def!,
-    driver: defaultObserverDriver(def!, 'cli-workflow-resume'),
     spawnSubagent,
     hostExecutors: createDefaultHostExecutorRegistry(),
     reconcilers: createDefaultProviderReconcilers(),
@@ -421,7 +418,6 @@ async function cmdWorkflowCancel(rest: string[]): Promise<void> {
     log,
     def,
     cliResumeSpawnSubagent,
-    'cli-workflow-cancel',
   );
   const result = await cancelWorkflowRun({
     ctx,
@@ -465,12 +461,10 @@ function workflowCliRuntimeContext(
   log: EventLog,
   def: Awaited<ReturnType<typeof loadRunWorkflowDefinition>>,
   spawnSubagent: WorkerSpawnFn,
-  driverSource: string,
 ): WorkflowRuntimeContext {
   return {
     log,
     def,
-    driver: defaultObserverDriver(def, driverSource),
     spawnSubagent,
     hostExecutors: createDefaultHostExecutorRegistry(),
     reconcilers: createDefaultProviderReconcilers(),

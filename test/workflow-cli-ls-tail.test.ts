@@ -18,7 +18,6 @@ import { EventLog } from '../src/workflows/events/append.js';
 import { createRun } from '../src/workflows/run-init.js';
 import { parseWorkflowDefinition } from '../src/workflows/definition.js';
 import { runLoop } from '../src/workflows/loop.js';
-import { defaultObserverDriver } from '../src/workflows/observer-driver.js';
 import type { WorkerSpawnFn } from '../src/workflows/runtime.js';
 
 const CLI_PATH = join(__dirname, '..', 'dist', 'cli.js');
@@ -92,7 +91,6 @@ async function seedTerminalRun(runId: string): Promise<void> {
   await runLoop({
     log,
     def: HELLO_DEF,
-    driver: defaultObserverDriver(HELLO_DEF, 'cli-ls-tail-test'),
     spawnSubagent: successSpawn,
   });
 }

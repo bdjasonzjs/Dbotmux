@@ -18,7 +18,6 @@ import { loadEffectInputSidecar } from '../src/workflows/effect-input.js';
 import { EventLog } from '../src/workflows/events/append.js';
 import { runLoop } from '../src/workflows/loop.js';
 import { gateActivityId, workActivityId } from '../src/workflows/orchestrator.js';
-import { defaultObserverDriver } from '../src/workflows/observer-driver.js';
 import { createRun } from '../src/workflows/run-init.js';
 import type { WorkerSpawnFn } from '../src/workflows/runtime.js';
 import { resolveWait } from '../src/workflows/wait.js';
@@ -93,7 +92,6 @@ describe('canary-multistep workflow', () => {
     const ctx = {
       log,
       def,
-      driver: defaultObserverDriver(def, 'canary-test'),
       spawnSubagent,
       hostExecutors: createDefaultHostExecutorRegistry(),
     };

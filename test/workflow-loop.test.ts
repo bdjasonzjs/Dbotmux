@@ -16,13 +16,7 @@ import {
   type WorkerSpawnFn,
 } from '../src/workflows/runtime.js';
 import { runLoop } from '../src/workflows/loop.js';
-import { resume } from '../src/workflows/resume.js';
-import {
-  resolveReviewDecision,
-  resolveWait,
-} from '../src/workflows/wait.js';
-import { flowWorkActivityId } from '../src/workflows/stateflow.js';
-import { defaultObserverDriver } from '../src/workflows/observer-driver.js';
+import { resolveWait } from '../src/workflows/wait.js';
 
 const RUN_ID = 'run-loop-test-01';
 const noopResolver: BotResolver = () => ({});
@@ -84,10 +78,7 @@ async function bootstrap(
     initiator: 'tester',
     botResolver: noopResolver,
   });
-  return {
-    log,
-    ctx: { log, def, driver: defaultObserverDriver(def, 'test-bootstrap'), spawnSubagent: spawn },
-  };
+  return { log, ctx: { log, def, spawnSubagent: spawn } };
 }
 
 // ─── linear, no gate ─────────────────────────────────────────────────────
@@ -103,43 +94,6 @@ describe('runLoop — linear workflow', () => {
 
     const snap = replay(await log.readAll());
     expect(snap.run.output?.outputHash).toMatch(/^sha256:/);
-  });
-
-  it('rejects explicit developer/executor and reviewer drivers', async () => {
-    const def = linear();
-    const { ctx } = await bootstrap(def);
-
-    await expect(
-      runLoop({
-        ...ctx,
-        driver: { actorId: 'dev-1', roleKind: 'developer', source: 'test' },
-      }),
-    ).rejects.toThrow(/requires observer driver/);
-
-    await expect(
-      runLoop({
-        ...ctx,
-        driver: { actorId: 'exec-1', roleKind: 'executor', source: 'test' },
-      }),
-    ).rejects.toThrow(/requires observer driver/);
-
-    await expect(
-      runLoop({
-        ...ctx,
-        driver: { actorId: 'review-1', roleKind: 'reviewer', source: 'test' },
-      }),
-    ).rejects.toThrow(/requires observer driver/);
-  });
-
-  it('allows an observer driver to advance workflow state', async () => {
-    const def = linear();
-    const { ctx } = await bootstrap(def);
-    const result = await runLoop({
-      ...ctx,
-      driver: defaultObserverDriver(def, 'test-observer'),
-    });
-    expect(result.reason).toBe('terminal');
-    expect(result.lastSnapshot.run.status).toBe('succeeded');
   });
 });
 
@@ -194,135 +148,6 @@ describe('runLoop — humanGate', () => {
   });
 });
 
-describe('runLoop — review flow arbitration', () => {
-  function reviewFlow(): WorkflowDefinition {
-    return parseWorkflowDefinition({
-      workflowId: 'review-observer-loop',
-      version: 1,
-      roles: {
-        dev: { id: 'dev', kind: 'developer', label: 'Developer' },
-        reviewer: { id: 'reviewer', kind: 'reviewer', label: 'Reviewer' },
-        monitor: { id: 'monitor', kind: 'observer', label: 'Monitor' },
-      },
-      nodes: {
-        work: {
-          type: 'semantic',
-          kind: 'milestone',
-          roleId: 'dev',
-          output: { text: 'implementation ready' },
-        },
-        review: {
-          type: 'semantic',
-          kind: 'reviewDecision',
-          roleId: 'reviewer',
-          humanGate: { stage: 'before', prompt: 'review?' },
-        },
-        report: {
-          type: 'semantic',
-          kind: 'report',
-          roleId: 'monitor',
-          output: { decision: { $ref: 'review.output.value.decision' } },
-        },
-      },
-      flow: {
-        start: 'work',
-        transitions: [
-          { from: 'work', to: 'review' },
-          {
-            from: 'review',
-            to: 'report',
-            when: {
-              type: 'outputEquals',
-              nodeId: 'review',
-              path: 'value.decision',
-              value: 'approved',
-            },
-          },
-        ],
-      },
-    });
-  }
-
-  it('records reviewer decision but only observer re-entry routes to the next node', async () => {
-    const def = reviewFlow();
-    const { log, ctx } = await bootstrap(def);
-
-    const first = await runLoop({
-      ...ctx,
-      driver: defaultObserverDriver(def, 'observer-1'),
-    });
-    expect(first.reason).toBe('awaiting-wait');
-
-    const reviewActivityId = flowWorkActivityId(RUN_ID, 'review', 1);
-    const review = first.lastSnapshot.activities.get(reviewActivityId);
-    expect(review?.attempts.at(-1)?.wait?.waitKind).toBe('human-gate');
-    await resolveReviewDecision(log, {
-      activityId: reviewActivityId,
-      attemptId: review!.currentAttemptId!,
-      resolution: 'approved',
-      by: 'ou_reviewer',
-      comment: 'approved',
-    });
-
-    let afterDecision = replay(await log.readAll());
-    expect(afterDecision.outputs.has(reviewActivityId)).toBe(false);
-    expect(afterDecision.activities.has(flowWorkActivityId(RUN_ID, 'report', 1))).toBe(false);
-
-    await expect(
-      runLoop({
-        ...ctx,
-        driver: { actorId: 'ou_reviewer', roleKind: 'reviewer', source: 'test' },
-      }),
-    ).rejects.toThrow(/requires observer driver/);
-    afterDecision = replay(await log.readAll());
-    expect(afterDecision.outputs.has(reviewActivityId)).toBe(false);
-    expect(afterDecision.activities.has(flowWorkActivityId(RUN_ID, 'report', 1))).toBe(false);
-
-    const final = await runLoop({
-      ...ctx,
-      driver: defaultObserverDriver(def, 'observer-2'),
-    });
-    expect(final.reason).toBe('terminal');
-    expect(final.lastSnapshot.outputs.has(reviewActivityId)).toBe(true);
-    expect(final.lastSnapshot.activities.has(flowWorkActivityId(RUN_ID, 'report', 1))).toBe(true);
-    expect(final.lastSnapshot.run.status).toBe('succeeded');
-  });
-
-  it('rejects direct resume of resolved review decision wait without workflow definition', async () => {
-    const def = reviewFlow();
-    const { log, ctx } = await bootstrap(def);
-
-    const first = await runLoop({
-      ...ctx,
-      driver: defaultObserverDriver(def, 'observer-before-review'),
-    });
-    expect(first.reason).toBe('awaiting-wait');
-
-    const reviewActivityId = flowWorkActivityId(RUN_ID, 'review', 1);
-    const review = first.lastSnapshot.activities.get(reviewActivityId);
-    await resolveReviewDecision(log, {
-      activityId: reviewActivityId,
-      attemptId: review!.currentAttemptId!,
-      resolution: 'approved',
-      by: 'ou_reviewer',
-    });
-
-    await expect(
-      resume({
-        log,
-        runId: RUN_ID,
-        daemonId: 'resume-without-def',
-        driver: defaultObserverDriver(def, 'observer-resume'),
-        reconcilers: new Map(),
-      }),
-    ).rejects.toThrow(/requires workflow definition/);
-
-    const afterRejectedResume = replay(await log.readAll());
-    expect(afterRejectedResume.outputs.has(reviewActivityId)).toBe(false);
-    expect(afterRejectedResume.activities.has(flowWorkActivityId(RUN_ID, 'report', 1))).toBe(false);
-  });
-});
-
 // ─── safety ──────────────────────────────────────────────────────────────
 
 describe('runLoop — safety', () => {
@@ -361,12 +186,7 @@ describe('runLoop — safety', () => {
         initiator: 't',
         botResolver: noopResolver,
       });
-      const dry = await runLoop({
-        log: dryLog,
-        def,
-        driver: defaultObserverDriver(def, 'test-dry-run'),
-        spawnSubagent: successSpawn,
-      });
+      const dry = await runLoop({ log: dryLog, def, spawnSubagent: successSpawn });
       const exactCap = dry.ticks;
       const result = await runLoop(ctx, { maxTicks: exactCap });
       expect(result.reason).toBe('terminal');
@@ -436,34 +256,5 @@ describe('runLoop — safety', () => {
         errorClass: 'retryable',
       },
     });
-  });
-
-  it('resume rejects explicit non-observer drivers', async () => {
-    const def = linear();
-    const { log } = await bootstrap(def);
-
-    await expect(
-      resume({
-        log,
-        runId: RUN_ID,
-        daemonId: 'resume-test',
-        driver: { actorId: 'reviewer-1', roleKind: 'reviewer', source: 'test' },
-        reconcilers: new Map(),
-      }),
-    ).rejects.toThrow(/requires observer driver/);
-  });
-
-  it('resume rejects missing driver instead of defaulting silently', async () => {
-    const def = linear();
-    const { log } = await bootstrap(def);
-
-    await expect(
-      resume({
-        log,
-        runId: RUN_ID,
-        daemonId: 'resume-test',
-        reconcilers: new Map(),
-      }),
-    ).rejects.toThrow(/no driver supplied/);
   });
 });

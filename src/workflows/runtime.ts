@@ -49,12 +49,10 @@ import type {
   DispatchGateAction,
   DispatchWorkAction,
 } from './orchestrator.js';
-import { parseFlowWorkActivityId } from './stateflow.js';
 import { createWait } from './wait.js';
 import { executeSideEffect } from './hostExecutors/protocol.js';
 import type { HostExecutorRegistry, RegisteredHostExecutor } from './hostExecutors/registry.js';
 import type { HostExecutorContext } from './hostExecutors/types.js';
-import { assertObserverDriver, type WorkflowDriverContext } from './observer-driver.js';
 import type { ProviderReconciler } from './resume.js';
 
 // ─── Worker spawn contract ────────────────────────────────────────────────
@@ -145,12 +143,6 @@ export type WorkerSpawnFn = (input: WorkerSpawnInput) => Promise<WorkerSpawnResu
 export type WorkflowRuntimeContext = {
   log: EventLog;
   def: WorkflowDefinition;
-  /**
-   * Workflow state may only be advanced by an observer/monitor driver.
-   * Missing driver and explicit developer/executor/reviewer drivers fail
-   * closed at every state-advancing entry point.
-   */
-  driver?: WorkflowDriverContext;
   spawnSubagent: WorkerSpawnFn;
   hostExecutors?: HostExecutorRegistry;
   /**
@@ -178,13 +170,6 @@ export type WorkflowRuntimeContext = {
    */
   registerAborters?: (aborters: Map<string, AbortController> | undefined) => void;
 };
-
-export function requireObserverRuntimeDriver(
-  ctx: WorkflowRuntimeContext,
-  operation: string,
-): WorkflowDriverContext {
-  return assertObserverDriver(ctx.driver, ctx.def, operation);
-}
 
 function nowMs(ctx: WorkflowRuntimeContext): number {
   return ctx.now ? ctx.now() : Date.now();
@@ -319,99 +304,6 @@ async function failHostExecutor(
   };
 }
 
-function semanticVisit(activityId: string): number {
-  return parseFlowWorkActivityId(activityId)?.visit ?? 1;
-}
-
-async function dispatchSemanticNode(
-  ctx: WorkflowRuntimeContext,
-  action: DispatchWorkAction,
-  attemptId: string,
-  snapshot: Snapshot,
-): Promise<DispatchWorkResult> {
-  const node = action.node;
-  if (node.type !== 'semantic') {
-    throw new Error(`dispatchSemanticNode called for non-semantic node '${action.nodeId}'`);
-  }
-  if (node.kind === 'fail') {
-    await ctx.log.append({
-      runId: ctx.log.runId,
-      type: 'activityFailed',
-      actor: 'scheduler',
-      payload: {
-        activityId: action.activityId,
-        attemptId,
-        error: {
-          errorCode: 'InputValidationFailed',
-          errorClass: 'userFault',
-          errorMessage: String(node.description || 'Workflow reached configured failure node'),
-        },
-      },
-    });
-    return {
-      kind: 'failed',
-      attemptId,
-      errorClass: 'userFault',
-      errorCode: 'InputValidationFailed',
-      errorMessage: String(node.description || 'Workflow reached configured failure node'),
-    };
-  }
-  let authored = node.output ?? node.input ?? {};
-  let resolved: unknown;
-  try {
-    resolved = await resolveBindings(authored, bindingContext(ctx, snapshot));
-  } catch (err) {
-    if (err instanceof BindingError) {
-      return failHostExecutor(ctx, action.activityId, attemptId, {
-        errorCode: 'InputBindingFailed',
-        errorClass: 'userFault',
-        errorMessage: err.message,
-      });
-    }
-    throw err;
-  }
-  const output = {
-    semanticKind: node.kind,
-    nodeId: action.nodeId,
-    roleId: node.roleId,
-    ...(node.roleId && ctx.def.roles?.[node.roleId]
-      ? {
-          role: {
-            id: ctx.def.roles[node.roleId]!.id,
-            kind: ctx.def.roles[node.roleId]!.kind,
-            label: ctx.def.roles[node.roleId]!.label,
-            responsibility: ctx.def.roles[node.roleId]!.responsibility,
-            bot: ctx.def.roles[node.roleId]!.bot,
-          },
-        }
-      : {}),
-    visit: semanticVisit(action.activityId),
-    value: resolved,
-  };
-  const outputRef = await writeJsonBlob(ctx.log, output);
-  await ctx.log.append({
-    runId: ctx.log.runId,
-    type: 'activitySucceeded',
-    actor: 'scheduler',
-    payload: {
-      activityId: action.activityId,
-      attemptId,
-      outputRef,
-    },
-  });
-  return {
-    kind: 'succeeded',
-    attemptId,
-    outputRef,
-    session: {
-      sessionId: `semantic-${action.activityId}-${attemptId}`,
-      botName: node.kind,
-      startedAt: nowMs(ctx),
-      endedAt: nowMs(ctx),
-    },
-  };
-}
-
 function executeRegisteredHostExecutor<I, O>(
   registered: RegisteredHostExecutor<I, O>,
   hostCtx: HostExecutorContext,
@@ -455,7 +347,6 @@ export async function dispatchGate(
   action: DispatchGateAction,
   options: { snapshot?: Snapshot } = {},
 ): Promise<DispatchGateResult> {
-  requireObserverRuntimeDriver(ctx, 'dispatchGate');
   const attemptId = gateAttemptId(action.activityId);
   const inputRef = await writeJsonBlob(ctx.log, {
     kind: 'human-gate',
@@ -612,7 +503,7 @@ async function writeBindingFailure(
 // ─── dispatchWork ─────────────────────────────────────────────────────────
 
 export type DispatchWorkResult =
-  | { kind: 'succeeded'; attemptId: string; outputRef: OutputRef; session?: WorkerSessionInfo }
+  | { kind: 'succeeded'; attemptId: string; outputRef: OutputRef; session: WorkerSessionInfo }
   | {
       kind: 'failed';
       attemptId: string;
@@ -647,7 +538,6 @@ export async function dispatchWork(
   action: DispatchWorkAction,
   options: { attemptNumber?: number; snapshot?: Snapshot; cancelSignal?: AbortSignal } = {},
 ): Promise<DispatchWorkResult> {
-  requireObserverRuntimeDriver(ctx, 'dispatchWork');
   const attemptNumber = options.attemptNumber ?? 1;
   const attemptId = workAttemptId(action.activityId, attemptNumber);
   const node = action.node;
@@ -656,28 +546,6 @@ export async function dispatchWork(
     ctx,
     options.snapshot ?? replay(await ctx.log.readAll()),
   );
-
-  if (node.type === 'semantic') {
-    const inputRef = await writeJsonBlob(ctx.log, {
-      kind: 'semantic',
-      semanticKind: node.kind,
-      input: node.input,
-      output: node.output,
-    });
-    await ctx.log.append({
-      runId: ctx.log.runId,
-      type: 'attemptCreated',
-      actor: 'scheduler',
-      payload: {
-        nodeId: action.nodeId,
-        activityId: action.activityId,
-        attemptId,
-        attemptNumber,
-        inputRef,
-      },
-    });
-    return dispatchSemanticNode(ctx, action, attemptId, bindingCtx.snapshot);
-  }
 
   if (node.type === 'hostExecutor') {
     // attemptCreated carries the RAW (pre-binding) input.  Operator-side
@@ -947,7 +815,6 @@ export async function completeNodeSucceeded(
   ctx: WorkflowRuntimeContext,
   action: CompleteNodeSucceededAction,
 ): Promise<NodeSucceededEvent> {
-  requireObserverRuntimeDriver(ctx, 'completeNodeSucceeded');
   return (await ctx.log.append({
     runId: ctx.log.runId,
     type: 'nodeSucceeded',
@@ -970,7 +837,6 @@ export async function completeNodeFailed(
   ctx: WorkflowRuntimeContext,
   action: CompleteNodeFailedAction,
 ): Promise<NodeFailedEvent> {
-  requireObserverRuntimeDriver(ctx, 'completeNodeFailed');
   return (await ctx.log.append({
     runId: ctx.log.runId,
     type: 'nodeFailed',
@@ -989,7 +855,6 @@ export async function completeRunSucceeded(
   ctx: WorkflowRuntimeContext,
   action: CompleteRunSucceededAction,
 ): Promise<RunSucceededEvent> {
-  requireObserverRuntimeDriver(ctx, 'completeRunSucceeded');
   return (await ctx.log.append({
     runId: ctx.log.runId,
     type: 'runSucceeded',
@@ -1033,7 +898,6 @@ export async function completeRunFailed(
   ctx: WorkflowRuntimeContext,
   action: CompleteRunFailedAction,
 ): Promise<RunFailedEvent> {
-  requireObserverRuntimeDriver(ctx, 'completeRunFailed');
   const rootCauseEventId = await findRootCauseEventId(ctx, action.failedNodeId);
   return (await ctx.log.append({
     runId: ctx.log.runId,

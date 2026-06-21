@@ -2,26 +2,19 @@
  * WorkflowDefinition — canonical JSON shape for v0 workflows
  * (see /tmp/wf-ui-v0.md §3 for the spec).
  *
- * Three node types:
+ * Two node types:
  *   - subagent     — runtime spawns the bot's worker, feeds `prompt`,
  *                    collects `output` JSON.
  *   - hostExecutor — runtime calls the executor registered by `executor`.
- *   - semantic     — runtime executes product-level workflow mechanics such
- *                    as submit gates, review decisions, reports and observers.
  *
  * The schema enforces shape; cross-field invariants (deps reachability,
- * DAG cycles, or stateflow transition integrity) are checked by
- * `parseWorkflowDefinition`.  A definition may either use legacy DAG `depends`
- * edges or an explicit `flow` state machine.  Flow definitions may contain
- * loops/back-edges; all behavior still comes from authored transitions.
- * The `revisionId`
+ * no cycles) are checked by `parseWorkflowDefinition`.  The `revisionId`
  * helper computes a content hash over canonical JSON so semantically
  * equal definitions get identical ids regardless of key ordering.
  */
 
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
-import { DEFAULT_OBSERVER_DRIVER_ROLE_ID } from './observer-driver.js';
 
 // ─── Field schemas ─────────────────────────────────────────────────────────
 
@@ -102,7 +95,6 @@ export const OutputSchemaSchema = z.record(z.unknown());
 
 const NodeBaseShape = {
   description: z.string().optional(),
-  roleId: z.string().optional(),
   depends: z.array(z.string()).optional(),
   humanGate: HumanGateSchema.optional(),
   retryPolicy: RetryPolicySchema.optional(),
@@ -152,15 +144,6 @@ export const HostExecutorNodeSchema = z.object({
 });
 export type HostExecutorNode = z.infer<typeof HostExecutorNodeSchema>;
 
-export const SemanticNodeSchema = z.object({
-  ...NodeBaseShape,
-  type: z.literal('semantic'),
-  kind: z.enum(['submitGate', 'reviewDecision', 'report', 'observer', 'milestone', 'fail']),
-  input: BoundJsonValueSchema.optional(),
-  output: BoundJsonValueSchema.optional(),
-});
-export type SemanticNode = z.infer<typeof SemanticNodeSchema>;
-
 /**
  * Executors that produce externally-visible side effects: sending a Feishu
  * message, scheduling a botmux cron task, etc.  Validator requires a
@@ -186,69 +169,8 @@ export function isSideEffectExecutor(executor: string): boolean {
 export const WorkflowNodeSchema = z.discriminatedUnion('type', [
   SubagentNodeSchema,
   HostExecutorNodeSchema,
-  SemanticNodeSchema,
 ]);
 export type WorkflowNode = z.infer<typeof WorkflowNodeSchema>;
-
-export const WorkflowRoleSchema = z.object({
-  id: z.string().min(1),
-  kind: z.enum(['developer', 'reviewer', 'reporter', 'observer', 'custom']),
-  label: z.string().min(1),
-  bot: z.string().optional(),
-  responsibility: z.string().optional(),
-  icon: z.string().optional(),
-});
-export type WorkflowRole = z.infer<typeof WorkflowRoleSchema>;
-
-export const WorkflowTransitionConditionSchema: z.ZodType<any> = z.lazy(() => z.discriminatedUnion('type', [
-  z.object({ type: z.literal('always') }),
-  z.object({
-    type: z.literal('visitCountLessThan'),
-    nodeId: z.string().optional(),
-    count: z.number().int().nonnegative(),
-  }),
-  z.object({
-    type: z.literal('visitCountAtLeast'),
-    nodeId: z.string().optional(),
-    count: z.number().int().nonnegative(),
-  }),
-  z.object({
-    type: z.literal('outputEquals'),
-    nodeId: z.string().optional(),
-    path: z.string().min(1),
-    value: z.unknown(),
-  }),
-  z.object({
-    type: z.literal('outputIn'),
-    nodeId: z.string().optional(),
-    path: z.string().min(1),
-    values: z.array(z.unknown()),
-  }),
-  z.object({
-    type: z.literal('all'),
-    conditions: z.array(WorkflowTransitionConditionSchema).min(1),
-  }),
-  z.object({
-    type: z.literal('any'),
-    conditions: z.array(WorkflowTransitionConditionSchema).min(1),
-  }),
-]));
-export type WorkflowTransitionCondition = z.infer<typeof WorkflowTransitionConditionSchema>;
-
-export const WorkflowTransitionSchema = z.object({
-  id: z.string().min(1).optional(),
-  from: z.string().min(1),
-  to: z.string().min(1),
-  label: z.string().optional(),
-  when: WorkflowTransitionConditionSchema.default({ type: 'always' }),
-});
-export type WorkflowTransition = z.infer<typeof WorkflowTransitionSchema>;
-
-export const WorkflowFlowSchema = z.object({
-  start: z.string().min(1),
-  transitions: z.array(WorkflowTransitionSchema).default([]),
-});
-export type WorkflowFlow = z.infer<typeof WorkflowFlowSchema>;
 
 /**
  * Node id constraint: safe path segment for use in activityId and the
@@ -285,8 +207,6 @@ export const WorkflowDefinitionSchema = z.object({
     })
     .optional(),
   nodes: z.record(NodeIdSchema, WorkflowNodeSchema),
-  roles: z.record(WorkflowRoleSchema).optional(),
-  flow: WorkflowFlowSchema.optional(),
 });
 export type WorkflowDefinition = z.infer<typeof WorkflowDefinitionSchema>;
 
@@ -332,43 +252,16 @@ export function computeRevisionId(def: WorkflowDefinition): string {
 /**
  * Schema parse + cross-field invariants:
  *   1. every `depends` entry references an existing node
- *   2. legacy DAG graph is acyclic, or explicit stateflow transitions are
- *      reachable and deterministic for default branches
- *   3. legacy DAG has at least one root node (no deps)
+ *   2. graph is acyclic
+ *   3. at least one root node (no deps)
  *
  * Throws on any failure.  Use `WorkflowDefinitionSchema.safeParse(...)`
  * directly if you only need shape checks (no graph validation).
  */
 export function parseWorkflowDefinition(raw: unknown): WorkflowDefinition {
   const def = WorkflowDefinitionSchema.parse(raw);
-  normalizeObserverRole(def);
   validateGraph(def);
   return def;
-}
-
-function normalizeObserverRole(def: WorkflowDefinition): void {
-  const roles = def.roles ?? {};
-  const hasObserver = Object.values(roles).some((role) => role.kind === 'observer');
-  if (hasObserver) {
-    if (!def.roles && Object.keys(roles).length > 0) def.roles = roles;
-    return;
-  }
-  const existingDefaultRole = roles[DEFAULT_OBSERVER_DRIVER_ROLE_ID];
-  if (existingDefaultRole && existingDefaultRole.kind !== 'observer') {
-    throw new Error(
-      `workflow role '${DEFAULT_OBSERVER_DRIVER_ROLE_ID}' is reserved for the default observer driver; ` +
-        `got kind=${existingDefaultRole.kind}`,
-    );
-  }
-  def.roles = {
-    ...roles,
-    [DEFAULT_OBSERVER_DRIVER_ROLE_ID]: {
-      id: DEFAULT_OBSERVER_DRIVER_ROLE_ID,
-      kind: 'observer',
-      label: 'Observer Driver',
-      responsibility: 'Default workflow monitor that is allowed to advance state.',
-    },
-  };
 }
 
 function validateGraph(def: WorkflowDefinition): void {
@@ -389,9 +282,6 @@ function validateGraph(def: WorkflowDefinition): void {
     }
   }
   for (const [nodeId, node] of Object.entries(def.nodes)) {
-    if (node.roleId && !def.roles?.[node.roleId]) {
-      throw new Error(`Node '${nodeId}' references unknown role '${node.roleId}'`);
-    }
     for (const dep of node.depends ?? []) {
       if (!def.nodes[dep]) {
         throw new Error(`Node '${nodeId}' depends on unknown node '${dep}'`);
@@ -417,99 +307,11 @@ function validateGraph(def: WorkflowDefinition): void {
       );
     }
   }
-  if (def.flow) {
-    validateFlow(def);
-  } else {
-    detectCycle(def);
-    const hasRoot = ids.some((id) => (def.nodes[id]!.depends ?? []).length === 0);
-    if (!hasRoot) {
-      throw new Error('Workflow has no root node (every node has dependencies)');
-    }
+  detectCycle(def);
+  const hasRoot = ids.some((id) => (def.nodes[id]!.depends ?? []).length === 0);
+  if (!hasRoot) {
+    throw new Error('Workflow has no root node (every node has dependencies)');
   }
-}
-
-function validateFlow(def: WorkflowDefinition): void {
-  if (!def.nodes[def.flow!.start]) {
-    throw new Error(`Workflow flow.start references unknown node '${def.flow!.start}'`);
-  }
-  const transitionIds = new Set<string>();
-  const outgoing = new Map<string, WorkflowTransition[]>();
-  for (const [idx, transition] of def.flow!.transitions.entries()) {
-    if (!def.nodes[transition.from]) {
-      throw new Error(`Workflow transition[${idx}].from references unknown node '${transition.from}'`);
-    }
-    if (!def.nodes[transition.to]) {
-      throw new Error(`Workflow transition[${idx}].to references unknown node '${transition.to}'`);
-    }
-    if (transition.id) {
-      if (transitionIds.has(transition.id)) {
-        throw new Error(`Workflow transition id '${transition.id}' is duplicated`);
-      }
-      transitionIds.add(transition.id);
-    }
-    validateTransitionConditionNodeRefs(def, transition.when, `Workflow transition[${idx}].when`);
-    const list = outgoing.get(transition.from) ?? [];
-    list.push(transition);
-    outgoing.set(transition.from, list);
-  }
-  validateFlowDefaultBranches(outgoing);
-  validateFlowReachability(def, outgoing);
-}
-
-function validateTransitionConditionNodeRefs(
-  def: WorkflowDefinition,
-  condition: WorkflowTransitionCondition | undefined,
-  path: string,
-): void {
-  if (!condition) return;
-  if (condition.type === 'all' || condition.type === 'any') {
-    (condition.conditions as WorkflowTransitionCondition[]).forEach((child, idx) =>
-      validateTransitionConditionNodeRefs(def, child, `${path}.conditions[${idx}]`),
-    );
-    return;
-  }
-  if ('nodeId' in condition && condition.nodeId && !def.nodes[condition.nodeId]) {
-    throw new Error(`${path} references unknown node '${condition.nodeId}'`);
-  }
-}
-
-function validateFlowDefaultBranches(outgoing: Map<string, WorkflowTransition[]>): void {
-  for (const [from, transitions] of outgoing.entries()) {
-    const defaultBranches = transitions.filter((transition) => isAlwaysCondition(transition.when));
-    if (defaultBranches.length > 1) {
-      const targets = defaultBranches.map((transition) => `'${transition.to}'`).join(', ');
-      throw new Error(
-        `Workflow flow has ambiguous always transitions from '${from}' to ${targets}; ` +
-        `make default routing explicit with mutually exclusive conditions`,
-      );
-    }
-  }
-}
-
-function validateFlowReachability(
-  def: WorkflowDefinition,
-  outgoing: Map<string, WorkflowTransition[]>,
-): void {
-  const reachable = new Set<string>();
-  const queue = [def.flow!.start];
-  while (queue.length > 0) {
-    const nodeId = queue.shift()!;
-    if (reachable.has(nodeId)) continue;
-    reachable.add(nodeId);
-    for (const transition of outgoing.get(nodeId) ?? []) {
-      if (!reachable.has(transition.to)) queue.push(transition.to);
-    }
-  }
-  const unreachable = Object.keys(def.nodes).filter((nodeId) => !reachable.has(nodeId));
-  if (unreachable.length > 0) {
-    throw new Error(
-      `Workflow flow cannot reach node '${unreachable[0]}' from start '${def.flow!.start}'`,
-    );
-  }
-}
-
-function isAlwaysCondition(condition: WorkflowTransitionCondition | undefined): boolean {
-  return !condition || condition.type === 'always';
 }
 
 function detectCycle(def: WorkflowDefinition): void {

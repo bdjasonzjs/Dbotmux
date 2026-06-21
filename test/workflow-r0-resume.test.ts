@@ -29,7 +29,6 @@ import { runLoop } from '../src/workflows/loop.js';
 import { workActivityId } from '../src/workflows/orchestrator.js';
 import { createRun } from '../src/workflows/run-init.js';
 import type { WorkerSpawnFn } from '../src/workflows/runtime.js';
-import { defaultObserverDriver } from '../src/workflows/observer-driver.js';
 
 const RUN_ID = 'r0-resume-test-01';
 
@@ -201,7 +200,6 @@ describe('R0 — schedule readOnlyLookup recovery', () => {
       {
         log,
         def,
-        driver: defaultObserverDriver(def, 'r0-resume-test'),
         spawnSubagent: spawnNotInvoked,
         reconcilers: createDefaultProviderReconcilers(),
       },
@@ -292,7 +290,6 @@ describe('R0 — feishu-send idempotentSubmit recovery via sidecar', () => {
       {
         log,
         def,
-        driver: defaultObserverDriver(def, 'r0-resume-test'),
         spawnSubagent: spawnNotInvoked,
         reconcilers: createDefaultProviderReconcilers(),
         loadEffectInput: (aid, atid) => loadEffectInputSidecar(log, aid, atid),
@@ -342,7 +339,7 @@ describe('R0 — explicit no-progress without reconcilers', () => {
     });
 
     const result = await runLoop(
-      { log, def, driver: defaultObserverDriver(def, 'r0-resume-test'), spawnSubagent: spawnNotInvoked /* no reconcilers */ },
+      { log, def, spawnSubagent: spawnNotInvoked /* no reconcilers */ },
       { maxTicks: 20 },
     );
     expect(result.reason).toBe('no-progress');
@@ -389,7 +386,6 @@ describe('R0 — no-progress when reconciler stays unresolved', () => {
       {
         log,
         def,
-        driver: defaultObserverDriver(def, 'r0-resume-test'),
         spawnSubagent: spawnNotInvoked,
         reconcilers: new Map(),
       },

@@ -150,7 +150,6 @@ export async function handleWorkflowApi(
         ok: true,
         workflowId: def.workflowId,
         nodeCount: Object.keys(def.nodes).length,
-        transitionCount: def.flow?.transitions.length ?? 0,
       });
     } catch (e: any) {
       jsonRes(res, 400, {
