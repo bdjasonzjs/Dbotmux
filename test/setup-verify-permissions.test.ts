@@ -28,6 +28,7 @@ import * as sdk from '@larksuiteoapi/node-sdk';
 import {
   validateCredentials,
   checkCriticalScopesByApplicationInfo,
+  listTenantScopeGrantStatuses,
   listGrantedTenantScopes,
   checkRequiredScopes,
   applyScopesUnverified,
@@ -35,6 +36,7 @@ import {
   buildEventSubDeepLink,
   buildRemainingSteps,
   BOTMUX_REQUIRED_SCOPES,
+  TENANT_SCOPE_GRANT_STATUS_GRANTED,
 } from '../src/setup/verify-permissions.js';
 
 const scopeListMock = (sdk as any).__scopeListMock as ReturnType<typeof vi.fn>;
@@ -197,18 +199,25 @@ describe('checkRequiredScopes (helper, not in main path)', () => {
     }
   });
 
-  it('listGrantedTenantScopes maps scope.list grant_status fixture into granted names', async () => {
+  it('listTenantScopeGrantStatuses keeps raw grant_status and maps grant_status=1 as granted', async () => {
     scopeListMock.mockResolvedValue({
       code: 0,
       data: {
         scopes: [
-          { scope_name: 'im:message', grant_status: 2 },
-          { scope_name: 'im:message.group_msg', grant_status: 2 },
-          { scope_name: 'im:resource', grant_status: 1 },
+          { scope_name: 'im:message', grant_status: TENANT_SCOPE_GRANT_STATUS_GRANTED },
+          { scope_name: 'im:message.group_msg', grant_status: TENANT_SCOPE_GRANT_STATUS_GRANTED },
+          { scope_name: 'im:resource', grant_status: 2 },
           { scope_name: 'contact:user.base:readonly', grant_status: 0 },
         ],
       },
     });
+    const raw = await listTenantScopeGrantStatuses('cli_x', 'sec', 'feishu');
+    expect(raw.ok).toBe(true);
+    if (raw.ok) {
+      expect(raw.byName.get('im:message.group_msg')).toMatchObject({ grantStatus: 1 });
+      expect(raw.byName.get('im:resource')).toMatchObject({ grantStatus: 2 });
+    }
+
     const r = await listGrantedTenantScopes('cli_x', 'sec', 'feishu');
     expect(r.ok).toBe(true);
     if (r.ok) {
@@ -216,14 +225,14 @@ describe('checkRequiredScopes (helper, not in main path)', () => {
     }
   });
 
-  it('lists granted scopes and computes missing critical/optional via grant_status===2', async () => {
+  it('lists granted scopes and computes missing critical/optional via grant_status===1', async () => {
     scopeListMock.mockResolvedValue({
       code: 0,
       data: {
         scopes: [
-          { scope_name: 'im:message', grant_status: 2 },
-          { scope_name: 'im:resource', grant_status: 1 }, // 已申请未生效, 算 missing
-          { scope_name: 'unrelated:scope', grant_status: 2 },
+          { scope_name: 'im:message', grant_status: 1 },
+          { scope_name: 'im:resource', grant_status: 2 }, // 非 1, 算 missing
+          { scope_name: 'unrelated:scope', grant_status: 1 },
         ],
       },
     });
@@ -232,7 +241,7 @@ describe('checkRequiredScopes (helper, not in main path)', () => {
     if (r.ok) {
       expect(r.granted).toContain('im:message');
       expect(r.granted).not.toContain('im:resource');
-      // missingCritical 应该包含 im:resource (critical=true, granted_status!=2)
+      // missingCritical 应该包含 im:resource (critical=true, grant_status!=1)
       expect(r.missingCritical.some(s => s.name === 'im:resource')).toBe(true);
       // im:message 已 granted, 不应该在 missingCritical 里
       expect(r.missingCritical.some(s => s.name === 'im:message')).toBe(false);

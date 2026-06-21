@@ -2,9 +2,9 @@ import { randomUUID } from 'node:crypto';
 import { CLONE_CORE_SCOPES, buildAuthUrl } from './clone-auth-link.js';
 import { hasWakeAck } from './subtask-store.js';
 import {
-  checkCriticalScopesByApplicationInfo,
-  listGrantedTenantScopes,
-  type CriticalScopeCheckResult,
+  listTenantScopeGrantStatuses,
+  isTenantScopeGranted,
+  type TenantScopeGrantStatusResult,
 } from '../setup/verify-permissions.js';
 import { sendMessage } from '../im/lark/client.js';
 
@@ -37,8 +37,7 @@ export interface CloneIntegrityTarget {
 }
 
 export interface CloneIntegrityGateDeps {
-  checkCriticalScopes?: (appId: string, appSecret: string) => Promise<CriticalScopeCheckResult>;
-  listScopes?: (appId: string, appSecret: string) => ReturnType<typeof listGrantedTenantScopes>;
+  listScopeGrantStatuses?: (appId: string, appSecret: string) => Promise<TenantScopeGrantStatusResult>;
   fetchBotInfo?: (appId: string, appSecret: string) => Promise<{ avatarUrl?: string; name?: string; description?: string } | null>;
   sendPost?: (content: string, uuid: string) => Promise<string>;
   ackSeen?: (taskId: string, appId: string, wakeId: string) => boolean;
@@ -55,31 +54,24 @@ async function checkStrictScopes(
   target: CloneIntegrityTarget,
   deps: CloneIntegrityGateDeps,
 ): Promise<CloneIntegrityCheck> {
-  const checkCriticalScopes = deps.checkCriticalScopes
-    ?? ((appId, appSecret) => checkCriticalScopesByApplicationInfo(appId, appSecret, 'feishu'));
-  const critical = await checkCriticalScopes(target.appId, target.appSecret);
-  if (critical.ok) {
-    return { item: 'scope', status: 'pass', detail: `critical scopes granted via application/v6 (${critical.granted.length} app scopes)` };
-  }
-  if (critical.error === 'missing_critical') {
-    const missing = critical.missingCritical.map(s => s.name);
-    return { item: 'scope', status: 'blocked', detail: `missing critical: ${missing.join(', ')}; auth=${buildAuthUrl(target.appId, missing)}` };
-  }
-
-  const listScopes = deps.listScopes ?? ((appId, appSecret) => listGrantedTenantScopes(appId, appSecret, 'feishu'));
-  const result = await listScopes(target.appId, target.appSecret);
+  const listScopeGrantStatuses = deps.listScopeGrantStatuses
+    ?? ((appId, appSecret) => listTenantScopeGrantStatuses(appId, appSecret, 'feishu'));
+  const result = await listScopeGrantStatuses(target.appId, target.appSecret);
   if (!result.ok) {
-    return { item: 'scope', status: 'unknown', detail: `application/v6 critical scope check inconclusive: ${critical.message}; scope.list failed: ${result.message}` };
+    return { item: 'scope', status: 'unknown', detail: `application/v6/scopes grant_status check failed: ${result.message}` };
   }
-  if (result.granted.length === 0) {
-    return { item: 'scope', status: 'unknown', detail: `application/v6 critical scope check inconclusive: ${critical.message}; scope.list returned empty grant set` };
-  }
-  const granted = new Set(result.granted);
-  const missing = CLONE_CORE_SCOPES.filter(s => !granted.has(s));
+  const missing = CLONE_CORE_SCOPES.filter(s => !isTenantScopeGranted(result.byName.get(s)));
   if (missing.length > 0) {
-    return { item: 'scope', status: 'blocked', detail: `missing: ${missing.join(', ')}; auth=${buildAuthUrl(target.appId, missing)}` };
+    const statuses = missing
+      .map(s => `${s}:grant_status=${result.byName.get(s)?.grantStatus ?? 'missing'}`)
+      .join(', ');
+    return {
+      item: 'scope',
+      status: 'blocked',
+      detail: `source=application/v6/scopes grantedStatus=1 missing/effective: ${statuses}; auth=${buildAuthUrl(target.appId, missing)}; after auth publish a new app version and wait for admin approval`,
+    };
   }
-  return { item: 'scope', status: 'pass', detail: 'scope.list returned all clone core scopes after application/v6 was inconclusive' };
+  return { item: 'scope', status: 'pass', detail: `source=application/v6/scopes grantedStatus=1 clone core scopes granted (${CLONE_CORE_SCOPES.length} checked)` };
 }
 
 async function fetchTenantToken(appId: string, appSecret: string): Promise<string | undefined> {
