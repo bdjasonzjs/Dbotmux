@@ -134,13 +134,14 @@ describe('taskteam batch 1 stores', () => {
     const sent = await outboxStore.completeTaskTeamAction(first.actionId, {
       status: 'sent',
       deliveredMessageId: 'om_demo',
+      dispatchAttemptId: claimed!.dispatchAttemptId,
     });
-    expect(sent.status).toBe('sent');
-    expect(sent.leaseExpiresAt).toBeNull();
-    expect(sent.deliveredMessageId).toBe('om_demo');
+    expect(sent?.status).toBe('sent');
+    expect(sent?.leaseExpiresAt).toBeNull();
+    expect(sent?.deliveredMessageId).toBe('om_demo');
   });
 
-  it('enforces retry-release and terminal-state boundaries (A2 / P1-2)', async () => {
+  it('enforces retry-release, CAS fencing and complete-side state machine (A2 / P1-2 / P1)', async () => {
     const { outboxStore } = await freshStores();
     const {
       enqueueTaskTeamAction: enqueue,
@@ -149,6 +150,7 @@ describe('taskteam batch 1 stores', () => {
       releaseTaskTeamActionForRetry: release,
       listPendingTaskTeamActions: listPending,
       TaskTeamActionTerminalError,
+      TaskTeamActionTransitionError,
     } = outboxStore;
 
     // —— claimed → release(retry)：仅同一 dispatch attempt 放行；退避 listPending/claim 都守 ——
@@ -173,25 +175,44 @@ describe('taskteam batch 1 stores', () => {
     expect(await claim(a.actionId, 60_000)).toBeNull(); // P2-1：claim 也守退避窗
     expect(listPending(new Date(baseMs + 1_000)).length).toBe(1);
 
-    // —— sent 不可被 release 复活；sent→acked 合法；acked 终态守卫 ——
+    // —— complete CAS fencing：非当前持有 attempt（含迟到旧 attempt）不可写入 ——
+    const d = await enqueue({ teamId: 'tt_team_demo', actionType: 'kickoff', idempotencyKey: 'k:cas' });
+    const dClaim = await claim(d.actionId, 60_000);
+    const holder = dClaim!.dispatchAttemptId;
+    // 错误 / 迟到 attempt → 拒写(null)，状态仍 claimed
+    expect(await complete(d.actionId, { status: 'sent', deliveredMessageId: 'om_late', dispatchAttemptId: 'tt_dispatch_stale' })).toBeNull();
+    // 无 attempt 凭证 → 拒写
+    expect(await complete(d.actionId, { status: 'sent' })).toBeNull();
+    expect(outboxStore.readTaskTeamOutbox().actions.find(x => x.actionId === d.actionId)?.status).toBe('claimed');
+    // 当前持有者 → 放行
+    expect((await complete(d.actionId, { status: 'sent', dispatchAttemptId: holder }))?.status).toBe('sent');
+
+    // —— complete 状态机：sent 不降级 failed；sent→acked 合法；acked 终态；pending 不可直接 complete ——
     const b = await enqueue({ teamId: 'tt_team_demo', actionType: 'report', idempotencyKey: 'k:sent' });
-    await claim(b.actionId, 60_000);
-    expect((await complete(b.actionId, { status: 'sent', deliveredMessageId: 'om_b' })).status).toBe('sent');
+    const bClaim = await claim(b.actionId, 60_000);
+    const bSent = await complete(b.actionId, { status: 'sent', deliveredMessageId: 'om_b', dispatchAttemptId: bClaim!.dispatchAttemptId });
+    expect(bSent?.status).toBe('sent');
     expect((await release(b.actionId, { backoffMs: 5_000 }))?.status).toBe('sent'); // 不复活已发送
-    expect((await complete(b.actionId, { status: 'acked' })).status).toBe('acked');
-    await expect(complete(b.actionId, { status: 'failed' })).rejects.toThrow(TaskTeamActionTerminalError); // 终态跨状态改写被拒
-    expect((await complete(b.actionId, { status: 'acked' })).status).toBe('acked'); // 同状态幂等放行
+    await expect(complete(b.actionId, { status: 'failed' })).rejects.toThrow(TaskTeamActionTransitionError); // sent→failed 禁止
+    expect((await complete(b.actionId, { status: 'acked' }))?.status).toBe('acked'); // sent→acked 合法
+    await expect(complete(b.actionId, { status: 'failed' })).rejects.toThrow(TaskTeamActionTerminalError); // acked 终态跨状态拒
+    expect((await complete(b.actionId, { status: 'acked' }))?.status).toBe('acked'); // 同状态幂等
     expect((await release(b.actionId, { backoffMs: 1_000 }))?.status).toBe('acked'); // acked 不可 release
+
+    // pending 未 claim 直接 complete → 非法跃迁
+    const p = await enqueue({ teamId: 'tt_team_demo', actionType: 'nudge', idempotencyKey: 'k:pending' });
+    await expect(complete(p.actionId, { status: 'sent' })).rejects.toThrow(TaskTeamActionTransitionError);
 
     // —— failed 终态：不复活、不可改写、不再额外加 retryCount ——
     const c = await enqueue({ teamId: 'tt_team_demo', actionType: 'nudge', idempotencyKey: 'k:failed' });
-    await claim(c.actionId, 60_000);
-    const cFailed = await complete(c.actionId, { status: 'failed', lastError: 'gave up' });
-    expect(cFailed.status).toBe('failed');
-    expect(cFailed.retryCount).toBe(0);
+    const cClaim = await claim(c.actionId, 60_000);
+    const cFailed = await complete(c.actionId, { status: 'failed', lastError: 'gave up', dispatchAttemptId: cClaim!.dispatchAttemptId });
+    expect(cFailed?.status).toBe('failed');
+    expect(cFailed?.retryCount).toBe(0);
     expect((await release(c.actionId, { backoffMs: 1_000 }))?.status).toBe('failed');
     await expect(complete(c.actionId, { status: 'sent' })).rejects.toThrow(TaskTeamActionTerminalError);
-    expect(listPending(new Date(baseMs + 999_999)).length).toBe(1); // 只有退避到点的 a 可取，b/c 终态不在
+    // 退避到点的 a + 从未 claim 的 p 仍 pending；终态 b(acked)/c(failed)、已发送 d(sent) 都不在
+    expect(listPending(new Date(baseMs + 999_999)).length).toBe(2);
   });
 
   it('backs up corrupt stores instead of treating them as empty (P2-2)', async () => {

@@ -39,4 +39,15 @@
 
 整改后复验：`vitest` 5/5 通过；`tsc --noEmit` exit 0；`git diff --check` 通过；红线#1 仍未破（仅新增 taskteam 文件）。
 
-待办：唤审查员（蔻黛克斯）复审 P1-1/P1-2；两层 review 均无 P1 后再 request-review 给 CEO。
+## 细节复审整改（complete 侧 P1，审查员蔻黛克斯 docx `R5uhdClAEoqEHaxILxycb7iJnQh`）
+
+复审结论：P1-1 两轴拆分闭环、P1-2 release 侧 + P2-1/P2-2 已关闭；架构师亦绿灯 P1-1。仅 complete 侧残留 1 个 P1：
+
+- **P1（已修）completeTaskTeamAction 缺 CAS + sent 可降级**：① 此前 complete 不校验持有者，迟到旧 attempt 能覆盖新 lease 的结果；② `sent` 非 guarded，可被改写成 `failed`，破坏"已发送不降级"。
+  - 修法（对齐 subtask outbox `completeDispatch(cmdId, attemptId, patch)` 范式）：complete 新增 `dispatchAttemptId` 参数；**claimed 来源的完成必须由当前持有 attempt 发起**，凭证缺失/不匹配一律拒写（返回 `null`，状态不变）。
+  - 显式 complete 状态机（新增 `TaskTeamActionTransitionError`）：仅允许 `claimed→sent|failed`、`sent→acked`，同状态幂等；**禁** `sent→failed`（已发送不降级）与 `pending→sent/acked/failed`（必须先 claim）；`acked/failed` 终态不可跨状态改写（沿用 `TaskTeamActionTerminalError`）。
+  - 单测补：迟到/无凭证 attempt complete 被拒(null)、当前持有者放行、`sent→failed` 抛 TransitionError、`pending→sent` 抛 TransitionError。
+
+整改后复验：`vitest` 5/5；`tsc --noEmit` exit 0；`git diff --check` 通过；红线#1 未破（仅新增 taskteam 文件）。
+
+待办：唤审查员（蔻黛克斯）复审 complete 侧 P1；无 P1 后再 request-review 给 CEO（届时验收文档写成飞书 docx）。

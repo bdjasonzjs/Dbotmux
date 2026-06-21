@@ -41,6 +41,20 @@ export class TaskTeamActionTerminalError extends Error {
 
 const TERMINAL_STATUSES: ReadonlySet<TaskTeamActionStatus> = new Set(['acked', 'failed']);
 
+// P1（complete 侧状态机）：合法的 complete 跃迁。claimed→sent|failed、sent→acked；
+// 禁止 sent→failed（已发送不降级）与 pending→任何终态（必须先 claim）。同状态幂等单独放行。
+const ALLOWED_COMPLETE_TRANSITIONS: Readonly<Record<string, ReadonlyArray<TaskTeamActionStatus>>> = {
+  claimed: ['sent', 'failed'],
+  sent: ['acked'],
+};
+
+export class TaskTeamActionTransitionError extends Error {
+  constructor(public actionId: TaskTeamActionId, public from: TaskTeamActionStatus, public to: TaskTeamActionStatus) {
+    super(`TaskTeam action ${actionId} illegal complete transition ${from} → ${to}`);
+    this.name = 'TaskTeamActionTransitionError';
+  }
+}
+
 function fp(): string {
   return join(config.session.dataDir, STORE_FILE);
 }
@@ -177,16 +191,30 @@ export async function claimTaskTeamAction(actionId: TaskTeamActionId, leaseMs: n
 
 export async function completeTaskTeamAction(
   actionId: TaskTeamActionId,
-  patch: { status: Exclude<TaskTeamActionStatus, 'pending' | 'claimed'>; deliveredMessageId?: string | null; lastError?: string | null },
-): Promise<TaskTeamAction> {
+  patch: {
+    status: Exclude<TaskTeamActionStatus, 'pending' | 'claimed'>;
+    deliveredMessageId?: string | null;
+    lastError?: string | null;
+    dispatchAttemptId?: string | null; // P1：CAS——complete 必须由当前持有者（同一 attempt）发起
+  },
+): Promise<TaskTeamAction | null> {
   return mutate(store => {
     const idx = store.actions.findIndex(a => a.actionId === actionId);
     if (idx < 0) throw new TaskTeamActionNotFoundError(actionId);
     const cur = store.actions[idx];
-    // P1-2：终态守卫——acked/failed 不可被改写；同状态幂等放行，跨状态拒绝
+    // 同状态幂等放行（迟到重复 complete 不抖动 version）
+    if (patch.status === cur.status) return { result: cur, dirty: false };
+    // 终态守卫——acked/failed 不可被改写
     if (TERMINAL_STATUSES.has(cur.status)) {
-      if (patch.status === cur.status) return { result: cur, dirty: false };
       throw new TaskTeamActionTerminalError(actionId, cur.status, patch.status);
+    }
+    // CAS fencing——claimed 的完成必须由当前持有 attempt 发起；迟到/无凭证旧 attempt 拒写（返回 null）
+    if (cur.status === 'claimed' && (!patch.dispatchAttemptId || cur.dispatchAttemptId !== patch.dispatchAttemptId)) {
+      return { result: null, dirty: false };
+    }
+    // 状态机守卫——只允许 claimed→sent|failed、sent→acked；禁 sent→failed / pending→终态
+    if (!(ALLOWED_COMPLETE_TRANSITIONS[cur.status] ?? []).includes(patch.status)) {
+      throw new TaskTeamActionTransitionError(actionId, cur.status, patch.status);
     }
     const next: TaskTeamAction = {
       ...cur,
