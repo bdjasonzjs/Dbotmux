@@ -19,7 +19,7 @@ import {
   enqueueCommand, listCommands, listPendingCommands, ackCommand, getCommand,
   updateCommand, claimCommandForDispatch, completeDispatch, transitionAndEnqueueCommand,
   helpReportDelivery, staleHelpCommandIds,
-  listObservations, pruneFinished, VersionConflictError, TaskNotFoundError, CommandRetryMismatchError, ACTIVE_STATUSES,
+  listObservations, pruneFinished, VersionConflictError, TaskNotFoundError, CommandRetryMismatchError, ACTIVE_STATUSES, OBSERVER_STATUSES,
   StoreCorruptError, __resetForTesting, addBotToSubTask, type SubTaskBot,
   recordWakeAck, hasWakeAck,
 } from '../src/services/subtask-store.js';
@@ -129,8 +129,9 @@ describe('状态机（含 review Blocker 2 路径）', () => {
   });
   it('ACTIVE_STATUSES 不含终态', () => {
     expect(ACTIVE_STATUSES).toContain('reported_done');
-    expect(ACTIVE_STATUSES).toContain('paused');
+    expect(ACTIVE_STATUSES).not.toContain('paused');
     expect(ACTIVE_STATUSES).not.toContain('finished');
+    expect(OBSERVER_STATUSES).toContain('paused');
   });
 });
 

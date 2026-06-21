@@ -155,17 +155,21 @@ function isOrgLayer(k: GroupKind): boolean { return k === 'main' || k === 'manag
 
 /** Map real SubTaskStatus (+ live metrics) → inspection status. severity:
  *  3 = needs human (pinned top, red), 2 = done-pending, 1 = working/observing,
- *  0 = finished/paused/idle. archivedLike → render under the archived section. */
-function inspectStatusOf(node: ChatNode): InspectStatus {
+ *  0 = finished/stopped/idle. archivedLike → render under the archived section. */
+export function inspectStatusOf(node: ChatNode): InspectStatus {
   // 迭代2 A2: 经理群是「中层管理者」，卡片不套执行态红绿灯（needs-you/done-pending）。
   // 自身状态恒定为「组织层进行中」(severity 1, 不红、不计 needs-you)；卡片状态位由
   // renderNodeCard 替换成「下次汇报倒计时」。真正的紧急来自子群冒泡 (subtreeMaxSev)，不丢。
-  // 仅 finished/paused/stopped 这种终态仍归档，让收尾的经理群正常折叠。
+  // 仅 finished/stopped 这种终态仍归档；paused 是「已求助·待人」，应继续露出给人看。
   if (node.reportingMode === 'manager') {
     switch (node.subtaskStatus) {
       case 'finished':
         return { key: 'topo.istatus.finished', cls: 'finished', severity: 0, archivedLike: true };
       case 'paused':
+        if (node.subtaskHelpStale) {
+          return { key: 'topo.istatus.stale_help', cls: 'stale_help', severity: 0, archivedLike: false, staleHelp: true };
+        }
+        return { key: 'topo.istatus.needs_human', cls: 'needs_human', severity: 3, archivedLike: false };
       case 'stopped':
         return { key: 'topo.istatus.paused', cls: 'paused', severity: 0, archivedLike: true };
       // 蔻黛 r5 P2: 经理群 error/activation_failed 是真问题，不该被「下次汇报倒计时」掩盖——
@@ -184,6 +188,7 @@ function inspectStatusOf(node: ChatNode): InspectStatus {
   }
   switch (node.subtaskStatus) {
     case 'reported_help':
+    case 'paused':
       // 迭代2 A1: age-aware。后端按 updatedAt 判过陈旧 (subtaskHelpStale)：陈旧求助
       // 单独「💤 陈旧求助」桶、置灰、severity 0、不计 needs-you；新鲜的才红 (severity 3)。
       if (node.subtaskHelpStale) {
@@ -203,7 +208,6 @@ function inspectStatusOf(node: ChatNode): InspectStatus {
       return { key: 'topo.istatus.creating', cls: 'creating', severity: 1, archivedLike: false };
     case 'finished':
       return { key: 'topo.istatus.finished', cls: 'finished', severity: 0, archivedLike: true };
-    case 'paused':
     case 'stopped':
       return { key: 'topo.istatus.paused', cls: 'paused', severity: 0, archivedLike: true };
   }
@@ -415,7 +419,7 @@ export function renderTopologyPage(root: HTMLElement): () => void {
       return max;
     }
     // 迭代2: 三桶路由 (active / 💤陈旧求助 / 📦已完成)。一个节点的桶：
-    //   done  = archived/finished/paused (archivedLike)
+    //   done  = archived/finished/stopped (archivedLike)
     //   stale = 陈旧求助 (reported_help 超阈值)
     //   active= 其它 (含 needs_human / working / 经理群)
     // 子树桶 = 子树里最「活」的桶 (active > stale > done)，用于 root/子级分段路由。

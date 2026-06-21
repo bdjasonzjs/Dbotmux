@@ -214,7 +214,10 @@ const ALLOWED_TRANSITIONS: Record<SubTaskStatus, SubTaskStatus[]> = {
   stopped: [],
 };
 
-export const ACTIVE_STATUSES: SubTaskStatus[] = ['observing', 'reported_help', 'reported_done', 'paused'];
+export const ACTIVE_STATUSES: SubTaskStatus[] = ['observing', 'reported_help', 'reported_done'];
+/** Observer still scans paused ("已求助·待人") for 2h heartbeat / true blocker changes,
+ *  but orchestration ACTIVE must keep paused out so nested spawn/adopt stays blocked. */
+export const OBSERVER_STATUSES: SubTaskStatus[] = [...ACTIVE_STATUSES, 'paused'];
 
 export function isTransitionAllowed(from: SubTaskStatus, to: SubTaskStatus): boolean {
   if (from === to) return true;

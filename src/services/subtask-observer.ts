@@ -17,7 +17,7 @@ import {
   listSubTasks, listObservations, listCommands, commitObservationTransaction,
   helpReportDelivery, staleHelpCommandIds, latestHelpReport,
   enqueueNudgeAndUpdateStats, escalateStalledTask,
-  CursorConflictError, InvalidCursorCommitError, VersionConflictError, ACTIVE_STATUSES,
+  CursorConflictError, InvalidCursorCommitError, VersionConflictError, OBSERVER_STATUSES,
   type SubTask, type SubTaskStatus, type Signal, type HelpDelivery,
 } from './subtask-store.js';
 
@@ -103,7 +103,7 @@ export function planStallNudge(t: SubTask, now: Date, lastInitiatingCmdAt: strin
 
 export async function runObserverTick(now: Date, exec: ObserverExecutors): Promise<{ checked: number; committed: number; errors: number }> {
   const stats = { checked: 0, committed: 0, errors: 0 };
-  for (const t of listSubTasks({ statuses: ACTIVE_STATUSES })) {
+  for (const t of listSubTasks({ statuses: OBSERVER_STATUSES })) {
     try {
       const did = await tickOne(t, now, exec);
       stats.checked += 1;
@@ -229,6 +229,8 @@ async function tickOne(t: SubTask, now: Date, exec: ObserverExecutors): Promise<
  * nudgeCount 入 key 让同窗口每次 attempt 唯一、两 tick 并发同 attempt 自然 dedup。
  */
 async function handleStall(t: SubTask, now: Date): Promise<boolean> {
+  if (t.status === 'paused') return handlePausedHeartbeat(t, now);
+
   // blocker2 fix: 最近一条非 nudge 发起命令时间 (kickoff/supplement/request_review)——
   // sentAt 优先 (已投出)，否则 createdAt (pending)。排除 nudge 自身。
   const initiating = listCommands(t.taskId).filter(c =>
@@ -266,6 +268,38 @@ async function handleStall(t: SubTask, now: Date): Promise<boolean> {
   } catch (err) {
     if (err instanceof VersionConflictError) {
       logger.info(`[subtask-observer] ${t.taskId} stall action version conflict, skip this tick`);
+      return false;
+    }
+    throw err;
+  }
+}
+
+/** paused("已求助·待人") 无新消息时不走普通 stall nudge，但仍保留 2h 心跳兜底。
+ *  这条路径不依赖文本 diff / 新消息数量：只有上次 help 实际投出后超过阈值才补一条 report_help。 */
+async function handlePausedHeartbeat(t: SubTask, now: Date): Promise<boolean> {
+  const prev = latestHelpReport(t.taskId);
+  if (!shouldStaleRereport(prev, now)) return false;
+  const stale = staleHelpCommandIds(t.taskId);
+  const baseline = prev?.lastRespondedAt ?? prev?.sentAt ?? t.updatedAt;
+  try {
+    const res = await commitObservationTransaction({
+      taskId: t.taskId,
+      readFromCursor: t.committedCursor,
+      readToCursor: t.committedCursor,
+      analyzedMessageIds: [],
+      summary: prev?.summary ? `2h heartbeat: ${prev.summary}` : '2h heartbeat: still blocked',
+      signal: 'need_help',
+      report: { commandType: 'report_help', idempotencyKey: `paused-heartbeat-${t.taskId}-${baseline}` },
+      supersedeCommandIds: stale.length ? stale : undefined,
+      expectedVersion: t.version,
+      hasExecutorActivity: false,
+    });
+    if (res == null) return false;
+    logger.info(`[subtask-observer] ${t.taskId} paused 超 2h 无响应→heartbeat 重报`);
+    return true;
+  } catch (err) {
+    if (err instanceof CursorConflictError || err instanceof InvalidCursorCommitError || err instanceof VersionConflictError) {
+      logger.info(`[subtask-observer] ${t.taskId} paused heartbeat conflict, skip this tick: ${(err as Error).message}`);
       return false;
     }
     throw err;

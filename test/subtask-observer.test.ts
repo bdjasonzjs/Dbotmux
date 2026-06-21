@@ -518,6 +518,29 @@ describe('runObserverTick', () => {
     expect(listCommands(t.taskId).filter(c => c.commandType === 'report_help')).toHaveLength(2);
   });
 
+  it('paused 兜底：无新消息且超 2h 无响应 → 心跳重报一次', async () => {
+    const t = await mkObserving();
+    const base = Date.now();
+    await runObserverTick(new Date(base), mkExec({ messages: [{ id: 'm1', rendered: '卡在 X' }], judged: { signal: 'need_help', summary: '卡在 X' } }));
+    const helpCmdId = listCommands(t.taskId).filter(c => c.commandType === 'report_help')[0].cmdId;
+    await updateCommand(helpCmdId, { deliveryStatus: 'sent', sentAt: new Date(base).toISOString() });
+
+    const exec = mkExec({ messages: [] });
+    await runObserverTick(new Date(base + STALE_REREPORT_MS + 5 * 60_000), exec);
+
+    const after = getSubTask(t.taskId)!;
+    const helps = listCommands(t.taskId).filter(c => c.commandType === 'report_help');
+    expect(exec.judge).not.toHaveBeenCalled();
+    expect(after.status).toBe('paused');
+    expect(after.committedCursor).toBe('m1');
+    expect(helps).toHaveLength(2);
+    expect(helps[0].supersededBy).toBe(helps[1].cmdId);
+    expect(listObservations(t.taskId).at(-1)!.analyzedMessageIds).toEqual([]);
+
+    await runObserverTick(new Date(base + STALE_REREPORT_MS + 10 * 60_000), mkExec({ messages: [] }));
+    expect(listCommands(t.taskId).filter(c => c.commandType === 'report_help')).toHaveLength(2);
+  });
+
   // bug 修复 (2026-05-31 蔻黛克斯 review): 响应 = 重新起算 2h，而非永久关闭兜底。
   it('兜底③：响应(acked)也已超 2h 同 blocker 仍卡 → 兜底重报 (响应没解决, 不永久埋掉)', async () => {
     const { t, base, helpCmdId } = await setupStaleHelp();
