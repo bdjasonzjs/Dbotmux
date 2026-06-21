@@ -114,6 +114,7 @@ export async function enqueueTaskTeamAction(opts: {
       status: 'pending',
       retryCount: 0,
       leaseExpiresAt: null,
+      nextAttemptAt: null,
       dispatchAttemptId: null,
       deliveredMessageId: null,
       lastError: null,
@@ -128,7 +129,11 @@ export async function enqueueTaskTeamAction(opts: {
 export function listPendingTaskTeamActions(now: Date = new Date()): TaskTeamAction[] {
   const nowMs = now.getTime();
   return readTaskTeamOutbox().actions.filter(a => {
-    if (a.status === 'pending') return true;
+    if (a.status === 'pending') {
+      // A2：退避窗口未到则暂不投递（dispatcher 退避重试用）
+      return !a.nextAttemptAt || new Date(a.nextAttemptAt).getTime() <= nowMs;
+    }
+    // mid-flight 但 lease 过期 → 可回收重投（不受退避窗影响）
     if (a.status !== 'claimed' || !a.leaseExpiresAt) return false;
     return new Date(a.leaseExpiresAt).getTime() <= nowMs;
   });
@@ -169,10 +174,41 @@ export async function completeTaskTeamAction(
       status: patch.status,
       deliveredMessageId: patch.deliveredMessageId ?? cur.deliveredMessageId,
       lastError: patch.lastError ?? null,
-      retryCount: patch.status === 'failed' ? cur.retryCount + 1 : cur.retryCount,
+      // 终态（sent/acked/failed）不再动 retryCount——重试计数归 releaseTaskTeamActionForRetry 所有
       leaseExpiresAt: null,
+      nextAttemptAt: null,
       dispatchAttemptId: null,
       updatedAt: new Date().toISOString(),
+    };
+    store.actions[idx] = next;
+    return { result: next, dirty: true };
+  });
+}
+
+/**
+ * A2 retry 出路（留给批3 dispatcher）：投递失败但仍可重试时，把 action 放回 pending，
+ * retryCount+1，按 backoffMs 设退避到点；listPending 在到点前不取。达 maxRetries 由 dispatcher
+ * 改调 completeTaskTeamAction(status:'failed') 落终态——本层只提供能力、不内置策略。
+ */
+export async function releaseTaskTeamActionForRetry(
+  actionId: TaskTeamActionId,
+  opts: { lastError?: string | null; backoffMs?: number } = {},
+): Promise<TaskTeamAction | null> {
+  return mutate(store => {
+    const idx = store.actions.findIndex(a => a.actionId === actionId);
+    if (idx < 0) return { result: null, dirty: false };
+    const cur = store.actions[idx];
+    if (cur.status === 'acked') return { result: cur, dirty: false }; // 已终结成功，绝不回退重投
+    const now = Date.now();
+    const next: TaskTeamAction = {
+      ...cur,
+      status: 'pending',
+      retryCount: cur.retryCount + 1,
+      lastError: opts.lastError ?? cur.lastError,
+      leaseExpiresAt: null,
+      nextAttemptAt: opts.backoffMs && opts.backoffMs > 0 ? new Date(now + opts.backoffMs).toISOString() : null,
+      dispatchAttemptId: null,
+      updatedAt: new Date(now).toISOString(),
     };
     store.actions[idx] = next;
     return { result: next, dirty: true };

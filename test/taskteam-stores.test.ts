@@ -67,6 +67,14 @@ describe('taskteam batch 1 stores', () => {
       'tt_slot_architect_main',
       'tt_slot_detail_reviewer_main',
     ]);
+    // A1：可分享的 OrgStructureShape 不含运行态身份（companyId/deptId 单列在 OrgRuntimeBinding）
+    expect(seeded.orgStructures[0]).not.toHaveProperty('companyId');
+    expect(seeded.orgStructures[0].departments[0]).not.toHaveProperty('deptId');
+    expect(seeded.orgStructures[0].companyName).toBe('一人公司');
+    // A3：细节 review 通过映射到 report（待验收），不直接 finish
+    const detailPassRule = seeded.rules.find(r => r.when.fromSlotId === 'tt_slot_detail_reviewer_main');
+    expect(detailPassRule?.do).toBe('report');
+    expect(seeded.rules.some(r => r.do === 'finish')).toBe(false);
     expect(existsSync(join(tempDir, 'taskteam-config.json'))).toBe(true);
     expect(existsSync(join(tempDir, 'subtasks.json'))).toBe(false);
   });
@@ -130,6 +138,52 @@ describe('taskteam batch 1 stores', () => {
     expect(sent.status).toBe('sent');
     expect(sent.leaseExpiresAt).toBeNull();
     expect(sent.deliveredMessageId).toBe('om_demo');
+  });
+
+  it('exposes a retry release path with backoff and keeps failed terminal (A2)', async () => {
+    const { outboxStore } = await freshStores();
+
+    const action = await outboxStore.enqueueTaskTeamAction({
+      teamId: 'tt_team_demo',
+      actionType: 'report',
+      idempotencyKey: 'demo:retry:1',
+    });
+    const claimed = await outboxStore.claimTaskTeamAction(action.actionId, 60_000);
+    expect(claimed?.status).toBe('claimed');
+
+    // 失败但可重试 → 回 pending、retryCount+1、按 backoff 设退避到点
+    const released = await outboxStore.releaseTaskTeamActionForRetry(action.actionId, {
+      lastError: 'lark send failed',
+      backoffMs: 10_000,
+    });
+    expect(released?.status).toBe('pending');
+    expect(released?.retryCount).toBe(1);
+    expect(released?.lastError).toBe('lark send failed');
+    expect(released?.leaseExpiresAt).toBeNull();
+
+    // 退避窗内不取，到点后才取
+    const baseMs = new Date(released!.nextAttemptAt!).getTime();
+    expect(outboxStore.listPendingTaskTeamActions(new Date(baseMs - 1_000)).length).toBe(0);
+    expect(outboxStore.listPendingTaskTeamActions(new Date(baseMs + 1_000)).length).toBe(1);
+
+    // 达上限由 dispatcher 落终态 failed —— 终态后不再出现在 pending
+    const failed = await outboxStore.completeTaskTeamAction(action.actionId, {
+      status: 'failed',
+      lastError: 'gave up after retries',
+    });
+    expect(failed.status).toBe('failed');
+    expect(failed.retryCount).toBe(1); // 终态不再额外加计数
+    expect(outboxStore.listPendingTaskTeamActions(new Date(baseMs + 999_999)).length).toBe(0);
+
+    // 已 acked 的 action 绝不被回退重投
+    const ackAction = await outboxStore.enqueueTaskTeamAction({
+      teamId: 'tt_team_demo',
+      actionType: 'report',
+      idempotencyKey: 'demo:retry:2',
+    });
+    await outboxStore.completeTaskTeamAction(ackAction.actionId, { status: 'acked' });
+    const reReleased = await outboxStore.releaseTaskTeamActionForRetry(ackAction.actionId, { backoffMs: 5_000 });
+    expect(reReleased?.status).toBe('acked');
   });
 
   it('backs up corrupt config instead of treating it as empty', async () => {

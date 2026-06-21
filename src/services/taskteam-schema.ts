@@ -99,17 +99,19 @@ export interface TaskTeamType {
   policy: TaskTeamCollabPolicy;
 }
 
+// 可分享 shape：进 TemplateBundle，绝不含运行态 / app-scoped 身份（§2.5 / 细节 review H3）
 export interface TaskTeamOrgStructureShape {
-  companyId: TaskTeamCompanyId;
   companyName: string;
-  departments: { deptId: TaskTeamDepartmentId; deptName: string; teamTypeIds: TaskTeamTypeId[] }[];
+  departments: { deptName: string; teamTypeIds: TaskTeamTypeId[] }[];
 }
 
+// 本地实例态：运行态身份单列于此（不进分享包，进 InstanceSnapshot）（§2.5 / H3）
 export interface TaskTeamOrgRuntimeBinding {
-  companyId: TaskTeamCompanyId;
+  companyId: TaskTeamCompanyId; // 运行态铸造的公司身份
+  companyName: string; // 绑定 → 对应 OrgStructureShape（按名称解析）
   rootChatId: string;
   ceoBotOpenId: string;
-  deptBindings: { deptId: TaskTeamDepartmentId; managerChatId?: string; managerBotOpenId?: string }[];
+  deptBindings: { deptId: TaskTeamDepartmentId; deptName: string; managerChatId?: string; managerBotOpenId?: string }[];
 }
 
 export interface TaskTeamRoleBinding {
@@ -167,6 +169,7 @@ export interface TaskTeamAction {
   status: TaskTeamActionStatus;
   retryCount: number;
   leaseExpiresAt: string | null;
+  nextAttemptAt: string | null; // 退避到点前 dispatcher 不取（A2：批3 retry 出路）
   dispatchAttemptId: string | null;
   deliveredMessageId: string | null;
   lastError: string | null;

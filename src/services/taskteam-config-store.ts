@@ -132,7 +132,7 @@ export async function upsertTaskTeamType(teamType: TaskTeamType): Promise<TaskTe
 
 export async function upsertTaskTeamOrgStructure(shape: TaskTeamOrgStructureShape): Promise<TaskTeamOrgStructureShape> {
   return mutateTaskTeamConfig(store => {
-    const idx = store.orgStructures.findIndex(o => o.companyId === shape.companyId);
+    const idx = store.orgStructures.findIndex(o => o.companyName === shape.companyName);
     if (idx >= 0) store.orgStructures[idx] = shape;
     else store.orgStructures.push(shape);
     return { result: shape, dirty: true };
@@ -209,7 +209,8 @@ export function defaultTaskTeamSeed(): Omit<TaskTeamConfigFile, 'version' | 'upd
     rules: [
       { ruleId: rules[0], when: { event: 'submit', status: 'running' }, whoSlot: 'tt_slot_architect_main', do: 'review-pass' },
       { ruleId: rules[1], when: { event: 'review-pass', status: 'reviewing', fromSlotId: 'tt_slot_architect_main' }, whoSlot: 'tt_slot_detail_reviewer_main', do: 'review-pass' },
-      { ruleId: rules[2], when: { event: 'review-pass', status: 'reviewing', fromSlotId: 'tt_slot_detail_reviewer_main' }, whoSlot: 'tt_slot_developer_main', do: 'finish' },
+      // A3：细节 review 通过 ≠ 自动完成；交付转\"待验收\"由 developer report，finish 仅由 owner 验收事件触发（设计 4.4）
+      { ruleId: rules[2], when: { event: 'review-pass', status: 'reviewing', fromSlotId: 'tt_slot_detail_reviewer_main' }, whoSlot: 'tt_slot_developer_main', do: 'report' },
       { ruleId: rules[3], when: { event: 'review-reject', status: 'reviewing' }, whoSlot: 'tt_slot_developer_main', do: 'rework' },
       { ruleId: rules[4], when: { event: 'stall', status: 'running' }, whoSlot: 'tt_slot_observer_main', do: 'report' },
     ],
@@ -235,9 +236,8 @@ export function defaultTaskTeamSeed(): Omit<TaskTeamConfigFile, 'version' | 'upd
     ],
     orgStructures: [
       {
-        companyId: 'tt_company_default',
         companyName: '一人公司',
-        departments: [{ deptId: 'tt_dept_default', deptName: '默认部门', teamTypeIds: ['tt_type_two_layer_review'] }],
+        departments: [{ deptName: '默认部门', teamTypeIds: ['tt_type_two_layer_review'] }],
       },
     ],
     orgRuntimeBindings: [],
