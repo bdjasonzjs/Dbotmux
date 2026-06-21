@@ -39,6 +39,18 @@
 2. 大白话看板按 `TaskTeamInstance.progress` + reviewState（按 roleInstance 显示票）渲染；SSE 实时刷新可作后续增量（本批为拉取式）。
 3. Web 页（DOM 渲染）按现有 dashboard 页范式，无单测（与 overview/sessions 等一致）；后端 `buildOrgTree` 有纯函数单测。
 
+## 两层 review 裁决与整改
+
+**架构 review：通过 ✓ 无 P1**（§8 Tab 接线 / API / 隔离）。
+
+**细节 review（docx `ERA5dkBUPo8djYxVO8Hc1cXvnQg`）：无 P1，1 个 P2，已整改**
+
+| 项 | 内容 | 处理 |
+|-|-|-|
+| **P2** | 前端 fetch 失败 / 非 2xx / JSON 异常全部折叠成 null，渲染成"暂无任务小组"——把 API 500 / store 解析失败 / 鉴权失败伪装成正常空态 | 抽出无 DOM 依赖、可 node 单测的数据层 `dashboard/web/task-team-data.ts`：`fetchTaskTeamJson` 返回 `LoadResult<T>`（`{ok:true,data}` / `{ok:false,error}`），非 2xx→`HTTP <status>`、throw→`请求失败`、JSON 异常→`响应解析失败`，**不再折叠成 null**。页面 `renderOrgTreeResult`/`renderBoardResult` 区分 error 态（渲染明确"加载失败：<reason>"）与真实空数组（"暂无"）。新增 i18n `taskTeam.loadError`。新增前端单测：非 2xx / throw / bad-json → error result（不伪装空）。 |
+
+整改后复验：`vitest` 50/50（批6 dashboard 3）；`tsc --noEmit` exit 0；`dashboard:bundle` 成功；红线#1 未破。
+
 ## 下一步
 
 批6 旁挂完成。批5 + 批6 两层 review 均过后，攒一起 request-review 给 CEO 关。

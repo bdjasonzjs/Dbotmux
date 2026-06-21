@@ -1,7 +1,11 @@
 // 任务小组 · Dashboard「任务小组」Tab（v3.1 §8.2）——组织树 + 大白话看板 + 用量。
 // 配置器（workflow-builder 迁移）属批7，不在本页。只读后端 /api/task-team/*。
+// P2 修复：fetch 失败 / 非 2xx / JSON 异常返回 error result（非 null），页面渲染明确错误态，
+//          不把 API 500 / 解析失败 / 鉴权失败伪装成"暂无任务小组"空态。
 
 import { escapeHtml, t } from './ui.js';
+import { fetchTaskTeamJson } from './task-team-data.js';
+import type { LoadResult } from './task-team-data.js';
 
 interface OrgTreeTeam { teamId: string; status: string; progress: string; chatId: string }
 interface OrgTree { companyName: string; departments: { deptName: string; teamTypeIds: string[]; teams: OrgTreeTeam[] }[] }
@@ -16,17 +20,13 @@ interface TeamInstance {
   roleInstances: { roleInstanceId: string; roleId: string; binding?: { botOpenId: string } }[];
 }
 
-async function fetchJson<T>(path: string): Promise<T | null> {
-  try {
-    const r = await fetch(path);
-    if (!r.ok) return null;
-    return (await r.json()) as T;
-  } catch {
-    return null;
-  }
+function renderError(error: string): string {
+  return `<p class="tt-error">⚠️ ${escapeHtml(t('taskTeam.loadError'))}：${escapeHtml(error)}</p>`;
 }
 
-function renderOrgTree(org: OrgTree[]): string {
+export function renderOrgTreeResult(result: LoadResult<{ org: OrgTree[] }>): string {
+  if (!result.ok) return renderError(result.error);
+  const org = result.data.org ?? [];
   if (!org.length) return `<p class="muted">${escapeHtml(t('taskTeam.empty'))}</p>`;
   return org
     .map(
@@ -45,7 +45,9 @@ function renderOrgTree(org: OrgTree[]): string {
     .join('');
 }
 
-function renderBoard(teams: TeamInstance[]): string {
+export function renderBoardResult(result: LoadResult<{ teams: TeamInstance[] }>): string {
+  if (!result.ok) return renderError(result.error);
+  const teams = result.data.teams ?? [];
   if (!teams.length) return `<p class="muted">${escapeHtml(t('taskTeam.empty'))}</p>`;
   return teams
     .map(team => {
@@ -75,14 +77,14 @@ export function renderTaskTeamPage(root: HTMLElement): (() => void) | undefined 
   let disposed = false;
   void (async () => {
     const [orgRes, instRes] = await Promise.all([
-      fetchJson<{ org: OrgTree[] }>('/api/task-team/org'),
-      fetchJson<{ teams: TeamInstance[] }>('/api/task-team/instances'),
+      fetchTaskTeamJson<{ org: OrgTree[] }>('/api/task-team/org'),
+      fetchTaskTeamJson<{ teams: TeamInstance[] }>('/api/task-team/instances'),
     ]);
     if (disposed) return;
     const orgEl = root.querySelector('#tt-org');
     const boardEl = root.querySelector('#tt-board');
-    if (orgEl) orgEl.innerHTML = renderOrgTree(orgRes?.org ?? []);
-    if (boardEl) boardEl.innerHTML = renderBoard(instRes?.teams ?? []);
+    if (orgEl) orgEl.innerHTML = renderOrgTreeResult(orgRes);
+    if (boardEl) boardEl.innerHTML = renderBoardResult(instRes);
   })();
 
   return () => { disposed = true; };
