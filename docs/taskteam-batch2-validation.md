@@ -19,7 +19,7 @@
 5. **`review-reject` 即返工**：`reworkCount+1` + nudge 开发者回 running；超 `policy.maxRework` 则 escalate 给 observer 席 + 置 `blocked`（无 escalate 规则时兜底 escalate 到 `isObserver` 角色）。
 6. **返回 `TeamDecision { actions, nextStatus?, reviewState? }`**：比方案 §3 的 `TeamAction[]` 多带状态跃迁。理由：纯引擎必须以确定性方式表达"审轮/状态机推进"，由驱动层（批3）落库应用；core 仍是"事件×规则→命令"。**此处偏离方案签名，请架构师确认口径。**
 
-## 单测（7 例，覆盖方案 §11 / §12.1 要求）
+## 单测（10 例，覆盖方案 §11 / §12.1 要求）
 
 - happy path：team-started→kickoff 开发者→submit→request-review 架构师→架构 pass→request-review 审查员→审查 pass→report 待验收→accept→done。
 - `review-reject`→nudge 开发者 + reworkCount+1 + 回 running。
@@ -28,6 +28,9 @@
 - **config-driven**：纯加「安全审查」角色+规则，引擎不变即插入一审查阶段。
 - **count>1 quorum（B2）**：两审查员同 role、quorum=2——架构 pass 扇出请求给两人；一人 pass 不推进、两人 pass 才 report。
 - 纯函数确定性：同输入→同输出，入参未被修改。
+- **规则作用域（P1）**：传入 foreign team-type 规则不被命中。
+- **accept 门禁（P2）**：running 态 accept 无效、awaiting-acceptance 态 accept→done。
+- **quorum 守卫（M1）**：达标但无路由规则时不吞票、不推进，保留票可观测。
 
 ## 红线#1 自检
 
