@@ -198,14 +198,19 @@ export function validateCanvas(team: CanvasTeam): ValidationIssue[] {
       issues.push({ level: 'error', message: `只能有一条「提交→请审」首审入口，当前有 ${submitEdges.length} 条，运行时会同时投递多条首审。` });
     }
 
-    // P1-1：每个审核席「通过」出口唯一——pass-next 与 pass-report 合计恰好 1 条，
-    // 否则一次 review-pass 会同时触发多条规则（既请下一审又汇报，语义歧义）。
-    for (const r of reviewers) {
-      const passOut = team.edges.filter(e => (e.chip === 'pass-next' || e.chip === 'pass-report') && e.from === r.slotId);
+    // P1-1：「通过」出口唯一——**按 roleId cohort 计**，不是按席位。
+    // 引擎按 roleId 路由 when.fromSlotId（engine.ts:95），同 role 的多个票席（quorum cohort）
+    // 在引擎眼里是同一来源；若每个同 role 票席都画一条 pass-report/pass-next，review-pass 时
+    // 会同时命中多条 report/下一审规则。所以一个审核角色（cohort）整体只能有 1 条「通过」出口。
+    const slotRoleId = new Map(team.nodes.map(n => [n.slotId, n.roleId] as const));
+    const reviewerRoleIds = new Set(reviewers.map(r => r.roleId));
+    const roleName = (roleId: string) => reviewers.find(r => r.roleId === roleId)?.name || roleId;
+    for (const roleId of reviewerRoleIds) {
+      const passOut = team.edges.filter(e => (e.chip === 'pass-next' || e.chip === 'pass-report') && slotRoleId.get(e.from) === roleId);
       if (passOut.length > 1) {
-        issues.push({ level: 'error', message: `审核席「${r.name || r.slotId}」有多个「通过」出口（下一审/汇报只能二选一且唯一），review-pass 会同时触发多条规则。` });
+        issues.push({ level: 'error', message: `审核角色「${roleName(roleId)}」有多个「通过」出口（含同角色多票席各自连线），引擎按角色路由会同时触发多条规则——一个审核角色整体只能连 1 条 通过→下一审 或 通过→汇报。` });
       } else if (passOut.length === 0) {
-        issues.push({ level: 'error', message: `审核席「${r.name || r.slotId}」缺「通过」出口（应连一条 通过→下一审 或 通过→汇报）。` });
+        issues.push({ level: 'error', message: `审核角色「${roleName(roleId)}」缺「通过」出口（该角色应有 1 条 通过→下一审 或 通过→汇报）。` });
       }
     }
 
@@ -246,11 +251,11 @@ export function validateCanvas(team: CanvasTeam): ValidationIssue[] {
       issues.push({ level: 'error', message: `审核席「${r.name || r.slotId}」不在审核链上（既非主链节点，也不是链上某审的同角色票席）。` });
     }
 
-    // 每个审核席应有 驳回→返工 回开发
-    for (const r of reviewers) {
-      const hasReject = team.edges.some(e => e.chip === 'reject-rework' && e.from === r.slotId);
+    // 每个审核角色（cohort）应有 驳回→返工 回开发（按 roleId 计，同角色票席共用一条即可）
+    for (const roleId of reviewerRoleIds) {
+      const hasReject = team.edges.some(e => e.chip === 'reject-rework' && slotRoleId.get(e.from) === roleId);
       if (!hasReject) {
-        issues.push({ level: 'warn', message: `审核席「${r.name || r.slotId}」缺「驳回→返工」出边，驳回时无去向。` });
+        issues.push({ level: 'warn', message: `审核角色「${roleName(roleId)}」缺「驳回→返工」出边，驳回时无去向。` });
       }
     }
   }

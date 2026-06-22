@@ -173,6 +173,40 @@ describe('validateCanvas（P1-1 非法拓扑硬校验）', () => {
     });
     expect(validateCanvas(t).some(i => i.level === 'error' && i.message.includes('不在审核链'))).toBe(true);
   });
+  it('同 role quorum 两票席各画 pass-report 报 error（引擎按 role 命中多条 report）', () => {
+    const t = team({
+      policy: { reviewQuorum: 2, maxRework: 1, escalateAfterStallMs: 0 },
+      nodes: [
+        { slotId: 'tt_slot_dev', roleId: 'tt_role_dev', kind: 'developer', name: '开发', responsibility: '', visibility: 'full', actions: ['submit'], activationTrigger: 'team-started', x: 0, y: 0 },
+        { slotId: 'tt_slot_rev_a', roleId: 'tt_role_rev', kind: 'reviewer', name: '审A', responsibility: '', visibility: 'review-only', actions: ['review-pass'], activationTrigger: 'submit', x: 0, y: 0 },
+        { slotId: 'tt_slot_rev_b', roleId: 'tt_role_rev', kind: 'reviewer', name: '审B', responsibility: '', visibility: 'review-only', actions: ['review-pass'], activationTrigger: 'submit', x: 0, y: 0 },
+        { slotId: 'tt_slot_rep', roleId: 'tt_role_rep', kind: 'reporter', name: '上报', responsibility: '', visibility: 'progress-only', actions: ['report'], activationTrigger: 'team-started', x: 0, y: 0 },
+      ],
+      edges: [
+        { id: 'e1', from: 'tt_slot_dev', to: 'tt_slot_rev_a', chip: 'submit-review' },
+        { id: 'e2', from: 'tt_slot_rev_a', to: 'tt_slot_rep', chip: 'pass-report' },
+        { id: 'e3', from: 'tt_slot_rev_b', to: 'tt_slot_rep', chip: 'pass-report' }, // 同 role 第二票席也画 report
+      ],
+    });
+    expect(validateCanvas(t).some(i => i.level === 'error' && i.message.includes('多个「通过」出口'))).toBe(true);
+  });
+  it('同 role quorum：只代表席连 report、票席仅投票 → 无 error（reviewQuorum=2 合法）', () => {
+    const t = team({
+      policy: { reviewQuorum: 2, maxRework: 1, escalateAfterStallMs: 0 },
+      nodes: [
+        { slotId: 'tt_slot_dev', roleId: 'tt_role_dev', kind: 'developer', name: '开发', responsibility: '', visibility: 'full', actions: ['submit'], activationTrigger: 'team-started', x: 0, y: 0 },
+        { slotId: 'tt_slot_rev_a', roleId: 'tt_role_rev', kind: 'reviewer', name: '审A', responsibility: '', visibility: 'review-only', actions: ['review-pass'], activationTrigger: 'submit', x: 0, y: 0 },
+        { slotId: 'tt_slot_rev_b', roleId: 'tt_role_rev', kind: 'reviewer', name: '审B', responsibility: '', visibility: 'review-only', actions: ['review-pass'], activationTrigger: 'submit', x: 0, y: 0 },
+        { slotId: 'tt_slot_rep', roleId: 'tt_role_rep', kind: 'reporter', name: '上报', responsibility: '', visibility: 'progress-only', actions: ['report'], activationTrigger: 'team-started', x: 0, y: 0 },
+      ],
+      edges: [
+        { id: 'e1', from: 'tt_slot_dev', to: 'tt_slot_rev_a', chip: 'submit-review' },
+        { id: 'e2', from: 'tt_slot_rev_a', to: 'tt_slot_rep', chip: 'pass-report' },
+        { id: 'e3', from: 'tt_slot_rev_a', to: 'tt_slot_dev', chip: 'reject-rework' },
+      ],
+    });
+    expect(validateCanvas(t).filter(i => i.level === 'error')).toEqual([]);
+  });
   it('typeId 非法前缀报 error', () => {
     expect(validateCanvas(team({ typeId: 'code_review' })).some(i => i.level === 'error' && i.message.includes('tt_type'))).toBe(true);
   });
