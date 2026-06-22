@@ -198,16 +198,35 @@ export function validateCanvas(team: CanvasTeam): ValidationIssue[] {
       issues.push({ level: 'error', message: `只能有一条「提交→请审」首审入口，当前有 ${submitEdges.length} 条，运行时会同时投递多条首审。` });
     }
 
-    // P1-1：审核链无分支（每个 reviewer 至多一条 pass-next 出边）
+    // P1-1：每个审核席「通过」出口唯一——pass-next 与 pass-report 合计恰好 1 条，
+    // 否则一次 review-pass 会同时触发多条规则（既请下一审又汇报，语义歧义）。
     for (const r of reviewers) {
-      const passNext = team.edges.filter(e => e.chip === 'pass-next' && e.from === r.slotId);
-      if (passNext.length > 1) {
-        issues.push({ level: 'error', message: `审核席「${r.name || r.slotId}」有多条「通过→下一审」出边，审核链不能分叉。` });
+      const passOut = team.edges.filter(e => (e.chip === 'pass-next' || e.chip === 'pass-report') && e.from === r.slotId);
+      if (passOut.length > 1) {
+        issues.push({ level: 'error', message: `审核席「${r.name || r.slotId}」有多个「通过」出口（下一审/汇报只能二选一且唯一），review-pass 会同时触发多条规则。` });
+      } else if (passOut.length === 0) {
+        issues.push({ level: 'error', message: `审核席「${r.name || r.slotId}」缺「通过」出口（应连一条 通过→下一审 或 通过→汇报）。` });
       }
     }
 
+    // P1-1：审核链无环——从首审席沿 pass-next 走，命中已访问节点即成环。
+    const passNextOf = new Map<string, string>();
+    for (const e of team.edges) {
+      if (e.chip === 'pass-next') passNextOf.set(e.from, e.to);
+    }
+    {
+      const visited = new Set<string>();
+      let cur: string | undefined = submitEdges[0]?.to;
+      let cyclic = false;
+      while (cur) {
+        if (visited.has(cur)) { cyclic = true; break; }
+        visited.add(cur);
+        cur = passNextOf.get(cur);
+      }
+      if (cyclic) issues.push({ level: 'error', message: '审核链成环（沿「通过→下一审」回到了已经过的审核席），流程无法收敛。' });
+    }
+
     const reviewOrder = deriveReviewOrder(team);
-    // P1-1：无环——deriveReviewOrder 遇环会提前停；若链长 < 经 pass-next 可达的 reviewer 数，说明有环/断裂
     const chainSet = new Set(reviewOrder);
 
     // 末级审核席必须有 →report 出边到验收
