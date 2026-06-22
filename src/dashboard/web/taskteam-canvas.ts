@@ -6,6 +6,7 @@
 import {
   CHIP_META,
   ROLE_KIND_LABEL,
+  allowedChips,
   assembleSaveOps,
   deriveReviewOrder,
   idSafe,
@@ -58,6 +59,16 @@ function chipColor(chip: CanvasEdgeChip): string {
   return '#2b5fff';
 }
 
+function kindDefaults(kind: CanvasRoleKind): { actions: string[]; visibility: CanvasNode['visibility']; isObserver: boolean } {
+  switch (kind) {
+    case 'developer': return { actions: ['submit'], visibility: 'full', isObserver: false };
+    case 'reviewer': return { actions: ['review-pass', 'review-reject'], visibility: 'review-only', isObserver: false };
+    case 'reporter': return { actions: ['report'], visibility: 'progress-only', isObserver: false };
+    case 'observer': return { actions: [], visibility: 'progress-only', isObserver: true };
+    default: return { actions: [], visibility: 'full', isObserver: false };
+  }
+}
+
 function defaultChip(fromKind: CanvasRoleKind, toKind: CanvasRoleKind): CanvasEdgeChip {
   if (fromKind === 'developer') return 'submit-review';
   if (fromKind === 'reviewer') {
@@ -100,8 +111,8 @@ export function renderTaskTeamCanvasPage(root: HTMLElement): () => void {
     <section class="page ttc-page">
       <header class="ttc-toolbar">
         <span class="ttc-crumb">配置器 ›</span>
-        <input class="ttc-title" id="ttc-name" value="${esc(team.name)}" />
-        <span class="ttc-crumb ttc-typeid">${esc(team.typeId)}</span>
+        <input class="ttc-title" id="ttc-name" value="${esc(team.name)}" placeholder="小组类型名称" />
+        <label class="ttc-typeid-wrap">ID <input class="ttc-typeid-input" id="ttc-typeid" value="${esc(team.typeId)}" placeholder="tt_type_xxx" /></label>
         <span class="ttc-spacer"></span>
         <span class="ttc-status" id="ttc-status"></span>
         <button class="ttc-btn primary" id="ttc-save">打包成小组类型 →</button>
@@ -246,8 +257,16 @@ export function renderTaskTeamCanvasPage(root: HTMLElement): () => void {
     const toN = team.nodes.find(n => n.slotId === to);
     if (!fromN || !toN) return;
     if (team.edges.some(e => e.from === from && e.to === to)) return;
+    // P1-1：只允许产生合法 chip 的连线，从源头挡住非法拓扑
+    const allowed = allowedChips(fromN.kind, toN.kind);
+    if (allowed.length === 0) {
+      statusEl.innerHTML = `<span class="ttc-err">✕ ${esc(ROLE_KIND_LABEL[fromN.kind])}→${esc(ROLE_KIND_LABEL[toN.kind])} 不是合法协作关系</span>`;
+      return;
+    }
+    const fallback = defaultChip(fromN.kind, toN.kind);
+    const chip = allowed.includes(fallback) ? fallback : allowed[0]!;
     const id = nextId(`e_${idSafe(from, 'a')}_${idSafe(to, 'b')}`, new Set(team.edges.map(e => e.id)));
-    team.edges.push({ id, from, to, chip: defaultChip(fromN.kind, toN.kind) });
+    team.edges.push({ id, from, to, chip });
     selected = { kind: 'edge', id };
     renderInspector();
     renderStatus();
@@ -267,6 +286,7 @@ export function renderTaskTeamCanvasPage(root: HTMLElement): () => void {
       actions: existing?.actions ?? (kind === 'reviewer' ? ['review-pass', 'review-reject'] : kind === 'developer' ? ['submit'] : kind === 'reporter' ? ['report'] : []),
       activationTrigger: 'team-started',
       model: existing?.model,
+      reasoningEffort: existing?.reasoningEffort,
       seatEngine: existing?.seatEngine,
       isObserver: existing?.isObserver ?? kind === 'observer',
       fromExisting: Boolean(existing),
@@ -321,6 +341,22 @@ export function renderTaskTeamCanvasPage(root: HTMLElement): () => void {
       h.textContent = node.name || node.slotId;
       inspectorEl.appendChild(h);
       inspectorEl.appendChild(field('角色名称', node.name, v => { node.name = v; renderCanvas(); }));
+      // P2-1：允许改 kind（让「自定义」也能配成审核/上报等，满足「拖角色搭团队」且不写死 5 类模板）
+      const kindOpts: CanvasRoleKind[] = ['developer', 'reviewer', 'reporter', 'observer', 'custom'];
+      const kindField = field('角色类型', node.kind, v => {
+        const nk = v as CanvasRoleKind;
+        node.kind = nk;
+        const d = kindDefaults(nk);
+        // 套用该 kind 的默认动作/可见性/观察标记（用户可再调）
+        node.actions = d.actions;
+        node.visibility = d.visibility;
+        node.isObserver = d.isObserver;
+        renderInspector();
+        renderCanvas();
+        renderStatus();
+      }, kindOpts);
+      kindField.querySelector('select')!.querySelectorAll('option').forEach(op => { op.textContent = ROLE_KIND_LABEL[(op.value as CanvasRoleKind)] ?? op.value; });
+      inspectorEl.appendChild(kindField);
       inspectorEl.appendChild(field('职责', node.responsibility, v => { node.responsibility = v; }));
       inspectorEl.appendChild(field('模型（给角色挑模型）', node.model ?? '', v => { node.model = v; renderCanvas(); }));
       inspectorEl.appendChild(field('推理强度', node.reasoningEffort ?? '', v => { node.reasoningEffort = v; }, ['', 'high', 'medium', 'low']));
@@ -328,6 +364,17 @@ export function renderTaskTeamCanvasPage(root: HTMLElement): () => void {
       inspectorEl.appendChild(field('可见性', node.visibility, v => { node.visibility = v as CanvasNode['visibility']; }, ['full', 'review-only', 'progress-only']));
       inspectorEl.appendChild(field('动作（逗号分隔）', node.actions.join(','), v => { node.actions = v.split(',').map(s => s.trim()).filter(Boolean); }));
       inspectorEl.appendChild(field('出场时机 activation', node.activationTrigger, v => { node.activationTrigger = v; }));
+      const obsWrap = document.createElement('label');
+      obsWrap.className = 'ttc-check';
+      const obsBox = document.createElement('input');
+      obsBox.type = 'checkbox';
+      obsBox.checked = !!node.isObserver;
+      obsBox.addEventListener('change', () => { node.isObserver = obsBox.checked; renderCanvas(); renderStatus(); });
+      obsWrap.appendChild(obsBox);
+      const obsText = document.createElement('span');
+      obsText.textContent = '只读观察席（isObserver，不计入工作者/审核链）';
+      obsWrap.appendChild(obsText);
+      inspectorEl.appendChild(obsWrap);
       const del = document.createElement('button');
       del.className = 'ttc-btn danger';
       del.textContent = '删除此席位';
@@ -352,8 +399,12 @@ export function renderTaskTeamCanvasPage(root: HTMLElement): () => void {
       const h = document.createElement('h2');
       h.textContent = `${from?.name ?? edge.from} → ${to?.name ?? edge.to}`;
       inspectorEl.appendChild(h);
-      const chips: CanvasEdgeChip[] = ['submit-review', 'pass-next', 'pass-report', 'reject-rework'];
-      inspectorEl.appendChild(field('关系类型', edge.chip, v => { edge.chip = v as CanvasEdgeChip; renderInspector(); renderCanvas(); renderStatus(); }, chips));
+      // P1-1：可选 chip 限制在源/目标 kind 合法范围内，UI 层面就挡住非法关系
+      const legal = from && to ? allowedChips(from.kind, to.kind) : [];
+      const chips: CanvasEdgeChip[] = legal.length ? legal : [edge.chip];
+      const chipField = field('关系类型', edge.chip, v => { edge.chip = v as CanvasEdgeChip; renderInspector(); renderCanvas(); renderStatus(); }, chips);
+      chipField.querySelector('select')!.querySelectorAll('option').forEach(op => { op.textContent = CHIP_META[op.value as CanvasEdgeChip]?.label ?? op.value; });
+      inspectorEl.appendChild(chipField);
       const meta = CHIP_META[edge.chip];
       const map = document.createElement('div');
       map.className = 'ttc-maps';
@@ -445,15 +496,24 @@ export function renderTaskTeamCanvasPage(root: HTMLElement): () => void {
   });
 
   // ---- save ----
+  let typeIdEdited = false;
+  const typeIdInput = root.querySelector<HTMLInputElement>('#ttc-typeid')!;
   root.querySelector('#ttc-name')!.addEventListener('input', ev => {
     team.name = (ev.target as HTMLInputElement).value;
-    if (team.typeId === 'tt_type_code_review' || !team.typeId) {
-      // keep typeId stable once set; only auto-derive while still default
+    // P1-2：typeId 未被手动编辑时随名称派生唯一 id，避免固定覆盖同一类型
+    if (!typeIdEdited) {
+      team.typeId = `tt_type_${idSafe(team.name, 'team')}`;
+      typeIdInput.value = team.typeId;
     }
     if (selected.kind === 'policy') {
       const h = inspectorEl.querySelector('h2');
       if (h) h.textContent = team.name || '（未命名小组）';
     }
+    renderStatus();
+  });
+  typeIdInput.addEventListener('input', ev => {
+    typeIdEdited = true;
+    team.typeId = (ev.target as HTMLInputElement).value.trim();
     renderStatus();
   });
 

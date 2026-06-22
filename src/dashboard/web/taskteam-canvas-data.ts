@@ -85,6 +85,25 @@ export const ROLE_KIND_LABEL: Record<CanvasRoleKind, string> = {
   custom: '自定义',
 };
 
+/**
+ * DESIGN §6 运行语义约束：每种 chip 对源/目标 kind 的合法组合。
+ * UI 按此限制可选 chip，保存前也据此硬校验，挡住非法/歧义拓扑。
+ */
+export function allowedChips(fromKind: CanvasRoleKind, toKind: CanvasRoleKind): CanvasEdgeChip[] {
+  const out: CanvasEdgeChip[] = [];
+  // 提交→请审：开发/提交源 → 审核席
+  if (fromKind === 'developer' && toKind === 'reviewer') out.push('submit-review');
+  // 通过→下一审：审核 → 审核
+  if (fromKind === 'reviewer' && toKind === 'reviewer') out.push('pass-next');
+  // 通过→汇报：末级审核 → 上报/开发（验收/汇报席）
+  if (fromKind === 'reviewer' && (toKind === 'reporter' || toKind === 'developer')) out.push('pass-report');
+  // 驳回→返工：审核 → 开发
+  if (fromKind === 'reviewer' && toKind === 'developer') out.push('reject-rework');
+  return out;
+}
+
+export const TYPE_ID_RE = /^tt_type_[a-z0-9][a-z0-9_-]*$/;
+
 /** kebab 化作 id 片段；非法字符折成连字符。 */
 export function idSafe(input: string, fallback: string): string {
   const cleaned = (input || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-+|-+$)/g, '');
@@ -100,7 +119,11 @@ export function nextId(base: string, used: Set<string>): string {
   return id;
 }
 
-/** DESIGN §8：按 roleId 聚合入/出边的对端角色，派生 io.from / io.to（去重）。 */
+/**
+ * DESIGN §8：按 roleId 聚合入/出边的对端角色，派生 io.from / io.to（去重）。
+ * 注意：派生结果只对**新建/自定义**角色落库（assembleSaveOps 不 upsert fromExisting 角色），
+ * 已存角色拖入=只绑 RoleSlot 不重建 Role，其 io 保持库里原值不被画布改写（松松方向③：已存角色只绑不改）。
+ */
 export function deriveRoleIo(team: CanvasTeam): Map<string, { from: string[]; to: string[] }> {
   const slotRole = new Map(team.nodes.map(n => [n.slotId, n.roleId]));
   const acc = new Map<string, { from: Set<string>; to: Set<string> }>();
@@ -143,28 +166,67 @@ export interface ValidationIssue {
   message: string;
 }
 
-/** DESIGN §7：保存前一致性校验。有 error 则禁用「打包成小组类型」。 */
+/** DESIGN §6/§7：保存前一致性校验。有 error 则禁用「打包成小组类型」。 */
 export function validateCanvas(team: CanvasTeam): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
   if (!team.name.trim()) issues.push({ level: 'error', message: '请填写小组类型名称。' });
+  if (!team.typeId.trim()) issues.push({ level: 'error', message: '请填写小组类型 ID。' });
+  else if (!TYPE_ID_RE.test(team.typeId)) issues.push({ level: 'error', message: '类型 ID 必须形如 tt_type_xxx（小写字母数字、下划线、连字符）。' });
   if (team.nodes.length === 0) issues.push({ level: 'error', message: '画布上至少要有一个角色席位。' });
 
+  const kindOf = new Map(team.nodes.map(n => [n.slotId, n.kind] as const));
+  const nameOf = (slot: string) => team.nodes.find(n => n.slotId === slot)?.name ?? slot;
+
+  // P1-1：每条连线的 chip 必须对源/目标 kind 合法（挡 reviewer→reviewer 标成提交→请审 等）
+  for (const e of team.edges) {
+    const fk = kindOf.get(e.from);
+    const tk = kindOf.get(e.to);
+    if (!fk || !tk) { issues.push({ level: 'error', message: '存在悬空连线（端点席位已删除）。' }); continue; }
+    if (!allowedChips(fk, tk).includes(e.chip)) {
+      issues.push({ level: 'error', message: `连线「${nameOf(e.from)}→${nameOf(e.to)}」的关系「${CHIP_META[e.chip].label}」与角色类型不匹配。` });
+    }
+  }
+
   const reviewers = team.nodes.filter(n => n.kind === 'reviewer');
-  const reviewOrder = deriveReviewOrder(team);
+  const submitEdges = team.edges.filter(e => e.chip === 'submit-review');
 
   if (reviewers.length > 0) {
-    const submitEdge = team.edges.find(e => e.chip === 'submit-review');
-    if (!submitEdge) {
+    // P1-1：唯一首审入口
+    if (submitEdges.length === 0) {
       issues.push({ level: 'error', message: '有审核席但缺「提交→请审」连线，首轮审核无法触发。' });
+    } else if (submitEdges.length > 1) {
+      issues.push({ level: 'error', message: `只能有一条「提交→请审」首审入口，当前有 ${submitEdges.length} 条，运行时会同时投递多条首审。` });
     }
+
+    // P1-1：审核链无分支（每个 reviewer 至多一条 pass-next 出边）
+    for (const r of reviewers) {
+      const passNext = team.edges.filter(e => e.chip === 'pass-next' && e.from === r.slotId);
+      if (passNext.length > 1) {
+        issues.push({ level: 'error', message: `审核席「${r.name || r.slotId}」有多条「通过→下一审」出边，审核链不能分叉。` });
+      }
+    }
+
+    const reviewOrder = deriveReviewOrder(team);
+    // P1-1：无环——deriveReviewOrder 遇环会提前停；若链长 < 经 pass-next 可达的 reviewer 数，说明有环/断裂
+    const chainSet = new Set(reviewOrder);
+
     // 末级审核席必须有 →report 出边到验收
-    const lastReviewer = reviewOrder[reviewOrder.length - 1];
     if (reviewOrder.length > 0) {
+      const lastReviewer = reviewOrder[reviewOrder.length - 1]!;
       const hasReport = team.edges.some(e => e.chip === 'pass-report' && e.from === lastReviewer);
       if (!hasReport) {
         issues.push({ level: 'error', message: '末级审核席缺「通过→汇报」出边，流程跑到末层会卡死。' });
       }
     }
+
+    // P1-1：所有 reviewer 要么在主链上，要么作为同 roleId 的 quorum cohort 支持链上某审
+    const chainRoles = new Set(reviewOrder.map(s => team.nodes.find(n => n.slotId === s)?.roleId));
+    for (const r of reviewers) {
+      if (chainSet.has(r.slotId)) continue;
+      if (chainRoles.has(r.roleId)) continue; // 同角色多席=quorum cohort
+      issues.push({ level: 'error', message: `审核席「${r.name || r.slotId}」不在审核链上（既非主链节点，也不是链上某审的同角色票席）。` });
+    }
+
     // 每个审核席应有 驳回→返工 回开发
     for (const r of reviewers) {
       const hasReject = team.edges.some(e => e.chip === 'reject-rework' && e.from === r.slotId);
@@ -276,6 +338,7 @@ export interface ExistingRoleOption {
   actions: string[];
   isObserver?: boolean;
   model?: string;
+  reasoningEffort?: string;
   seatEngine?: string;
 }
 
@@ -296,6 +359,7 @@ export async function loadExistingRoles(
       actions: Array.isArray(r.actions) ? (r.actions as string[]) : [],
       isObserver: Boolean(r.isObserver),
       model: (r.model as { model?: string } | undefined)?.model,
+      reasoningEffort: (r.model as { reasoningEffort?: string } | undefined)?.reasoningEffort,
       seatEngine: (r.seatHint as { engine?: string } | undefined)?.engine,
     })).filter(r => r.roleId);
   } catch {

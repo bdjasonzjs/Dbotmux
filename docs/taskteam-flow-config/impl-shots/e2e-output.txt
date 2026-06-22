@@ -1,0 +1,26 @@
+=== STEP 1: 画布 → assembleSaveOps → 真 admin upsert（真落库）===
+  /api/taskteam-role-upsert  →  {"ok":true,"roleId":"tt_role_e2e_dev"}
+  /api/taskteam-role-upsert  →  {"ok":true,"roleId":"tt_role_e2e_rev"}
+  /api/taskteam-role-upsert  →  {"ok":true,"roleId":"tt_role_e2e_rep"}
+  /api/taskteam-rule-upsert  →  {"ok":true,"ruleId":"tt_rule_submit-review_tt-slot-rev"}
+  /api/taskteam-rule-upsert  →  {"ok":true,"ruleId":"tt_rule_pass-report_tt-slot-rep"}
+  /api/taskteam-rule-upsert  →  {"ok":true,"ruleId":"tt_rule_reject-rework_tt-slot-dev"}
+  /api/taskteam-type-upsert  →  {"ok":true,"typeId":"tt_type_e2e_demo"}
+
+=== STEP 2: config-list 查到新类型（真读 store）===
+  roles=3 rules=3 teamTypes=1
+  新类型 tt_type_e2e_demo 是否在 config-list: true
+  type.roleSlots=["tt_slot_dev","tt_slot_rev","tt_slot_rep"]
+  type.rules=["tt_rule_submit-review_tt-slot-rev","tt_rule_pass-report_tt-slot-rep","tt_rule_reject-rework_tt-slot-dev"]
+  type.policy.reviewOrder=["tt_slot_rev"] reviewRounds=1
+  submit 规则: {"ruleId":"tt_rule_submit-review_tt-slot-rev","when":{"event":"submit","status":"running"},"whoSlot":"tt_slot_rev","do":"request-review"}
+
+=== STEP 3: 用新类型真建组 + 引擎驱动 ===
+  建组成功 teamId=tt_team_e2e 初始status=running（team-started 已驱动）
+  kickoff 动作: ["kickoff","kickoff"]
+
+=== STEP 4: 喂 submit 事件 → 引擎驱动 ===
+  submit 后 status=reviewing  engine.nextStatus=reviewing
+  产出动作: [{"actionType":"request-review","target":"tt_slot_rev"}]
+
+>>> 结论: submit→reviewing  ✅ 引擎按 upsert 的规则驱动成功

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  allowedChips,
   assembleSaveOps,
   deriveReviewOrder,
   deriveRoleIo,
@@ -70,6 +71,80 @@ describe('validateCanvas', () => {
   it('reviewQuorum 超审核席数报 error', () => {
     const t = team({ policy: { reviewQuorum: 3, maxRework: 1, escalateAfterStallMs: 0 } });
     expect(validateCanvas(t).some(i => i.level === 'error' && i.message.includes('通过票数'))).toBe(true);
+  });
+});
+
+describe('allowedChips（P1-1 chip 源/目标 kind 约束）', () => {
+  it('提交→请审仅 开发→审核', () => {
+    expect(allowedChips('developer', 'reviewer')).toContain('submit-review');
+    expect(allowedChips('reviewer', 'reviewer')).not.toContain('submit-review');
+  });
+  it('下一审仅 审核→审核', () => {
+    expect(allowedChips('reviewer', 'reviewer')).toContain('pass-next');
+  });
+  it('开发→开发无合法关系', () => {
+    expect(allowedChips('developer', 'developer')).toEqual([]);
+  });
+});
+
+describe('validateCanvas（P1-1 非法拓扑硬校验）', () => {
+  it('reviewer→reviewer 标成提交→请审报 error', () => {
+    const t = team({
+      nodes: [
+        { slotId: 'tt_slot_dev', roleId: 'tt_role_dev', kind: 'developer', name: '开发', responsibility: '', visibility: 'full', actions: ['submit'], activationTrigger: 'team-started', x: 0, y: 0 },
+        { slotId: 'tt_slot_r1', roleId: 'tt_role_r1', kind: 'reviewer', name: '审1', responsibility: '', visibility: 'review-only', actions: ['review-pass'], activationTrigger: 'submit', x: 0, y: 0 },
+        { slotId: 'tt_slot_r2', roleId: 'tt_role_r2', kind: 'reviewer', name: '审2', responsibility: '', visibility: 'review-only', actions: ['review-pass'], activationTrigger: 'submit', x: 0, y: 0 },
+      ],
+      edges: [{ id: 'e1', from: 'tt_slot_r1', to: 'tt_slot_r2', chip: 'submit-review' }],
+    });
+    expect(validateCanvas(t).some(i => i.level === 'error' && i.message.includes('不匹配'))).toBe(true);
+  });
+  it('两条提交→请审报 error（首审不唯一）', () => {
+    const t = team({
+      nodes: [
+        { slotId: 'tt_slot_dev', roleId: 'tt_role_dev', kind: 'developer', name: '开发', responsibility: '', visibility: 'full', actions: ['submit'], activationTrigger: 'team-started', x: 0, y: 0 },
+        { slotId: 'tt_slot_r1', roleId: 'tt_role_r1', kind: 'reviewer', name: '审1', responsibility: '', visibility: 'review-only', actions: ['review-pass'], activationTrigger: 'submit', x: 0, y: 0 },
+        { slotId: 'tt_slot_r2', roleId: 'tt_role_r2', kind: 'reviewer', name: '审2', responsibility: '', visibility: 'review-only', actions: ['review-pass'], activationTrigger: 'submit', x: 0, y: 0 },
+        { slotId: 'tt_slot_rep', roleId: 'tt_role_rep', kind: 'reporter', name: '上报', responsibility: '', visibility: 'progress-only', actions: ['report'], activationTrigger: 'team-started', x: 0, y: 0 },
+      ],
+      edges: [
+        { id: 'e1', from: 'tt_slot_dev', to: 'tt_slot_r1', chip: 'submit-review' },
+        { id: 'e2', from: 'tt_slot_dev', to: 'tt_slot_r2', chip: 'submit-review' },
+        { id: 'e3', from: 'tt_slot_r1', to: 'tt_slot_rep', chip: 'pass-report' },
+      ],
+    });
+    expect(validateCanvas(t).some(i => i.level === 'error' && i.message.includes('首审入口'))).toBe(true);
+  });
+  it('审核链分叉报 error', () => {
+    const t = team({
+      nodes: [
+        { slotId: 'tt_slot_dev', roleId: 'tt_role_dev', kind: 'developer', name: '开发', responsibility: '', visibility: 'full', actions: ['submit'], activationTrigger: 'team-started', x: 0, y: 0 },
+        { slotId: 'tt_slot_r1', roleId: 'tt_role_r1', kind: 'reviewer', name: '审1', responsibility: '', visibility: 'review-only', actions: ['review-pass'], activationTrigger: 'submit', x: 0, y: 0 },
+        { slotId: 'tt_slot_r2', roleId: 'tt_role_r2', kind: 'reviewer', name: '审2', responsibility: '', visibility: 'review-only', actions: ['review-pass'], activationTrigger: 'submit', x: 0, y: 0 },
+        { slotId: 'tt_slot_r3', roleId: 'tt_role_r3', kind: 'reviewer', name: '审3', responsibility: '', visibility: 'review-only', actions: ['review-pass'], activationTrigger: 'submit', x: 0, y: 0 },
+      ],
+      edges: [
+        { id: 'e1', from: 'tt_slot_dev', to: 'tt_slot_r1', chip: 'submit-review' },
+        { id: 'e2', from: 'tt_slot_r1', to: 'tt_slot_r2', chip: 'pass-next' },
+        { id: 'e3', from: 'tt_slot_r1', to: 'tt_slot_r3', chip: 'pass-next' },
+      ],
+    });
+    expect(validateCanvas(t).some(i => i.level === 'error' && i.message.includes('分叉'))).toBe(true);
+  });
+  it('reviewer 不在审核链上报 error', () => {
+    const t = team({
+      nodes: [
+        ...team().nodes,
+        { slotId: 'tt_slot_orphan', roleId: 'tt_role_orphan', kind: 'reviewer', name: '游离审', responsibility: '', visibility: 'review-only', actions: ['review-pass'], activationTrigger: 'submit', x: 0, y: 0 },
+      ],
+    });
+    expect(validateCanvas(t).some(i => i.level === 'error' && i.message.includes('不在审核链'))).toBe(true);
+  });
+  it('typeId 非法前缀报 error', () => {
+    expect(validateCanvas(team({ typeId: 'code_review' })).some(i => i.level === 'error' && i.message.includes('tt_type'))).toBe(true);
+  });
+  it('合法样例无 error', () => {
+    expect(validateCanvas(team()).filter(i => i.level === 'error')).toEqual([]);
   });
 });
 
