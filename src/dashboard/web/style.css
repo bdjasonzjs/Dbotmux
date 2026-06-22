@@ -1772,3 +1772,54 @@ input.row-select,
 .topo-insp-stale-fold { margin: 2px 0 2px calc(var(--insp-depth, 0) * 22px); }
 .topo-insp-stale-fold > summary { cursor: pointer; font-size: 12px; color: #94a3b8; padding: 4px 0; }
 .topo-insp-stale-fold .topo-insp-row { margin-left: 0; }
+
+/* ===== 流程化任务小组配置器画布（PRD §8.2） ===== */
+.ttc-page { display: flex; flex-direction: column; height: calc(100vh - 60px); padding: 0; }
+.ttc-toolbar { display: flex; align-items: center; gap: 12px; height: 52px; padding: 0 18px; background: #fff; border-bottom: 1px solid #e5e6eb; }
+.ttc-crumb { color: #8a8f99; font-size: 13px; }
+.ttc-typeid { font-size: 12px; }
+.ttc-title { font-size: 15px; font-weight: 600; padding: 6px 10px; border: 1px solid transparent; border-radius: 6px; width: 220px; }
+.ttc-title:hover, .ttc-title:focus { border-color: #d8dbe2; background: #f7f8fa; outline: none; }
+.ttc-spacer { flex: 1; }
+.ttc-status { font-size: 12.5px; }
+.ttc-status .ttc-ok { color: #00a870; } .ttc-status .ttc-warn { color: #d4640a; } .ttc-status .ttc-err { color: #f53f3f; }
+.ttc-btn { padding: 7px 14px; border-radius: 6px; font-size: 13px; border: 1px solid #d0d3d9; background: #fff; cursor: pointer; }
+.ttc-btn.primary { background: #2b5fff; color: #fff; border-color: #2b5fff; font-weight: 600; }
+.ttc-btn.primary:disabled { background: #b9c6e8; border-color: #b9c6e8; cursor: not-allowed; }
+.ttc-btn.danger { color: #f53f3f; border-color: #f7c4c4; margin-top: 14px; width: 100%; }
+.ttc-main { flex: 1; display: flex; min-height: 0; }
+.ttc-palette { width: 190px; background: #fff; border-right: 1px solid #e5e6eb; padding: 14px 12px; overflow-y: auto; }
+.ttc-palette h3 { font-size: 12px; color: #8a8f99; letter-spacing: .4px; margin: 0 0 10px; }
+.ttc-pal-sub { font-size: 11px; color: #a5a9b3; margin: 12px 0 6px; }
+.ttc-role-card { display: flex; align-items: center; gap: 8px; padding: 9px 10px; border: 1px dashed #cfd3dc; border-radius: 8px; margin-bottom: 8px; background: #fafbfc; cursor: grab; font-size: 13px; }
+.ttc-role-card.ttc-custom { border-style: solid; }
+.ttc-dot { width: 9px; height: 9px; border-radius: 50%; }
+.ttc-grip { margin-left: auto; color: #c2c6cf; }
+.ttc-pal-empty { font-size: 11px; color: #b8bcc4; padding: 6px 0; }
+.ttc-hint { margin-top: 14px; font-size: 11px; color: #a5a9b3; line-height: 1.6; }
+.ttc-canvas-wrap { flex: 1; position: relative; overflow: hidden; background: radial-gradient(circle, #e1e3e8 1px, transparent 1px); background-size: 22px 22px; background-color: #fbfbfc; }
+.ttc-svg { width: 100%; height: 100%; }
+.ttc-node rect:first-of-type { fill: #fff; stroke-width: 1.5; filter: drop-shadow(0 2px 6px rgba(0,0,0,.06)); }
+.ttc-node.active rect:first-of-type { stroke-width: 2.5; }
+.ttc-node-title { font: 600 13.5px -apple-system, "PingFang SC", sans-serif; fill: #1f2329; }
+.ttc-node-sub { font: 11px -apple-system, "PingFang SC", sans-serif; fill: #8a8f99; }
+.ttc-obs { fill: #d4640a; font-weight: 400; }
+.ttc-port { fill: #fff; stroke: #2b5fff; stroke-width: 2; cursor: crosshair; }
+.ttc-port.in { stroke: #9aa0ad; }
+.ttc-edge path { fill: none; stroke-width: 2; }
+.ttc-edge.active path { stroke-width: 3; }
+.ttc-edge text { font: 11px -apple-system, "PingFang SC", sans-serif; }
+.ttc-edge rect { cursor: pointer; }
+.ttc-temp { fill: none; stroke: #2b5fff; stroke-width: 2; stroke-dasharray: 5 4; }
+.ttc-inspector { width: 286px; background: #fff; border-left: 1px solid #e5e6eb; padding: 16px 16px; overflow-y: auto; }
+.ttc-itag { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 4px; background: #eaf1ff; color: #2b5fff; }
+.ttc-itag.policy { background: #fff3e8; color: #d4640a; }
+.ttc-itag.edge { background: #eef9f3; color: #00a870; }
+.ttc-inspector h2 { font-size: 15px; margin: 8px 0 14px; }
+.ttc-field { display: block; margin-bottom: 12px; }
+.ttc-field > span { display: block; font-size: 12px; color: #8a8f99; margin-bottom: 5px; }
+.ttc-field input, .ttc-field select { width: 100%; padding: 7px 9px; border: 1px solid #d8dbe2; border-radius: 6px; font-size: 13px; background: #fff; box-sizing: border-box; }
+.ttc-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.ttc-chip { font-size: 11.5px; padding: 3px 9px; border-radius: 13px; border: 1px solid #d8dbe2; color: #4e5969; }
+.ttc-chip.on { background: #2b5fff; color: #fff; border-color: #2b5fff; }
+.ttc-maps { font-size: 11px; color: #8a8f99; line-height: 1.7; background: #f7f8fa; border-radius: 6px; padding: 9px 10px; margin-top: 6px; }
