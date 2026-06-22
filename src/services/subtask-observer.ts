@@ -666,7 +666,7 @@ export function planCommit(
     // observation 仍按 signal='need_help' 写入，由定期 digest 携带「⚠️ 受阻」。manager 唯一实时路径=report_urgent。
     if (plan.report?.commandType === 'report_help') {
       const { report: _drop, ...rest } = plan;
-      if (status === 'observing' && signal === 'need_help' && rest.statusTo === 'paused') {
+      if (signal === 'need_help' && rest.statusTo === 'paused') {
         rest.statusTo = 'reported_help';
       }
       return rest;

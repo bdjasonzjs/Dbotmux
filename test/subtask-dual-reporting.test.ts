@@ -130,6 +130,12 @@ describe('planCommit manager 门控', () => {
     expect(p.report).toBeUndefined();
     expect(p.statusTo).toBe('reported_help');
   });
+  it('manager reported_done+need_help → 剥 report_help、转 reported_help (复检路径也不可 paused)', () => {
+    const p = planCommit('reported_done', 'need_help', 'm1', () => ['cmd_olddone'], undefined, undefined, () => true, 'manager');
+    expect(p.report).toBeUndefined();
+    expect(p.statusTo).toBe('reported_help');
+    expect(p.supersedeCommandIds).toEqual(['cmd_olddone']);
+  });
   it('executor observing+need_help → 仍推 report_help 并进入 paused (旧行为不变，回归)', () => {
     const p = planCommit('observing', 'need_help', 'm1', noop, undefined, undefined, () => true);   // executor
     expect(p.report?.commandType).toBe('report_help');
