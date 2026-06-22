@@ -130,10 +130,10 @@ describe('planCommit manager 门控', () => {
     expect(p.report).toBeUndefined();
     expect(p.statusTo).toBe('reported_help');
   });
-  it('executor observing+need_help → 仍推 report_help (旧行为不变，回归)', () => {
+  it('executor observing+need_help → 仍推 report_help 并进入 paused (旧行为不变，回归)', () => {
     const p = planCommit('observing', 'need_help', 'm1', noop, undefined, undefined, () => true);   // executor
     expect(p.report?.commandType).toBe('report_help');
-    expect(p.statusTo).toBe('reported_help');
+    expect(p.statusTo).toBe('paused');
   });
   it('manager reported_help+need_help (补发分支) → 也剥 report_help', () => {
     // reported_help 下 helpDelivery=none → planCommitBase 会产 helpReport 补发；manager 须剥掉
