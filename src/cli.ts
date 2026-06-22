@@ -43,8 +43,7 @@ import { logger } from './utils/logger.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional } from './cli/arg-utils.js';
 import {
-  formatBotInfoEntriesForCli,
-  formatChatBotsForCli,
+  formatAuthoritativeBotsForCli,
 } from './cli/bots-list-output.js';
 import { isLocale, setDefaultLocale, SUPPORTED_LOCALES, type Locale } from './i18n/index.js';
 import { readGlobalConfig, setGlobalLocale, globalConfigPath } from './global-config.js';
@@ -3208,26 +3207,25 @@ async function cmdBots(sub: string, rest: string[]): Promise<void> {
 
   const appId = s.larkAppId!;
   const dataDir = resolveDataDir();
-  const botInfoPath = join(dataDir, 'bots-info.json');
-
-  type BotInfoEntry = { larkAppId: string; botOpenId: string | null; botName: string | null; cliId: string };
-  let botEntries: BotInfoEntry[] = [];
-  try { if (existsSync(botInfoPath)) botEntries = JSON.parse(readFileSync(botInfoPath, 'utf-8')); } catch { /* */ }
-
-  try {
-    const { listChatBotMembers } = await import('./im/lark/client.js');
-    const chatBots = await listChatBotMembers(appId, s.chatId);
-    // source: 'configured' = registered in local bots.json (managed by some
-    // botmux daemon on this host). 'introduce' = discovered via /introduce
-    // collaboration command (external bot, possibly other-tenant). isSelf is
-    // retained (not filtered) so the model can still identify itself when needed.
-    const result = formatChatBotsForCli(chatBots, appId);
-    console.log(JSON.stringify({ sessionId: sid, chatId: s.chatId, bots: result, total: result.length }, null, 2));
-  } catch (err: any) {
-    // Fallback to bots-info.json
-    const result = formatBotInfoEntriesForCli(botEntries, appId);
-    console.log(JSON.stringify({ sessionId: sid, bots: result, total: result.length, note: `chat query failed: ${err.message}` }, null, 2));
-  }
+  const { listAuthoritativeBots } = await import('./services/bot-inventory.js');
+  const bots = listAuthoritativeBots({
+    botsJsonPath: BOTS_JSON_FILE,
+    configDir: CONFIG_DIR,
+    dataDir,
+    pm2Name: PM2_NAME,
+    pkgRoot: PKG_ROOT,
+    pm2Home: PM2_HOME,
+  });
+  const result = formatAuthoritativeBotsForCli(bots, appId);
+  const notes = [...new Set(bots.map(b => b.statusNote).filter((n): n is string => !!n))];
+  console.log(JSON.stringify({
+    sessionId: sid,
+    chatId: s.chatId,
+    bots: result,
+    total: result.length,
+    source: 'configured+clones',
+    ...(notes.length ? { notes } : {}),
+  }, null, 2));
 }
 
 // ─── botmux lang ─────────────────────────────────────────────────────────────

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  formatAuthoritativeBotsForCli,
   formatBotInfoEntriesForCli,
   formatChatBotsForCli,
 } from '../src/cli/bots-list-output.js';
@@ -97,6 +98,70 @@ describe('botmux bots list CLI output mapping', () => {
         source: 'configured',
         larkAppId: 'cli_peer',
         workflowBot: 'cli_peer',
+      },
+    ]);
+  });
+
+  it('includes cloneName, engine, cliId and pm2 status for authoritative inventory rows', () => {
+    const rows = formatAuthoritativeBotsForCli([
+      {
+        larkAppId: 'cli_clone',
+        name: '克劳德初号机',
+        cloneName: '克劳德初号机',
+        cliId: 'claude-code',
+        engine: 'claude',
+        source: 'clone-dir',
+        isClone: true,
+        index: null,
+        botOpenId: 'ou_clone',
+        pm2Name: null,
+        pm2Status: 'unknown',
+        statusNote: 'clone_not_registered_in_bots_json',
+      },
+      {
+        larkAppId: 'cli_codex',
+        name: '蔻黛克斯',
+        cloneName: '蔻黛克斯',
+        cliId: 'codex',
+        engine: 'codex',
+        source: 'configured',
+        isClone: false,
+        index: 1,
+        botOpenId: 'ou_codex',
+        pm2Name: 'botmux-1',
+        pm2Status: 'online',
+      },
+    ], 'cli_codex');
+
+    expect(rows).toEqual([
+      {
+        name: '克劳德初号机',
+        cloneName: '克劳德初号机',
+        openId: 'ou_clone',
+        isSelf: false,
+        source: 'clone-dir',
+        larkAppId: 'cli_clone',
+        workflowBot: 'cli_clone',
+        cliId: 'claude-code',
+        engine: 'claude',
+        isClone: true,
+        pm2Name: null,
+        pm2Status: 'unknown',
+        statusNote: 'clone_not_registered_in_bots_json',
+      },
+      {
+        name: '蔻黛克斯',
+        cloneName: '蔻黛克斯',
+        openId: 'ou_codex',
+        isSelf: true,
+        source: 'configured',
+        larkAppId: 'cli_codex',
+        workflowBot: 'cli_codex',
+        cliId: 'codex',
+        engine: 'codex',
+        isClone: false,
+        pm2Name: 'botmux-1',
+        pm2Status: 'online',
       },
     ]);
   });
