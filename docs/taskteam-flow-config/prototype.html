@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>任务小组配置器 · 流程化原型</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; background: #f5f6f8; color: #1f2329; }
+  .app { display: flex; flex-direction: column; height: 760px; width: 1280px; }
+  /* toolbar */
+  .toolbar { height: 56px; background: #fff; border-bottom: 1px solid #e5e6eb; display: flex; align-items: center; padding: 0 20px; gap: 16px; }
+  .toolbar .title-input { font-size: 15px; font-weight: 600; border: 1px solid transparent; padding: 6px 10px; border-radius: 6px; width: 240px; }
+  .toolbar .title-input:hover { border-color: #e5e6eb; background: #f7f8fa; }
+  .toolbar .crumb { color: #8a8f99; font-size: 13px; }
+  .toolbar .spacer { flex: 1; }
+  .btn { padding: 7px 14px; border-radius: 6px; font-size: 13px; border: 1px solid #d0d3d9; background: #fff; cursor: pointer; }
+  .btn.primary { background: #2b5fff; color: #fff; border-color: #2b5fff; font-weight: 600; }
+  .btn.ghost { border-color: transparent; color: #4e5969; }
+  /* body */
+  .main { flex: 1; display: flex; min-height: 0; }
+  /* palette */
+  .palette { width: 196px; background: #fff; border-right: 1px solid #e5e6eb; padding: 16px 14px; }
+  .palette h3 { font-size: 12px; color: #8a8f99; letter-spacing: .5px; margin-bottom: 12px; font-weight: 600; }
+  .role-card { display: flex; align-items: center; gap: 9px; padding: 10px 11px; border: 1px dashed #cfd3dc; border-radius: 8px; margin-bottom: 10px; background: #fafbfc; cursor: grab; font-size: 13px; }
+  .role-card .dot { width: 10px; height: 10px; border-radius: 50%; }
+  .role-card .grip { margin-left: auto; color: #c2c6cf; font-size: 14px; }
+  .palette .hint { margin-top: 14px; font-size: 11px; color: #a5a9b3; line-height: 1.6; }
+  /* canvas */
+  .canvas-wrap { flex: 1; position: relative; overflow: hidden; background:
+      radial-gradient(circle, #e1e3e8 1px, transparent 1px); background-size: 22px 22px; background-color: #fbfbfc; }
+  .node { position: absolute; width: 168px; border-radius: 10px; background: #fff; border: 1.5px solid #d8dbe2;
+          box-shadow: 0 2px 8px rgba(0,0,0,.06); padding: 11px 12px; }
+  .node.selected { border-color: #2b5fff; box-shadow: 0 0 0 3px rgba(43,95,255,.15), 0 2px 8px rgba(0,0,0,.08); }
+  .node .nhead { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; }
+  .node .nhead .dot { width: 9px; height: 9px; border-radius: 50%; }
+  .node .nhead .nname { font-size: 13.5px; font-weight: 600; }
+  .node .nhead .seat { margin-left: auto; font-size: 10px; color: #8a8f99; }
+  .node .badges { display: flex; gap: 6px; flex-wrap: wrap; }
+  .badge { font-size: 10.5px; padding: 2px 7px; border-radius: 4px; background: #f0f2f5; color: #4e5969; }
+  .badge.model { background: #eaf1ff; color: #2b5fff; }
+  .badge.obs { background: #fff3e8; color: #d4640a; }
+  .port { position: absolute; width: 12px; height: 12px; border-radius: 50%; background: #fff; border: 2px solid #2b5fff; top: 50%; margin-top: -6px; }
+  .port.out { right: -7px; } .port.in { left: -7px; border-color: #9aa0ad; }
+  svg.edges { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  .edge-label { font-size: 11px; fill: #4e5969; }
+  .edge-chip { }
+  /* inspector */
+  .inspector { width: 290px; background: #fff; border-left: 1px solid #e5e6eb; padding: 18px 18px; overflow-y: auto; }
+  .inspector .itag { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 4px; background: #eaf1ff; color: #2b5fff; margin-bottom: 4px; }
+  .inspector h2 { font-size: 15px; margin-bottom: 16px; }
+  .field { margin-bottom: 13px; }
+  .field label { display: block; font-size: 12px; color: #8a8f99; margin-bottom: 5px; }
+  .field input, .field select { width: 100%; padding: 7px 9px; border: 1px solid #d8dbe2; border-radius: 6px; font-size: 13px; background:#fff; }
+  .field .chips { display: flex; gap: 6px; flex-wrap: wrap; }
+  .chip { font-size: 11.5px; padding: 3px 9px; border-radius: 13px; border: 1px solid #d8dbe2; color:#4e5969; }
+  .chip.on { background: #2b5fff; color: #fff; border-color: #2b5fff; }
+  .sep { height: 1px; background: #eef0f3; margin: 16px 0; }
+  .inspector .maps { font-size: 11px; color: #a5a9b3; line-height: 1.7; background:#f7f8fa; border-radius:6px; padding:9px 10px; }
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- toolbar -->
+  <div class="toolbar">
+    <span class="crumb">配置器 ›</span>
+    <input class="title-input" value="代码评审小组" />
+    <span class="crumb">类型 tt_type_code_review</span>
+    <div class="spacer"></div>
+    <button class="btn ghost">⤺ 撤销</button>
+    <button class="btn">预览编排</button>
+    <button class="btn primary">打包成小组类型 →</button>
+  </div>
+  <div class="main">
+    <!-- palette -->
+    <div class="palette">
+      <h3>角色（拖进画布）</h3>
+      <div class="role-card"><span class="dot" style="background:#2b5fff"></span>开发<span class="grip">⠿</span></div>
+      <div class="role-card"><span class="dot" style="background:#d4640a"></span>审核<span class="grip">⠿</span></div>
+      <div class="role-card"><span class="dot" style="background:#00a870"></span>上报<span class="grip">⠿</span></div>
+      <div class="role-card"><span class="dot" style="background:#8a8f99"></span>观察<span class="grip">⠿</span></div>
+      <div class="role-card"><span class="dot" style="background:#7d4cff"></span>自定义<span class="grip">⠿</span></div>
+      <div class="hint">拖角色进画布生成<b>席位</b>；<br>从节点右侧蓝点拖到另一节点 = <b>连「谁审谁」</b>。</div>
+    </div>
+    <!-- canvas -->
+    <div class="canvas-wrap">
+      <svg class="edges">
+        <defs>
+          <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+            <path d="M0,0 L8,3 L0,6 Z" fill="#2b5fff"/>
+          </marker>
+          <marker id="arrow2" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+            <path d="M0,0 L8,3 L0,6 Z" fill="#00a870"/>
+          </marker>
+        </defs>
+        <!-- 开发(out ~268,150) -> 审核(in ~430,150) : submit/request-review -->
+        <path d="M 268 150 C 330 150, 368 150, 430 150" stroke="#2b5fff" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+        <rect x="312" y="120" width="78" height="22" rx="11" fill="#eaf1ff" stroke="#cdddff"/>
+        <text class="edge-label" x="351" y="135" text-anchor="middle" fill="#2b5fff">提交→请审</text>
+        <!-- 审核(out ~598,150) -> 上报(in ~628,300): review-pass/report -->
+        <path d="M 598 150 C 660 150, 600 300, 628 300" stroke="#00a870" stroke-width="2" fill="none" marker-end="url(#arrow2)"/>
+        <rect x="600" y="232" width="76" height="22" rx="11" fill="#e8f8f1" stroke="#bfe9d6"/>
+        <text class="edge-label" x="638" y="247" text-anchor="middle" fill="#00a870">通过→汇报</text>
+        <!-- 审核 reject 回 开发 -->
+        <path d="M 514 184 C 480 250, 280 250, 200 184" stroke="#d4640a" stroke-width="1.6" fill="none" stroke-dasharray="5 4" marker-end="url(#arrow)" style="marker-end:none"/>
+        <text class="edge-label" x="357" y="262" text-anchor="middle" fill="#d4640a">驳回→返工</text>
+      </svg>
+      <!-- 开发 -->
+      <div class="node" style="left:100px; top:116px;">
+        <div class="nhead"><span class="dot" style="background:#2b5fff"></span><span class="nname">开发</span><span class="seat">席位 dev</span></div>
+        <div class="badges"><span class="badge model">claude-opus-4-8</span><span class="badge">submit</span></div>
+        <div class="port in"></div><div class="port out"></div>
+      </div>
+      <!-- 审核 (selected) -->
+      <div class="node selected" style="left:430px; top:116px;">
+        <div class="nhead"><span class="dot" style="background:#d4640a"></span><span class="nname">审核</span><span class="seat">席位 review</span></div>
+        <div class="badges"><span class="badge model">claude-opus-4-8</span><span class="badge">review-pass</span><span class="badge">review-reject</span></div>
+        <div class="port in"></div><div class="port out"></div>
+      </div>
+      <!-- 上报 -->
+      <div class="node" style="left:628px; top:266px;">
+        <div class="nhead"><span class="dot" style="background:#00a870"></span><span class="nname">上报</span><span class="seat">席位 report</span></div>
+        <div class="badges"><span class="badge">report</span></div>
+        <div class="port in"></div><div class="port out"></div>
+      </div>
+      <!-- 观察 -->
+      <div class="node" style="left:628px; top:116px;">
+        <div class="nhead"><span class="dot" style="background:#8a8f99"></span><span class="nname">观察</span><span class="seat">席位 obs</span></div>
+        <div class="badges"><span class="badge obs">isObserver</span><span class="badge">progress-only</span></div>
+        <div class="port in"></div><div class="port out"></div>
+      </div>
+    </div>
+    <!-- inspector -->
+    <div class="inspector">
+      <span class="itag">节点 · 角色席位</span>
+      <h2>审核</h2>
+      <div class="field"><label>角色名称</label><input value="审核"/></div>
+      <div class="field"><label>职责</label><input value="审架构 + 审代码，往严了挑"/></div>
+      <div class="field"><label>模型（给角色挑模型）</label>
+        <select><option>claude-opus-4-8 · high</option><option>claude-sonnet-4-6</option></select></div>
+      <div class="field"><label>引擎席位</label>
+        <select><option>codex</option><option>claude</option></select></div>
+      <div class="field"><label>可见性</label>
+        <select><option>review-only</option><option>full</option><option>progress-only</option></select></div>
+      <div class="field"><label>动作</label>
+        <div class="chips"><span class="chip on">review-pass</span><span class="chip on">review-reject</span><span class="chip">rework</span><span class="chip">escalate</span></div></div>
+      <div class="sep"></div>
+      <div class="maps">映射 → <b>TaskTeamRole</b>（model / seatHint / actions / visibility）<br>选中连线 → <b>CollabRule</b>（when→whoSlot→do）<br>点画布空白 → <b>Type.policy</b>（审几轮 / quorum / 返工 / 升级）</div>
+    </div>
+  </div>
+</div>
+</body>
+</html>
