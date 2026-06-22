@@ -57,17 +57,23 @@
 | 通过→下一审（多层审递进） | `review-pass` | `reviewing` | 当前审核席 | 下一审核席 | `request-review` | →reviewing(清票/round++) | config-store.ts:214; engine.ts:200 |
 | 通过→汇报（末层审通过） | `review-pass` | `reviewing` | 末层审核席 | 开发/上报席 | `report` | →awaiting-acceptance | config-store.ts:216; engine.ts:188 |
 | 驳回→返工 | `review-reject` | `reviewing` | （空） | 开发席 | `nudge` | →running(reworkCount+1) | config-store.ts:218; engine.ts:157 |
-| 超返工上限→升级 | `review-reject` | `reviewing` | （空） | 观察/升级席 | `escalate` | →blocked(超 maxRework) | engine.ts:152-154 |
 | 卡死→升级 | `stall` | `running` | （空） | 观察席 | `escalate` | 无跃迁 | config-store.ts:220; engine.ts:198 |
 
 实现要点：UI 上画一条连线时，按「源/目标角色 kind + 选中的 chip」查这张表确定 6 个字段，**不让实现者按中文 label 猜 `do`**。同一条「通过」连线根据目标是否末层审，自动选 `request-review`(下一审) 还是 `report`(验收)。
+
+> ⚠️ **「超返工上限→升级」不是可连线的 CollabRule（review 复审 P1）**：当前 `TaskTeamTriggerCondition` 没有 `reworkCount`/`maxRework` 条件，普通 `review-reject→escalate` 规则无法表达「仅超上限时触发」。引擎对 `review-reject` 的处理是：`nextRework ≤ maxRework` 直接 `emit(matched)`（nudge 返工），**只有 `nextRework > maxRework` 才内置 filter `do==='escalate'` 或 fallback 到 observer**（`engine.ts:150-154`）。因此若把它存成普通规则，**第一次驳回就会和返工规则一起 matched 命中、提前升级**。结论：超限升级是 `policy.maxRework` 的**引擎内置兜底语义**，只在策略面板里展示说明，**不作为画布连线、不写进 `type.rules`**；保存 rules 时 `review-reject` 只产出 `→nudge` 返工规则。
 
 ## 7. reviewOrder / reviewRounds 一致性（review P1-2，含修正）
 
 > 核对发现：引擎推进多轮 review 的真实依据是**命中的 `review-pass` 规则链**（`fromSlotId→whoSlot`，按 roleId 路由）+ `reviewQuorum`（`engine.ts:160-195`）。`reviewRounds` / `reviewOrder` **未在引擎代码中被消费**——它们是声明/可读性字段。所以 review P1-2 的方向对（要一致性），但**画布连线（规则链）才是 review 顺序的唯一运行真相**，reviewOrder 应从画布派生而非反向驱动。
 
+**reviewOrder 派生算法（review 复审：必须含首轮 reviewer）**：首轮 reviewer 来自 `submit→request-review` 边的 target，**不能只从 `review-pass→request-review` 边收集、否则漏首轮**。精确定义：
+- `reviewOrder[0]` = `submit→request-review` 边的 target 审核席；
+- 之后沿 `review-pass→request-review` 边逐个追加下一审核席（按链路顺序）；
+- 末级审核席必须存在一条 `review-pass→report` 出边（到验收），否则流程跑到末层卡死。
+
 保存前校验（不一致则禁用「打包成小组类型」并报错）：
-1. `reviewOrder` = 画布上 `review-pass→request-review` 连线串出的审核席顺序（自动派生，只读展示，不让用户手填）。
+1. `reviewOrder` 按上述算法从画布派生（自动、只读展示，不让用户手填）。
 2. `reviewRounds` = `reviewOrder` 的层数（派生值），与画布一致。
 3. 每个审核席必须有一条出边：要么 `→request-review`(下一审) 要么 `→report`(验收)；**末层审核席必须能到 `report`/验收**，否则流程跑到末层卡死。
 4. 每个审核席应有 `review-reject→nudge` 回开发席的返工边（缺失则审核驳回无去向，告警）。
