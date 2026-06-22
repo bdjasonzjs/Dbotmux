@@ -34,7 +34,7 @@ const VERB_ROUTE: Record<string, string> = {
 };
 const NUM_FLAGS = new Set(['expectedVersion', 'limit']);
 const LIST_FLAGS = new Set(['bots', 'sourceMessageIds', 'relatedRefs', 'ids']);
-const BOOL_FLAGS = new Set(['force', 'spawnable', 'cascade', 'manager', 'noObserver', 'unreadOnly', 'withBody', 'commit']);
+const BOOL_FLAGS = new Set(['force', 'spawnable', 'cascade', 'manager', 'noObserver', 'unreadOnly', 'withBody', 'commit', 'dryRun']);
 // 注：bot 简写 c/k/t → claude|codex|tilly 的归一化已下沉到 orchestrator（N-bot ref 解析，
 // 支持 ref:role 后缀 + 分身 name/appId）。CLI 侧不再做映射，--bots 原样透传。
 
@@ -135,10 +135,11 @@ function parseBody(argv: string[]): { body: Record<string, unknown>; sessionSour
 
 const HELP = `botmux subtask-{start|report|query|finish|supplement} — 子任务编排 v2
 
-  subtask-start      --goal "<任务>" [--acceptance "<验收>"] [--bots <ref>[:role],...]
+  subtask-start      --goal "<任务>" [--acceptance "<验收>"] [--bots <ref>[:role],...] [--dry-run]
                      [--task-type prd|bug|misc] [--name "<群名>"] [--related-refs a,b]
     --bots  逗号分隔；每项 <ref>[:role]。ref = c|k|t / claude|codex|tilly / 已注册 bot 的 name 或 appId（含分身）。
             role ∈ main|collab|observer（省略走默认：内建 bot 保留原角色，其它默认 collab）。默认全拉三 bot。
+    --dry-run  只打印建群前预览：席位→bot→引擎→角色、worktree/task-type/name；不建群、不落库、不发 kickoff。
                      [--spawnable]  (授权新子群可再派孙群；默认关，create 一锤定音)
                      [--no-observer] (显式 opt-out：executor 群即使含 main 也不自动补 t:observer)
                      [--manager]    (部门经理子群：只真紧急才实时推、其余定期 digest；默认 executor 实时直报)
@@ -170,6 +171,35 @@ const HELP = `botmux subtask-{start|report|query|finish|supplement} — 子任�
 
 通用: [--session-id <sid>]（缺省取 env BOTMUX_SESSION_ID）。
 鉴权/幂等/版本在 daemon service 侧；CLI 仅透传。`;
+
+function roleAction(role: string): string {
+  if (role === 'main') return '执行';
+  if (role === 'collab') return 'review';
+  if (role === 'observer') return '观测';
+  return role;
+}
+
+function renderStartDryRun(json: any): string | null {
+  const preview = json?.preview;
+  if (json?.dryRun !== true || !preview || !Array.isArray(preview.seats)) return null;
+  const lines = [
+    'botmux subtask-start --dry-run 预览',
+    `name = ${preview.name ?? '(未命名)'}`,
+    `taskType = ${preview.taskType ?? 'misc'}`,
+    `worktree = ${preview.worktree ?? '(未记录)'}`,
+    '',
+    '席位:',
+  ];
+  for (const seat of preview.seats) {
+    const role = String(seat.role ?? seat.seat ?? '');
+    const botName = seat.cloneName || seat.botName || seat.ref || '(unknown)';
+    const engine = seat.engine || 'unknown';
+    const app = seat.larkAppId ? ` [${seat.larkAppId}]` : '';
+    lines.push(`- ${role} = ${botName}(${engine}) ${roleAction(role)}${app}`);
+  }
+  lines.push('', 'dry-run: 不建群、不写 SubTask/ChatContext/Topology、不发 kickoff。');
+  return lines.join('\n');
+}
 
 export async function cmdSubtaskOrch(verb: string, argv: string[]): Promise<void> {
   const route = VERB_ROUTE[verb];
@@ -205,6 +235,7 @@ export async function cmdSubtaskOrch(verb: string, argv: string[]): Promise<void
       : 'session came from --session-id';
     (json as any).diagnostic = [sourceHint, selected.diagnostic].filter(Boolean).join('; ');
   }
-  console.log(JSON.stringify(json));
+  const rendered = verb === 'start' ? renderStartDryRun(json) : null;
+  console.log(rendered ?? JSON.stringify(json));
   process.exit(res.ok && (json as any).ok !== false ? 0 : 1);
 }

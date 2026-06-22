@@ -5,7 +5,7 @@
  * Run: pnpm vitest run test/subtask-orchestrator.test.ts
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -125,6 +125,7 @@ beforeEach(() => {
   mockCreateGroup.mockResolvedValue({ ok: true, chatId: 'oc_sub_new', creator: 'app_claude', invalidBotIds: [], invalidUserIds: [] });
   mockEnsureCloneScopesProvisioned.mockReset();
   mockEnsureCloneScopesProvisioned.mockResolvedValue(undefined);
+  delete process.env.BOTS_CONFIG;
 });
 
 // ─── create_subtask ──────────────────────────────────────────────────────────
@@ -173,6 +174,47 @@ describe('createSubtask', () => {
     expect(task.bots.find((b: any) => b.openId === 'ou_coco')).toMatchObject({
       name: '缇蕾', role: 'observer', larkAppId: 'app_coco',
     });
+  });
+
+  it('dry-run: 只返回建群前席位预览，不建群、不写 store、不发 kickoff', async () => {
+    mainSession();
+    const botsConfigPath = join(tempDir, 'bots.json');
+    process.env.BOTS_CONFIG = botsConfigPath;
+    writeFileSync(botsConfigPath, JSON.stringify([
+      { larkAppId: 'app_codex', cliId: 'codex', displayName: '蔻黛克斯' },
+      { larkAppId: 'app_clone', cliId: 'codex', displayName: '蔻黛克斯初号机', claudeConfigDir: '/tmp/clone/.codex' },
+      { larkAppId: 'app_coco', cliId: 'coco', displayName: '缇蕾' },
+    ]), 'utf-8');
+
+    const res = await createSubtask({
+      sessionId: 'sess_main',
+      goal: 'dry run preview',
+      name: 'Dry Run Preview',
+      taskType: 'bug',
+      bots: ['codex:main', 'claude-clone:collab'],
+      dryRun: true,
+    });
+
+    expect(res).toMatchObject({
+      dryRun: true,
+      preview: {
+        name: 'Dry Run Preview',
+        taskType: 'bug',
+        worktree: null,
+        writes: [],
+        willCreateGroup: false,
+      },
+    });
+    expect((res as any).preview.seats).toEqual([
+      expect.objectContaining({ seat: 'main', ref: 'codex', botName: '蔻黛克斯', engine: 'codex', role: 'main', larkAppId: 'app_codex' }),
+      expect.objectContaining({ seat: 'collab', ref: 'claude-clone', botName: 'claude-clone', cloneName: '蔻黛克斯初号机', engine: 'codex', role: 'collab', larkAppId: 'app_clone' }),
+      expect.objectContaining({ seat: 'observer', ref: 'tilly', botName: '缇蕾', engine: 'coco', role: 'observer', larkAppId: 'app_coco' }),
+    ]);
+    expect(mockEnsureCloneScopesProvisioned).not.toHaveBeenCalled();
+    expect(mockCreateGroup).not.toHaveBeenCalled();
+    expect(getByChatId('oc_sub_new')).toBeNull();
+    expect(readChatContext('oc_sub_new')).toBeNull();
+    expect(readTopology().nodes).toEqual([]);
   });
 
   it('clone scope gate: 缺 required scope 时阻断建群, 不静默 createGroupWithBots', async () => {

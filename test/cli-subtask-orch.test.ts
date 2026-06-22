@@ -98,6 +98,43 @@ describe('cli subtask-orch', () => {
     expect(body.bots).toEqual(['k:main', 'c:collab', 't:observer', '蔻黛克斯（初号机）:collab']);
   });
 
+  it('passes --dry-run to subtask-start and renders the pre-create preview', async () => {
+    writeDaemon('app_codex', '蔻黛克斯', 9102);
+    writeSession('app_codex', {
+      sessionId: 'sid_codex',
+      chatId: 'oc_codex_root',
+      rootMessageId: 'om_root',
+      larkAppId: 'app_codex',
+    });
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      new Response(JSON.stringify({
+        ok: true,
+        dryRun: true,
+        preview: {
+          name: '子任务·dry',
+          taskType: 'bug',
+          worktree: '/repo',
+          seats: [
+            { role: 'main', cloneName: '蔻黛克斯', engine: 'codex', larkAppId: 'app_codex' },
+            { role: 'collab', cloneName: '蔻黛克斯初号机', engine: 'codex', larkAppId: 'app_codex_1' },
+          ],
+        },
+      }), { status: 200 }),
+    );
+    const logSpy = vi.spyOn(console, 'log');
+
+    await runCmd('start', ['--session-id', 'sid_codex', '--goal', 'dry', '--task-type', 'bug', '--dry-run']);
+
+    expect(exitCode.value).toBe(0);
+    const body = JSON.parse((vi.mocked(globalThis.fetch).mock.calls[0][1] as RequestInit).body as string);
+    expect(body.dryRun).toBe(true);
+    const out = String(logSpy.mock.calls[0][0]);
+    expect(out).toContain('botmux subtask-start --dry-run 预览');
+    expect(out).toContain('main = 蔻黛克斯(codex) 执行 [app_codex]');
+    expect(out).toContain('collab = 蔻黛克斯初号机(codex) review [app_codex_1]');
+    expect(out).toContain('不建群、不写 SubTask/ChatContext/Topology');
+  });
+
   it('adds explicit stale-env diagnostics when daemon rejects an env session', async () => {
     writeDaemon('app_codex', '蔻黛克斯', 9102);
     writeSession('app_codex', {

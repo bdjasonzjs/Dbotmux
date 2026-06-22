@@ -26,6 +26,7 @@ import { createGroupWithBots } from './group-creator.js';
 import { getSession } from './session-store.js';
 import { logger } from '../utils/logger.js';
 import { ensureCloneScopesProvisioned } from './clone-scope-provisioning.js';
+import { listAuthoritativeBots } from './bot-inventory.js';
 import type { Session } from '../types.js';
 import { create as createChatContext, read as readChatContext, update as updateChatContext, isSafeChatId } from './chat-context-store.js';
 import { readTopology, writeTopology, type ChatNode } from './chat-topology-store.js';
@@ -423,9 +424,35 @@ export interface CreateSubtaskReq {
   manager?: boolean;
   /** 显式 opt-out：executor 群即使含 main 也不自动补 tilly observer。 */
   noObserver?: boolean;
+  /** Preview only: resolve seats/bots before group creation and store writes. */
+  dryRun?: boolean;
 }
 
-export async function createSubtask(req: CreateSubtaskReq): Promise<{ taskId: string; chatId: string; isNew: boolean }> {
+export type CreateSubtaskDryRunPreview = {
+  goal: string;
+  name: string;
+  worktree: string | null;
+  taskType: 'prd' | 'bug' | 'misc';
+  seats: Array<{
+    seat: SubTaskBot['role'];
+    ref: string;
+    botName: string;
+    cloneName: string;
+    larkAppId: string;
+    engine: string;
+    role: SubTaskBot['role'];
+  }>;
+  writes: string[];
+  willCreateGroup: boolean;
+};
+
+type CreateSubtaskResult =
+  | { taskId: string; chatId: string; isNew: boolean }
+  | { dryRun: true; preview: CreateSubtaskDryRunPreview };
+
+export function createSubtask(req: CreateSubtaskReq & { dryRun: true }): Promise<{ dryRun: true; preview: CreateSubtaskDryRunPreview }>;
+export function createSubtask(req: CreateSubtaskReq & { dryRun?: false | undefined }): Promise<{ taskId: string; chatId: string; isNew: boolean }>;
+export async function createSubtask(req: CreateSubtaskReq): Promise<CreateSubtaskResult> {
   if (!req.goal?.trim()) throw new HttpError(400, 'missing goal');
   const ctx = await authzSpawn(req.sessionId);              // 主话题=原 authzCheck 语义；子群=嵌套闸
   const session = getSession(req.sessionId);                // for ownerOpenId
@@ -485,6 +512,33 @@ export async function createSubtask(req: CreateSubtaskReq): Promise<{ taskId: st
   }
   const larkAppIds = resolved.map(r => r.larkAppId);
   const subtaskBots: SubTaskBot[] = resolved.map(r => ({ openId: r.openId, name: r.name, role: r.role, larkAppId: r.larkAppId }));
+
+  if (req.dryRun === true) {
+    const inventoryByApp = new Map(listAuthoritativeBots({ dataDir: config.session.dataDir }).map(bot => [bot.larkAppId, bot]));
+    return {
+      dryRun: true,
+      preview: {
+        goal: req.goal,
+        name: req.name ?? `子任务·${req.goal.slice(0, 20)}`,
+        worktree: session?.workingDir ?? null,
+        taskType: req.taskType ?? 'misc',
+        seats: resolved.map(r => {
+          const inventory = inventoryByApp.get(r.larkAppId);
+          return {
+            seat: r.role,
+            ref: r.ref,
+            botName: r.name,
+            cloneName: inventory?.cloneName ?? r.name,
+            larkAppId: r.larkAppId,
+            engine: inventory?.engine ?? 'unknown',
+            role: r.role,
+          };
+        }),
+        writes: [],
+        willCreateGroup: false,
+      },
+    };
+  }
 
   await ensureCloneScopesProvisioned({
     creatorLarkAppId: ctx.callerBotAppId,
