@@ -10,6 +10,8 @@ import { renderWorkflowCatalogPage } from './workflow-catalog.js';
 import { renderTopologyPage } from './topology.js';
 import { renderTaskTeamPage } from './task-team.js';
 import { renderTaskTeamBuilderPage } from './taskteam-builder.js';
+import { renderTaskTeamOnboardingPage } from './task-team-onboarding.js';
+import { renderTaskTeamBuildPage } from './task-team-build.js';
 import { wireBotOnboardingButton } from './bot-onboarding.js';
 import { t, ui } from './ui.js';
 import type { DashboardLocale } from './i18n.js';
@@ -38,6 +40,8 @@ function route() {
   ) {
     pageDispose = renderWorkflowCatalogPage(root);
   } else if (hash.startsWith('#/workflows')) pageDispose = renderWorkflowsPage(root);
+  else if (hash.startsWith('#/task-team/onboarding')) pageDispose = renderTaskTeamOnboardingPage(root) ?? null;
+  else if (hash.startsWith('#/task-team/build')) pageDispose = renderTaskTeamBuildPage(root) ?? null;
   else if (hash.startsWith('#/task-team/builder')) pageDispose = renderTaskTeamBuilderPage(root) ?? null;
   else if (hash.startsWith('#/task-team')) pageDispose = renderTaskTeamPage(root) ?? null;
   else if (hash.startsWith('#/topology')) pageDispose = renderTopologyPage(root);

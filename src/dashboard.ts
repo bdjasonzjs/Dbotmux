@@ -823,6 +823,103 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // 任务小组 · 配置写代理（onboarding 向导 + 画布配置器从网页落库；设计 v4 §3.1）。
+    // role/rule/type-upsert 只注册在 daemon IPC；聚合服务把写请求代理到一个在线 daemon 执行。
+    // taskteam config 是全局共享文件（~/.botmux/data），写哪个在线 daemon 都落同一份。
+    {
+      const TASKTEAM_WRITE_PATHS = new Set([
+        '/api/taskteam-role-upsert',
+        '/api/taskteam-rule-upsert',
+        '/api/taskteam-type-upsert',
+      ]);
+      if (req.method === 'POST' && TASKTEAM_WRITE_PATHS.has(url.pathname)) {
+        const target = [...registry.list()].sort((a, b) => a.botIndex - b.botIndex)[0];
+        if (!target) return jsonRes(res, 503, { ok: false, error: 'no_online_daemon' });
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(c as Buffer);
+        const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+        const upstream = await proxyToDaemon(target.larkAppId, url.pathname, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: raw,
+        });
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(await upstream.text());
+        return;
+      }
+    }
+    // 读兼容：画布数据层 loadExistingRoles() 打 /api/taskteam-config-list（daemon 那边是 POST IPC）。
+    // 聚合服务这里直接返回共享 config（与 /api/task-team/config 同源、只读），让画布数据层复用不撞 404。
+    if (req.method === 'GET' && url.pathname === '/api/taskteam-config-list') {
+      const { readTaskTeamConfig } = await import('./services/taskteam-config-store.js');
+      return jsonRes(res, 200, readTaskTeamConfig());
+    }
+
+    // 新手引导第二段「用模板建真群」：列可填进角色的现成 bot（设计 v5 §四）。
+    // 服务端读 listBots（已配置 bot）+ bots-info.json（跨进程真实 botOpenId），客户端只勾选 appId、供不了 openId。
+    if (req.method === 'GET' && url.pathname === '/api/available-bots') {
+      const { listBots } = await import('./services/bot-inventory.js');
+      type BotInfoEntry = { larkAppId: string; botOpenId: string | null; botName: string | null };
+      let info: BotInfoEntry[] = [];
+      try {
+        const p = join(config.session.dataDir, 'bots-info.json');
+        if (existsSync(p)) info = JSON.parse(readFileSync(p, 'utf-8'));
+      } catch { /* 读不到就当无 openid，usable=false */ }
+      const infoByApp = new Map(info.filter(e => e.larkAppId).map(e => [e.larkAppId, e]));
+      const online = new Set(registry.list().map(d => d.larkAppId));
+      const bots = listBots().map(b => {
+        const inf = infoByApp.get(b.larkAppId);
+        const botOpenId = inf?.botOpenId ?? undefined;
+        return {
+          larkAppId: b.larkAppId,
+          botName: inf?.botName ?? b.name ?? `bot-${b.index}`,
+          botOpenId,
+          isClone: !!b.claudeConfigDir,
+          online: online.has(b.larkAppId),
+          usable: !!botOpenId, // 有真实 openId 才能绑进角色（isUsableOnboardingBot 同口径）
+        };
+      });
+      return jsonRes(res, 200, { bots });
+    }
+
+    // 新手引导第二段「用模板建真群」：服务端组装 roleInstances + 拉用户进群（设计 v5 §四 / §3.2）。
+    // 入参只收 { typeId, selectedBotBySlot, goal?, acceptance? }；creator + operator open_id 走 pickCreatorForGroup
+    // （app-scope 同源），没 operator 就建群前 409（堵 fallback、不建无人可见的群）；其余转 creator daemon 服务端组装。
+    if (req.method === 'POST' && url.pathname === '/api/taskteam-create') {
+      const body = await readJsonBody<{ typeId?: string; selectedBotBySlot?: Record<string, string>; goal?: string; acceptance?: string }>(req);
+      if (!body?.typeId || !body?.selectedBotBySlot || !Object.keys(body.selectedBotBySlot).length) {
+        return jsonRes(res, 400, { ok: false, error: 'missing typeId/selectedBotBySlot' });
+      }
+      const selectedIds = [...new Set(Object.values(body.selectedBotBySlot).filter((x): x is string => typeof x === 'string' && !!x))];
+      if (!selectedIds.length) return jsonRes(res, 400, { ok: false, error: 'no_bot_selected' });
+      const pick = pickCreatorForGroup(selectedIds, (id) => {
+        const d = registry.getByAppId(id);
+        return d ? { larkAppId: d.larkAppId, resolvedAllowedUsers: d.resolvedAllowedUsers ?? [] } : undefined;
+      });
+      if (!pick) return jsonRes(res, 503, { ok: false, error: 'no_online_daemon' });
+      // 堵 fallback：onboarding 要求"当前用户在群里"，没有 app-scope 的 operator open_id 就别建无人可见的群。
+      const operator = pick.userOpenIds[0];
+      if (!operator) {
+        return jsonRes(res, 409, { ok: false, error: 'no_operator_open_id', hint: '所选 bot 没有可邀请的 owner（resolvedAllowedUsers 为空）；先给 bot 绑 owner/allowedUsers 再建群，否则建出的群你看不到。' });
+      }
+      const upstream = await proxyToDaemon(pick.creatorLarkAppId, '/api/taskteam-create-from-template', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          typeId: body.typeId,
+          selectedBotBySlot: body.selectedBotBySlot,
+          goal: body.goal,
+          acceptance: body.acceptance,
+          creatorLarkAppId: pick.creatorLarkAppId,
+          userOpenIds: [operator],
+          notifyOwnerOpenId: operator,
+        }),
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // ─── Groups (Phase B) ────────────────────────────────────────────────────
 
     if (req.method === 'GET' && url.pathname === '/api/groups') {

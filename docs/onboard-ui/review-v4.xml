@@ -1,0 +1,41 @@
+<title>新手引导 UI 设计稿 v4 复审 - Codex review/challenge</title>
+
+<h1>新手引导 UI 设计稿 v4 复审</h1>
+<p>结论：v4 对 v3 的两个 P1 和一个 P2 已经从设计合同上闭合，可以进入实现。但实现时必须带上下面两个门槛，否则会在代码落地时把旧信任边界或旧 CLI 合同撞坏。</p>
+
+<h2>结论：可进实现，但不是无条件放行</h2>
+<ul>
+  <li>信任边界合同成立：浏览器只提交 typeId + selectedBotBySlot + goal/acceptance，不再提交 roleInstances[].binding.botOpenId；roleInstances 由服务端按已存 TaskTeamType.roleSlots 与 getBotOpenId(appId) 组装，失败 409。</li>
+  <li>用户进群合同成立：creator 必须有 creator-app scope 的 operator open_id；无 operator open_id 时建群前 409，堵住 groups/create 的 fallback；createGroup 返回形状也明确扩展到 userInvited/warning 能落地。</li>
+  <li>config-list 读兼容成立：dashboard 新增 GET /api/taskteam-config-list，能让 loadExistingRoles() 继续复用，不再撞 404。</li>
+</ul>
+
+<h2>P1 实现门槛：不要把 daemon /api/taskteam-create 的旧裸合同直接改坏</h2>
+<p>v4 文档写“服务端（daemon /api/taskteam-create）组装 TaskTeamRoleInstance[]”。这个方向对 dashboard 是对的，但现有 CLI 已经把 taskteam-create 定义为裸 CreateTaskTeamParams 透传到同一个 daemon route，见 src/cli/taskteam-cli.ts:18 和 :45；daemon route 当前也直接把 body 交给 createTaskTeam，见 src/daemon.ts:1455-1463。</p>
+<p>因此实现不能简单把 daemon /api/taskteam-create 改成“只接 selectedBotBySlot”的新 body，否则会破坏现有 CLI/自动化调用。也不能让 dashboard 公共 route 继续接受 roleInstances，否则又把 v3 的浏览器伪造 botOpenId 问题放回来了。</p>
+<p>要求实现方案二选一：</p>
+<ul>
+  <li>推荐：dashboard 公共路由单独做 selection-to-instance 组装/校验，然后调用内部 createTaskTeam；daemon 旧 /api/taskteam-create 维持兼容。</li>
+  <li>或：daemon route 兼容两种 body，但 dashboard 侧必须显式拒绝/忽略 roleInstances，只允许 selectedBotBySlot；CLI legacy body 只能走本地 IPC/CLI 信任边界。</li>
+</ul>
+
+<h2>P2 实现门槛：补齐服务端默认字段，不要让新 body 少字段卡住 createTaskTeam</h2>
+<p>v4 dashboard create 入参只列了 typeId、selectedBotBySlot、goal、acceptance；但现有 CreateTaskTeamParams 还需要 companyId、creatorLarkAppId，并可选 groupName/sourceChatId，见 src/services/taskteam-runtime.ts:151-160。v4 已经说明 creator 由 dashboard 选，用户 open_id 由 creator resolvedAllowedUsers 取，但没有显式写 companyId/groupName 的服务端生成规则。</p>
+<p>要求实现时明确：creatorLarkAppId 由选中的 creator daemon 注入；companyId 使用稳定默认值或从 onboarding context 生成，例如 tt_company_onboard / tt_company_${typeId-safe}；groupName 用向导里的小组名派生。否则新 body 通过信任边界校验后，仍会在 createTaskTeam 必填字段上卡住。</p>
+
+<h2>已确认闭合的合同</h2>
+<ul>
+  <li>§6 服务端组装 roleInstances：能挡住浏览器伪造 botOpenId/larkAppId；409 回 bot 盘点步是正确失败语义。</li>
+  <li>§3.2 creator 无 operator open_id 建群前 409：比 groups/create 的通用 fallback 更适合 onboarding，因为 onboarding 的验收必须证明“当前用户在群里”。</li>
+  <li>§3.2 扩 createGroup 返回形状：当前 createGroupWithBots 已有 invalidUserIds/notifyError/ownerTransferredTo 等信息，问题在 runtime/deps 丢弃；v4 已明确要透出。</li>
+  <li>§3.1 GET /api/taskteam-config-list：直接 readTaskTeamConfig() 即可，和现有 /api/task-team/config 同源，属于低风险兼容。</li>
+  <li>§4 克隆继续裁剪出第一切片：合理，不再把 ceo-spawn 的 sessionId/chatId 依赖塞进 dashboard 主路径。</li>
+</ul>
+
+<h2>建议执行者实现时的验收重点</h2>
+<ul>
+  <li>用恶意请求验证 dashboard /api/taskteam-create 提交 roleInstances[].binding.botOpenId 会被拒绝或忽略，不能落库。</li>
+  <li>用无 resolvedAllowedUsers 的 creator 场景验证建群前 409，不允许建出用户不可见的群。</li>
+  <li>用邀请失败/notify 失败模拟验证 route 仍返回 teamId/chatId，同时 userInvited:false 和 warning 能到 UI。</li>
+  <li>保留或覆盖 CLI taskteam-create legacy 合同，避免旧调用被新 selection body 改坏。</li>
+</ul>

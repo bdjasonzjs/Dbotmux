@@ -69,6 +69,12 @@ export function renderTaskTeamPage(root: HTMLElement): (() => void) | undefined 
   root.innerHTML = `
     <section class="page task-team-page">
       <h2>${escapeHtml(t('nav.taskTeam'))} <a href="#/task-team/builder" class="tt-link">⚙ ${escapeHtml(t('taskTeam.openBuilder'))}</a></h2>
+      <a href="#/task-team/onboarding" class="tt-onboard-card">
+        <div class="tt-onboard-icon">✨</div>
+        <div class="tt-onboard-text"><strong>第一次用？跟着引导建一个工作小组</strong><span>一步步来：起名 → 加成员 → 连谁审谁 → 存好，配出一个可复用的模板</span></div>
+        <div class="tt-onboard-go">开始 →</div>
+      </a>
+      <p class="tt-build-link">已有模板？<a href="#/task-team/build">用模板建一个真群（挑机器人 → 建群拉你进群）→</a></p>
       <div class="tt-section"><h3>${escapeHtml(t('taskTeam.org'))}</h3><div id="tt-org">…</div></div>
       <div class="tt-section"><h3>${escapeHtml(t('taskTeam.board'))}</h3><div id="tt-board">…</div></div>
       <div class="tt-section"><h3>${escapeHtml(t('taskTeam.usage'))}</h3><p class="muted">${escapeHtml(t('taskTeam.usageNote'))}</p></div>

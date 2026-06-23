@@ -1467,6 +1467,123 @@ ipcRoute('POST', '/api/taskteam-create', async (req, res) => {
   }
 });
 
+// 任务小组 · 新手引导第二段「用模板建真群」（设计 v5 §四）——服务端组装 roleInstances（信任边界）。
+// body: { typeId, selectedBotBySlot:{slotId->appId}, goal?, acceptance?, creatorLarkAppId, userOpenIds?, notifyOwnerOpenId?, companyId? }
+// 信任边界：不收前端组装的 roleInstances；服务端按已存 TaskTeamType.roleSlots + 真实 bot 清单组装 binding，
+//   binding.botOpenId 取自 bots-info.json（跨进程真实 app-scoped openId），对不上/选不全 → 409，浏览器供不了 openId。
+ipcRoute('POST', '/api/taskteam-create-from-template', async (req, res) => {
+  let body: {
+    typeId?: string;
+    selectedBotBySlot?: Record<string, string>;
+    goal?: string;
+    acceptance?: string;
+    creatorLarkAppId?: string;
+    userOpenIds?: string[];
+    notifyOwnerOpenId?: string;
+    companyId?: string;
+  };
+  try { body = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (!body.typeId || !body.creatorLarkAppId || !body.selectedBotBySlot) {
+    return jsonRes(res, 400, { ok: false, error: 'missing typeId/creatorLarkAppId/selectedBotBySlot' });
+  }
+  try {
+    const { readTaskTeamConfig } = await import('./services/taskteam-config-store.js');
+    const cfg = readTaskTeamConfig();
+    const type = cfg.teamTypes.find(t => t.typeId === body.typeId);
+    if (!type) return jsonRes(res, 404, { ok: false, error: `unknown typeId: ${body.typeId}` });
+
+    // 真实可用 bot：bots-info.json（跨进程真实 botOpenId）。usable = botOpenId 非空。
+    type BotInfoEntry = { larkAppId: string; botOpenId: string | null; botName: string | null };
+    let info: BotInfoEntry[] = [];
+    try {
+      const p = join(config.session.dataDir, 'bots-info.json');
+      if (existsSync(p)) info = JSON.parse(readFileSync(p, 'utf-8'));
+    } catch { /* 读不到就当无可用 bot，下面会 409 */ }
+    const openIdByApp = new Map<string, string>();
+    for (const e of info) if (e.larkAppId && e.botOpenId) openIdByApp.set(e.larkAppId, e.botOpenId);
+
+    // 服务端按 roleSlots 组装 roleInstances；逐项校验选中 bot 真实可用。
+    const sel = body.selectedBotBySlot;
+    // P1-2：默认要求每个角色用不同 bot（禁止一 bot 多角色绕过"角色到齐"/自审自盯）。
+    const chosenApps = type.roleSlots.map(s => sel[s.slotId]).filter((x): x is string => !!x);
+    if (new Set(chosenApps).size !== chosenApps.length) {
+      return jsonRes(res, 409, { ok: false, error: 'duplicate_bot_assignment', hint: '每个角色要用不同的机器人' });
+    }
+    const problems: Array<{ slotId: string; reason: string }> = [];
+    const roleInstances = type.roleSlots.map(slot => {
+      const appId = sel[slot.slotId];
+      if (!appId) { problems.push({ slotId: slot.slotId, reason: 'no_bot_selected' }); return null; }
+      const botOpenId = openIdByApp.get(appId);
+      if (!botOpenId) { problems.push({ slotId: slot.slotId, reason: 'bot_not_usable_or_no_openid' }); return null; }
+      return {
+        roleInstanceId: `tt_ri_${slot.slotId}` as never,
+        slotId: slot.slotId,
+        roleId: slot.roleId,
+        binding: { bindingId: `tt_binding_${slot.slotId}` as never, botOpenId, larkAppId: appId },
+      };
+    });
+    if (problems.length) {
+      return jsonRes(res, 409, { ok: false, error: 'role_binding_invalid', problems, neededSlots: type.roleSlots.map(s => s.slotId) });
+    }
+
+    // 包一层 createGroup 捕获建群结果（invalidUserIds/notifyError），落"邀请失败不静默"。
+    const { createTaskTeam } = await import('./services/taskteam-runtime.js');
+    const { defaultCreateTaskTeamDeps } = await import('./services/taskteam-deps.js');
+    const { createGroupWithBots } = await import('./services/group-creator.js');
+    const base = defaultCreateTaskTeamDeps();
+    let groupResult: { invalidUserIds?: string[]; notifyError?: string | null } = {};
+    const deps = {
+      ...base,
+      createGroup: async (opts: { name?: string; creatorLarkAppId: string; larkAppIds: string[]; userOpenIds?: string[]; sourceChatId?: string | null; purpose?: string }) => {
+        const r = await createGroupWithBots({
+          name: opts.name,
+          creatorLarkAppId: opts.creatorLarkAppId,
+          larkAppIds: opts.larkAppIds,
+          userOpenIds: opts.userOpenIds,
+          notifyOwnerOpenId: body.notifyOwnerOpenId,
+          transferOwnerTo: body.notifyOwnerOpenId,
+          purpose: opts.purpose,
+          sourceChatId: opts.sourceChatId ?? null,
+        });
+        groupResult = { invalidUserIds: r.invalidUserIds, notifyError: r.notifyError };
+        // P1-1：role bot 被飞书拒邀（invalidBotIds）→ 在 persistTeam 之前抛错，别落"看似成功"的实例。
+        const rejected = (opts.larkAppIds ?? []).filter(id => (r.invalidBotIds ?? []).includes(id));
+        if (rejected.length) throw new Error(`role_bot_rejected:${rejected.join(',')}`);
+        return { chatId: r.chatId };
+      },
+    };
+    const team = await createTaskTeam(deps as never, {
+      typeId: body.typeId as never,
+      companyId: 'tt_company_onboard' as never, // P2：companyId 服务端固定，不收浏览器透传
+      goal: body.goal ?? '示例小目标：跑通一次「交活→把关→完成」',
+      acceptance: body.acceptance ?? '示例小组完整跑通一轮 review',
+      roleInstances: roleInstances as never,
+      creatorLarkAppId: body.creatorLarkAppId,
+      userOpenIds: body.userOpenIds,
+    });
+    const op = body.notifyOwnerOpenId;
+    const userInvited = !op || !(groupResult.invalidUserIds ?? []).includes(op);
+    return jsonRes(res, 200, {
+      ok: true,
+      teamId: team.teamId,
+      chatId: team.chatId,
+      status: team.status,
+      userInvited,
+      invalidUserIds: groupResult.invalidUserIds ?? [],
+      notifyError: groupResult.notifyError ?? null,
+    });
+  } catch (err: any) {
+    const msg = String(err?.message ?? err);
+    // P1-1：role bot 被飞书拒邀 → 409，且因为是在 persistTeam 之前抛的，实例未落库。
+    if (msg.startsWith('role_bot_rejected:')) {
+      return jsonRes(res, 409, { ok: false, error: 'role_bot_rejected', rejected: msg.slice('role_bot_rejected:'.length).split(',').filter(Boolean) });
+    }
+    const status = err && err.name === 'HttpError' ? err.status : 500;
+    return jsonRes(res, status, { ok: false, error: msg });
+  }
+});
+
 // ── 任务小组 · 管理面 IPC（批5，§5）：配置 CRUD + template/instance 导入导出。纯新增、与 subtask IPC 独立。
 const TASKTEAM_ADMIN_ROUTES: Array<[string, string]> = [
   ['/api/taskteam-config-list', 'listTaskTeamConfig'],

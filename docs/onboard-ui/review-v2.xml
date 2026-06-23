@@ -1,0 +1,56 @@
+<title>新手引导 UI 设计稿 v2 复审</title>
+
+<callout emoji="⚠️" background-color="light-red" border-color="red">
+  <p><b>结论：</b>v2 方向明显收敛，旧“搭公司/root 群”方向已正确作废；但暂不通过。当前设计仍有 3 个 P1：dashboard 写接口并不存在、<code>/api/taskteam-create</code> 无法保证用户进群可见、补 bot 的 ceo-spawn 依赖被标成“未决”却仍放在主路径。另有若干 P2 需要补清楚，避免实现阶段再踩坑。</p>
+</callout>
+
+<table>
+  <thead><tr><th background-color="light-gray">Review 对象</th><th background-color="light-gray">取证范围</th></tr></thead>
+  <tbody>
+    <tr><td>飞书 docx</td><td>https://bytedance.larkoffice.com/docx/RvT3dHTChomWhtxceSfcndaBnCb</td></tr>
+    <tr><td>本机源</td><td><code>/home/zoujinsong.jason/work/Dbotmux_wt/onboard-ui/docs/onboard-ui/design.md</code></td></tr>
+    <tr><td>关键代码</td><td><code>src/dashboard.ts</code>, <code>src/daemon.ts</code>, <code>src/dashboard/web/taskteam-canvas-data.ts</code>, <code>src/dashboard/web/taskteam-builder-data.ts</code>, <code>src/services/taskteam-runtime.ts</code>, <code>src/services/taskteam-onboard.ts</code>, <code>src/services/ceo-spawn-service.ts</code></td></tr>
+  </tbody>
+</table>
+
+<h1>P1：v2 说“dashboard 代理转发”不成立，画布保存/建实例从网页会打不到 daemon 写接口</h1>
+<p>设计稿第 34 行说 <code>POST /api/taskteam-create</code> 是“dashboard 代理转发”，第 74 行把 <code>/api/taskteam-{role,rule,type}-upsert</code>、<code>/api/taskteam-create</code>、<code>/api/taskteam-config-list</code> 列为可直接复用。真实代码里这些路由只注册在 daemon IPC：<code>src/daemon.ts:1455-1468</code> 是 <code>/api/taskteam-create</code>，<code>src/daemon.ts:1471-1502</code> 是 admin upsert/config-list，<code>src/daemon.ts:1505-1521</code> 是 onboard。</p>
+<p>dashboard 聚合服务目前只挂了 task-team 只读 API：<code>src/dashboard.ts:821-824</code> 调 <code>handleTaskTeamApi</code>，该 handler 只处理 <code>GET /api/task-team/config|roles|rules|types|instances|org</code>。全仓搜索也没有 dashboard 侧 <code>/api/taskteam-create</code> 或 <code>/api/taskteam-role-upsert</code> 代理。现有画布 UI 的 <code>postAdmin(op.path,...)</code> 直接 fetch <code>/api/taskteam-role-upsert</code>，在 dashboard 页面同源下会 404，而不是写到 daemon。</p>
+<p><b>要求执行者改设计：</b>新增“dashboard 写接口代理”作为明确实现项，而不是说已有。至少要定义：这些 <code>/api/taskteam-*</code> 写接口由哪个 daemon 执行、如何选择 creator/owner daemon、请求体如何透传、错误如何回显。否则 v2 的第一实现切片“落库一个小组类型”从网页路径并不成立。</p>
+
+<h1>P1：<code>/api/taskteam-create</code> 建出的飞书群不会把 dashboard 用户拉进去</h1>
+<p>设计稿第 62、94 行把“存成能用的小组”定义为 <code>POST /api/taskteam-create</code> 建实例，并要求贴飞书群真建出来截图。但当前 <code>CreateTaskTeamParams</code> 只有 <code>typeId/companyId/goal/acceptance/roleInstances/groupName/creatorLarkAppId/sourceChatId</code>，没有 <code>userOpenIds</code> 或 owner invite 字段。<code>createTaskTeam()</code> 调 <code>deps.createGroup</code> 时只传 <code>creatorLarkAppId/larkAppIds/sourceChatId/purpose</code>；<code>defaultCreateTaskTeamDeps()</code> 又把 <code>userOpenIds: opts.userOpenIds</code> 透给 <code>createGroupWithBots</code>，但 CreateTaskTeamDeps 入参类型里根本没有 userOpenIds，实际永远是 undefined。</p>
+<p>结果是：从 dashboard 创建的小组最多是 bot 创建并邀请 role bots 的群，不能保证当前人是群成员。用户在 dashboard 点向导后很可能拿不到飞书群入口，也无法在群里“当场跑一遍”。这不是文案问题，是 API 合同缺字段。</p>
+<p><b>要求执行者改设计：</b>建实例步骤必须补用户可见性合同：当前用户 open_id 从哪里来、以哪个 app-scope 邀请、<code>/api/taskteam-create</code> 是否扩展 <code>userOpenIds/notifyOwnerOpenId</code>，以及如果邀请失败是否阻断“创建成功”。否则“真实可用工作小组”和 E2E 截图证据都不可靠。</p>
+
+<h1>P1：§6 把 ceo-spawn 未决依赖放在补 bot 主路径，不能作为可实现设计放行</h1>
+<p>设计稿第 83-87 行已经诚实指出 <code>ceo-spawn</code> 强依赖聊天 <code>sessionId</code>，dashboard 无 chat session，需在实现前决定改 daemon 路由或缩小范围。但同一节仍把“克隆分身”作为补 bot 的可选路径，第 61 行也把它列在向导流程里。</p>
+<p>真实 <code>ceoSpawn()</code> 在 <code>src/services/ceo-spawn-service.ts:106-110</code> 强制 <code>getSession(req.sessionId)</code>，随后使用 <code>session.chatId</code>、<code>session.rootMessageId</code>、<code>session.lastCallerOpenId</code>，clone QR/status 也会发到 chat/subgroup。dashboard 场景没有这些上下文。设计中“要么改造 daemon 路由接受显式 ownerOpenId，要么 v1 只做到扫码激活成可用 bot”是两条不同产品/安全路径，不能留到实现阶段再定。</p>
+<p><b>要求执行者改设计：</b>v2 必须明确裁剪：第一切片只支持“加现成 bot”，克隆入口置灰并给未支持原因；或先设计一个新的 dashboard clone API，含 owner 身份、source bot、scope grant、QR 展示、openId ready、失败/超时/重试合同。不能把 ceo-spawn 作为 dashboard 可复用能力直接接。</p>
+
+<h1>P2：onboard-plan 不应信任客户端传入 availableBots</h1>
+<p>设计稿第 70 行提出 <code>POST /api/taskteam-onboard-plan</code> 入参含 <code>availableBots[]</code>。这沿用了旧 <code>/api/taskteam-onboard</code> 的形态，但 dashboard 产品路径里 available bots 应来自服务端真实 <code>listBots()+getBotOpenId()</code>，不是由浏览器提交。否则前端可以把未 ready、错误 app-scope、甚至伪造 openId 的 bot 传入 plan，后续 roleInstances 再进入 <code>/api/taskteam-create</code>。</p>
+<p><b>建议：</b><code>/api/taskteam-onboard-plan</code> 只接受 <code>sampleTypeId</code> 和可选 selected bot appIds，由服务端读取可用 bot 并过滤；返回 plan + usableBots + rejected reasons。这样“加现成 bot”和 plan 结果同源。</p>
+
+<h1>P2：从 CanvasTeam 到 roleInstances 的桥接还缺精确 shape</h1>
+<p><code>assembleSaveOps()</code> 落库类型这段总体成立：它会生成 role/rule/type 三类 payload，<code>validateCanvas()</code> 也能挡住主要非法拓扑。但 <code>/api/taskteam-create</code> 需要的是实例态 <code>roleInstances[]</code>，每项必须有 <code>roleInstanceId/slotId/roleId/binding{bindingId,botOpenId,larkAppId}</code>。设计稿第 62 行只写“roleInstances 由 botGap 那步的席位→bot 分配产出”，没有说明前端如何从 <code>plan.seats</code> 或用户手动选择生成稳定 ID、如何处理未绑定席位、如何保留 observer 的 modelOverride。</p>
+<p><b>建议：</b>在设计里补一个明确转换表：<code>plan.seats[] + selectedBotBySlot</code> → <code>TaskTeamRoleInstance[]</code>。创建前再以服务端 plan 校验一次 ready，避免客户端草稿和已保存 type 不一致。</p>
+
+<h1>P2：模板起步/完整画布微调缺少现成反向映射</h1>
+<p>设计稿第 56 行说“从已有小组类型挑模板起步”，第 66 行说可以切到完整画布并带上当前草稿。现有 <code>taskteam-canvas-data.ts</code> 只有 CanvasTeam → schema 的 <code>assembleSaveOps()</code>，以及已存角色读取 <code>loadExistingRoles()</code>；没有 TaskTeamType + roles/rules → CanvasTeam 的反向 mapper，也没有路由参数/草稿存储合同。</p>
+<p><b>建议：</b>如果第一切片要包含模板起步或逃生到完整画布，需把 reverse mapper/localStorage key/hash 参数列入实现项；否则先删掉这两项承诺，避免 UI 到时只能空白起步。</p>
+
+<h1>上轮 4 个 P1 复核</h1>
+<table>
+  <thead><tr><th background-color="light-gray">上轮问题</th><th background-color="light-gray">本轮状态</th></tr></thead>
+  <tbody>
+    <tr><td>向导状态不能直接用 plan.steps</td><td>基本改到位：第 100-101 行改为客户端 currentStep + CanvasTeam 草稿/localStorage，不再把 plan.steps 当状态源。但 firstRun “用户建的小组类型/实例”还需要可识别 marker。</td></tr>
+    <tr><td>补 bot 不能把 bot-onboarding 当 clone</td><td>文案改诚实了：第 83 行明确 cloneBot/ceo-spawn 不是 bot-onboarding。但 ceo-spawn dashboard 无 session 的依赖未定，仍是本轮 P1。</td></tr>
+    <tr><td>runOnboarding/验收需要两段证据</td><td>基本改到位：第 92-96 行拆“配置+落库”和“真实引擎跑通”，并明确看 team.status，不再承诺单次 create 跑完。</td></tr>
+    <tr><td>席位不能硬编码 3 个</td><td>改到位：第 95 行要求按 plan.seats 动态渲染，默认两层 review 是 4 席。</td></tr>
+  </tbody>
+</table>
+
+<h1>本轮结论</h1>
+<p>v2 的产品方向我认可：给画布配置器套新手向导壳，比 v1 的“搭公司/root 群”更贴近实际范围。但设计还不能进入实现，执行者需要先补上三个硬合同：dashboard 写接口代理、建群时用户可见性、clone/ceo-spawn 在 dashboard 的裁剪或新 API。补完后再复审一次桥接表和第一切片范围。</p>
+

@@ -1,0 +1,52 @@
+<title>新手引导 UI 设计稿 v1 Review</title>
+
+<callout emoji="⚠️" background-color="light-red" border-color="red">
+  <p><b>结论：</b>暂不通过。设计方向对，但四个关键接线点仍过度乐观：plan.steps 不能直接当向导状态源、skeleton 的 root 群缺少可见/可运营闭环、D 步复用 bot-onboarding 不等于克隆分身、F 步 runOnboarding 不能独立证明 submit→reviewing→done。</p>
+</callout>
+
+<table>
+  <thead><tr><th background-color="light-gray">Review 对象</th><th background-color="light-gray">取证范围</th></tr></thead>
+  <tbody>
+    <tr><td>飞书 docx</td><td>https://bytedance.larkoffice.com/docx/ZmuEdESAOozlLnxBinZcf8vEnUe</td></tr>
+    <tr><td>本机源</td><td><code>/home/zoujinsong.jason/work/Dbotmux_wt/onboard-ui/docs/onboard-ui/design.md</code></td></tr>
+    <tr><td>关键代码</td><td><code>src/services/taskteam-onboard.ts</code>, <code>src/dashboard/bot-onboarding.ts</code>, <code>src/services/taskteam-runtime.ts</code>, <code>src/services/taskteam-deps.ts</code>, <code>src/services/taskteam-config-store.ts</code>, <code>src/services/main-topic-config.ts</code></td></tr>
+  </tbody>
+</table>
+
+<h1>P1：7 步向导不能“直接渲染 planOnboarding.steps”当单一状态源</h1>
+<p>设计稿第 51-67 行说步骤条直接渲染 <code>plan.steps</code>，且 UI 不自己编状态机。但真实 <code>planOnboarding()</code> 的 steps 只是静态规划标签和 bot 缺口状态：<code>skeleton</code> 永远是 <code>auto</code>，<code>invite/handoff</code> 永远是 <code>manual</code>，<code>sample-team/assign-roles/dry-run</code> 只跟 <code>ready</code> 相关。它不知道用户是否已经点了邀请、skeleton 是否已经建好、root 群是否可见、F 步是否已经创建小组或跑到 reviewing/done。</p>
+<p>更具体地说，<code>src/services/taskteam-onboard.ts:93-100</code> 目前没有 completed/running/error/current step 的字段。用它驱动向导会导致 B 步未执行也显示自动就绪，skeleton API 执行失败后也无处落错误态，刷新页面也无法恢复当前进度。</p>
+<p><b>要求执行者改设计：</b>保留 <code>plan.steps</code> 作为步骤定义/缺口提示来源可以，但 <code>GET /api/task-team/onboarding/state</code> 必须额外返回可恢复的运行态，例如 inviteDismissed/skeletonReady/rootChatId/companyId/runTeamId/runStatus/lastError/currentStep，或说明如何从 company、orgRuntimeBindings、taskteams、onboarding job 推导。不要把 <code>plan.steps.status</code> 描述成单一事实源。</p>
+
+<h1>P1：skeleton 薄 API 还没闭合“管理办公室 root 群可见可运营”</h1>
+<p>设计稿第 59、78-94 行推荐新建管理办公室 root 群并 <code>upsertCompany({rootChatId, ceoLarkAppId=当前bot})</code>。但现有 <code>CompanyConfig</code> 合同需要 <code>id/name/rootChatId/ceoBotRef</code>，可选 <code>ceoLarkAppId/ceoOpenId</code>；<code>upsertCompany()</code> 会写公司并同步 ChatTopology root，但不会设置 <code>mainTopicChatId</code>。设计现在没有说明 companyId 如何生成、ceoBotRef 如何取、ceoOpenId 是否需要落、是否要把 root 群设为主话题。</p>
+<p>更大的缺口是用户可见性：<code>createGroupWithBots()</code> 支持 <code>userOpenIds</code>、<code>notifyOwnerOpenId</code>、<code>bindWorkingDir</code>、<code>sourceChatId</code>，但 skeleton 方案没有指定要把当前人拉进 root 群，也没有说明 dashboard 如何拿到当前用户在创建 app 视角下的 open_id。一个 bot 自动创建但没有 owner/user 成员和 oncall/主话题绑定的 root 群，不等于用户能“去管理办公室跟管理者说要做啥”。</p>
+<p><b>要求执行者改设计：</b>skeleton API 必须明确 root 群创建合同：creatorLarkAppId 来源、当前用户 open_id 来源与 app-scope、是否邀请/通知用户、是否 bind oncall 到工作目录、是否调用 <code>setMainTopicChatId</code> 或只登记 company，以及 root 群创建失败/半成功时如何幂等重试。否则 B/G 的产品承诺不成立。</p>
+
+<h1>P1：D 步“扫码克隆我的分身”不能直接复用 bot-onboarding</h1>
+<p>设计稿第 61、97、107 行把 D 步写成复用 <code>POST /api/bot-onboarding/start</code>。但真实 <code>BotOnboardingManager</code> 只是注册一个新飞书 app、校验凭证、向 bots.json 写入最小配置：<code>cliId: 'claude-code'</code>、<code>workingDir: '~'</code>、可选 allowedUsers。它没有调用 <code>cloneBot</code>，没有复制当前 bot home/model/身份配置，没有设置 clone displayName/description/avatar，也不会把新 bot 加入 root 群或已创建的小组群。</p>
+<p>这和设计里的“克隆我的分身”“尽量批量、能用自己的模型”“Observer 默认便宜模型”不是同一个能力。更危险的是，<code>planOnboarding()</code> 只有 <code>botName</code> 正则匹配 coco/trae/tilly/haiku 才会优先给 Observer；bot-onboarding 新增的配置没有 botName/displayName，后续 availableBots 如果拿不到真实 botName/openId，会被 <code>isUsableOnboardingBot()</code> 过滤掉，进度可能永远不递减。</p>
+<p><b>要求执行者改设计：</b>D 步必须二选一说清楚：要么改文案为“新增 Claude bot”并承认不是克隆/不是继承模型；要么接真正的 clone/ceo-spawn 能力，明确 source bot、cloneName、cloneHome 支持矩阵、扫码完成后如何热注册、如何取 app-scoped open_id、如何邀请到 root/sample 群，以及批量流程如何排队。不能把 bot-onboarding 当作 clone 替身。</p>
+
+<h1>P1：F 步验收路径把 runOnboarding 说重了，缺少真实驱动闭环</h1>
+<p>设计稿第 63、95-96、120 行说 <code>POST /run</code> 等于 <code>runOnboarding</code> 真建小组加引擎驱动，轮询 <code>/api/task-team/instances</code> 看 <code>reviewState</code> 就能证明 submit→reviewing→done。真实代码不是这样：<code>runOnboarding()</code> 只创建 roleInstances 后调用 <code>createSampleTeam()</code>；<code>createTaskTeam()</code> 在 <code>src/services/taskteam-runtime.ts:167-191</code> 建群、落库、apply <code>team-started</code> 后返回。后续 submit/review-pass 依赖真实 bot 在群里发言、observer 抓消息、judge 归因、engine 产命令、dispatcher 投递。</p>
+<p><code>reviewState</code> 本身也没有 reviewing/done 字段；状态在 <code>TaskTeamInstance.status</code>，reviewState 只有 round/reworkCount/pendingInstanceId/votes。只看 <code>reviewState</code> 会漏掉状态机结果。并且默认 seed 的示例小组是四席位：开发者、架构师、审查员、盯梢，设计第 60 行写“三个角色卡（执行者/把关者/盯梢者）”会少展示一层 reviewer，和默认两层 review 不一致。</p>
+<p><b>要求执行者改设计：</b>F 步必须拆成“创建小组成功”和“真实引擎跑通”两段验收。接口返回 created/teamId/chatId 后，UI 应轮询 team.status/progress/reviewState/pendingInstanceId，并且验收证据要包含 dispatcher/observer 已运行、角色消息或投递 message_id、状态从 running 到 reviewing/awaiting-acceptance/done 的真实记录。若 v1 只要求 reviewing，也要把 done 改成可选后续，不要承诺 <code>runOnboarding</code> 单次调用能直接跑完。</p>
+
+<h1>P2：firstRun 判定和“可重走”会互相污染</h1>
+<p>设计稿第 43、46 行定义 firstRun = 没有 company 且没有任务小组实例，非首次仍可重走。但 <code>runOnboarding()</code> 默认 companyId 是固定 <code>tt_company_onboard</code>，如果用户重走，若没有幂等键/实例筛选，可能重复建示例小组；如果有历史任意 taskteam，firstRun 就不出现，即使新手从未完成 onboarding 也不会被邀请。</p>
+<p><b>建议：</b>state 返回 onboarding-specific marker，例如 companyId、rootChatId、sampleTeamId、completedAt、dismissedAt。首次邀请不要只看全局 taskteams 是否为空。</p>
+
+<h1>本轮审查结论</h1>
+<table>
+  <thead><tr><th background-color="light-gray">问题</th><th background-color="light-gray">结论</th></tr></thead>
+  <tbody>
+    <tr><td>① 7 步映射 planOnboarding.steps</td><td>不成立。steps 可做定义/提示，不能做向导状态源。</td></tr>
+    <tr><td>② skeleton 3 个薄 API</td><td>方向不够，skeleton 需要补 root 群用户可见、company 合同、主话题/oncall、幂等失败态。</td></tr>
+    <tr><td>③ D 步扫码补 bot 复用 bot-onboarding</td><td>不合理。现有 bot-onboarding 不是 clone，也不保证可用 bot/openId/model/进群。</td></tr>
+    <tr><td>④ F 步 runOnboarding 验收路径</td><td>不成立。runOnboarding 只启动小组，不保证 submit→reviewing→done；验收要看真实 observer/dispatcher/消息证据。</td></tr>
+  </tbody>
+</table>
+
+<p>我建议执行者先改设计稿而不是进入实现。改完后下一轮重点复核：state API 的可恢复字段、skeleton 的 root 群创建合同、D 步到底是新增 bot 还是 clone、F 步真实 E2E 证据链。</p>
+

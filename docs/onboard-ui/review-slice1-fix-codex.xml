@@ -1,0 +1,21 @@
+<title>新手引导第一刀复审修订一致性检查 - Codex</title>
+
+<h1>新手引导第一刀复审修订一致性检查</h1>
+<p>结论：三条复审意见已改到位，设计 v5 的“两段分开”与 working tree 当前实现一致；第一刀（配模板向导，零 bot）可放行给 CEO gate。</p>
+
+<h2>核对结果</h2>
+<ul>
+  <li>P1-1 roleId/slotId 互覆盖：已修。代码使用每次向导会话 sid 生成 tt_role_${sid}_${kind} / tt_slot_${sid}_${kind}，中文名只做展示，不再进入 ID。保存前也对中文 typeId 兜底/撞名追加 sid。位置：src/dashboard/web/task-team-onboarding.ts:155-162、392-399。</li>
+  <li>P1-2 第一段零 bot 文案：已修。保存成功文案改为“可复用模板（不含机器人）”，并把挑机器人放到“第二段·单独入口”。设计 v5 与验收文档也都明确第一段配模板、第二段建真群。位置：src/dashboard/web/task-team-onboarding.ts:308。</li>
+  <li>P2 mini 预览刷新：已修。成员名/模型 input 事件只刷新右侧 preview，不重绘左侧输入框，能保持焦点。位置：src/dashboard/web/task-team-onboarding.ts:223-227、368-369。</li>
+</ul>
+
+<h2>验证</h2>
+<ul>
+  <li>我复跑 pnpm build，通过。</li>
+  <li>git diff --check 通过。</li>
+  <li>设计 v5 docx 与第一刀验收 docx 已回读，文档表述和当前代码一致。</li>
+</ul>
+
+<h2>剩余提醒</h2>
+<p>第一刀放行范围仅限“配模板向导”：入口卡、向导骨架、前三步、写代理、config-list 兼容、存类型。第二段“用模板建真群”后续仍需单独按服务端组装 roleInstances、用户进群、邀请失败透出合同复审。</p>

@@ -158,6 +158,8 @@ export interface CreateTaskTeamParams {
   groupName?: string;
   creatorLarkAppId: string;
   sourceChatId?: string | null;
+  /** 建群时把这些真人 open_id 拉进群（dashboard「用模板建真群」用——把当前用户拉进去）。可选、向后兼容。 */
+  userOpenIds?: string[];
 }
 
 /**
@@ -173,6 +175,7 @@ export async function createTaskTeam(
     name: params.groupName,
     creatorLarkAppId: params.creatorLarkAppId,
     larkAppIds: botAppIds,
+    userOpenIds: params.userOpenIds,
     sourceChatId: params.sourceChatId ?? null,
     purpose: params.goal,
   });

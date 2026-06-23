@@ -1,0 +1,32 @@
+<title>新手引导第一刀 working tree 复审 - Codex review/challenge</title>
+
+<h1>新手引导第一刀 working tree 复审</h1>
+<p>结论：第一刀主体方向正确，确实是“配模板向导，零 bot”，写代理和 assembleSaveOps 落库链路也基本成立；但还有 2 个需要执行者改的点。P1 修掉后再进入“用模板建真群”第二段更稳。</p>
+
+<h2>已核通过的部分</h2>
+<ul>
+  <li>范围基本符合最新纠正：当前实现只做起名、加角色、连线、存类型，没有 bot 选择、bot 盘点、克隆入口。</li>
+  <li>落库路径复用 assembleSaveOps + postAdmin，没有另起一套配置 schema。保存会发 role/rule/type upsert。</li>
+  <li>dashboard §3.1 写代理已补：POST /api/taskteam-role-upsert、rule-upsert、type-upsert 代理到在线 daemon；GET /api/taskteam-config-list 兼容 readTaskTeamConfig。</li>
+  <li>我复跑了 pnpm build，构建通过；git diff --check 通过。</li>
+  <li>验收 docx 与截图能证明入口卡、连线步、保存成功路径存在；隔离 round-trip 证据覆盖了“config-list 查到新类型”。</li>
+</ul>
+
+<h2>P1：中文默认角色名会生成重复 roleId/slotId，后续模板可能互相覆盖</h2>
+<p>问题：向导默认用“干活的/把关的/盯梢的/汇报的”这些中文名生成 roleId/slotId，但 idSafe 只保留 a-z0-9。结果所有中文默认名都会先折成 fallback：roleId 基础值都是 tt_role_role，slotId 基础值都是 tt_slot_slot。nextId 只在当前页面会话内去重，所以同一次向导里会变成 tt_role_role、tt_role_role-2、tt_role_role-3；但下一次新建模板又从同样 ID 开始。</p>
+<p>代码位置：src/dashboard/web/task-team-onboarding.ts:154-168；idSafe 规则在 src/dashboard/web/taskteam-canvas-data.ts:108-111；upsertTaskTeamRole 按 roleId 覆盖全局角色，见 src/services/taskteam-config-store.ts:106-112。</p>
+<p>风险：这不是只有 typeId 中文兜底的问题。typeId 现在至少有输入框可手动改；roleId/slotId 没有入口让用户改。用户第二次用向导建另一个模板时，role upsert 会覆盖第一次模板引用的全局角色定义，旧模板的 roleSlots 仍指向这些 roleId，语义可能被后一个模板改掉。</p>
+<p>要求执行者修：roleId/slotId 生成必须带模板级稳定前缀或随机/时间短后缀，例如 tt_role_${typeSlug}_${kind}_${n} / tt_slot_${typeSlug}_${kind}_${n}。对中文 typeSlug 也要避免落到固定 team，可以用短随机后缀。修完要补一个最小验证：连续创建两个中文命名模板，第二个保存不能覆盖第一个模板的 roles/roleSlots。</p>
+
+<h2>P1：保存成功文案仍把“bot 盘点”带回了配模板阶段</h2>
+<p>最新 CEO 纠正明确说：第一段“配模板向导”全程零 bot；bot 只在第二段“用模板建一个真群”才出现。当前保存成功后 UI 文案仍写“下一步（下个切片）：盘点机器人够不够、把它真的建成一个能跑的小组。”这会把刚纠正掉的模型又塞回用户心智里。</p>
+<p>代码位置：src/dashboard/web/task-team-onboarding.ts:298；验收文档 slice1 里也有“下一刀：盘点 bot”的表述。</p>
+<p>要求执行者修：把保存成功后的下一步文案改为“下一步：用这个模板建一个真群，再给每个角色选择实际 bot”。第一段内不要出现“bot 够不够/盘点/补 bot”的字样。第二段可以再谈 bot 不够和克隆置灰。</p>
+
+<h2>P2：成员名/模型输入不会实时刷新右侧 mini 预览</h2>
+<p>问题：右侧预览号称实时画出流程图，但成员名和模型输入只更新内存，不触发 rerender；用户打字时右侧卡片仍显示旧名字，只有切步或其它触发 rerender 后才刷新。</p>
+<p>代码位置：src/dashboard/web/task-team-onboarding.ts:360-361 只改 node.name/node.model，没有 rerender 或局部更新预览。</p>
+<p>建议：input 事件里做轻量 rerender，或者只重绘 preview 区域。这个不阻塞第一刀主链，但会影响“实时预览”的体验承诺。</p>
+
+<h2>复审建议</h2>
+<p>修掉两个 P1 后，我认为第一刀可以放行给 CEO gate。第二段“用模板建真群”再继续按 v4 的服务端组装 roleInstances、用户进群、邀请失败透出合同审。</p>

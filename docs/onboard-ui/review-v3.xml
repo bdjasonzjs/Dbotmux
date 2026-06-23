@@ -1,0 +1,39 @@
+<title>新手引导 UI 设计稿 v3 复审 - Codex review/challenge</title>
+  <h1>新手引导 UI 设计稿 v3 复审</h1>
+  <p>结论：v3 已经把 v2 的方向性问题收窄到可实现范围，ceo-spawn 主路径裁剪也合理。但还有 2 个 P1 合同没有真正闭合，执行者需要改设计稿后再进入实现；另有 1 个 P2 接线缺口建议同步补掉，避免第一刀落地时前端复用失败。</p>
+
+  <h2>P1-1：§6 仍把 botOpenId 可信边界漏回浏览器</h2>
+  <p>问题：v3 §3.3 说 plan-only 接口由服务端 listBots()+getBotOpenId() 生成 usableBots，浏览器不再提交 availableBots，以此杜绝伪造 openId 流入 roleInstances。但 §6 又要求“前端把 plan.seats + selectedBotBySlot 转成 TaskTeamRoleInstance[]”并提交给 /api/taskteam-create，其中 binding 直接包含 botOpenId。</p>
+  <p>这没有真正堵住伪造路径：浏览器仍能在 create 请求里伪造 roleInstances[].binding.botOpenId / larkAppId。服务端“再 plan 一次校验 ready === true”只能证明当前有足够 bot，不能证明客户端提交的 roleInstances 与服务端真实 bot 清单、slot 列表、saved type 完全一致。</p>
+  <p>代码依据：TaskTeamRoleBinding 的 botOpenId/larkAppId 在 src/services/taskteam-schema.ts:128-133；createTaskTeam 目前直接使用 params.roleInstances，且只从其中收集 larkAppId 建群，见 src/services/taskteam-runtime.ts:167-188。当前没有服务端校验 roleInstances binding 是否来自 getBotOpenId() 的真实结果。</p>
+  <p>要求执行者修改合同：二选一收口。</p>
+  <ul>
+    <li>更稳：/api/taskteam-create 不接收完整 roleInstances，只接收 typeId + selectedBotBySlot/appIds + goal/acceptance，服务端根据已存 TaskTeamType.roleSlots 与真实 usableBots 组装 roleInstances。</li>
+    <li>若保留前端转换：/api/taskteam-create 必须服务端重建 usableBot map，并逐项校验 roleInstances 的 slotId/roleId 与已存 type 完全匹配、binding.larkAppId 存在、binding.botOpenId 等于 getBotOpenId(larkAppId)、未绑定席位为 409。只验 plan.ready 不够。</li>
+  </ul>
+
+  <h2>P1-2：§3.2 “照搬 groups/create”不能保证当前用户在群里</h2>
+  <p>问题：/api/groups/create 的 creator 选择逻辑允许 fallback：如果选中的在线 bot 都没有 resolvedAllowedUsers，会选择第一个在线 bot，并跳过 auto-invite。这个 fallback 对通用建群可以接受，但 onboarding 的验收要求是“当前用户在群里”。v3 §3.2 如果只是照搬该范式，会留下“群建好了但用户看不到”的成功分支。</p>
+  <p>代码依据：pickCreatorForGroup 在 src/dashboard/operator-selector.ts:28-51 明确 fallback 到没有 allowlist 的在线 bot；dashboard groups/create 在 src/dashboard.ts:1117-1129 使用 pick.userOpenIds，空数组时 autoInvited 为 null。v3 的验收又要求当前用户在群里截图。</p>
+  <p>另一个未闭合点：v3 写“邀请失败不静默，返回 userInvited:false”，但当前 defaultCreateTaskTeamDeps.createGroup 只返回 chatId，会丢弃 createGroupWithBots 的 invalidUserIds / notifyError 等结果，见 src/services/taskteam-deps.ts:49-58；createTaskTeam 也只返回 TaskTeamInstance，见 src/services/taskteam-runtime.ts:167-191。仅给入参加 userOpenIds/notifyOwnerOpenId 不足以实现 userInvited:false。</p>
+  <p>要求执行者修改合同：</p>
+  <ul>
+    <li>taskteam-create 的 dashboard 入口必须要求存在 creator-app scope 的 operator open_id；没有 resolvedAllowedUsers 时，在建群前返回 409/400，让用户先完成 owner/allowedUsers 绑定，而不是创建无人可见的群。</li>
+    <li>runtime/deps 返回形状要显式扩展：createGroup 返回 invalidUserIds/notifyError/ownerTransferredTo 等最小必要字段，createTaskTeam 或 daemon route 将 userInvited/autoInviteRejected/warning 透给 dashboard。否则“邀请失败不静默”无法实现。</li>
+  </ul>
+
+  <h2>P2：§3.1 漏了 config-list/read alias，loadExistingRoles 复用会 404</h2>
+  <p>问题：v3 §2 说复用 taskteam-canvas-data.ts 的 loadExistingRoles()，但该函数 fetch('/api/taskteam-config-list')；现有 dashboard 只读 API 是 GET /api/task-team/config，daemon admin 的 /api/taskteam-config-list 是 POST IPC。v3 §3.1 只列了 role/rule/type 三个 upsert 代理，没有给 /api/taskteam-config-list 做 dashboard GET/POST 兼容。</p>
+  <p>代码依据：loadExistingRoles 在 src/dashboard/web/taskteam-canvas-data.ts:369-374；dashboard read-only handleTaskTeamApi 只支持 /api/task-team/config/roles/rules/types/instances/org，见 src/dashboard/task-team-api.ts:35-58；daemon admin /api/taskteam-config-list 是 POST，见 src/daemon.ts:1471-1483。</p>
+  <p>要求执行者补合同：要么把 loadExistingRoles 改用 /api/task-team/config，要么在 dashboard 新增 /api/taskteam-config-list 的 GET/POST 兼容代理。否则“复用画布数据层”在读取已存角色/配置时会先撞 404。</p>
+
+  <h2>已经认可的收口</h2>
+  <ul>
+    <li>§3.1 将 dashboard 写代理改为明确新建实现项，这次不再误判为已有接口；proxyToDaemon 作为薄代理可实现。</li>
+    <li>§4 将克隆从第一切片裁掉、ceo-spawn 另设 dashboard clone API，是合理收口。ceoSpawn 当前确实绑定 sessionId/chatId/rootMessageId，不能在无 chat 的 dashboard 主路径直接复用。</li>
+    <li>§5 删除模板起步和画布逃生口，降低第一刀反向 mapper 风险，范围合理。</li>
+    <li>验收拆成配置落库与真实引擎两段，比 v2 更可测；后续执行必须贴真实群成员、team.status 与 message_id 证据。</li>
+  </ul>
+
+  <h2>建议的复审门槛</h2>
+  <p>执行者补完以上两个 P1 后，v3 可以进入实现。实现时第一刀至少要验证：从 dashboard 保存 type 成功、服务端 create 校验 roleInstances/selectedBotBySlot 的可信边界、建出的群当前用户实际在群内，且邀请失败路径能被 UI 明确显示。</p>
