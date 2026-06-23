@@ -25,7 +25,7 @@
 
 ### 前端（画布配置器，客户端 TS，复用核心）
 - `taskteam-canvas-data.ts`（纯函数）：`CanvasTeam`、`allowedChips`/`validateCanvas`/`deriveReviewOrder`、`assembleSaveOps`（→三类 upsert）、`loadExistingRoles`。
-  - ⚠️ 关键：`CanvasNode` 是**席位（roleSlot）**，`model` 是角色级 LLM 选择（模板级，画布本来就有），**不是 bot 绑定**。binding（botOpenId/larkAppId）只在第二段建实例才出现。所以"配模板向导零 bot"天然成立。
+  - ⚠️ 关键：`CanvasNode` 是**席位（roleSlot）**，不是 bot 绑定。binding（botOpenId/larkAppId）只在第二段建实例才出现。`CanvasNode.model` 字段虽存在于数据层（完整画布编辑器用），但**新手向导第一段不暴露/不设置模型**——模型随第二段挑的 bot 走。所以"配模板向导零 bot"天然成立。
 - `taskteam-canvas.ts`：SVG 渲染（向导做只读 mini 预览）。
 
 ### 后端（daemon IPC，已存在）
@@ -44,7 +44,7 @@
 | 步 | 做什么 | 复用 |
 |---|---|---|
 | 起名 | 小组名 + 自动派生 typeId | 写 `CanvasTeam.name/typeId` |
-| 加角色 | 大白话挑角色（干活/把关/汇报/盯梢，纯 slot）+「一键加一套推荐」；可设名字、角色级模型（盯梢的提示便宜模型）。**不出现任何 bot** | `addNode` 同款 + `kindDefaults` |
+| 加角色 | 默认预填一套示例（开发工程师/代码审查员/进度观察员），可改名/增删；每角色标含义。**不出现任何 bot、不配模型**（模型随第二段挑的 bot 走） | `addNode` 同款 + `kindDefaults` |
 | 连谁审谁 | 「✨ 智能连好」自动连合法流程 + 手动加/删；实时 `validateCanvas` + `deriveReviewOrder` | `allowedChips`/`defaultChip`/`deriveReviewOrder` |
 | 存好 | 校验过 → 存成可复用的小组**类型** | `validateCanvas`→`assembleSaveOps`→写代理（§五） |
 

@@ -4,7 +4,7 @@
 // 不重写配置逻辑：CanvasTeam 模型 / 校验 / 派生 / 落库全复用 taskteam-canvas-data + taskteam-builder-data。
 // 【两段分开 · 松松 2026-06-22 纠正】本向导 = 第一段「配模板」，全程零 bot，产出 bot-agnostic 模板（TaskTeamType+roleSlots）。
 //   选 bot / 盘点 / 补 bot / 建实例（含拉用户进群）全归「第二段：用模板建真群」（单独入口），本文件不含。
-//   注：每个角色的 model 是角色级 LLM 选择（模板级，画布本来就有），不是 bot 绑定。
+//   注：本向导只配「角色」（名字 + 类型 + 连线），不碰 LLM 模型/引擎——模型随第二段挑的 bot 走，配模板这步不出现。
 
 import {
   allowedChips,
@@ -32,6 +32,22 @@ const KIND_PLAIN: Record<CanvasRoleKind, string> = {
   reporter: '汇报的',
   observer: '盯梢的',
   custom: '自定义',
+};
+// 角色含义（说人话，给字段标清）
+const KIND_DESC: Record<CanvasRoleKind, string> = {
+  developer: '负责执行、出活',
+  reviewer: '负责审，把关质量',
+  reporter: '负责对外汇报',
+  observer: '只看进展、不插手',
+  custom: '自定义职责',
+};
+// 默认示例角色名（一进「加成员」就摆好一套填好的样板，照着改即可，不是空白）
+const KIND_SAMPLE_NAME: Record<CanvasRoleKind, string> = {
+  developer: '开发工程师',
+  reviewer: '代码审查员',
+  reporter: '进度汇报员',
+  observer: '进度观察员',
+  custom: '自定义角色',
 };
 const KIND_COLOR: Record<CanvasRoleKind, string> = {
   developer: '#2b5fff',
@@ -130,7 +146,7 @@ function renderMiniCanvas(team: CanvasTeam): string {
   }).join('');
   const nodes = team.nodes.map(n => {
     const col = KIND_COLOR[n.kind];
-    const sub = n.model || KIND_PLAIN[n.kind];
+    const sub = KIND_PLAIN[n.kind]; // 预览：上行=角色名（开发工程师），下行=干啥（干活的），不重复
     return `<g transform="translate(${n.x},${n.y})">
       <rect width="${NODE_W}" height="${NODE_H}" rx="9" fill="#fff" stroke="${col}" stroke-width="1.5"></rect>
       <rect x="0" y="0" width="5" height="${NODE_H}" rx="2.5" fill="${col}"></rect>
@@ -156,14 +172,14 @@ export function renderTaskTeamOnboardingPage(root: HTMLElement): (() => void) {
   // 杜绝中文默认名经 idSafe 都折成 tt_role_role/tt_slot_slot、跨模板互相覆盖全局 role/rule。
   const sid = Math.random().toString(36).slice(2, 7);
 
-  function addRole(kind: CanvasRoleKind): void {
+  function addRole(kind: CanvasRoleKind, name?: string): void {
     // 用 kind（英文）+ 会话前缀 sid 生成稳定唯一 id；中文名只做展示 label，不进 id。
     const roleId = nextId(`tt_role_${sid}_${kind}`, usedRole);
     const slotId = nextId(`tt_slot_${sid}_${kind}`, usedSlot);
     const d = kindDefaults(kind);
     team.nodes.push({
       slotId, roleId, kind,
-      name: KIND_PLAIN[kind],
+      name: name ?? KIND_SAMPLE_NAME[kind], // 默认给有意义的示例名（开发工程师…），不是"干活的"占位
       responsibility: '',
       visibility: d.visibility,
       actions: d.actions,
@@ -220,7 +236,7 @@ export function renderTaskTeamOnboardingPage(root: HTMLElement): (() => void) {
 
   // ---- 渲染 ----
   function rerender(): void { root.querySelector('.ttw')!.outerHTML = view(); wire(); }
-  // P2：只重绘右侧预览（成员名/模型打字时实时刷新，又不动左侧输入框、保持焦点）。
+  // P2：只重绘右侧预览（成员名打字时实时刷新，又不动左侧输入框、保持焦点）。
   function refreshPreview(): void {
     const pv = root.querySelector('.ttw-preview');
     if (pv) pv.innerHTML = `<div class="ttw-preview-cap">流程预览</div>${renderMiniCanvas(team)}`;
@@ -246,20 +262,19 @@ export function renderTaskTeamOnboardingPage(root: HTMLElement): (() => void) {
     const rows = team.nodes.map(n => `
       <div class="ttw-member" data-slot="${esc(n.slotId)}">
         <span class="ttw-dot" style="background:${KIND_COLOR[n.kind]}"></span>
-        <span class="ttw-mkind">${esc(KIND_PLAIN[n.kind])}</span>
-        <input class="ttw-mname" value="${esc(n.name)}" placeholder="给TA起个名" />
-        <input class="ttw-mmodel" value="${esc(n.model ?? '')}" placeholder="模型（可空，盯梢的建议用便宜模型）" />
-        <button class="ttw-del" title="删除">✕</button>
+        <span class="ttw-mkind" title="${esc(KIND_DESC[n.kind])}">${esc(KIND_PLAIN[n.kind])}<small>${esc(KIND_DESC[n.kind])}</small></span>
+        <input class="ttw-mname" value="${esc(n.name)}" placeholder="给这个角色起个名，比如'前端工程师'" />
+        <button class="ttw-del" title="删除这个角色">✕</button>
       </div>`).join('');
     return `<div class="ttw-body">
-      <h3>加成员：谁干活、谁把关、谁盯梢</h3>
-      <p class="ttw-hint">用大白话挑角色，至少加一个"干活的"。把关的负责审、盯梢的只看不插手。</p>
+      <h3>给这个小组配上角色：谁干活、谁审、谁盯</h3>
+      <p class="ttw-hint">下面已经给你摆了一套常见的（开发工程师 / 代码审查员 / 进度观察员），改改名就行；也能加/删。这步只配角色，不挑机器人——机器人在下一段「建真群」再选。</p>
       <div class="ttw-addbar">
-        <button class="ttw-add" data-kind="developer">+ 干活的</button>
-        <button class="ttw-add" data-kind="reviewer">+ 把关的</button>
-        <button class="ttw-add" data-kind="reporter">+ 汇报的</button>
-        <button class="ttw-add" data-kind="observer">+ 盯梢的</button>
-        ${team.nodes.length ? '' : '<button class="ttw-add ttw-add-set" data-set="1">一键加一套推荐（干活+把关+盯梢）</button>'}
+        <button class="ttw-add" data-kind="developer" title="${esc(KIND_DESC.developer)}">+ 干活的</button>
+        <button class="ttw-add" data-kind="reviewer" title="${esc(KIND_DESC.reviewer)}">+ 把关的</button>
+        <button class="ttw-add" data-kind="reporter" title="${esc(KIND_DESC.reporter)}">+ 汇报的</button>
+        <button class="ttw-add" data-kind="observer" title="${esc(KIND_DESC.observer)}">+ 盯梢的</button>
+        ${team.nodes.length ? '' : '<button class="ttw-add ttw-add-set" data-set="1">恢复一套推荐（开发+审查+观察）</button>'}
       </div>
       <div class="ttw-members">${rows || '<div class="ttw-mini-empty">还没加成员，点上面按钮加一个</div>'}</div>
     </div>`;
@@ -366,7 +381,6 @@ export function renderTaskTeamOnboardingPage(root: HTMLElement): (() => void) {
       const slot = row.dataset.slot!;
       const node = team.nodes.find(n => n.slotId === slot);
       row.querySelector<HTMLInputElement>('.ttw-mname')?.addEventListener('input', e => { if (node) { node.name = (e.target as HTMLInputElement).value; refreshPreview(); } });
-      row.querySelector<HTMLInputElement>('.ttw-mmodel')?.addEventListener('input', e => { if (node) { node.model = (e.target as HTMLInputElement).value || undefined; refreshPreview(); } });
       row.querySelector<HTMLButtonElement>('.ttw-del')?.addEventListener('click', () => { removeNode(slot); rerender(); });
     });
 
@@ -408,6 +422,9 @@ export function renderTaskTeamOnboardingPage(root: HTMLElement): (() => void) {
     saveResult = { ok: true, msg: `✓ 已存好工作小组「${team.name}」（类型 ${team.typeId}，共 ${ops.length} 项）` };
     rerender();
   }
+
+  // 默认就摆好一套填好的示例小组（开发工程师/代码审查员/进度观察员）——「加成员」不再是空白。
+  addRole('developer'); addRole('reviewer'); addRole('observer');
 
   root.innerHTML = view();
   wire();
