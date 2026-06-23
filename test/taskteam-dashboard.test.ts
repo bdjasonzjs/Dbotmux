@@ -53,6 +53,43 @@ describe('buildOrgTree (§8.2 org tree)', () => {
     expect((badJson as { error: string }).error).toContain('bad json');
   });
 
+  it('shows login-required for redirected login HTML before parsing JSON', async () => {
+    const redirected = await fetchTaskTeamJson('/p', async () => ({
+      ok: true,
+      status: 200,
+      redirected: true,
+      headers: { get: () => 'text/html; charset=utf-8' },
+      json: async () => { throw new Error('should not parse login html'); },
+    }));
+    expect(redirected).toEqual({ ok: false, error: '请登录后再访问 Dashboard' });
+
+    const unauthorized = await fetchTaskTeamJson('/p', async () => ({
+      ok: false,
+      status: 401,
+      headers: { get: () => 'text/html; charset=utf-8' },
+      json: async () => ({}),
+    }));
+    expect(unauthorized).toEqual({ ok: false, error: '请登录后再访问 Dashboard' });
+  });
+
+  it('does not misreport real non-JSON API errors as login-required', async () => {
+    const html500 = await fetchTaskTeamJson('/p', async () => ({
+      ok: false,
+      status: 500,
+      headers: { get: () => 'text/html; charset=utf-8' },
+      json: async () => { throw new Error('should not parse error html'); },
+    }));
+    expect(html500).toEqual({ ok: false, error: 'HTTP 500' });
+
+    const html200 = await fetchTaskTeamJson('/p', async () => ({
+      ok: true,
+      status: 200,
+      headers: { get: () => 'text/html; charset=utf-8' },
+      json: async () => { throw new Error('should not parse html'); },
+    }));
+    expect(html200).toEqual({ ok: false, error: '响应不是 JSON：text/html; charset=utf-8' });
+  });
+
   it('returns empty departments when no teams match', () => {
     const config = {
       version: 1, roles: [], rules: [], teamTypes: [],

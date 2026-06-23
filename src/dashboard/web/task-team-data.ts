@@ -4,16 +4,36 @@
 
 export type LoadResult<T> = { ok: true; data: T } | { ok: false; error: string };
 
-export type FetchLike = (path: string) => Promise<{ ok: boolean; status: number; json: () => Promise<unknown> }>;
+type FetchResponseLike = {
+  ok: boolean;
+  status: number;
+  redirected?: boolean;
+  headers?: { get: (name: string) => string | null };
+  json: () => Promise<unknown>;
+};
+
+export type FetchLike = (path: string) => Promise<FetchResponseLike>;
+
+function isJsonResponse(res: FetchResponseLike): boolean {
+  const contentType = res.headers?.get('content-type');
+  return !contentType || /\bapplication\/json\b|\+json\b/i.test(contentType);
+}
+
+function isLoginResponse(res: FetchResponseLike): boolean {
+  if (res.status === 302 || res.status === 401) return true;
+  return !!res.redirected && !isJsonResponse(res);
+}
 
 export async function fetchTaskTeamJson<T>(path: string, fetchImpl: FetchLike = p => fetch(p)): Promise<LoadResult<T>> {
-  let res: { ok: boolean; status: number; json: () => Promise<unknown> };
+  let res: FetchResponseLike;
   try {
     res = await fetchImpl(path);
   } catch (err) {
     return { ok: false, error: `请求失败：${String(err)}` };
   }
+  if (isLoginResponse(res)) return { ok: false, error: '请登录后再访问 Dashboard' };
   if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
+  if (!isJsonResponse(res)) return { ok: false, error: `响应不是 JSON：${res.headers?.get('content-type') ?? 'unknown'}` };
   try {
     return { ok: true, data: (await res.json()) as T };
   } catch (err) {
