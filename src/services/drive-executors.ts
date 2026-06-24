@@ -88,6 +88,11 @@ async function cocoJudge(prompt: string): Promise<DriveJudgeResult | null> {
   }
 }
 
+export function withDriveMention(text: string, mentionOpenId?: string | null): string {
+  const id = mentionOpenId?.trim();
+  return id ? `<at user_id="${id}"></at> ${text}` : text;
+}
+
 export function makeDriveExecutors(): DriveExecutors {
   const tilly = resolveBotIdent('tilly');
   const normalizeSenderId = (m: any): string => {
@@ -113,9 +118,9 @@ export function makeDriveExecutors(): DriveExecutors {
       return cocoJudge(JUDGE_PROMPT(goal, rendered));
     },
 
-    async speak(chatId: string, text: string): Promise<boolean> {
+    async speak(chatId: string, text: string, mentionOpenId?: string | null): Promise<boolean> {
       try {
-        await sendMessage(tilly.larkAppId, chatId, text, 'text');
+        await sendMessage(tilly.larkAppId, chatId, withDriveMention(text, mentionOpenId), 'text');
         logger.info(`[drive-exec] 缇蕾在群 ${chatId.slice(0, 12)} 发了催促`);
         return true;
       } catch (err: any) {

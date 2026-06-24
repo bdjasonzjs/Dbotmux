@@ -45,6 +45,12 @@ export interface ChatPolicy {
   scoutMode: ScoutMode;
   /** 推动目标文本（drive=on 必带，推向什么/催什么）；off 时可为 null/空。 */
   driveGoal?: string | null;
+  /** 推动催促时需要 @ 唤醒的人/bot open_id；空则只发普通文本。 */
+  driveMentionOpenId?: string | null;
+  /** 推动自动停止时间。epoch ms；空则不自动停。 */
+  driveUntil?: number | null;
+  /** 每群每日推动预算；空则用 drive-store 默认值。 */
+  driveMaxPerDay?: number | null;
   updatedAt: string;
 }
 
@@ -93,7 +99,7 @@ function defaultPolicy(chatId: string, now: string): ChatPolicy {
     chatId,
     driveOn: false,
     reportTargetChatId: null,
-    scoutMode: 'watch', // 默认扫（主话题的默认静音由 getScoutMutedChatIds 兜底处理，不靠建策略）
+    scoutMode: chatId === MAIN_TOPIC_CHAT_ID ? 'mute' : 'watch',
     updatedAt: now,
   };
 }
@@ -152,13 +158,28 @@ export interface ChatPolicyPatch {
   reportTargetChatId?: string | null;
   scoutMode?: ScoutMode;
   driveGoal?: string | null;
+  driveMentionOpenId?: string | null;
+  driveUntil?: number | null;
+  driveMaxPerDay?: number | null;
 }
 
 /** 推动配置（drive=on 且有目标才算真正开启推动）。 */
-export function getDriveConfig(chatId: string): { enabled: boolean; goal: string | null } {
+export function getDriveConfig(chatId: string): {
+  enabled: boolean;
+  goal: string | null;
+  mentionOpenId: string | null;
+  until: number | null;
+  maxPerDay: number | null;
+} {
   const p = getPolicy(chatId);
   const goal = p?.driveGoal ?? null;
-  return { enabled: p?.driveOn === true && !!goal, goal };
+  return {
+    enabled: p?.driveOn === true && !!goal,
+    goal,
+    mentionOpenId: p?.driveMentionOpenId ?? null,
+    until: Number.isFinite(p?.driveUntil) ? p!.driveUntil! : null,
+    maxPerDay: Number.isFinite(p?.driveMaxPerDay) ? p!.driveMaxPerDay! : null,
+  };
 }
 
 /** Upsert 一条群策略（已存在则按 patch 局部更新，不存在则建默认再 patch）。 */
@@ -173,6 +194,9 @@ export function setPolicy(chatId: string, patch: ChatPolicyPatch): ChatPolicy {
     ...(patch.reportTargetChatId !== undefined ? { reportTargetChatId: patch.reportTargetChatId } : {}),
     ...(patch.scoutMode !== undefined ? { scoutMode: patch.scoutMode } : {}),
     ...(patch.driveGoal !== undefined ? { driveGoal: patch.driveGoal } : {}),
+    ...(patch.driveMentionOpenId !== undefined ? { driveMentionOpenId: patch.driveMentionOpenId } : {}),
+    ...(patch.driveUntil !== undefined ? { driveUntil: patch.driveUntil } : {}),
+    ...(patch.driveMaxPerDay !== undefined ? { driveMaxPerDay: patch.driveMaxPerDay } : {}),
     updatedAt: now,
   };
   if (idx >= 0) store.policies[idx] = next;

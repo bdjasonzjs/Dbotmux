@@ -15,7 +15,7 @@
  * 决策逻辑在此、可单测；IO（拉消息带 senderId/时间、judge、群内发言）由 executors 注入。
  */
 import { logger } from '../utils/logger.js';
-import { listPolicies, getDriveConfig } from './chat-policy-store.js';
+import { listPolicies, getDriveConfig, setPolicy } from './chat-policy-store.js';
 import {
   getOrInitDriveState, saveDriveState, budgetRemaining, dateKeyOf, type DriveState,
 } from './drive-store.js';
@@ -47,8 +47,8 @@ export interface DriveExecutors {
   fetchMessages(chatId: string, limit: number): Promise<FetchedMsg[]>;
   /** 缇蕾对照 goal 判断该不该催 + 催什么；判不出返 null（当作不催）。 */
   judge(goal: string, renderedNewMessages: string): Promise<DriveJudgeResult | null>;
-  /** 缇蕾在**被盯群**里发一句催促，返是否发成功。 */
-  speak(chatId: string, text: string): Promise<boolean>;
+  /** 缇蕾在**被盯群**里发一句催促，返是否发成功。mentionOpenId 有值时前缀 @ 唤醒目标。 */
+  speak(chatId: string, text: string, mentionOpenId?: string | null): Promise<boolean>;
   /** 推动发言者（缇蕾）的 senderId —— 用于①防自激过滤。 */
   driveSpeakerId: string;
 }
@@ -74,9 +74,27 @@ export async function runDriveTick(
   for (const p of listPolicies()) {
     const drive = getDriveConfig(p.chatId);
     if (!drive.enabled || !drive.goal) continue;
+    if (drive.until != null && now.getTime() > drive.until) {
+      setPolicy(p.chatId, { driveOn: false });
+      logger.info(`[drive] ${p.chatId.slice(0, 12)} driveUntil reached → auto stop`);
+      continue;
+    }
     res.checked += 1;
     try {
-      await tickOne(p.chatId, drive.goal, now, exec, { stallMs, maxNudges, judgeCooldownMs, maxPerDay: opts.maxPerDay }, res);
+      await tickOne(
+        p.chatId,
+        drive.goal,
+        now,
+        exec,
+        {
+          stallMs,
+          maxNudges,
+          judgeCooldownMs,
+          maxPerDay: drive.maxPerDay ?? opts.maxPerDay,
+          mentionOpenId: drive.mentionOpenId,
+        },
+        res,
+      );
     } catch (err) {
       logger.warn(`[drive] tick chat=${p.chatId.slice(0, 12)} failed: ${err}`);
     }
@@ -86,7 +104,7 @@ export async function runDriveTick(
 
 async function tickOne(
   chatId: string, goal: string, now: Date, exec: DriveExecutors,
-  cfg: { stallMs: number; maxNudges: number; judgeCooldownMs: number; maxPerDay?: number },
+  cfg: { stallMs: number; maxNudges: number; judgeCooldownMs: number; maxPerDay?: number; mentionOpenId?: string | null },
   res: DriveTickResult,
 ): Promise<void> {
   const msgs = await exec.fetchMessages(chatId, 30);
@@ -136,7 +154,7 @@ async function tickOne(
     return;
   }
 
-  const ok = await exec.speak(chatId, judged.nudgeText);
+  const ok = await exec.speak(chatId, judged.nudgeText, cfg.mentionOpenId);
   if (!ok) return; // 发失败 → 不记，下轮重试
 
   const dk = dateKeyOf(now);
