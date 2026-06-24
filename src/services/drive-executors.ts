@@ -90,6 +90,12 @@ async function cocoJudge(prompt: string): Promise<DriveJudgeResult | null> {
 
 export function makeDriveExecutors(): DriveExecutors {
   const tilly = resolveBotIdent('tilly');
+  const normalizeSenderId = (m: any): string => {
+    const id = m?.sender?.id ?? m?.sender?.sender_id?.open_id ?? '';
+    // Lark list APIs can return bot senders as app_id; drive's self-filter uses
+    // open_id, so normalize Tilly's own app_id back to her open_id.
+    return id === tilly.larkAppId ? tilly.openId : id;
+  };
   return {
     driveSpeakerId: tilly.openId,
 
@@ -97,7 +103,7 @@ export function makeDriveExecutors(): DriveExecutors {
       const msgs = await listChatMessages(tilly.larkAppId, chatId, limit); // newest first
       return msgs.map((m: any) => ({
         id: m.message_id,
-        senderId: m?.sender?.id ?? m?.sender?.sender_id?.open_id ?? '',
+        senderId: normalizeSenderId(m),
         createTimeMs: Number(m?.create_time) || 0,
         rendered: renderMsg(m),
       }));
