@@ -14,6 +14,11 @@
  */
 import { logger } from '../utils/logger.js';
 import {
+  episodeAnchorMs as _episodeAnchorMs,
+  effectiveNudgeCount as _effectiveNudgeCount,
+  planStall,
+} from './stall-throttle.js';
+import {
   listSubTasks, listObservations, listCommands, commitObservationTransaction,
   helpReportDelivery, staleHelpCommandIds, latestHelpReport,
   enqueueNudgeAndUpdateStats, escalateStalledTask, enqueueCommand,
@@ -72,19 +77,14 @@ export const MAX_NUDGES = 3;
 export type StallAction = { kind: 'none' } | { kind: 'nudge' } | { kind: 'escalate' };
 
 /** episode anchor = max{执行者实质活动, 最近非 nudge 发起命令, 建群时间} 的毫秒数。
- *  fresh supplement/request_review/kickoff 会推高它 → 开启**新 episode**。NaN 表示全脏。 */
+ *  fresh supplement/request_review/kickoff 会推高它 → 开启**新 episode**。NaN 表示全脏。
+ *  2026-06-24：核心算法抽到 stall-throttle util（drive 共用），这里是 SubTask 适配壳。 */
 export function episodeAnchorMs(t: SubTask, lastInitiatingCmdAt: string | null): number {
-  const ms = [t.lastExecutorActivityAt, lastInitiatingCmdAt, t.createdAt]
-    .filter((s): s is string => !!s)
-    .map(s => new Date(s).getTime())
-    .filter(Number.isFinite);
-  return ms.length ? Math.max(...ms) : NaN;
+  return _episodeAnchorMs({ activityAt: t.lastExecutorActivityAt, initiatingAt: lastInitiatingCmdAt, createdAt: t.createdAt });
 }
 /** 当前 episode 的有效 nudge 次数：上次 nudge 早于 episode anchor (= 新 episode 已开启) → 视作 0。 */
 export function effectiveNudgeCount(t: SubTask, anchorMs: number): number {
-  const lastNudgeMs = t.lastNudgeAt ? new Date(t.lastNudgeAt).getTime() : 0;
-  const sameEpisode = Number.isFinite(lastNudgeMs) && lastNudgeMs >= anchorMs;
-  return sameEpisode ? (t.nudgeCount ?? 0) : 0;
+  return _effectiveNudgeCount(t.lastNudgeAt, t.nudgeCount ?? 0, anchorMs);
 }
 
 /** 经理群是「汇报制」、事件驱动：没事就静默（等子群上报 / CEO 派活），静默=正常空闲、不是「停滞」。
@@ -98,15 +98,10 @@ export function managerExemptFromStall(t: SubTask): boolean {
 export function planStallNudge(t: SubTask, now: Date, lastInitiatingCmdAt: string | null = null): StallAction {
   if (t.status !== 'observing') return { kind: 'none' };       // 只在执行者本应继续的态唤
   const anchorMs = episodeAnchorMs(t, lastInitiatingCmdAt);
-  if (!Number.isFinite(anchorMs)) return { kind: 'none' };     // 全脏 → 保守不唤
-  // since = max(episode anchor, lastNudgeAt cooldown)：新 episode(anchor 更新) → 从 anchor 重开窗口；
-  // 同 episode 内已 nudge → 按 lastNudgeAt cooldown。
-  const lastNudgeMs = t.lastNudgeAt ? new Date(t.lastNudgeAt).getTime() : 0;
-  const sinceMs = Math.max(anchorMs, Number.isFinite(lastNudgeMs) ? lastNudgeMs : 0);
-  if (now.getTime() - sinceMs <= STALL_AFTER_MS) return { kind: 'none' };
-  // 蔻黛克斯 round2 blocker：用 episode 有效次数 (新 episode 重置为 0)，不被旧窗口的 MAX 卡成立即 escalate。
-  if (effectiveNudgeCount(t, anchorMs) >= MAX_NUDGES) return { kind: 'escalate' };
-  return { kind: 'nudge' };
+  // 核心节流走公共 util（drive 共用同一份真理）；子任务把"催够了(capped)"映射成 escalate(升级父群)。
+  const d = planStall({ anchorMs, lastNudgeAt: t.lastNudgeAt, nudgeCount: t.nudgeCount ?? 0, now, stallMs: STALL_AFTER_MS, maxNudges: MAX_NUDGES });
+  if (d.kind === 'capped') return { kind: 'escalate' };
+  return d;
 }
 
 export async function runObserverTick(now: Date, exec: ObserverExecutors): Promise<{ checked: number; committed: number; errors: number }> {

@@ -16,7 +16,6 @@
  */
 import {
   registerMonitor, listMonitors, removeMonitor,
-  listPendingReports, markReportConsumed,
 } from '../services/group-monitor-store.js';
 
 function argValue(rest: string[], flag: string): string | undefined {
@@ -65,24 +64,5 @@ export async function cmdGroupMonitor(sub: string, rest: string[]): Promise<void
   console.error(`❌ 未知子命令: ${sub} (add/list/remove)`); process.exitCode = 2;
 }
 
-export async function cmdMonitorReports(_rest: string[]): Promise<void> {
-  const reports = listPendingReports();
-  if (reports.length === 0) { console.log('暂无未处理的群监控上报。'); return; }
-  console.log(`未处理的群监控上报 (${reports.length}):\n`);
-  for (const r of reports) {
-    console.log(`── ${r.id} ─────────────────`);
-    console.log(`  监控群: ${r.chatId}`);
-    console.log(`  目标:   ${r.goal}`);
-    console.log(`  情况:   ${r.summary}`);
-    console.log(`  证据:   ${r.evidence}`);
-    console.log(`  时间:   ${r.createdAt} | 已戳 ${r.pokeCount} 次`);
-    console.log(`  处理完: botmux monitor-report-consume ${r.id}\n`);
-  }
-}
-
-export async function cmdMonitorReportConsume(rest: string[]): Promise<void> {
-  const id = rest.find(a => a.startsWith('mr_')) ?? argValue(rest, '--id');
-  if (!id) { console.error('❌ 缺 report id (mr_xxx)，用 `botmux monitor-reports` 查'); process.exitCode = 2; return; }
-  const r = markReportConsumed(id);
-  console.log(r ? `✅ 报告 ${id} 已标记处理完` : `⚠️ 没找到报告 ${id}`);
-}
+// 一期退场：cmdMonitorReports / cmdMonitorReportConsume 已移除。群监控命中现在改写
+// watch-inbox incident，列查/关闭走 `botmux watch incidents` / `botmux watch close <id>`。

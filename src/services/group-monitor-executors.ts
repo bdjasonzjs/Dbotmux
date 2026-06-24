@@ -1,17 +1,16 @@
 /**
- * 群监控的真 executor (2026-05-30): IO + LLM, 跟 subgroup-watcher-executors 同款。
+ * 群监控的真 executor (2026-05-30; 一期改造 2026-06-24): IO + LLM。
  *
  * fetchMessages: 缇蕾拉群最近消息。
  * judge: coco 按监控目标判断有无该上报事件。
- * wakeClaude: 缇蕾身份发主话题、@克劳德, 唤醒主会话去读报告 (read-only, 不发被监控群)。
+ * （一期退场）wakeClaude 已移除：命中改写 watch-inbox incident，由投递层按 targetChatId 发，
+ *   不再 @克劳德主话题；杜绝旧 report+wakeClaude 双通道。
  */
 import { spawn } from 'node:child_process';
 import { logger } from '../utils/logger.js';
-import { listChatMessages, sendMessage } from '../im/lark/client.js';
+import { listChatMessages } from '../im/lark/client.js';
 import { resolveBotIdent } from '../core/main-bot-playbook.js';
-import { getMainTopicChatId } from './main-topic-config.js';
 import type { MonitorExecutors, JudgeResult } from './group-monitor.js';
-import type { MonitorReport } from './group-monitor-store.js';
 
 const JUDGE_TIMEOUT_MS = 120_000;
 const MAX_CONTENT = 200;
@@ -99,27 +98,6 @@ export function makeMonitorExecutors(): MonitorExecutors {
 
     async judge(goal: string, rendered: string): Promise<JudgeResult | null> {
       return cocoJudge(JUDGE_PROMPT(goal, rendered));
-    },
-
-    async wakeClaude(report: MonitorReport): Promise<boolean> {
-      const mainTopic = getMainTopicChatId();
-      if (!mainTopic) { logger.error('[group-monitor-exec] mainTopic not configured, cannot wake claude'); return false; }
-      const claude = resolveBotIdent('claude');
-      // @ 克劳德主体, 给一句话 + 指引它自己去读报告 JSON (松松设计: 戳一下让它读, 不程序化塞全文)
-      const text = [
-        `<at user_id="${claude.openId}">克劳德</at> 🔎 群监控上报`,
-        `【监控群】${report.chatId}`,
-        `【情况】${clean(report.summary, 200)}`,
-        `→ 详情/证据在群监控报告 ${report.id}，\`botmux monitor-reports\` 看全部待处理；核实处理后 \`botmux monitor-report-consume ${report.id}\` 标记已处理。`,
-      ].join('\n');
-      try {
-        await sendMessage(tilly.larkAppId, mainTopic, text, 'text');
-        logger.info(`[group-monitor-exec] woke claude for report ${report.id} → mainTopic`);
-        return true;
-      } catch (err: any) {
-        logger.warn(`[group-monitor-exec] wakeClaude sendMessage failed: ${err?.message ?? err}`);
-        return false;
-      }
     },
   };
 }

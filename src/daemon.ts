@@ -3084,7 +3084,16 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           ? new Date(lastEnd.getTime() - HIGH_WATER_OVERLAP_MS)
           : new Date(end.getTime() - TILLY_TICK_INTERVAL_MS);
         const windowMin = Math.round((end.getTime() - start.getTime()) / 60000);
-        const fresh = await fetchRecentMessages({ start, end });
+        // 一期（给任意群挂 observer + 扫读静音）：扫读静音名单从统一群级配置取
+        // （fail-closed：含主话题 Flumy 小分队，配置损坏也保守静音），传进 fetch 做
+        // per-chat 排除——被静音群的消息根本不进 fresh，也就不进 analyzeMessages /
+        // pushHighPriorityToScoutInbox。
+        const { getScoutMutedChatIds } = await import('./services/chat-policy-store.js');
+        const scoutMuted = getScoutMutedChatIds();
+        if (scoutMuted.length > 0) {
+          logger.info(`[tilly/scout] scout-muted ${scoutMuted.length} chat(s) excluded from scan: ${scoutMuted.map(c => c.slice(0, 12)).join(',')}`);
+        }
+        const fresh = await fetchRecentMessages({ start, end, excludeChatIds: scoutMuted });
         if (fresh.length === 0) {
           logger.info(`[tilly/scout] tick — no new messages (window ${windowMin}min, high-water=${lastEnd ? 'on' : 'first-run'})`);
           // fetch 成功且无新消息 → 推进高水位 (这段时间确认没漏)
@@ -3247,14 +3256,22 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       if (monitorTickInFlight) { logger.info('[group-monitor] previous tick in flight — skip'); return; }
       monitorTickInFlight = true;
       try {
-        const { runMonitorTick, runReportPollFallback } = await import('./services/group-monitor.js');
+        // 一期改造：命中改写 watch-inbox incident（旧 addReport/wakeClaude/poll-fallback 退场）。
+        // incident 的实际投递 + at-least-once 重投由 watch-inbox 投递层（publisher，按 targetChatId）负责。
+        const { runMonitorTick } = await import('./services/group-monitor.js');
         const { makeMonitorExecutors } = await import('./services/group-monitor-executors.js');
-        const { pruneReports } = await import('./services/group-monitor-store.js');
-        pruneReports();
         const exec = makeMonitorExecutors();
         const now = new Date();
         await runMonitorTick(now, exec);
-        await runReportPollFallback(now, exec);
+        // 一期：汇报投递层 —— 把 open incident 按目标群聚合成 digest 发出（缇蕾身份）。
+        // 内容没变不重发 + 目标群日预算兜底 + 发成功标 incident delivery=sent（at-least-once）。
+        const { runDigestTick } = await import('./services/watch-publisher.js');
+        const { makePublisherExecutors } = await import('./services/watch-publisher-executors.js');
+        await runDigestTick(now, makePublisherExecutors());
+        // 二期：推动 —— 对 drive=on 的群，缇蕾按目标盯进展、卡住了在群里催一句（四道防刷屏闸）。
+        const { runDriveTick } = await import('./services/drive.js');
+        const { makeDriveExecutors } = await import('./services/drive-executors.js');
+        await runDriveTick(now, makeDriveExecutors());
       } catch (err) {
         logger.error(`[group-monitor] tick failed: ${err}`);
       } finally {

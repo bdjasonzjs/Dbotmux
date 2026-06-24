@@ -3455,18 +3455,15 @@ switch (command) {
     await cmdGroupMonitor(process.argv[3] ?? '', process.argv.slice(4));
     break;
   }
-  case 'monitor-reports': {
+  case 'watch': {
+    // 给任意群挂 observer + 扫读静音的统一群级配置 CLI（一期）。
     process.env.SESSION_DATA_DIR ??= resolveDataDir();
-    const { cmdMonitorReports } = await import('./cli/group-monitor.js');
-    await cmdMonitorReports(process.argv.slice(3));
+    const { cmdWatch } = await import('./cli/watch.js');
+    await cmdWatch(process.argv[3] ?? '', process.argv.slice(4));
     break;
   }
-  case 'monitor-report-consume': {
-    process.env.SESSION_DATA_DIR ??= resolveDataDir();
-    const { cmdMonitorReportConsume } = await import('./cli/group-monitor.js');
-    await cmdMonitorReportConsume(process.argv.slice(3));
-    break;
-  }
+  // 一期退场：monitor-reports / monitor-report-consume 已被 watch-inbox 单通道取代，
+  // 改用 `botmux watch incidents`（列 open incident）/ `botmux watch close <id>`（显式闭嘴）。
   case 'mailbox': {
     // 先固定 dataDir 再 import，否则 mailbox 读默认 <repo>/data 而非 daemon 的 ~/.botmux/data
     process.env.SESSION_DATA_DIR ??= resolveDataDir();
