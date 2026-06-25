@@ -44,24 +44,14 @@ afterEach(() => {
 });
 
 describe('botmux watch CLI', () => {
-  it('set 三开关 → 落库（推动用 --push 带目标）', async () => {
+  it('set 三开关 → 落库（推动用 --push 带目标，可配急急如律令目标）', async () => {
     const { cli, policy } = await fresh();
-    await cli.cmdWatch('set', [
-      '--chat', 'oc_a',
-      '--scout', 'mute',
-      '--push', '推进目标X',
-      '--mention', 'ou_ceo',
-      '--until', '2026-06-25T10:00:00+08:00',
-      '--max-per-day', '20',
-      '--report', 'oc_t',
-    ], { reachProber: okProber });
+    await cli.cmdWatch('set', ['--chat', 'oc_a', '--scout', 'mute', '--push', '推进目标X', '--summon', '克劳德', '--report', 'oc_t'], { reachProber: okProber });
     const p = policy.getPolicy('oc_a')!;
     expect(p.scoutMode).toBe('mute');
     expect(p.driveOn).toBe(true);
     expect(p.driveGoal).toBe('推进目标X');
-    expect(p.driveMentionOpenId).toBe('ou_ceo');
-    expect(p.driveUntil).toBe(Date.parse('2026-06-25T10:00:00+08:00'));
-    expect(p.driveMaxPerDay).toBe(20);
+    expect(p.driveTargetSummonName).toBe('克劳德');
     expect(p.reportTargetChatId).toBe('oc_t');
     expect(process.exitCode).toBe(0);
   });
@@ -75,24 +65,9 @@ describe('botmux watch CLI', () => {
 
   it('--push off 关推动', async () => {
     const { cli, policy } = await fresh();
-    await cli.cmdWatch('set', ['--chat', 'oc_a', '--push', '目标', '--mention', 'ou_ceo', '--until', '2026-06-25T10:00:00+08:00'], {});
+    await cli.cmdWatch('set', ['--chat', 'oc_a', '--push', '目标'], {});
     await cli.cmdWatch('set', ['--chat', 'oc_a', '--push', 'off'], {});
-    const p = policy.getPolicy('oc_a')!;
-    expect(p.driveOn).toBe(false);
-    expect(p.driveMentionOpenId).toBe(null);
-    expect(p.driveUntil).toBe(null);
-  });
-
-  it('非法 --mention/--until/--max-per-day 值 → 报错', async () => {
-    const { cli } = await fresh();
-    await cli.cmdWatch('set', ['--chat', 'oc_a', '--mention', 'cli_x'], {});
-    expect(process.exitCode).toBe(2);
-    process.exitCode = 0;
-    await cli.cmdWatch('set', ['--chat', 'oc_a', '--until', 'not-a-time'], {});
-    expect(process.exitCode).toBe(2);
-    process.exitCode = 0;
-    await cli.cmdWatch('set', ['--chat', 'oc_a', '--max-per-day', '0'], {});
-    expect(process.exitCode).toBe(2);
+    expect(policy.getPolicy('oc_a')!.driveOn).toBe(false);
   });
 
   it('P2-2：目标群不可达 → 报错 + 不落库', async () => {

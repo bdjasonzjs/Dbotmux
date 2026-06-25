@@ -30,7 +30,7 @@ function mkExec(over: any = {}) {
     driveSpeakerId: SPEAKER,
     fetchMessages: vi.fn(async () => [{ id: 'm1', senderId: HUMAN, createTimeMs: T0 - 40 * 60_000, rendered: '[human] 卡住了' }]),
     judge: vi.fn(async () => ({ shouldNudge: true, nudgeText: '关于目标X，看起来卡在A了，要不要先把B推一下？' })),
-    speak: vi.fn(async () => true),
+    nudge: vi.fn(async () => true),
     ...over,
   };
 }
@@ -49,14 +49,14 @@ describe('runDriveTick', () => {
     expect(exec.fetchMessages).not.toHaveBeenCalled();
   });
 
-  it('卡够久 + judge 说催 → 在群里催 + 记次数/预算', async () => {
+  it('卡够久 + judge 说催 → 急急如律令 nudge + 记次数/预算', async () => {
     const { drive, policy, store } = await fresh();
-    policy.setPolicy('oc_a', { driveOn: true, driveGoal: '推进目标X', driveMentionOpenId: 'ou_ceo' });
+    policy.setPolicy('oc_a', { driveOn: true, driveGoal: '推进目标X', driveTargetSummonName: '克劳德' });
     const exec = mkExec();
     const r = await drive.runDriveTick(new Date(T0), exec, opts);
     expect(r.nudged).toBe(1);
-    expect(exec.speak).toHaveBeenCalledOnce();
-    expect(exec.speak).toHaveBeenCalledWith('oc_a', '关于目标X，看起来卡在A了，要不要先把B推一下？', 'ou_ceo');
+    expect(exec.nudge).toHaveBeenCalledOnce();
+    expect(exec.nudge).toHaveBeenCalledWith('oc_a', '关于目标X，看起来卡在A了，要不要先把B推一下？', '克劳德');
     const st = store.getDriveState('oc_a')!;
     expect(st.nudgeCount).toBe(1);
     expect(st.sentToday).toBe(1);
@@ -97,7 +97,7 @@ describe('runDriveTick', () => {
     // 31min 后再卡（冷却已过），judge 还是同一句 → 应被变化检测压住
     const r2 = await drive.runDriveTick(new Date(T0 + 31 * 60_000), exec, opts);
     expect(r2.suppressedRepeat).toBe(1);
-    expect(exec.speak).toHaveBeenCalledOnce(); // 只发了一次
+    expect(exec.nudge).toHaveBeenCalledOnce(); // 只发了一次
   });
 
   it('②停滞节流：本窗口催满 MAX 后停手（capped）', async () => {
@@ -110,7 +110,7 @@ describe('runDriveTick', () => {
     await drive.runDriveTick(new Date(T0 + 31 * 60_000), exec, opts);
     await drive.runDriveTick(new Date(T0 + 62 * 60_000), exec, opts);
     const r4 = await drive.runDriveTick(new Date(T0 + 93 * 60_000), exec, opts);
-    expect(exec.speak).toHaveBeenCalledTimes(3); // 催 3 次封顶
+    expect(exec.nudge).toHaveBeenCalledTimes(3); // 催 3 次封顶
     expect(r4.stalledButQuiet).toBe(1);          // 第 4 次 capped 停手
   });
 
@@ -123,28 +123,7 @@ describe('runDriveTick', () => {
     await drive.runDriveTick(new Date(T0), exec, o1);                      // 用掉唯一预算
     const r2 = await drive.runDriveTick(new Date(T0 + 31 * 60_000), exec, o1);
     expect(r2.droppedBudget).toBe(1);
-    expect(exec.speak).toHaveBeenCalledOnce();
-  });
-
-  it('per-policy 日预算覆盖默认 opts', async () => {
-    const { drive, policy } = await fresh();
-    policy.setPolicy('oc_a', { driveOn: true, driveGoal: '推进目标X', driveMaxPerDay: 2 });
-    let n = 0;
-    const exec = mkExec({ judge: vi.fn(async () => ({ shouldNudge: true, nudgeText: `催第${++n}次` })) });
-    await drive.runDriveTick(new Date(T0), exec, { ...opts, maxPerDay: 1 });
-    const r2 = await drive.runDriveTick(new Date(T0 + 31 * 60_000), exec, { ...opts, maxPerDay: 1 });
-    expect(r2.nudged).toBe(1);
-    expect(exec.speak).toHaveBeenCalledTimes(2);
-  });
-
-  it('driveUntil 过期 → 自动关推动并跳过', async () => {
-    const { drive, policy } = await fresh();
-    policy.setPolicy('oc_a', { driveOn: true, driveGoal: '推进目标X', driveUntil: T0 - 1000 });
-    const exec = mkExec();
-    const r = await drive.runDriveTick(new Date(T0), exec, opts);
-    expect(r.checked).toBe(0);
-    expect(exec.fetchMessages).not.toHaveBeenCalled();
-    expect(policy.getPolicy('oc_a')!.driveOn).toBe(false);
+    expect(exec.nudge).toHaveBeenCalledOnce();
   });
 
   it('judge 说不用催 → 不催', async () => {
@@ -153,7 +132,7 @@ describe('runDriveTick', () => {
     const exec = mkExec({ judge: vi.fn(async () => ({ shouldNudge: false, nudgeText: '' })) });
     const r = await drive.runDriveTick(new Date(T0), exec, opts);
     expect(r.nudged).toBe(0);
-    expect(exec.speak).not.toHaveBeenCalled();
+    expect(exec.nudge).not.toHaveBeenCalled();
   });
 
   it('群里有人动了 → 开新窗口、催次数归零', async () => {
@@ -171,10 +150,16 @@ describe('runDriveTick', () => {
     expect(st.nudgeCount).toBe(0);          // 窗口重置
     expect(st.lastNudgeSignature).toBe(null);
   });
+});
 
-  it('withDriveMention 给文本前缀 Lark @ 语法', async () => {
-    const { withDriveMention } = await import('../src/services/drive-executors.js');
-    expect(withDriveMention('请推进', 'ou_ceo')).toBe('<at user_id="ou_ceo"></at> 请推进');
-    expect(withDriveMention('请推进', null)).toBe('请推进');
+describe('drive urgent summon renderer', () => {
+  it('渲染急急如律令目标名，不使用 Lark @ open_id', async () => {
+    const { buildDriveNudgeSummon } = await import('../src/services/drive-executors.js');
+    expect(buildDriveNudgeSummon('请推进下一步', '克劳德')).toBe('急急如律令：【克劳德】请推进下一步');
+  });
+
+  it('未配置目标名时默认唤醒克劳德 root/main bot', async () => {
+    const { buildDriveNudgeSummon } = await import('../src/services/drive-executors.js');
+    expect(buildDriveNudgeSummon('继续推进', null)).toBe('急急如律令：【克劳德】继续推进');
   });
 });

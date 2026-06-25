@@ -7,7 +7,7 @@
  * 再 import 本模块，否则 store 读错 dataDir。
  *
  * 用法：
- *   botmux watch set --chat oc_xxx [--push "<目标>"|off] [--mention ou_xxx|off] [--until "<时间>"|off] [--max-per-day N] [--report oc_target|off] [--scout watch|mute] [--skip-verify]
+ *   botmux watch set --chat oc_xxx [--push "<目标>"|off] [--summon 克劳德] [--report oc_target|off] [--scout watch|mute] [--skip-verify]
  *   botmux watch list
  *   botmux watch show --chat oc_xxx
  *   botmux watch remove --chat oc_xxx
@@ -36,16 +36,6 @@ function hasFlag(rest: string[], flag: string): boolean {
   return rest.includes(flag);
 }
 
-function parseUntil(raw: string): number | null {
-  if (raw === 'off') return null;
-  if (/^\d+$/.test(raw)) {
-    const n = Number(raw);
-    return Number.isFinite(n) ? n : NaN;
-  }
-  const ms = Date.parse(raw);
-  return Number.isFinite(ms) ? ms : NaN;
-}
-
 /** 蔻黛克斯 P2-2：验证汇报目标群可达（机器人发得到才接受）。返 ok 或原因。
  *  默认实现：用 lark-cli 列出 bot 所在群，目标群在其中 = 机器人是成员 = 发得到。
  *  注入式（reachProber 参数）便于单测；真实可达性在投递阶段（publisher）再确认一次。 */
@@ -68,14 +58,8 @@ const defaultReachProber: ReachProber = async (targetChatId) => {
 };
 
 function fmtPolicy(p: ChatPolicy): string {
-  const bits: string[] = [];
-  if (p.driveOn) {
-    bits.push(`目标：${p.driveGoal ?? '（未设，无效）'}`);
-    if (p.driveMentionOpenId) bits.push(`@ ${p.driveMentionOpenId}`);
-    if (p.driveUntil) bits.push(`到 ${new Date(p.driveUntil).toISOString()}`);
-    if (p.driveMaxPerDay) bits.push(`每日最多 ${p.driveMaxPerDay}`);
-  }
-  const drive = p.driveOn ? `on（${bits.join('；')}）` : 'off';
+  const target = p.driveTargetSummonName ? `，唤醒：${p.driveTargetSummonName}` : '';
+  const drive = p.driveOn ? `on（目标：${p.driveGoal ?? '（未设，无效）'}${target}）` : 'off';
   return `${p.chatId}\n   推动: ${drive} | 汇报: ${p.reportTargetChatId ?? 'off'} | 扫读: ${p.scoutMode}\n   更新: ${p.updatedAt}`;
 }
 
@@ -90,14 +74,14 @@ export async function cmdWatch(
     console.log(`botmux watch —— 给任意群挂 observer + 扫读静音的统一群级配置
 
 用法:
-  botmux watch set --chat oc_xxx [--push "<目标>"|off] [--mention ou_xxx|off] [--until "<时间>"|off] [--max-per-day N] [--report oc_target|off] [--scout watch|mute] [--skip-verify]
+  botmux watch set --chat oc_xxx [--push "<目标>"|off] [--summon 克劳德] [--report oc_target|off] [--scout watch|mute] [--skip-verify]
   botmux watch list
   botmux watch show --chat oc_xxx
   botmux watch remove --chat oc_xxx
   botmux watch incidents [--target oc_xxx]
   botmux watch close <incidentId> [--by 名字]
 
-每个群三个独立开关: 推动(drive, --push 设目标后缇蕾按目标在群里催) / 汇报(report, off 或目标群) / 扫读(scout, watch|mute)。
+每个群三个独立开关: 推动(drive, --push 设目标后按目标急急如律令唤醒目标 bot) / 汇报(report, off 或目标群) / 扫读(scout, watch|mute)。
 主话题默认扫读静音(fail-closed)。`);
     return;
   }
@@ -113,8 +97,6 @@ export async function cmdWatch(
     if (push !== undefined) {
       if (push === 'off') {
         patch.driveOn = false;
-        patch.driveMentionOpenId = null;
-        patch.driveUntil = null;
       } else if (push.trim()) {
         patch.driveOn = true;
         patch.driveGoal = push.trim();
@@ -123,29 +105,10 @@ export async function cmdWatch(
       }
     }
 
-    const mention = argValue(rest, '--mention', '--drive-mention');
-    if (mention !== undefined) {
-      if (mention === 'off') {
-        patch.driveMentionOpenId = null;
-      } else if (mention.startsWith('ou_')) {
-        patch.driveMentionOpenId = mention;
-      } else {
-        console.error('❌ --mention 只能是 off 或 ou_xxx'); process.exitCode = 2; return;
-      }
-    }
-
-    const until = argValue(rest, '--until', '--drive-until');
-    if (until !== undefined) {
-      const parsed = parseUntil(until);
-      if (Number.isNaN(parsed)) { console.error('❌ --until 要么是 off、epoch ms，或可解析时间（如 2026-06-25T10:00:00+08:00）'); process.exitCode = 2; return; }
-      patch.driveUntil = parsed;
-    }
-
-    const maxPerDay = argValue(rest, '--max-per-day', '--drive-max-per-day');
-    if (maxPerDay !== undefined) {
-      const n = Number(maxPerDay);
-      if (!Number.isInteger(n) || n <= 0 || n > 200) { console.error('❌ --max-per-day 必须是 1..200 的整数'); process.exitCode = 2; return; }
-      patch.driveMaxPerDay = n;
+    const summon = argValue(rest, '--summon', '--target-bot');
+    if (summon !== undefined) {
+      if (!summon.trim()) { console.error('❌ --summon 要填 bot 名/displayName，例如 克劳德'); process.exitCode = 2; return; }
+      patch.driveTargetSummonName = summon.trim();
     }
     // 兼容 --drive on/off：on 必须已有或同时给目标。
     const drive = argValue(rest, '--drive');

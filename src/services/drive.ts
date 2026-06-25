@@ -1,8 +1,8 @@
 /**
  * 给任意群挂 observer · 二期「推动」决策逻辑 + tick。
  *
- * 对每个 drive=on（带目标）的群：缇蕾盯群里进展，**卡住了就在群里发一句目标导向的催促**。
- * 这是 group-monitor「只读」之外松松显式要的「在被盯群发言」能力。
+ * 对每个 drive=on（带目标）的群：缇蕾盯群里进展，卡住了就沿用 subtask-observer
+ * 的「急急如律令」唤醒范式催被推动方，不走缇蕾普通文本发言。
  *
  * 防刷屏四道闸（observer/scout 上踩过 respam，重犯不得）：
  *   ① 实质活动判定防自激：只有真人/他方 bot 说话才算"群动了"；**缇蕾自己的催促一律不算**
@@ -12,10 +12,10 @@
  *   ③ 变化检测：催促文本归一化签名，跟上次一样 → **不重复说同样的话**。
  *   ④ 每群每日催次数上限：预算耗尽 → **只记录不发**。
  *
- * 决策逻辑在此、可单测；IO（拉消息带 senderId/时间、judge、群内发言）由 executors 注入。
+ * 决策逻辑在此、可单测；IO（拉消息带 senderId/时间、judge、急急如律令投递）由 executors 注入。
  */
 import { logger } from '../utils/logger.js';
-import { listPolicies, getDriveConfig, setPolicy } from './chat-policy-store.js';
+import { listPolicies, getDriveConfig } from './chat-policy-store.js';
 import {
   getOrInitDriveState, saveDriveState, budgetRemaining, dateKeyOf, type DriveState,
 } from './drive-store.js';
@@ -47,8 +47,8 @@ export interface DriveExecutors {
   fetchMessages(chatId: string, limit: number): Promise<FetchedMsg[]>;
   /** 缇蕾对照 goal 判断该不该催 + 催什么；判不出返 null（当作不催）。 */
   judge(goal: string, renderedNewMessages: string): Promise<DriveJudgeResult | null>;
-  /** 缇蕾在**被盯群**里发一句催促，返是否发成功。mentionOpenId 有值时前缀 @ 唤醒目标。 */
-  speak(chatId: string, text: string, mentionOpenId?: string | null): Promise<boolean>;
+  /** 用急急如律令唤醒被推动方，返是否入队/投递成功。 */
+  nudge(chatId: string, text: string, targetSummonName?: string | null): Promise<boolean>;
   /** 推动发言者（缇蕾）的 senderId —— 用于①防自激过滤。 */
   driveSpeakerId: string;
 }
@@ -74,27 +74,15 @@ export async function runDriveTick(
   for (const p of listPolicies()) {
     const drive = getDriveConfig(p.chatId);
     if (!drive.enabled || !drive.goal) continue;
-    if (drive.until != null && now.getTime() > drive.until) {
-      setPolicy(p.chatId, { driveOn: false });
-      logger.info(`[drive] ${p.chatId.slice(0, 12)} driveUntil reached → auto stop`);
-      continue;
-    }
     res.checked += 1;
     try {
-      await tickOne(
-        p.chatId,
-        drive.goal,
-        now,
-        exec,
-        {
-          stallMs,
-          maxNudges,
-          judgeCooldownMs,
-          maxPerDay: drive.maxPerDay ?? opts.maxPerDay,
-          mentionOpenId: drive.mentionOpenId,
-        },
-        res,
-      );
+      await tickOne(p.chatId, drive.goal, now, exec, {
+        stallMs,
+        maxNudges,
+        judgeCooldownMs,
+        maxPerDay: opts.maxPerDay,
+        targetSummonName: drive.targetSummonName,
+      }, res);
     } catch (err) {
       logger.warn(`[drive] tick chat=${p.chatId.slice(0, 12)} failed: ${err}`);
     }
@@ -104,7 +92,7 @@ export async function runDriveTick(
 
 async function tickOne(
   chatId: string, goal: string, now: Date, exec: DriveExecutors,
-  cfg: { stallMs: number; maxNudges: number; judgeCooldownMs: number; maxPerDay?: number; mentionOpenId?: string | null },
+  cfg: { stallMs: number; maxNudges: number; judgeCooldownMs: number; maxPerDay?: number; targetSummonName?: string | null },
   res: DriveTickResult,
 ): Promise<void> {
   const msgs = await exec.fetchMessages(chatId, 30);
@@ -154,7 +142,7 @@ async function tickOne(
     return;
   }
 
-  const ok = await exec.speak(chatId, judged.nudgeText, cfg.mentionOpenId);
+  const ok = await exec.nudge(chatId, judged.nudgeText, cfg.targetSummonName);
   if (!ok) return; // 发失败 → 不记，下轮重试
 
   const dk = dateKeyOf(now);

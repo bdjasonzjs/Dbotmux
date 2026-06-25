@@ -3,17 +3,20 @@
  *
  * fetchMessages：缇蕾拉群最近消息（带 senderId + 时间，给防自激/停滞判定用）。
  * judge：coco(缇蕾) 对照该群目标判"该不该催 + 催什么"。
- * speak：缇蕾在**被盯群**里发一句目标导向的催促（这是松松显式要的发言能力）。
+ * nudge：复用 subtask-observer 的物理通道，写 Base relay 记录，以 owner 身份发
+ * `急急如律令：【目标bot】...` 唤醒被推动方。
  * driveSpeakerId：缇蕾的 open_id —— 防自激过滤（缇蕾自己的催促不算"群进展"）。
  */
 import { spawn } from 'node:child_process';
 import { logger } from '../utils/logger.js';
-import { listChatMessages, sendMessage } from '../im/lark/client.js';
+import { listChatMessages } from '../im/lark/client.js';
 import { resolveBotIdent } from '../core/main-bot-playbook.js';
+import { writeRelayRecord } from './base-relay.js';
 import type { DriveExecutors, DriveJudgeResult } from './drive.js';
 
 const JUDGE_TIMEOUT_MS = 120_000;
 const MAX_CONTENT = 200;
+const DEFAULT_DRIVE_TARGET_SUMMON_NAME = '克劳德';
 
 function clean(s: unknown, n: number): string {
   const str = typeof s === 'string' ? s : (s == null ? '' : (() => { try { return JSON.stringify(s); } catch { return String(s); } })());
@@ -29,6 +32,17 @@ function renderMsg(m: any): string {
     text = body?.text ?? body?.content ?? body?.title ?? JSON.stringify(body ?? {});
   } catch { text = m?.body?.content ?? ''; }
   return `[${clean(sender, 16)}] ${clean(text, MAX_CONTENT)}`;
+}
+
+function singleLine(s: unknown, n: number): string {
+  const str = typeof s === 'string' ? s : (s == null ? '' : String(s));
+  // eslint-disable-next-line no-control-regex
+  return str.replace(/[\x00-\x1F\x7F]/g, ' ').slice(0, n).trim();
+}
+
+export function buildDriveNudgeSummon(text: string, targetSummonName?: string | null): string {
+  const target = singleLine(targetSummonName, 40) || DEFAULT_DRIVE_TARGET_SUMMON_NAME;
+  return `急急如律令：【${target}】${singleLine(text, 320)}`;
 }
 
 const JUDGE_PROMPT = (goal: string, rendered: string) => `你是缇蕾, 在帮老板"推动"一个群往一个**目标**走。看这批最近消息, 判断: 群里有没有在往目标推进 / 是不是卡住了 / 现在该不该主动催一句。只输出 JSON。
@@ -88,17 +102,10 @@ async function cocoJudge(prompt: string): Promise<DriveJudgeResult | null> {
   }
 }
 
-export function withDriveMention(text: string, mentionOpenId?: string | null): string {
-  const id = mentionOpenId?.trim();
-  return id ? `<at user_id="${id}"></at> ${text}` : text;
-}
-
 export function makeDriveExecutors(): DriveExecutors {
   const tilly = resolveBotIdent('tilly');
   const normalizeSenderId = (m: any): string => {
     const id = m?.sender?.id ?? m?.sender?.sender_id?.open_id ?? '';
-    // Lark list APIs can return bot senders as app_id; drive's self-filter uses
-    // open_id, so normalize Tilly's own app_id back to her open_id.
     return id === tilly.larkAppId ? tilly.openId : id;
   };
   return {
@@ -118,15 +125,15 @@ export function makeDriveExecutors(): DriveExecutors {
       return cocoJudge(JUDGE_PROMPT(goal, rendered));
     },
 
-    async speak(chatId: string, text: string, mentionOpenId?: string | null): Promise<boolean> {
-      try {
-        await sendMessage(tilly.larkAppId, chatId, withDriveMention(text, mentionOpenId), 'text');
-        logger.info(`[drive-exec] 缇蕾在群 ${chatId.slice(0, 12)} 发了催促`);
+    async nudge(chatId: string, text: string, targetSummonName?: string | null): Promise<boolean> {
+      const summon = buildDriveNudgeSummon(text, targetSummonName);
+      const res = await writeRelayRecord({ targetChatId: chatId, text: summon });
+      if (res.ok) {
+        logger.info(`[drive-exec] 急急如律令推动已写 relay record，群 ${chatId.slice(0, 12)} record=${res.recordId?.slice(0, 12) ?? '?'}`);
         return true;
-      } catch (err: any) {
-        logger.warn(`[drive-exec] speak to ${chatId.slice(0, 12)} failed: ${err?.message ?? err}`);
-        return false;
       }
+      logger.warn(`[drive-exec] urgent nudge to ${chatId.slice(0, 12)} failed${res.authError ? ' [AUTH]' : ''}: ${res.error ?? 'unknown'}`);
+      return false;
     },
   };
 }

@@ -27,26 +27,11 @@ afterEach(() => { rmSync(tempDir, { recursive: true, force: true }); });
 describe('chat-policy-store', () => {
   it('setPolicy/getPolicy round trip + 局部 patch 保留其他字段', async () => {
     const s = await freshImport();
-    s.setPolicy('oc_a', {
-      scoutMode: 'mute',
-      reportTargetChatId: 'oc_target',
-      driveOn: true,
-      driveGoal: '目标',
-      driveMentionOpenId: 'ou_ceo',
-      driveUntil: 1782362400000,
-      driveMaxPerDay: 20,
-    });
+    s.setPolicy('oc_a', { scoutMode: 'mute', reportTargetChatId: 'oc_target', driveOn: true });
     let p = s.getPolicy('oc_a')!;
     expect(p.scoutMode).toBe('mute');
     expect(p.reportTargetChatId).toBe('oc_target');
     expect(p.driveOn).toBe(true);
-    expect(s.getDriveConfig('oc_a')).toMatchObject({
-      enabled: true,
-      goal: '目标',
-      mentionOpenId: 'ou_ceo',
-      until: 1782362400000,
-      maxPerDay: 20,
-    });
     // 局部 patch 只改 scout，其余不动
     s.setPolicy('oc_a', { scoutMode: 'watch' });
     p = s.getPolicy('oc_a')!;
@@ -68,13 +53,6 @@ describe('chat-policy-store', () => {
     const s = await freshImport();
     expect(s.getScoutMutedChatIds()).toContain(s.MAIN_TOPIC_CHAT_ID);
     expect(s.isScoutMuted(s.MAIN_TOPIC_CHAT_ID)).toBe(true);
-  });
-
-  it('主话题只配置推动时仍默认 scout=mute', async () => {
-    const s = await freshImport();
-    s.setPolicy(s.MAIN_TOPIC_CHAT_ID, { driveOn: true, driveGoal: '推进 CEO' });
-    expect(s.getPolicy(s.MAIN_TOPIC_CHAT_ID)!.scoutMode).toBe('mute');
-    expect(s.getScoutMutedChatIds()).toContain(s.MAIN_TOPIC_CHAT_ID);
   });
 
   it('显式 scout=mute 的群进 muted 名单；普通 watch 群不在', async () => {
