@@ -759,6 +759,43 @@ describe('manager self-heal step2+3 wiring', () => {
     expect(exec.recoverManagerSession).toHaveBeenCalledTimes(1);
   });
 
+  it('auto-recover 失败不写 manager_recovered，因此不占成功 cooldown、下轮可重试', async () => {
+    process.env.BOTMUX_MANAGER_AUTO_RECOVER = '1';
+    const start = new Date('2026-06-24T00:00:00Z');
+    const t = await mkManagerTask('observing', start, 'mgr-recover-fail');
+    sessionStore.init('app_mgr');
+    const s = sessionStore.createSession(t.chatId, 'om_root', 'manager session');
+    sessionStore.updateSession({
+      ...s,
+      larkAppId: 'app_mgr',
+      createdAt: start.toISOString(),
+      lastMessageAt: new Date(start.getTime() + 30 * 60_000).toISOString(),
+    });
+    sessionStore.init('app_observer');
+    await enqueueCommand({
+      taskId: t.taskId,
+      direction: 'parent_to_child',
+      targetChatId: t.chatId,
+      commandType: 'request_report',
+      payload: { requestId: 'req_recover_fail' },
+      idempotencyKey: 'req-report-recover-fail',
+    });
+
+    const exec = mkExec({ messages: [] }) as any;
+    exec.recoverManagerSession = vi.fn(async (req: any) => ({
+      ok: false,
+      oldSessionId: req.session.sessionId,
+      error: 'spawn_failed',
+    }));
+    const now = new Date(start.getTime() + 13 * 60 * 60_000);
+    vi.setSystemTime(now);
+    await runObserverTick(now, exec);
+    expect(rootInbox.listOpen().filter(it => it.kind === 'manager_recovered')).toHaveLength(0);
+
+    await runObserverTick(new Date(now.getTime() + 2 * MIN_OBSERVE_INTERVAL_MS), exec);
+    expect(exec.recoverManagerSession).toHaveBeenCalledTimes(2);
+  });
+
   it('manager aging 只认 manager main app 的 session，同 chat 其它 app session 不触发', async () => {
     const start = new Date('2026-06-24T00:00:00Z');
     const t = await mkManagerTask('observing', start, 'mgr-wrong-app');

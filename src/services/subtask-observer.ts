@@ -260,6 +260,10 @@ async function maybeAutoRecoverManager(
   if (decision.kind !== 'recover' || !session) return false;
   const prompt = buildManagerRecoverPrompt({ task: fresh, session, reason, recoverId: decision.recoverId });
   const result = await exec.recoverManagerSession({ task: fresh, session, reason, recoverId: decision.recoverId, prompt });
+  if (!result.ok) {
+    logger.warn(`[subtask-observer] ${fresh.taskId} manager auto-recover failed: ${result.error ?? 'unknown'}`);
+    return false;
+  }
   const status = result.ok
     ? `成功，新 session=${result.newSessionId ?? '(unknown)'}`
     : `失败：${result.error ?? 'unknown'}`;
