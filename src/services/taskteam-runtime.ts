@@ -142,6 +142,7 @@ export interface CreateTaskTeamDeps extends TaskTeamRuntimeDeps {
     companyId: TaskTeamCompanyId;
     deptId?: TaskTeamDepartmentId;
     chatId: string;
+    targetExternalChatId?: string;
     goal: string;
     acceptance: string;
     roleInstances: TaskTeamRoleInstance[];
@@ -158,6 +159,8 @@ export interface CreateTaskTeamParams {
   groupName?: string;
   creatorLarkAppId: string;
   sourceChatId?: string | null;
+  /** 可选：observer 监控的外部群；不设则默认监控任务小组自己的群。运行态绑定，不进模板。 */
+  targetExternalChatId?: string;
   /** 建群时把这些真人 open_id 拉进群（dashboard「用模板建真群」用——把当前用户拉进去）。可选、向后兼容。 */
   userOpenIds?: string[];
 }
@@ -185,6 +188,7 @@ export async function createTaskTeam(
     companyId: params.companyId,
     deptId: params.deptId,
     chatId,
+    targetExternalChatId: params.targetExternalChatId,
     goal: params.goal,
     acceptance: params.acceptance,
     roleInstances: params.roleInstances,

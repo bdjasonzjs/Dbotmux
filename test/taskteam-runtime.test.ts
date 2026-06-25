@@ -236,7 +236,7 @@ describe('createTaskTeam', () => {
         return { chatId: 'oc_new' };
       },
       persistTeam: async opts => {
-        team = { ...fix.instance, status: 'forming', chatId: opts.chatId, roleInstances: opts.roleInstances };
+        team = { ...fix.instance, status: 'forming', chatId: opts.chatId, targetExternalChatId: opts.targetExternalChatId, roleInstances: opts.roleInstances };
         return team;
       },
     };
@@ -247,8 +247,10 @@ describe('createTaskTeam', () => {
       acceptance: 'a',
       roleInstances: fix.instance.roleInstances,
       creatorLarkAppId: 'cli_creator',
+      targetExternalChatId: 'oc_external',
     });
     expect(created.status).toBe('running'); // team-started 驱动后
+    expect(created.targetExternalChatId).toBe('oc_external');
     expect(enqueued.some(a => a.actionType === 'kickoff' && a.targetRoleInstanceId === 'tt_ri_dev')).toBe(true);
   });
 });
@@ -284,6 +286,21 @@ describe('runTaskTeamObserverTick', () => {
     expect(stats.gatedOut).toBe(1);
     expect(detectCalls).toBe(0);
     expect(cursorById()['tt_team_x']).toBeUndefined();
+  });
+
+  it('配置 targetExternalChatId 后 cheap gate 读外部群，没配则读小组群', async () => {
+    const fix = fixture();
+    const seen: string[] = [];
+    const { deps } = observerDeps(fix, [
+      { ...fix.instance, teamId: 'tt_team_external' as any, chatId: 'oc_team', targetExternalChatId: 'oc_external', cursor: 'om_last' },
+      { ...fix.instance, teamId: 'tt_team_self' as any, chatId: 'oc_self', cursor: 'om_last' },
+    ]);
+    const exec: TaskTeamObserverExecutors = {
+      peek: async (chatId) => { seen.push(chatId); return { hasNew: false, cursor: 'om_last' }; },
+      detect: async () => ({ events: [], cursor: null }),
+    };
+    await runTaskTeamObserverTick(new Date(), deps, exec);
+    expect(seen).toEqual(['oc_external', 'oc_self']);
   });
 
   it('new activity → detect events applied + cursor advanced', async () => {

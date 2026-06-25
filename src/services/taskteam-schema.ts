@@ -151,6 +151,8 @@ export interface TaskTeamInstance {
   companyId: TaskTeamCompanyId;
   deptId?: TaskTeamDepartmentId;
   chatId: string;
+  /** 可选：observer 实际监控的外部群。不设则沿用小组自己的 chatId。运行态绑定，不进 TemplateBundle。 */
+  targetExternalChatId?: string;
   goal: string;
   acceptance: string;
   roleInstances: TaskTeamRoleInstance[];

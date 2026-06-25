@@ -11,7 +11,8 @@ import { spawn } from 'node:child_process';
 import { listChatMessages, listMessagesAsc, getMessageDetail } from '../im/lark/client.js';
 import { parseApiMessage, isPureCardUpgradeFallback } from '../im/lark/message-parser.js';
 import { logger } from '../utils/logger.js';
-import { TaskTeamCursorInvalidError } from './taskteam-observer.js';
+import { peekByMessageHighWater } from './group-monitor.js';
+import { observedChatIdForTaskTeam, TaskTeamCursorInvalidError } from './taskteam-observer.js';
 import type { TaskTeamObserverExecutors, TaskTeamDetectResult } from './taskteam-observer.js';
 import type { TaskTeamInstance } from './taskteam-schema.js';
 import type { TeamEvent, TaskTeamEventType } from './taskteam-engine.js';
@@ -400,7 +401,7 @@ export function makeTaskTeamObserveExecutors(
     async peek(chatId: string, cursor: string | null) {
       const msgs = await listChatMessages(observerLarkAppId, chatId, 1); // ByCreateTimeDesc，最新在前
       const newest: string | null = msgs[0]?.message_id ?? null;
-      return { hasNew: !!newest && newest !== cursor, cursor: newest ?? cursor };
+      return peekByMessageHighWater(newest, cursor);
     },
 
     // 判读层（PRD §4.2）：读增量 → 注入式 judge 判读角色行为 → 映射 TeamEvent[]，并返回已读边界 cursor。
@@ -409,7 +410,7 @@ export function makeTaskTeamObserveExecutors(
     //  - cursor 失效 → fetchSince 抛 TaskTeamCursorInvalidError，tick 跳到最新避免卡死。
     //  - 无增量 / 判读成功但无行为 / 归因不到 → 返 events:[]，cursor 推进到已读边界（不伪造事件）。
     async detect(instance: TaskTeamInstance, cursor: string | null): Promise<TaskTeamDetectResult> {
-      const { messages } = await fetchSince(instance.chatId, cursor, FETCH_LIMIT);
+      const { messages } = await fetchSince(observedChatIdForTaskTeam(instance), cursor, FETCH_LIMIT);
       if (!messages.length) return { events: [], cursor }; // 无增量 → cursor 不变
 
       // 已读边界 = 连续老→新批次的最后一条；cursor 只推到这里（修 P1#2：busy 群多 tick 渐进 drain）。

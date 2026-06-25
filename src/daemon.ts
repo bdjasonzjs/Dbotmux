@@ -1477,6 +1477,7 @@ ipcRoute('POST', '/api/taskteam-create-from-template', async (req, res) => {
     selectedBotBySlot?: Record<string, string>;
     goal?: string;
     acceptance?: string;
+    targetExternalChatId?: string;
     creatorLarkAppId?: string;
     userOpenIds?: string[];
     notifyOwnerOpenId?: string;
@@ -1558,6 +1559,7 @@ ipcRoute('POST', '/api/taskteam-create-from-template', async (req, res) => {
       companyId: 'tt_company_onboard' as never, // P2：companyId 服务端固定，不收浏览器透传
       goal: body.goal ?? '示例小目标：跑通一次「交活→把关→完成」',
       acceptance: body.acceptance ?? '示例小组完整跑通一轮 review',
+      targetExternalChatId: body.targetExternalChatId,
       roleInstances: roleInstances as never,
       creatorLarkAppId: body.creatorLarkAppId,
       userOpenIds: body.userOpenIds,

@@ -1,6 +1,6 @@
 // 新手引导第二段「用模板建一个真群」（设计 v5 §四）——这一步才碰 bot。
 // 选一个已存模板 → 给每个角色挑现成 bot → 建飞书群 + 把当前用户拉进群。
-// 信任边界在服务端：本页只提交 { typeId, selectedBotBySlot, goal }，roleInstances/binding 全由服务端按真实 bot 组装。
+// 信任边界在服务端：本页只提交 { typeId, selectedBotBySlot, goal, targetExternalChatId }，roleInstances/binding 全由服务端按真实 bot 组装。
 // 克隆新分身置灰、延后（ceo-spawn 需 chat session，dashboard 另设独立 clone API 后续做）。
 
 function esc(s: string): string {
@@ -21,6 +21,7 @@ export function renderTaskTeamBuildPage(root: HTMLElement): (() => void) {
   let typeId = '';
   const pick: Record<string, string> = {}; // slotId -> appId
   let goal = '';
+  let targetExternalChatId = '';
   let busy = false;
   let result: { ok: boolean; html: string } | null = null;
 
@@ -70,6 +71,7 @@ export function renderTaskTeamBuildPage(root: HTMLElement): (() => void) {
           <select id="ttb-type">${typeId ? '' : '<option value="">— 选一个模板 —</option>'}${typeOpts}</select></label>
         ${typeId ? `<div class="ttb-section"><div class="ttw-field"><span>② 给每个角色挑机器人</span></div>${noBots}<div class="ttb-slots">${slotRows}</div></div>` : ''}
         ${typeId ? `<label class="ttw-field"><span>③ 给个小目标（可空）</span><input id="ttb-goal" value="${esc(goal)}" placeholder="例如：跑通一次「交活→把关→完成」" /></label>` : ''}
+        ${typeId ? `<label class="ttw-field"><span>④ 监控外部群 chatId（可空）</span><input id="ttb-target-chat" value="${esc(targetExternalChatId)}" placeholder="留空则监控新建的小组群；例如 oc_xxx" /></label>` : ''}
         <button class="ttw-save ttb-build" ${!allSlotsPicked() || busy ? 'disabled' : ''}>${busy ? '建群中…' : '建这个真群'}</button>
         ${result ? `<div class="ttb-result ${result.ok ? 'ok' : 'err'}">${result.html}</div>` : ''}
       </div>
@@ -103,6 +105,7 @@ export function renderTaskTeamBuildPage(root: HTMLElement): (() => void) {
       });
     });
     q<HTMLInputElement>('#ttb-goal')?.addEventListener('input', e => { goal = (e.target as HTMLInputElement).value; });
+    q<HTMLInputElement>('#ttb-target-chat')?.addEventListener('input', e => { targetExternalChatId = (e.target as HTMLInputElement).value; });
     q<HTMLButtonElement>('.ttb-build')?.addEventListener('click', () => { void doBuild(); });
   }
 
@@ -112,7 +115,7 @@ export function renderTaskTeamBuildPage(root: HTMLElement): (() => void) {
     try {
       const r = await fetch('/api/taskteam-create', {
         method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ typeId, selectedBotBySlot: pick, goal: goal || undefined }),
+        body: JSON.stringify({ typeId, selectedBotBySlot: pick, goal: goal || undefined, targetExternalChatId: targetExternalChatId.trim() || undefined }),
       });
       const data = await r.json().catch(() => ({}));
       busy = false;

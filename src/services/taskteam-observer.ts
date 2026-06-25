@@ -47,6 +47,11 @@ export interface TaskTeamObserverStats {
   errors: number;
 }
 
+export function observedChatIdForTaskTeam(team: Pick<TaskTeamInstance, 'chatId' | 'targetExternalChatId'>): string {
+  const external = team.targetExternalChatId?.trim();
+  return external || team.chatId;
+}
+
 export async function runTaskTeamObserverTick(
   now: Date,
   deps: TaskTeamObserverDeps,
@@ -58,8 +63,9 @@ export async function runTaskTeamObserverTick(
     stats.scanned += 1;
     try {
       const cursor = team.cursor ?? null;
+      const observedChatId = observedChatIdForTaskTeam(team);
       // 廉价 gate：无新动静 → 直接跳过，零模型调用（等价"事件触发休眠"）
-      const peeked = await exec.peek(team.chatId, cursor);
+      const peeked = await exec.peek(observedChatId, cursor);
       if (!peeked.hasNew) {
         stats.gatedOut += 1;
         continue;

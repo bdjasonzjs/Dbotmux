@@ -38,6 +38,11 @@ export interface MonitorExecutors {
 export const MIN_JUDGE_INTERVAL_MS = 120_000;
 const FETCH_LIMIT = 30;
 
+/** group-monitor 的 messageId 高水位判断：无最新消息或最新等于游标 → 无新增。 */
+export function peekByMessageHighWater(newestMessageId: string | null, lastSeenMessageId: string | null): { hasNew: boolean; cursor: string | null } {
+  return { hasNew: !!newestMessageId && newestMessageId !== lastSeenMessageId, cursor: newestMessageId ?? lastSeenMessageId };
+}
+
 /** 把事件要点归一化成稳定 slug（去空白/标点/控制字符、小写、截断），让"同一卡点换个
  *  说法"也落同一 fingerprint。与 subtask-observer 的 normalizeAsk 同思路。 */
 export function normalizeSlug(s: string): string {
@@ -65,7 +70,7 @@ async function tickOne(mon: GroupMonitor, now: Date, exec: MonitorExecutors): Pr
   if (msgs.length === 0) return;
   const newestId = msgs[0].id;
   // "有消息才读": 没新消息 (newest 跟上次一样) → 跳过, 不跑 LLM
-  if (mon.lastSeenMessageId === newestId) return;
+  if (!peekByMessageHighWater(newestId, mon.lastSeenMessageId).hasNew) return;
 
   // 只取"上次见过之后"的新消息 (按 id 高水位)
   let newMsgs = msgs;

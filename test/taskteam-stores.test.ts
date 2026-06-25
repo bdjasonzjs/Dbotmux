@@ -87,12 +87,14 @@ describe('taskteam batch 1 stores', () => {
       companyId: 'tt_company_default',
       deptId: 'tt_dept_default',
       chatId: 'oc_team',
+      targetExternalChatId: 'oc_external',
       goal: 'implement batch 1',
       acceptance: 'tests pass',
       roleInstances: sampleRoleInstances(),
     });
 
     expect(team.teamId.startsWith('tt_team_')).toBe(true);
+    expect(team.targetExternalChatId).toBe('oc_external');
     expect(team.roleInstances[0].roleInstanceId).toBe('tt_ri_dev');
     expect(team.roleInstances[0].binding?.botOpenId).toBe('ou_dev');
 

@@ -81,6 +81,19 @@ describe('taskteam detect() — 别名归因 + 已读边界 cursor', () => {
     expect(seen.roster.map((r: any) => r.alias)).toEqual(['R1', 'R2']);
   });
 
+  it('配置 targetExternalChatId 时 detect 从外部群读取增量，cursor 仍按实例推进', async () => {
+    const seen: Array<{ chatId: string; cursor: string | null }> = [];
+    const fetchSince: TaskTeamFetchSinceFn = async (chatId, cursor) => {
+      seen.push({ chatId, cursor });
+      return { messages: [{ id: 'om_ext_1', text: '外部群新消息', senderId: DEV_OID }] };
+    };
+    const res = await execWith(async () => [], fetchSince)
+      .detect(instanceFixture({ targetExternalChatId: 'oc_external' }), 'om_cursor');
+
+    expect(seen).toEqual([{ chatId: 'oc_external', cursor: 'om_cursor' }]);
+    expect(res).toEqual({ events: [], cursor: 'om_ext_1' });
+  });
+
   it('by 兼容直接给 roleInstanceId / slotId', async () => {
     const judge: TaskTeamJudgeFn = async () => [
       { type: 'submit', by: 'tt_ri_dev' },

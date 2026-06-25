@@ -95,6 +95,7 @@ export async function createTaskTeam(opts: {
   companyId: TaskTeamCompanyId;
   deptId?: TaskTeamDepartmentId;
   chatId: string;
+  targetExternalChatId?: string;
   goal: string;
   acceptance: string;
   roleInstances: TaskTeamRoleInstance[];
@@ -108,6 +109,7 @@ export async function createTaskTeam(opts: {
       companyId: opts.companyId,
       deptId: opts.deptId,
       chatId: opts.chatId,
+      ...(opts.targetExternalChatId ? { targetExternalChatId: opts.targetExternalChatId } : {}),
       goal: opts.goal,
       acceptance: opts.acceptance,
       roleInstances: opts.roleInstances,
