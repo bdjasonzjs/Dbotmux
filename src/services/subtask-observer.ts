@@ -95,6 +95,31 @@ export function managerExemptFromStall(t: SubTask): boolean {
   return t.reportingMode === 'manager';
 }
 
+/** 经理卡死阈值：经理任务在 paused / reported_help 滞留超此时长 → 判卡死、上浮 CEO。
+ *  经理是汇报制、正常静默不算卡死（managerExemptFromStall 已豁免 stall-nudge）；但被 paused /
+ *  reported_help 卡住后长期无人处理 = 真烂了（实测有老任务从 6/18 烂到 6/24 无人管）。可调。 */
+export const MANAGER_STALL_MS = 2 * 60 * 60 * 1000; // 2h
+
+export type ManagerHealthAction =
+  | { kind: 'none' }
+  | { kind: 'escalate_ceo'; stalledMs: number };
+
+/** 经理存活检测（纯函数，可单测）—— 与 stall-nudge 互补：
+ *  stall-nudge 管「执行者超时静默」(planStallNudge)；本函数管「经理被 paused/reported_help 卡死躺尸」。
+ *  这就是 managerExemptFromStall 注释承诺的「另起一套、基于卡死状态而非超时静默」的经理存活检测。
+ *  判定：reportingMode==='manager' 且 status∈{paused,reported_help} 且 (now − updatedAt) > 阈值
+ *    → escalate_ceo（默认只上浮告警 CEO、不自动 resume，宁稳勿乱、防误伤正在合理等待的任务）。
+ *  其余（执行者 / observing 等活跃态 / 未超期 / updatedAt 脏）→ none。 */
+export function planManagerHealth(t: SubTask, now: Date): ManagerHealthAction {
+  if (t.reportingMode !== 'manager') return { kind: 'none' };
+  if (t.status !== 'paused' && t.status !== 'reported_help') return { kind: 'none' };
+  const updatedMs = t.updatedAt ? new Date(t.updatedAt).getTime() : NaN;
+  if (!Number.isFinite(updatedMs)) return { kind: 'none' };
+  const stalledMs = now.getTime() - updatedMs;
+  if (stalledMs <= MANAGER_STALL_MS) return { kind: 'none' };
+  return { kind: 'escalate_ceo', stalledMs };
+}
+
 export function planStallNudge(t: SubTask, now: Date, lastInitiatingCmdAt: string | null = null): StallAction {
   if (t.status !== 'observing') return { kind: 'none' };       // 只在执行者本应继续的态唤
   const anchorMs = episodeAnchorMs(t, lastInitiatingCmdAt);
