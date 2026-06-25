@@ -171,5 +171,24 @@ describe('root-inbox-publisher (P2 commit #5)', () => {
       expect(root.lookup('manager_stalled:st_mgr')?.updateCount).toBe(1);
       expect(root.lookup('manager_stalled:st_mgr')?.summary).toBe('stalled');
     });
+
+    it('closed manager alert can reopen as a new generation for a later incident', async () => {
+      fakeMainTopic = 'oc_flumy';
+      sendMessageSpy.mockResolvedValueOnce('msg_first').mockResolvedValueOnce('msg_second');
+      const { pub, root } = await freshImports();
+
+      const first = await pub.publishManagerStalled({ task, summary: 'first incident', larkAppId: 'app_x' });
+      expect(first.inserted).toBe(true);
+      expect(first.itemId).toBe('manager_stalled:st_mgr');
+      root.close(first.itemId);
+
+      const second = await pub.publishManagerStalled({ task, summary: 'second incident', larkAppId: 'app_x' });
+      expect(second.inserted).toBe(true);
+      expect(second.itemId).toBe('manager_stalled:st_mgr#2');
+      expect(second.rootCardMessageId).toBe('msg_second');
+      expect(sendMessageSpy).toHaveBeenCalledTimes(2);
+      expect(root.lookup('manager_stalled:st_mgr')?.status).toBe('closed');
+      expect(root.lookup('manager_stalled:st_mgr#2')?.summary).toBe('second incident');
+    });
   });
 });

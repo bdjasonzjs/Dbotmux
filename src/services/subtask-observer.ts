@@ -238,12 +238,18 @@ function findActiveSessionForTask(t: SubTask): Session | null {
 
 function hasPendingManagerWork(t: SubTask): boolean {
   if (t.status === 'paused' || t.status === 'reported_help') return true;
-  return listCommands(t.taskId).some(c =>
-    c.direction === 'parent_to_child'
-    && c.supersededBy == null
-    && c.deliveryStatus !== 'acked'
-    && c.deliveryStatus !== 'failed'
-    && (c.commandType === 'kickoff' || c.commandType === 'supplement' || c.commandType === 'request_report' || c.commandType === 'request_review'));
+  return listCommands(t.taskId).some(c => isPendingManagerCommand(c));
+}
+
+function isPendingManagerCommand(c: OutboxCommand): boolean {
+  if (c.direction !== 'parent_to_child') return false;
+  if (c.supersededBy != null) return false;
+  if (c.deliveryStatus === 'acked' || c.deliveryStatus === 'failed') return false;
+  const targetRole = c.payload.targetRole;
+  if (c.commandType === 'kickoff') return targetRole !== 'collab';
+  if (c.commandType === 'supplement' || c.commandType === 'request_report') return targetRole == null || targetRole === 'main';
+  if (c.commandType === 'request_review') return targetRole === 'main';
+  return false;
 }
 
 function managerSessionAppIds(t: SubTask): Set<string> {

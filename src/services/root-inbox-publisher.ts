@@ -102,6 +102,7 @@ async function publishManagerAlert(
     subChatId: opts.task.chatId,
     subChatName: opts.task.goal || opts.task.chatId,
     summary: opts.summary,
+    allowReopen: true,
   });
 
   const dest = resolveRootDestination(opts.task, opts.larkAppId);

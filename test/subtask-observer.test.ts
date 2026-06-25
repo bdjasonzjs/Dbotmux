@@ -739,6 +739,33 @@ describe('manager self-heal step2+3 wiring', () => {
     expect(rootInbox.lookup(`manager_session_aged:${t.taskId}`)).toBeNull();
   });
 
+  it('request_review targetRole=collab 不算 manager pending work，避免待审误判 session 老化', async () => {
+    const start = new Date('2026-06-24T00:00:00Z');
+    const t = await mkManagerTask('observing', start, 'mgr-review-collab');
+    sessionStore.init('app_mgr');
+    const s = sessionStore.createSession(t.chatId, 'om_root', 'manager session');
+    sessionStore.updateSession({
+      ...s,
+      larkAppId: 'app_mgr',
+      createdAt: start.toISOString(),
+      lastMessageAt: new Date(start.getTime() + 30 * 60_000).toISOString(),
+    });
+    sessionStore.init('app_observer');
+    await enqueueCommand({
+      taskId: t.taskId,
+      direction: 'parent_to_child',
+      targetChatId: t.chatId,
+      commandType: 'request_review',
+      payload: { summary: 'https://docx/review', targetRole: 'collab' },
+      idempotencyKey: 'request-review-collab',
+    });
+
+    const now = new Date(start.getTime() + 13 * 60 * 60_000);
+    vi.setSystemTime(now);
+    await runObserverTick(now, mkExec({ messages: [] }));
+    expect(rootInbox.lookup(`manager_session_aged:${t.taskId}`)).toBeNull();
+  });
+
   it('长 session 但无 pending work → 不判老化，防误判正常待命经理', async () => {
     const start = new Date('2026-06-24T00:00:00Z');
     const t = await mkManagerTask('observing', start, 'mgr-idle-ok');
