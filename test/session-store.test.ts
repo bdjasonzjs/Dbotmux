@@ -50,6 +50,7 @@ import {
   updateSession,
   updateSessionPid,
   findActiveSessionsByRoot,
+  findActiveSessionsByChatId,
 } from '../src/services/session-store.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -114,6 +115,20 @@ describe('init()', () => {
     // for a different appId context, it starts fresh
     init('different-app');
     expect(listSessions()).toHaveLength(0);
+  });
+});
+
+describe('findActiveSessionsByChatId()', () => {
+  it('finds active sessions across per-app session files regardless of scope', () => {
+    init('app_manager');
+    const s = createSession('oc_mgr', 'om_root', 'Manager');
+    updateSession({ ...s, larkAppId: 'app_manager', scope: 'thread' });
+
+    init('app_observer');
+    createSession('oc_other', 'om_other', 'Other');
+
+    const rows = findActiveSessionsByChatId('oc_mgr');
+    expect(rows.map(r => r.sessionId)).toContain(s.sessionId);
   });
 });
 

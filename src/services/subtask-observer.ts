@@ -25,6 +25,9 @@ import {
   CursorConflictError, InvalidCursorCommitError, VersionConflictError, OBSERVER_STATUSES,
   type SubTask, type SubTaskStatus, type Signal, type HelpDelivery, type OutboxCommand,
 } from './subtask-store.js';
+import * as sessionStore from './session-store.js';
+import { publishManagerSessionAged, publishManagerStalled } from './root-inbox-publisher.js';
+import type { Session } from '../types.js';
 
 export interface JudgeContext {
   goal: string;
@@ -104,6 +107,13 @@ export type ManagerHealthAction =
   | { kind: 'none' }
   | { kind: 'escalate_ceo'; stalledMs: number };
 
+export const MANAGER_SESSION_AGE_MS = 12 * 60 * 60 * 1000; // 12h
+export const MANAGER_SESSION_IDLE_MS = 2 * 60 * 60 * 1000; // 2h
+
+export type ManagerSessionAgingAction =
+  | { kind: 'none' }
+  | { kind: 'alert'; ageMs: number; idleMs: number; recover: false };
+
 /** 经理存活检测（纯函数，可单测）—— 与 stall-nudge 互补：
  *  stall-nudge 管「执行者超时静默」(planStallNudge)；本函数管「经理被 paused/reported_help 卡死躺尸」。
  *  这就是 managerExemptFromStall 注释承诺的「另起一套、基于卡死状态而非超时静默」的经理存活检测。
@@ -120,6 +130,39 @@ export function planManagerHealth(t: SubTask, now: Date): ManagerHealthAction {
   return { kind: 'escalate_ceo', stalledMs };
 }
 
+export interface ManagerSessionSnapshot {
+  status: 'active' | 'closed';
+  createdAt?: string;
+  lastMessageAt?: string;
+}
+
+/** Session 老化保守判定：
+ *  - 只看 manager；
+ *  - session 必须仍 active；
+ *  - 年龄 > 12h 且最近活动 > 2h；
+ *  - 必须有 pending work，避免把正常长时间待命的经理误判为老化。
+ *  observer 层只能可靠拿到持久化 session.createdAt / lastMessageAt；daemon 进程活性、
+ *  worker 屏幕状态、recover kill/restart 仍属后续 daemon-layer opt-in wiring。 */
+export function planManagerSessionAging(
+  t: SubTask,
+  session: ManagerSessionSnapshot | null,
+  hasPendingWork: boolean,
+  now: Date,
+): ManagerSessionAgingAction {
+  if (t.reportingMode !== 'manager') return { kind: 'none' };
+  if (!session || session.status !== 'active') return { kind: 'none' };
+  if (!hasPendingWork) return { kind: 'none' };
+  const createdMs = session.createdAt ? new Date(session.createdAt).getTime() : NaN;
+  if (!Number.isFinite(createdMs)) return { kind: 'none' };
+  const lastMs = session.lastMessageAt ? new Date(session.lastMessageAt).getTime() : createdMs;
+  if (!Number.isFinite(lastMs)) return { kind: 'none' };
+  const ageMs = now.getTime() - createdMs;
+  const idleMs = now.getTime() - lastMs;
+  if (ageMs <= MANAGER_SESSION_AGE_MS) return { kind: 'none' };
+  if (idleMs <= MANAGER_SESSION_IDLE_MS) return { kind: 'none' };
+  return { kind: 'alert', ageMs, idleMs, recover: false };
+}
+
 export function planStallNudge(t: SubTask, now: Date, lastInitiatingCmdAt: string | null = null): StallAction {
   if (t.status !== 'observing') return { kind: 'none' };       // 只在执行者本应继续的态唤
   const anchorMs = episodeAnchorMs(t, lastInitiatingCmdAt);
@@ -133,15 +176,70 @@ export async function runObserverTick(now: Date, exec: ObserverExecutors): Promi
   const stats = { checked: 0, committed: 0, errors: 0 };
   for (const t of listSubTasks({ statuses: OBSERVER_STATUSES })) {
     try {
+      const managerDid = await handleManagerHealth(t, now);
       const did = await tickOne(t, now, exec);
       stats.checked += 1;
-      if (did) stats.committed += 1;
+      if (managerDid || did) stats.committed += 1;
     } catch (err) {
       stats.errors += 1;
       logger.warn(`[subtask-observer] tick ${t.taskId} failed: ${err}`);
     }
   }
   return stats;
+}
+
+async function handleManagerHealth(t: SubTask, now: Date): Promise<boolean> {
+  if (t.reportingMode !== 'manager') return false;
+  const larkAppId = managerAlertLarkAppId(t);
+  let did = false;
+  const health = planManagerHealth(t, now);
+  if (health.kind === 'escalate_ceo') {
+    const hours = (health.stalledMs / 3600_000).toFixed(1);
+    const res = await publishManagerStalled({
+      task: t,
+      larkAppId,
+      summary: `经理任务 ${t.taskId} 卡在 ${t.status} 已 ${hours} 小时。默认仅告警，不自动 resume；请判断恢复、补充信息或关闭。`,
+    });
+    did = did || res.inserted;
+    if (res.inserted) logger.info(`[subtask-observer] ${t.taskId} manager stalled → RootInbox(manager_stalled)`);
+  }
+
+  if (health.kind !== 'none') return did;
+
+  const session = findActiveSessionForTask(t);
+  const aging = planManagerSessionAging(t, session, hasPendingManagerWork(t), now);
+  if (aging.kind === 'alert') {
+    const ageHours = (aging.ageMs / 3600_000).toFixed(1);
+    const idleHours = (aging.idleMs / 3600_000).toFixed(1);
+    const res = await publishManagerSessionAged({
+      task: t,
+      larkAppId,
+      summary: `经理任务 ${t.taskId} 的会话已运行 ${ageHours} 小时，近 ${idleHours} 小时无产出且仍有 pending work。默认仅告警；自动 recover 需后续 daemon 层 opt-in。`,
+    });
+    did = did || res.inserted;
+    if (res.inserted) logger.info(`[subtask-observer] ${t.taskId} manager session aged → RootInbox(manager_session_aged)`);
+  }
+  return did;
+}
+
+function managerAlertLarkAppId(t: SubTask): string {
+  return t.createdByLarkAppId ?? t.bots.find(b => b.role === 'main' && b.larkAppId)?.larkAppId ?? t.bots.find(b => b.larkAppId)?.larkAppId ?? '';
+}
+
+function findActiveSessionForTask(t: SubTask): Session | null {
+  const sessions = sessionStore.findActiveSessionsByChatId(t.chatId)
+    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  return sessions[0] ?? null;
+}
+
+function hasPendingManagerWork(t: SubTask): boolean {
+  if (t.status === 'paused' || t.status === 'reported_help') return true;
+  return listCommands(t.taskId).some(c =>
+    c.direction === 'parent_to_child'
+    && c.supersededBy == null
+    && c.deliveryStatus !== 'acked'
+    && c.deliveryStatus !== 'failed'
+    && (c.commandType === 'kickoff' || c.commandType === 'supplement' || c.commandType === 'request_report' || c.commandType === 'request_review'));
 }
 
 async function tickOne(t: SubTask, now: Date, exec: ObserverExecutors): Promise<boolean> {
@@ -257,9 +355,9 @@ async function tickOne(t: SubTask, now: Date, exec: ObserverExecutors): Promise<
  * nudgeCount 入 key 让同窗口每次 attempt 唯一、两 tick 并发同 attempt 自然 dedup。
  */
 async function handleStall(t: SubTask, now: Date): Promise<boolean> {
-  if (t.status === 'paused') return handlePausedHeartbeat(t, now);
-
   if (managerExemptFromStall(t)) return false;
+
+  if (t.status === 'paused') return handlePausedHeartbeat(t, now);
 
   // blocker2 fix: 最近一条非 nudge 发起命令 (kickoff/supplement/request_review)——
   // sentAt 优先 (已投出)，否则 createdAt (pending)。排除 nudge 自身。

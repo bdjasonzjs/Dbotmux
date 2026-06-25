@@ -28,14 +28,19 @@ const STORE_FILE = 'root-inbox.json';
 /** Escalation rule id — must match `EscalationRuleId` in main-bot-digest-store. */
 export type EscalationRuleId = 'R1' | 'R2' | 'R3' | 'R4' | 'R5';
 
-export type RootInboxKind = 'escalation' | 'progress' | 'request_decision' | 'tilly_digest' | 'tilly_alert';
+export type RootInboxKind =
+  | 'escalation' | 'progress' | 'request_decision'
+  | 'manager_stalled' | 'manager_session_aged'
+  | 'tilly_digest' | 'tilly_alert';
 export type RootInboxStatus = 'open' | 'updated' | 'closed';
 
 export interface RootInboxItem {
   /** Deterministic dedup key. Composition depends on kind:
    *  - kind=escalation:        `${ruleId}:${subChatId}`
    *  - kind=progress:          `progress:${subChatId}:${slug}`
-   *  - kind=request_decision:  `request_decision:${subChatId}:${slug}` */
+   *  - kind=request_decision:  `request_decision:${subChatId}:${slug}`
+   *  - kind=manager_stalled:   `manager_stalled:${taskId}`
+   *  - kind=manager_session_aged: `manager_session_aged:${taskId}` */
   id: string;
   kind: RootInboxKind;
   subChatId: string;
@@ -130,9 +135,13 @@ export function lookupOpenByBaseId(baseId: string): RootInboxItem | null {
 /** Build a dedup id from kind + relevant fields. Helper for callers. */
 export function buildId(opts:
   | { kind: 'escalation'; ruleId: EscalationRuleId; subChatId: string }
-  | { kind: 'progress' | 'request_decision'; subChatId: string; slug: string },
+  | { kind: 'progress'; subChatId: string; slug: string }
+  | { kind: 'request_decision'; subChatId: string; slug: string }
+  | { kind: 'manager_stalled'; taskId: string }
+  | { kind: 'manager_session_aged'; taskId: string },
 ): string {
   if (opts.kind === 'escalation') return `${opts.ruleId}:${opts.subChatId}`;
+  if (opts.kind === 'manager_stalled' || opts.kind === 'manager_session_aged') return `${opts.kind}:${opts.taskId}`;
   return `${opts.kind}:${opts.subChatId}:${opts.slug}`;
 }
 

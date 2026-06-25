@@ -2,7 +2,7 @@
  * Unit tests for subtask-observer (Phase 2 观测脚本)。
  * Run: pnpm vitest run test/subtask-observer.test.ts
  */
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -24,6 +24,8 @@ import {
   MIN_OBSERVE_INTERVAL_MS, STALE_REREPORT_MS, STALL_AFTER_MS,
   type ObserverExecutors, type JudgeResult, type PrevHelpReport,
 } from '../src/services/subtask-observer.js';
+import * as rootInbox from '../src/services/root-inbox-store.js';
+import * as sessionStore from '../src/services/session-store.js';
 
 /** 造一个上次 help 上报快照 (PrevHelpReport)，默认 = 已投出、未响应。 */
 function mkPrev(over: Partial<PrevHelpReport> = {}): PrevHelpReport {
@@ -64,6 +66,11 @@ function mkExec(over: {
 beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), 'sto-test-'));
   __resetForTesting();
+  sessionStore.init();
+});
+
+afterEach(() => {
+  vi.useRealTimers();
 });
 
 // ─── planCommit 纯决策 ──────────────────────────────────────────────────────
@@ -593,6 +600,122 @@ describe('managerExemptFromStall: 经理群豁免 observer stall-nudge', () => {
   });
   it('reportingMode 缺省（旧任务）→ 不豁免（字节兼容旧 executor 行为）', () => {
     expect(managerExemptFromStall({} as any)).toBe(false);
+  });
+});
+
+describe('manager self-heal step2+3 wiring', () => {
+  async function mkManagerTask(status: 'observing' | 'paused' | 'reported_help', at: Date, key = 'mgr-k') {
+    vi.useFakeTimers();
+    vi.setSystemTime(at);
+    const t = await createSubTask({
+      chatId: `oc_mgr_${key}`,
+      parentChatId: 'oc_parent',
+      parentMessageId: 'om_src',
+      goal: '经理部门任务',
+      acceptance: null,
+      bots: [{ openId: 'ou_mgr', name: '经理', role: 'main', larkAppId: 'app_mgr' }],
+      requester: 'ou_jason',
+      createdBy: 'ou_mgr',
+      createdByLarkAppId: 'app_mgr',
+      idempotencyKey: key,
+      reportingMode: 'manager',
+      rootChatId: 'oc_root',
+    });
+    await transitionStatus(t.taskId, 'observing');
+    if (status !== 'observing') await transitionStatus(t.taskId, status);
+    return getSubTask(t.taskId)!;
+  }
+
+  it('manager paused 卡死超 2h → 写 manager_stalled RootInbox；重复 tick 不重复上浮/更新', async () => {
+    const start = new Date('2026-06-24T00:00:00Z');
+    const t = await mkManagerTask('paused', start, 'mgr-stalled');
+    const now = new Date(start.getTime() + 3 * 60 * 60 * 1000);
+    vi.setSystemTime(now);
+
+    await runObserverTick(now, mkExec({ messages: [] }));
+    const id = `manager_stalled:${t.taskId}`;
+    expect(rootInbox.lookup(id)?.kind).toBe('manager_stalled');
+    expect(rootInbox.lookup(id)?.updateCount).toBe(1);
+    expect(rootInbox.lookup(`manager_session_aged:${t.taskId}`)).toBeNull();
+    expect(listCommands(t.taskId).filter(c => c.commandType === 'report_help')).toHaveLength(0);
+    expect(getSubTask(t.taskId)!.status).toBe('paused'); // 默认只告警，不自动 resume/转态
+
+    await runObserverTick(new Date(now.getTime() + 2 * MIN_OBSERVE_INTERVAL_MS), mkExec({ messages: [] }));
+    expect(rootInbox.lookup(id)?.updateCount).toBe(1);
+    expect(rootInbox.listOpen().filter(it => it.id === id)).toHaveLength(1);
+  });
+
+  it('未卡死 manager / executor 不写 manager_stalled', async () => {
+    const start = new Date('2026-06-24T00:00:00Z');
+    await mkManagerTask('reported_help', start, 'mgr-fresh');
+    const freshNow = new Date(start.getTime() + 60 * 60 * 1000);
+    vi.setSystemTime(freshNow);
+    await runObserverTick(freshNow, mkExec({ messages: [] }));
+    expect(rootInbox.listOpen().filter(it => it.kind === 'manager_stalled')).toHaveLength(0);
+
+    const exec = await createSubTask({
+      chatId: 'oc_exec',
+      parentChatId: 'oc_parent',
+      parentMessageId: 'om_src',
+      goal: '执行任务',
+      acceptance: null,
+      bots: BOTS,
+      requester: 'ou_jason',
+      createdBy: 'ou_claude',
+      idempotencyKey: 'exec-stalled',
+      reportingMode: 'executor',
+    });
+    await transitionStatus(exec.taskId, 'paused');
+    await runObserverTick(new Date(freshNow.getTime() + 30 * 60 * 1000), mkExec({ messages: [] }));
+    expect(rootInbox.listOpen().filter(it => it.kind === 'manager_stalled')).toHaveLength(0);
+  });
+
+  it('manager active session 年龄>12h + idle>2h + pending work → 写 manager_session_aged，默认不 recover', async () => {
+    const start = new Date('2026-06-24T00:00:00Z');
+    const t = await mkManagerTask('observing', start, 'mgr-aged');
+    sessionStore.init('app_mgr');
+    const s = sessionStore.createSession(t.chatId, 'om_root', 'manager session');
+    sessionStore.updateSession({
+      ...s,
+      larkAppId: 'app_mgr',
+      createdAt: start.toISOString(),
+      lastMessageAt: new Date(start.getTime() + 30 * 60_000).toISOString(),
+    });
+    sessionStore.init('app_observer');
+    await enqueueCommand({
+      taskId: t.taskId,
+      direction: 'parent_to_child',
+      targetChatId: t.chatId,
+      commandType: 'request_report',
+      payload: { requestId: 'req_1' },
+      idempotencyKey: 'req-report-1',
+    });
+
+    const now = new Date(start.getTime() + 13 * 60 * 60_000);
+    vi.setSystemTime(now);
+    await runObserverTick(now, mkExec({ messages: [] }));
+    const item = rootInbox.lookup(`manager_session_aged:${t.taskId}`);
+    expect(item?.kind).toBe('manager_session_aged');
+    expect(item?.summary).toContain('默认仅告警');
+
+    await runObserverTick(new Date(now.getTime() + 2 * MIN_OBSERVE_INTERVAL_MS), mkExec({ messages: [] }));
+    expect(rootInbox.lookup(`manager_session_aged:${t.taskId}`)?.updateCount).toBe(1);
+  });
+
+  it('长 session 但无 pending work → 不判老化，防误判正常待命经理', async () => {
+    const start = new Date('2026-06-24T00:00:00Z');
+    const t = await mkManagerTask('observing', start, 'mgr-idle-ok');
+    const s = sessionStore.createSession(t.chatId, 'om_root', 'manager idle session');
+    sessionStore.updateSession({
+      ...s,
+      larkAppId: 'app_mgr',
+      createdAt: start.toISOString(),
+      lastMessageAt: new Date(start.getTime() + 30 * 60_000).toISOString(),
+    });
+    const now = new Date(start.getTime() + 13 * 60 * 60_000);
+    vi.setSystemTime(now);
+    await runObserverTick(now, mkExec({ messages: [] }));
+    expect(rootInbox.lookup(`manager_session_aged:${t.taskId}`)).toBeNull();
   });
 });
 

@@ -18,7 +18,7 @@ import { getCompanyByRootChatId, getMainTopicChatId } from './main-topic-config.
 import * as rootInbox from './root-inbox-store.js';
 import { sendOrUpdateCard } from './root-inbox-card-renderer.js';
 import { logger } from './../utils/logger.js';
-import { getByChatId } from './subtask-store.js';
+import { getByChatId, type SubTask } from './subtask-store.js';
 
 export interface PublishOpts {
   /** Caller's session id (for audit + future authz; not stored). */
@@ -48,6 +48,12 @@ export interface PublishResult {
   rootCardMessageId: string | null;
 }
 
+export interface PublishManagerAlertOpts {
+  task: SubTask;
+  summary: string;
+  larkAppId: string;
+}
+
 /** Publish a progress report to RootInbox + mainTopic. */
 export async function publishProgress(opts: PublishOpts): Promise<PublishResult> {
   return publishGeneric('progress', opts);
@@ -56,6 +62,62 @@ export async function publishProgress(opts: PublishOpts): Promise<PublishResult>
 /** Publish a request-decision card to RootInbox + mainTopic. */
 export async function publishRequestDecision(opts: PublishOpts): Promise<PublishResult> {
   return publishGeneric('request_decision', opts);
+}
+
+export async function publishManagerStalled(opts: PublishManagerAlertOpts): Promise<PublishResult> {
+  return publishManagerAlert('manager_stalled', opts);
+}
+
+export async function publishManagerSessionAged(opts: PublishManagerAlertOpts): Promise<PublishResult> {
+  return publishManagerAlert('manager_session_aged', opts);
+}
+
+async function publishManagerAlert(
+  kind: 'manager_stalled' | 'manager_session_aged',
+  opts: PublishManagerAlertOpts,
+): Promise<PublishResult> {
+  const id = rootInbox.buildId({ kind, taskId: opts.task.taskId });
+  const existing = rootInbox.lookupOpenByBaseId(id);
+  if (existing) {
+    const dest = resolveRootDestination(opts.task, opts.larkAppId);
+    if (dest && !existing.rootCardMessageId) {
+      const messageId = await sendOrUpdateCard(dest.larkAppId, dest.chatId, existing);
+      return {
+        mainTopicConfigured: true,
+        itemId: existing.id,
+        inserted: false,
+        rootCardMessageId: messageId,
+      };
+    }
+    return {
+      mainTopicConfigured: !!dest,
+      itemId: existing.id,
+      inserted: false,
+      rootCardMessageId: existing.rootCardMessageId,
+    };
+  }
+  const { item, inserted } = rootInbox.upsertOpen({
+    id,
+    kind,
+    subChatId: opts.task.chatId,
+    subChatName: opts.task.goal || opts.task.chatId,
+    summary: opts.summary,
+  });
+
+  const dest = resolveRootDestination(opts.task, opts.larkAppId);
+  if (!dest) {
+    logger.debug('[root-inbox-publisher] mainTopic not configured — manager alert written but card not sent');
+    return { mainTopicConfigured: false, itemId: item.id, inserted, rootCardMessageId: item.rootCardMessageId };
+  }
+  const messageId = await sendOrUpdateCard(dest.larkAppId, dest.chatId, item);
+  return { mainTopicConfigured: true, itemId: item.id, inserted, rootCardMessageId: messageId };
+}
+
+function resolveRootDestination(task: Pick<SubTask, 'rootChatId' | 'parentChatId'>, fallbackLarkAppId: string): { chatId: string; larkAppId: string } | null {
+  const company = getCompanyByRootChatId(task.rootChatId ?? task.parentChatId);
+  const mainTopic = company?.rootChatId ?? getMainTopicChatId();
+  if (!mainTopic) return null;
+  return { chatId: mainTopic, larkAppId: company?.ceoLarkAppId ?? fallbackLarkAppId };
 }
 
 async function publishGeneric(

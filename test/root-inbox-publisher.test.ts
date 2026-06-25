@@ -144,4 +144,32 @@ describe('root-inbox-publisher (P2 commit #5)', () => {
       expect(root.lookup(r.itemId)?.kind).toBe('request_decision');
     });
   });
+
+  describe('publishManagerStalled', () => {
+    const task = {
+      taskId: 'st_mgr',
+      chatId: 'oc_mgr',
+      parentChatId: 'oc_parent',
+      goal: '经理任务',
+      bots: [],
+    } as any;
+
+    it('existing open manager alert without rootCardMessageId retries first-send instead of staying silent forever', async () => {
+      fakeMainTopic = 'oc_flumy';
+      sendMessageSpy.mockResolvedValueOnce(null).mockResolvedValueOnce('msg_retry');
+      const { pub, root } = await freshImports();
+
+      const first = await pub.publishManagerStalled({ task, summary: 'stalled', larkAppId: 'app_x' });
+      expect(first.inserted).toBe(true);
+      expect(first.rootCardMessageId).toBeNull();
+      expect(sendMessageSpy).toHaveBeenCalledTimes(1);
+
+      const second = await pub.publishManagerStalled({ task, summary: 'stalled newer text', larkAppId: 'app_x' });
+      expect(second.inserted).toBe(false);
+      expect(second.rootCardMessageId).toBe('msg_retry');
+      expect(sendMessageSpy).toHaveBeenCalledTimes(2);
+      expect(root.lookup('manager_stalled:st_mgr')?.updateCount).toBe(1);
+      expect(root.lookup('manager_stalled:st_mgr')?.summary).toBe('stalled');
+    });
+  });
 });

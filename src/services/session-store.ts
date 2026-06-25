@@ -191,6 +191,13 @@ export function findActiveChatScopeSessionsByChat(chatId: string): Session[] {
   return findActiveSessionsMatching(s => s.chatId === chatId && s.scope === 'chat');
 }
 
+/** Cross-file lookup: find every active session attached to a chatId, regardless
+ *  of thread/chat scope. Manager health observer uses this because manager
+ *  subgroup sessions may be owned by a different bot daemon/app file. */
+export function findActiveSessionsByChatId(chatId: string): Session[] {
+  return findActiveSessionsMatching(s => s.chatId === chatId);
+}
+
 function findActiveSessionsMatching(predicate: (s: Session) => boolean): Session[] {
   load();
   const matches: Session[] = [];

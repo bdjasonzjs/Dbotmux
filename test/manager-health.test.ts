@@ -4,7 +4,13 @@
  * Run: pnpm vitest run test/manager-health.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { planManagerHealth, MANAGER_STALL_MS } from '../src/services/subtask-observer.js';
+import {
+  planManagerHealth,
+  planManagerSessionAging,
+  MANAGER_STALL_MS,
+  MANAGER_SESSION_AGE_MS,
+  MANAGER_SESSION_IDLE_MS,
+} from '../src/services/subtask-observer.js';
 import type { SubTask } from '../src/services/subtask-store.js';
 
 const now = new Date('2026-06-24T10:00:00Z');
@@ -47,5 +53,45 @@ describe('planManagerHealth — 经理卡死检测', () => {
   it('边界：恰超阈值 → escalate_ceo；恰未到 → none', () => {
     expect(planManagerHealth(mk({ updatedAt: ago(MANAGER_STALL_MS + 1000) }), now).kind).toBe('escalate_ceo');
     expect(planManagerHealth(mk({ updatedAt: ago(MANAGER_STALL_MS - 1000) }), now).kind).toBe('none');
+  });
+});
+
+describe('planManagerSessionAging — 经理 session 老化检测', () => {
+  const oldSession = {
+    status: 'active' as const,
+    createdAt: ago(MANAGER_SESSION_AGE_MS + 60_000),
+    lastMessageAt: ago(MANAGER_SESSION_IDLE_MS + 60_000),
+  };
+
+  it('manager + session 足够老 + 近期无活动 + 有 pending work → alert，且 recover 默认 false', () => {
+    const a = planManagerSessionAging(mk({ status: 'observing' }), oldSession, true, now);
+    expect(a.kind).toBe('alert');
+    if (a.kind === 'alert') expect(a.recover).toBe(false);
+  });
+
+  it('正常空闲长 session：无 pending work → none，防误判', () => {
+    expect(planManagerSessionAging(mk({ status: 'observing' }), oldSession, false, now).kind).toBe('none');
+  });
+
+  it('近期有活动 → none', () => {
+    expect(planManagerSessionAging(
+      mk({ status: 'observing' }),
+      { ...oldSession, lastMessageAt: ago(MANAGER_SESSION_IDLE_MS - 60_000) },
+      true,
+      now,
+    ).kind).toBe('none');
+  });
+
+  it('session 年龄未到阈值 → none', () => {
+    expect(planManagerSessionAging(
+      mk({ status: 'observing' }),
+      { ...oldSession, createdAt: ago(MANAGER_SESSION_AGE_MS - 60_000) },
+      true,
+      now,
+    ).kind).toBe('none');
+  });
+
+  it('executor 即便满足时间条件也不判老化', () => {
+    expect(planManagerSessionAging(mk({ reportingMode: 'executor' }), oldSession, true, now).kind).toBe('none');
   });
 });
