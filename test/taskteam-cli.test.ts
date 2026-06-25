@@ -35,9 +35,44 @@ describe('buildTaskTeamRequest (CLI→IPC contract, P1)', () => {
   });
 
   it('create is bare (params at top level)', () => {
-    expect(buildTaskTeamRequest('create', ['--json', '{"goal":"g","companyId":"c"}'])).toEqual({
+    expect(buildTaskTeamRequest('raw-create', ['--json', '{"goal":"g","companyId":"c"}'])).toEqual({
       path: '/api/taskteam-create',
       body: { goal: 'g', companyId: 'c' },
+    });
+  });
+
+  it('default create maps to create-from-template and folds repeated --slot flags into selectedBotBySlot', () => {
+    expect(buildTaskTeamRequest('create', [
+      '--type-id', 'tt_type_two_layer_review',
+      '--slot', 'tt_slot_developer_main=claude',
+      '--slot', 'tt_slot_observer_main=t',
+      '--goal', 'g',
+      '--target-external-chat-id', 'oc_ext',
+    ])).toEqual({
+      path: '/api/taskteam-create-from-template',
+      body: {
+        typeId: 'tt_type_two_layer_review',
+        goal: 'g',
+        targetExternalChatId: 'oc_ext',
+        selectedBotBySlot: {
+          tt_slot_developer_main: 'claude',
+          tt_slot_observer_main: 't',
+        },
+      },
+    });
+  });
+
+  it('taskteam-types is discoverable; type alias maps to typeId', () => {
+    expect(buildTaskTeamRequest('types', [])).toEqual({ path: '/api/taskteam-types', body: {} });
+    expect(buildTaskTeamRequest('create', ['--type', 'tt_type_x', '--json', '{"selectedBotBySlot":{"main":"k"}}'])).toEqual({
+      path: '/api/taskteam-create-from-template',
+      body: { typeId: 'tt_type_x', selectedBotBySlot: { main: 'k' } },
+    });
+  });
+
+  it('returns executable errors for malformed create args instead of throwing', () => {
+    expect(buildTaskTeamRequest('create', ['--slot', 'not-a-pair'])).toMatchObject({
+      error: expect.stringContaining('expected <slotId-or-label>=<bot-ref>'),
     });
   });
 

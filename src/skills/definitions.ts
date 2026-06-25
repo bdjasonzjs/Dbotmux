@@ -888,6 +888,54 @@ botmux subtask-report --task-id <taskId> --type need_help|done --summary "一句
 - 409 = 版本/状态冲突 → 重新 query 拿最新状态再决策。403 = 鉴权（非主话题主 bot / 非该子群参与者）。
 `;
 
+const TASKTEAM_SKILL = `---
+name: botmux-taskteam
+description: 任务小组 —— 当主 bot 需要创建一个按固定协作流程运行的小组时触发：多角色/多层 review、observer 盯进展、定时盯外部群、MOA/反馈群巡检、需要从模板按 slot 选 bot 建实例。默认用 botmux taskteam-create；不要手拼 roleInstances/openId，raw-create 只给高级调试。
+---
+
+# botmux-taskteam — 模板化任务小组
+
+任务小组适合“固定流程 + 多角色 + 可观测”的工作：开发者、评审、observer、定时盯外部群等角色按模板运行。它不同于普通 \`subtask-start\`：subtask 是临时子群任务；taskteam 是可复用的类型模板，server 会按 slot 绑定真实 bot openId 并创建实例。
+
+## 何时用
+
+- 用户要“建一个固定协作流程的小组”“两层 review 小组”“定时盯群小组”“MOA/反馈群巡检小组”。
+- 任务需要 observer 持续读群、按规则唤醒角色、或围绕外部群 \`targetExternalChatId\` 做增量观测。
+- 需要让另一个主 bot 也能复用同一类小组，而不是在聊天里手写流程。
+
+## 一句命令
+
+先发现类型和可用 bot：
+
+\`\`\`bash
+botmux taskteam-types
+\`\`\`
+
+按模板创建：
+
+\`\`\`bash
+botmux taskteam-create --type-id tt_type_two_layer_review \\
+  --slot tt_slot_developer_main=claude \\
+  --slot tt_slot_architect_main=codex \\
+  --slot tt_slot_detail_reviewer_main=k \\
+  --slot tt_slot_observer_main=t \\
+  --goal "推进 X，产出可 review 文档、实现、测试和 commit" \\
+  --target-external-chat-id oc_xxx
+\`\`\`
+
+\`--slot\` 右侧可以填 appId、bot 名、或简写 \`c\` / \`k\` / \`t\`。server 端会读取 \`bots-info.json\`，解析 app-scoped \`botOpenId\`，校验每个 slot 是否填满、每个角色是否是不同可用 bot，并把 owner 拉进群。不要自己拼 \`binding.botOpenId\`。
+
+## 验证
+
+- 创建命令返回 \`ok:true\`、\`teamId\`、\`chatId\`、\`status\`。
+- 返回 \`role_binding_invalid\` 时，按 \`problems[].slotId/reason\` 修 slot 或 bot ref，再重跑；先用 \`taskteam-types\` 看可用值。
+- 外部群观察类实例要确认返回实例含 \`targetExternalChatId\` 对应目标群；observer 读不到目标群时会走 owner user 权限读取。
+
+## 高级接口
+
+\`botmux taskteam-raw-create --json '<CreateTaskTeamParams>'\` 保留给迁移/调试，需要手写 \`roleInstances\` 和 \`binding\`。普通 bot 默认不要用 raw-create。
+`;
+
 const BOT_CEO_SKILL = `---
 name: botmux-bot-ceo
 description: 当 owner 在聊天里说"建个子群推 XX 任务，worker/reviewer 都用克劳德分身"（或类似：用克隆分身建群、给某任务配 worker+reviewer 分身）时触发。你（CEO 克劳德）端到端编排：数够不够 claude 分身 → 不够则聊天里克隆（发二维码 @owner 扫）→ owner 批准后激活 → 拉进群给角色建子群。命令：botmux bot ceo-spawn。仅 owner 可用。
@@ -927,6 +975,7 @@ export const BUILTIN_SKILLS: SkillDef[] = [
   { name: 'botmux-bots', content: BOTS_SKILL },
   { name: 'botmux-workflow-create', content: WORKFLOW_CREATE_SKILL },
   { name: 'botmux-subtask', content: SUBTASK_SKILL },
+  { name: 'botmux-taskteam', content: TASKTEAM_SKILL },
   { name: 'botmux-bot-ceo', content: BOT_CEO_SKILL },
 ];
 

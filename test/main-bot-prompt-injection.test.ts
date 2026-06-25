@@ -53,6 +53,7 @@ describe('buildMainBotPromptBlock (P1 commit #8)', () => {
       expect(block).toContain('<main_bot_routing>');
       expect(block).toContain('CEO 主话题');
       expect(block).toContain('botmux subtask-start');
+      expect(block).toContain('botmux-taskteam');
     });
   });
 

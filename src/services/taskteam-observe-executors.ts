@@ -8,7 +8,14 @@
 // （tick 跳最新）；判读成功但无行为 / 归因不到 → events:[]（不伪造事件）。judge 与 fetchSince 可注入，便于单测。
 
 import { spawn } from 'node:child_process';
-import { listChatMessages, listMessagesAsc, getMessageDetail } from '../im/lark/client.js';
+import {
+  listChatMessages,
+  listChatMessagesAsOwnerUser,
+  listMessagesAsc,
+  listMessagesAscAsOwnerUser,
+  getMessageDetail,
+  getMessageDetailAsOwnerUser,
+} from '../im/lark/client.js';
 import { parseApiMessage, isPureCardUpgradeFallback } from '../im/lark/message-parser.js';
 import { logger } from '../utils/logger.js';
 import { peekByMessageHighWater } from './group-monitor.js';
@@ -94,6 +101,40 @@ export function isCursorGoneError(err: unknown): boolean {
   return !!m && CURSOR_GONE_LARK_CODES.has(Number(m[1]));
 }
 
+const OWNER_USER_FALLBACK_CODES: ReadonlySet<number> = new Set([
+  99991672, // no permission / app not in visible range
+  99991663, // no permission
+  232024,  // bot not in chat / cannot operate target chat
+  230020,  // message/chat not visible to current app
+]);
+
+export function shouldTryOwnerUserMessageReadFallback(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  const m = /\(code:\s*(\d+)\)/.exec(msg);
+  if (m && OWNER_USER_FALLBACK_CODES.has(Number(m[1]))) return true;
+  return /permission|not in chat|not.*member|not visible|forbidden|Bot is NOT in the group/i.test(msg);
+}
+
+async function withOwnerUserFallback<T>(
+  label: string,
+  botRead: () => Promise<T>,
+  ownerRead: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await botRead();
+  } catch (err) {
+    if (isCursorGoneError(err) || !shouldTryOwnerUserMessageReadFallback(err)) throw err;
+    try {
+      const result = await ownerRead();
+      logger.info(`[taskteam-observe-exec] ${label}: observer bot read failed; used owner user token fallback (${err instanceof Error ? err.message : err})`);
+      return result;
+    } catch (ownerErr) {
+      logger.warn(`[taskteam-observe-exec] ${label}: owner user fallback failed: ${ownerErr instanceof Error ? ownerErr.message : ownerErr}`);
+      throw err;
+    }
+  }
+}
+
 /**
  * observer 可判读的「角色行为」事件子集——生命周期事件（team-started/accept）走显式入口、
  * 引擎内部态（rework）由引擎驱动，都不在 observer 判读范围，避免观测层伪造生命周期跃迁。
@@ -139,7 +180,11 @@ async function decodeMsgText(m: any, larkAppId: string): Promise<string> {
   }
   if (m?.msg_type === 'interactive' && isPureCardUpgradeFallback(text)) {
     try {
-      const detail = await getMessageDetail(larkAppId, m.message_id, { userCardContent: true });
+      const detail = await withOwnerUserFallback(
+        `card-detail ${m.message_id}`,
+        () => getMessageDetail(larkAppId, m.message_id, { userCardContent: true }),
+        () => getMessageDetailAsOwnerUser(larkAppId, m.message_id, { userCardContent: true }),
+      );
       const real = detail?.items?.[0];
       if (real) {
         const recovered = parseApiMessage(real).content ?? '';
@@ -160,7 +205,11 @@ function makeDefaultFetchSince(observerLarkAppId: string): TaskTeamFetchSinceFn 
     if (afterMessageId) {
       let detail: any;
       try {
-        detail = await getMessageDetail(observerLarkAppId, afterMessageId, { userCardContent: false });
+        detail = await withOwnerUserFallback(
+          `cursor-detail ${afterMessageId}`,
+          () => getMessageDetail(observerLarkAppId, afterMessageId, { userCardContent: false }),
+          () => getMessageDetailAsOwnerUser(observerLarkAppId, afterMessageId, { userCardContent: false }),
+        );
       } catch (err) {
         // cursor 消息撤回/不可读（已知码）→ 永久失效，跳最新；其它（瞬时网络等）→ 传播让 tick 持 cursor 重试。
         if (isCursorGoneError(err)) {
@@ -183,11 +232,19 @@ function makeDefaultFetchSince(observerLarkAppId: string): TaskTeamFetchSinceFn 
     let pages = 0;
     while (pages < MAX_PAGES) {
       pages += 1;
-      const { items, nextPageToken } = await listMessagesAsc(observerLarkAppId, chatId, {
-        startTimeSec,
-        pageSize: limit,
-        pageToken,
-      });
+      const { items, nextPageToken } = await withOwnerUserFallback(
+        `list-asc ${chatId}`,
+        () => listMessagesAsc(observerLarkAppId, chatId, {
+          startTimeSec,
+          pageSize: limit,
+          pageToken,
+        }),
+        () => listMessagesAscAsOwnerUser(observerLarkAppId, chatId, {
+          startTimeSec,
+          pageSize: limit,
+          pageToken,
+        }),
+      );
       for (const m of items) {
         if (!found) {
           if (m.message_id === afterMessageId) found = true; // 切到 cursor，之后才收
@@ -399,7 +456,11 @@ export function makeTaskTeamObserveExecutors(
   return {
     // 廉价 gate：只拉最新一条消息比对 cursor（无 LLM）——无新动静即零模型调用
     async peek(chatId: string, cursor: string | null) {
-      const msgs = await listChatMessages(observerLarkAppId, chatId, 1); // ByCreateTimeDesc，最新在前
+      const msgs = await withOwnerUserFallback(
+        `peek ${chatId}`,
+        () => listChatMessages(observerLarkAppId, chatId, 1),
+        () => listChatMessagesAsOwnerUser(observerLarkAppId, chatId, 1),
+      ); // ByCreateTimeDesc，最新在前
       const newest: string | null = msgs[0]?.message_id ?? null;
       return peekByMessageHighWater(newest, cursor);
     },

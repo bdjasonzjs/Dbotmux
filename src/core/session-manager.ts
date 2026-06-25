@@ -258,7 +258,7 @@ export function buildMainBotPromptBlock(chatId: string | undefined, larkAppId: s
   const bot = getBot(larkAppId);
   const companyName = company?.name ?? 'legacy-main-topic';
   const identityLine = `你是 bot「${bot.botName ?? bot.config.larkAppId}」担任 Company「${companyName}」的 CEO / main-bot。启动前必须读取并遵守自己的身份来源：${identitySourceForCli(bot.config.cliId)}；不要继承其他 bot 的身份文件或私密记忆。`;
-  const commandLine = '复杂任务优先用 `botmux subtask-start` 或 `botmux bot ceo-spawn` 编排；需要审查的工程产出先写飞书 docx/绝对路径，再 request-review；未经授权不 commit/push/deploy。';
+  const commandLine = '复杂任务优先用 `botmux subtask-start` 或 `botmux bot ceo-spawn` 编排；要起固定协作流程小组（observer / 多层评审 / 定时盯外部群）用任务小组，详见 skill `botmux-taskteam`；需要审查的工程产出先写飞书 docx/绝对路径，再 request-review；未经授权不 commit/push/deploy。';
   return `<main_bot_routing>
 你在 Company「${companyName}」的 CEO 主话题工作（rootChatId=${chatId}）。
 

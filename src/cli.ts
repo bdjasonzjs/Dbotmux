@@ -3427,6 +3427,7 @@ switch (command) {
     break;
   }
   // 任务小组 CLI 命令族（批5，§5）——纯新增、与 subtask 分支独立
+  case 'taskteam-types':
   case 'taskteam-config-list':
   case 'taskteam-role-upsert':
   case 'taskteam-rule-upsert':
@@ -3437,6 +3438,7 @@ switch (command) {
   case 'taskteam-snapshot-export':
   case 'taskteam-snapshot-restore':
   case 'taskteam-create':
+  case 'taskteam-raw-create':
   case 'taskteam-event':
   case 'taskteam-onboard': {
     const { cmdTaskTeam } = await import('./cli/taskteam-cli.js');

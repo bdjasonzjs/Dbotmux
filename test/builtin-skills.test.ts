@@ -68,6 +68,19 @@ describe('built-in botmux-subtask skill (Phase 5)', () => {
   });
 });
 
+describe('built-in botmux-taskteam skill', () => {
+  it('exists and teaches template create instead of raw openId binding', () => {
+    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-taskteam');
+    expect(skill).toBeDefined();
+    expect(skill!.content).toContain('botmux taskteam-types');
+    expect(skill!.content).toContain('botmux taskteam-create --type-id');
+    expect(skill!.content).toContain('--slot tt_slot_developer_main=claude');
+    expect(skill!.content).toContain('--target-external-chat-id');
+    expect(skill!.content).toContain('不要自己拼');
+    expect(skill!.content).toContain('taskteam-raw-create');
+  });
+});
+
 describe('built-in botmux-workflow-create skill', () => {
   it('exists and teaches validate + current workflow binding constraints', () => {
     const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-workflow-create');

@@ -3,6 +3,7 @@ import {
   makeTaskTeamObserveExecutors,
   mapBehaviorToEvent,
   isCursorGoneError,
+  shouldTryOwnerUserMessageReadFallback,
   type TaskTeamJudgeFn,
   type TaskTeamFetchSinceFn,
   type TaskTeamDetectedBehavior,
@@ -190,6 +191,19 @@ describe('isCursorGoneError — cursor 永久失效错误码识别', () => {
     expect(isCursorGoneError(new Error('network ETIMEDOUT'))).toBe(false);
     expect(isCursorGoneError(new Error('Failed to get message: x (code: 99999)'))).toBe(false);
     expect(isCursorGoneError('plain string')).toBe(false);
+  });
+});
+
+describe('shouldTryOwnerUserMessageReadFallback — observer 外部群 owner-user fallback 分类', () => {
+  it('permission / bot-not-in-chat 类错误走 owner user fallback', () => {
+    expect(shouldTryOwnerUserMessageReadFallback(new Error('listMessagesAsc failed: bot not in chat (code: 232024)'))).toBe(true);
+    expect(shouldTryOwnerUserMessageReadFallback(new Error('Failed to get message: no permission (code: 99991672)'))).toBe(true);
+    expect(shouldTryOwnerUserMessageReadFallback(new Error('Forbidden: Bot is NOT in the group'))).toBe(true);
+  });
+
+  it('cursor gone and transient network errors do not get rewritten as owner fallback', () => {
+    expect(shouldTryOwnerUserMessageReadFallback(new Error('Failed to get message: withdrawn (code: 230011)'))).toBe(false);
+    expect(shouldTryOwnerUserMessageReadFallback(new Error('network ETIMEDOUT'))).toBe(false);
   });
 });
 

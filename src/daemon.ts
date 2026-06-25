@@ -1467,8 +1467,28 @@ ipcRoute('POST', '/api/taskteam-create', async (req, res) => {
   }
 });
 
+// 任务小组 · 类型发现：给 bot CLI / Dashboard 展示可创建类型、slot 以及可填 bot ref。
+ipcRoute('POST', '/api/taskteam-types', async (_req, res) => {
+  try {
+    const { readTaskTeamConfig, seedDefaultTaskTeamConfig } = await import('./services/taskteam-config-store.js');
+    const { listBots } = await import('./services/bot-inventory.js');
+    const { buildTaskTeamAvailableBots, summarizeTaskTeamTypes } = await import('./services/taskteam-template-create.js');
+    let info: Array<{ larkAppId: string; botOpenId: string | null; botName: string | null }> = [];
+    try {
+      const p = join(config.session.dataDir, 'bots-info.json');
+      if (existsSync(p)) info = JSON.parse(readFileSync(p, 'utf-8'));
+    } catch { /* best-effort discovery; unusable bots remain visible with no openId */ }
+    const bots = buildTaskTeamAvailableBots(listBots(), info);
+    await seedDefaultTaskTeamConfig();
+    return jsonRes(res, 200, { ok: true, result: summarizeTaskTeamTypes(readTaskTeamConfig(), bots) });
+  } catch (err: any) {
+    const status = err && err.name === 'HttpError' ? err.status : 500;
+    return jsonRes(res, status, { ok: false, error: String(err?.message ?? err) });
+  }
+});
+
 // 任务小组 · 新手引导第二段「用模板建真群」（设计 v5 §四）——服务端组装 roleInstances（信任边界）。
-// body: { typeId, selectedBotBySlot:{slotId->appId}, goal?, acceptance?, creatorLarkAppId, userOpenIds?, notifyOwnerOpenId?, companyId? }
+// body: { typeId, selectedBotBySlot:{slotId|label->appId|botName|c|k|t}, goal?, acceptance?, targetExternalChatId?, creatorLarkAppId?, userOpenIds?, notifyOwnerOpenId?, companyId? }
 // 信任边界：不收前端组装的 roleInstances；服务端按已存 TaskTeamType.roleSlots + 真实 bot 清单组装 binding，
 //   binding.botOpenId 取自 bots-info.json（跨进程真实 app-scoped openId），对不上/选不全 → 409，浏览器供不了 openId。
 ipcRoute('POST', '/api/taskteam-create-from-template', async (req, res) => {
@@ -1485,47 +1505,41 @@ ipcRoute('POST', '/api/taskteam-create-from-template', async (req, res) => {
   };
   try { body = await readJsonBody(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
-  if (!body.typeId || !body.creatorLarkAppId || !body.selectedBotBySlot) {
-    return jsonRes(res, 400, { ok: false, error: 'missing typeId/creatorLarkAppId/selectedBotBySlot' });
+  const creatorLarkAppId = body.creatorLarkAppId ?? getAllBots()[0]?.config.larkAppId;
+  if (!body.typeId || !creatorLarkAppId || !body.selectedBotBySlot) {
+    return jsonRes(res, 400, { ok: false, error: 'missing typeId/selectedBotBySlot (or no daemon creator app)' });
   }
   try {
-    const { readTaskTeamConfig } = await import('./services/taskteam-config-store.js');
+    const { readTaskTeamConfig, seedDefaultTaskTeamConfig } = await import('./services/taskteam-config-store.js');
+    const { listBots } = await import('./services/bot-inventory.js');
+    const { buildRoleInstancesFromTemplate, buildTaskTeamAvailableBots } = await import('./services/taskteam-template-create.js');
+    await seedDefaultTaskTeamConfig();
     const cfg = readTaskTeamConfig();
     const type = cfg.teamTypes.find(t => t.typeId === body.typeId);
     if (!type) return jsonRes(res, 404, { ok: false, error: `unknown typeId: ${body.typeId}` });
 
     // 真实可用 bot：bots-info.json（跨进程真实 botOpenId）。usable = botOpenId 非空。
-    type BotInfoEntry = { larkAppId: string; botOpenId: string | null; botName: string | null };
-    let info: BotInfoEntry[] = [];
+    let info: Array<{ larkAppId: string; botOpenId: string | null; botName: string | null }> = [];
     try {
       const p = join(config.session.dataDir, 'bots-info.json');
       if (existsSync(p)) info = JSON.parse(readFileSync(p, 'utf-8'));
     } catch { /* 读不到就当无可用 bot，下面会 409 */ }
-    const openIdByApp = new Map<string, string>();
-    for (const e of info) if (e.larkAppId && e.botOpenId) openIdByApp.set(e.larkAppId, e.botOpenId);
 
     // 服务端按 roleSlots 组装 roleInstances；逐项校验选中 bot 真实可用。
-    const sel = body.selectedBotBySlot;
-    // P1-2：默认要求每个角色用不同 bot（禁止一 bot 多角色绕过"角色到齐"/自审自盯）。
-    const chosenApps = type.roleSlots.map(s => sel[s.slotId]).filter((x): x is string => !!x);
-    if (new Set(chosenApps).size !== chosenApps.length) {
-      return jsonRes(res, 409, { ok: false, error: 'duplicate_bot_assignment', hint: '每个角色要用不同的机器人' });
-    }
-    const problems: Array<{ slotId: string; reason: string }> = [];
-    const roleInstances = type.roleSlots.map(slot => {
-      const appId = sel[slot.slotId];
-      if (!appId) { problems.push({ slotId: slot.slotId, reason: 'no_bot_selected' }); return null; }
-      const botOpenId = openIdByApp.get(appId);
-      if (!botOpenId) { problems.push({ slotId: slot.slotId, reason: 'bot_not_usable_or_no_openid' }); return null; }
-      return {
-        roleInstanceId: `tt_ri_${slot.slotId}` as never,
-        slotId: slot.slotId,
-        roleId: slot.roleId,
-        binding: { bindingId: `tt_binding_${slot.slotId}` as never, botOpenId, larkAppId: appId },
-      };
+    const availableBots = buildTaskTeamAvailableBots(listBots(), info);
+    const { roleInstances, selectedAppBySlot, problems } = buildRoleInstancesFromTemplate({
+      type,
+      selectedBotBySlot: body.selectedBotBySlot,
+      availableBots,
     });
     if (problems.length) {
-      return jsonRes(res, 409, { ok: false, error: 'role_binding_invalid', problems, neededSlots: type.roleSlots.map(s => s.slotId) });
+      return jsonRes(res, 409, {
+        ok: false,
+        error: 'role_binding_invalid',
+        problems,
+        neededSlots: type.roleSlots.map(s => ({ slotId: s.slotId, label: s.label, roleId: s.roleId })),
+        hint: '先运行 `botmux taskteam-types` 查看 slotId/label 和可用 bot ref；每个 slot 必须选一个带 botOpenId 的不同 bot。',
+      });
     }
 
     // 包一层 createGroup 捕获建群结果（invalidUserIds/notifyError），落"邀请失败不静默"。
@@ -1534,6 +1548,9 @@ ipcRoute('POST', '/api/taskteam-create-from-template', async (req, res) => {
     const { createGroupWithBots } = await import('./services/group-creator.js');
     const base = defaultCreateTaskTeamDeps();
     let groupResult: { invalidUserIds?: string[]; notifyError?: string | null } = {};
+    const ownerOpenId = getOwnerOpenId(creatorLarkAppId);
+    const userOpenIds = body.userOpenIds?.length ? body.userOpenIds : ownerOpenId ? [ownerOpenId] : undefined;
+    const notifyOwnerOpenId = body.notifyOwnerOpenId ?? ownerOpenId;
     const deps = {
       ...base,
       createGroup: async (opts: { name?: string; creatorLarkAppId: string; larkAppIds: string[]; userOpenIds?: string[]; sourceChatId?: string | null; purpose?: string }) => {
@@ -1542,8 +1559,8 @@ ipcRoute('POST', '/api/taskteam-create-from-template', async (req, res) => {
           creatorLarkAppId: opts.creatorLarkAppId,
           larkAppIds: opts.larkAppIds,
           userOpenIds: opts.userOpenIds,
-          notifyOwnerOpenId: body.notifyOwnerOpenId,
-          transferOwnerTo: body.notifyOwnerOpenId,
+          notifyOwnerOpenId,
+          transferOwnerTo: notifyOwnerOpenId,
           purpose: opts.purpose,
           sourceChatId: opts.sourceChatId ?? null,
         });
@@ -1556,21 +1573,22 @@ ipcRoute('POST', '/api/taskteam-create-from-template', async (req, res) => {
     };
     const team = await createTaskTeam(deps as never, {
       typeId: body.typeId as never,
-      companyId: 'tt_company_onboard' as never, // P2：companyId 服务端固定，不收浏览器透传
+      companyId: (body.companyId ?? 'tt_company_onboard') as never,
       goal: body.goal ?? '示例小目标：跑通一次「交活→把关→完成」',
       acceptance: body.acceptance ?? '示例小组完整跑通一轮 review',
       targetExternalChatId: body.targetExternalChatId,
       roleInstances: roleInstances as never,
-      creatorLarkAppId: body.creatorLarkAppId,
-      userOpenIds: body.userOpenIds,
+      creatorLarkAppId,
+      userOpenIds,
     });
-    const op = body.notifyOwnerOpenId;
+    const op = notifyOwnerOpenId;
     const userInvited = !op || !(groupResult.invalidUserIds ?? []).includes(op);
     return jsonRes(res, 200, {
       ok: true,
       teamId: team.teamId,
       chatId: team.chatId,
       status: team.status,
+      selectedBotBySlot: selectedAppBySlot,
       userInvited,
       invalidUserIds: groupResult.invalidUserIds ?? [],
       notifyError: groupResult.notifyError ?? null,

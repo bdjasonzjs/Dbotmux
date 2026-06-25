@@ -886,7 +886,7 @@ const server = createServer(async (req, res) => {
     // 入参只收 { typeId, selectedBotBySlot, goal?, acceptance? }；creator + operator open_id 走 pickCreatorForGroup
     // （app-scope 同源），没 operator 就建群前 409（堵 fallback、不建无人可见的群）；其余转 creator daemon 服务端组装。
     if (req.method === 'POST' && url.pathname === '/api/taskteam-create') {
-      const body = await readJsonBody<{ typeId?: string; selectedBotBySlot?: Record<string, string>; goal?: string; acceptance?: string }>(req);
+      const body = await readJsonBody<{ typeId?: string; selectedBotBySlot?: Record<string, string>; goal?: string; acceptance?: string; targetExternalChatId?: string; companyId?: string }>(req);
       if (!body?.typeId || !body?.selectedBotBySlot || !Object.keys(body.selectedBotBySlot).length) {
         return jsonRes(res, 400, { ok: false, error: 'missing typeId/selectedBotBySlot' });
       }
@@ -910,6 +910,8 @@ const server = createServer(async (req, res) => {
           selectedBotBySlot: body.selectedBotBySlot,
           goal: body.goal,
           acceptance: body.acceptance,
+          targetExternalChatId: body.targetExternalChatId,
+          companyId: body.companyId,
           creatorLarkAppId: pick.creatorLarkAppId,
           userOpenIds: [operator],
           notifyOwnerOpenId: operator,
