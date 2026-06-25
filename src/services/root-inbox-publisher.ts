@@ -80,7 +80,7 @@ async function publishManagerAlert(
   const existing = rootInbox.lookupOpenByBaseId(id);
   if (existing) {
     const dest = resolveRootDestination(opts.task, opts.larkAppId);
-    if (dest && !existing.rootCardMessageId) {
+    if (shouldRetryExistingManagerAlert(existing, dest)) {
       const messageId = await sendOrUpdateCard(dest.larkAppId, dest.chatId, existing);
       return {
         mainTopicConfigured: true,
@@ -118,6 +118,13 @@ function resolveRootDestination(task: Pick<SubTask, 'rootChatId' | 'parentChatId
   const mainTopic = company?.rootChatId ?? getMainTopicChatId();
   if (!mainTopic) return null;
   return { chatId: mainTopic, larkAppId: company?.ceoLarkAppId ?? fallbackLarkAppId };
+}
+
+function shouldRetryExistingManagerAlert(
+  item: rootInbox.RootInboxItem,
+  dest: { chatId: string; larkAppId: string } | null,
+): dest is { chatId: string; larkAppId: string } {
+  return dest != null && item.rootCardMessageId == null;
 }
 
 async function publishGeneric(

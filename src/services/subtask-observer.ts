@@ -227,9 +227,13 @@ function managerAlertLarkAppId(t: SubTask): string {
 }
 
 function findActiveSessionForTask(t: SubTask): Session | null {
-  const sessions = sessionStore.findActiveSessionsByChatId(t.chatId)
-    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-  return sessions[0] ?? null;
+  const sessions = sessionStore.findActiveSessionsByChatId(t.chatId);
+  const managerAppIds = managerSessionAppIds(t);
+  const candidates = managerAppIds.size
+    ? sessions.filter(s => !!s.larkAppId && managerAppIds.has(s.larkAppId))
+    : sessions;
+  const sorted = candidates.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  return sorted[0] ?? null;
 }
 
 function hasPendingManagerWork(t: SubTask): boolean {
@@ -240,6 +244,13 @@ function hasPendingManagerWork(t: SubTask): boolean {
     && c.deliveryStatus !== 'acked'
     && c.deliveryStatus !== 'failed'
     && (c.commandType === 'kickoff' || c.commandType === 'supplement' || c.commandType === 'request_report' || c.commandType === 'request_review'));
+}
+
+function managerSessionAppIds(t: SubTask): Set<string> {
+  return new Set([
+    t.createdByLarkAppId,
+    ...t.bots.filter(b => b.role === 'main').map(b => b.larkAppId),
+  ].filter((id): id is string => !!id));
 }
 
 async function tickOne(t: SubTask, now: Date, exec: ObserverExecutors): Promise<boolean> {

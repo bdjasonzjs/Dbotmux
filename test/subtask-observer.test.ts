@@ -629,6 +629,15 @@ describe('manager self-heal step2+3 wiring', () => {
   it('manager paused 卡死超 2h → 写 manager_stalled RootInbox；重复 tick 不重复上浮/更新', async () => {
     const start = new Date('2026-06-24T00:00:00Z');
     const t = await mkManagerTask('paused', start, 'mgr-stalled');
+    sessionStore.init('app_mgr');
+    const s = sessionStore.createSession(t.chatId, 'om_root', 'old manager session');
+    sessionStore.updateSession({
+      ...s,
+      larkAppId: 'app_mgr',
+      createdAt: start.toISOString(),
+      lastMessageAt: new Date(start.getTime() + 30 * 60_000).toISOString(),
+    });
+    sessionStore.init('app_observer');
     const now = new Date(start.getTime() + 3 * 60 * 60 * 1000);
     vi.setSystemTime(now);
 
@@ -643,6 +652,7 @@ describe('manager self-heal step2+3 wiring', () => {
     await runObserverTick(new Date(now.getTime() + 2 * MIN_OBSERVE_INTERVAL_MS), mkExec({ messages: [] }));
     expect(rootInbox.lookup(id)?.updateCount).toBe(1);
     expect(rootInbox.listOpen().filter(it => it.id === id)).toHaveLength(1);
+    expect(rootInbox.lookup(`manager_session_aged:${t.taskId}`)).toBeNull();
   });
 
   it('未卡死 manager / executor 不写 manager_stalled', async () => {
@@ -700,6 +710,33 @@ describe('manager self-heal step2+3 wiring', () => {
 
     await runObserverTick(new Date(now.getTime() + 2 * MIN_OBSERVE_INTERVAL_MS), mkExec({ messages: [] }));
     expect(rootInbox.lookup(`manager_session_aged:${t.taskId}`)?.updateCount).toBe(1);
+  });
+
+  it('manager aging 只认 manager main app 的 session，同 chat 其它 app session 不触发', async () => {
+    const start = new Date('2026-06-24T00:00:00Z');
+    const t = await mkManagerTask('observing', start, 'mgr-wrong-app');
+    sessionStore.init('app_other');
+    const s = sessionStore.createSession(t.chatId, 'om_root', 'unrelated session');
+    sessionStore.updateSession({
+      ...s,
+      larkAppId: 'app_other',
+      createdAt: start.toISOString(),
+      lastMessageAt: new Date(start.getTime() + 30 * 60_000).toISOString(),
+    });
+    sessionStore.init('app_observer');
+    await enqueueCommand({
+      taskId: t.taskId,
+      direction: 'parent_to_child',
+      targetChatId: t.chatId,
+      commandType: 'request_report',
+      payload: { requestId: 'req_wrong_app' },
+      idempotencyKey: 'req-report-wrong-app',
+    });
+
+    const now = new Date(start.getTime() + 13 * 60 * 60_000);
+    vi.setSystemTime(now);
+    await runObserverTick(now, mkExec({ messages: [] }));
+    expect(rootInbox.lookup(`manager_session_aged:${t.taskId}`)).toBeNull();
   });
 
   it('长 session 但无 pending work → 不判老化，防误判正常待命经理', async () => {
