@@ -31,6 +31,7 @@ export type EscalationRuleId = 'R1' | 'R2' | 'R3' | 'R4' | 'R5';
 export type RootInboxKind =
   | 'escalation' | 'progress' | 'request_decision'
   | 'manager_stalled' | 'manager_session_aged'
+  | 'manager_recovered'
   | 'tilly_digest' | 'tilly_alert';
 export type RootInboxStatus = 'open' | 'updated' | 'closed';
 
@@ -40,7 +41,8 @@ export interface RootInboxItem {
    *  - kind=progress:          `progress:${subChatId}:${slug}`
    *  - kind=request_decision:  `request_decision:${subChatId}:${slug}`
    *  - kind=manager_stalled:   `manager_stalled:${taskId}`
-   *  - kind=manager_session_aged: `manager_session_aged:${taskId}` */
+   *  - kind=manager_session_aged: `manager_session_aged:${taskId}`
+   *  - kind=manager_recovered: `manager_recovered:${taskId}:${sessionId}` */
   id: string;
   kind: RootInboxKind;
   subChatId: string;
@@ -138,10 +140,12 @@ export function buildId(opts:
   | { kind: 'progress'; subChatId: string; slug: string }
   | { kind: 'request_decision'; subChatId: string; slug: string }
   | { kind: 'manager_stalled'; taskId: string }
-  | { kind: 'manager_session_aged'; taskId: string },
+  | { kind: 'manager_session_aged'; taskId: string }
+  | { kind: 'manager_recovered'; taskId: string; sessionId: string },
 ): string {
   if (opts.kind === 'escalation') return `${opts.ruleId}:${opts.subChatId}`;
   if (opts.kind === 'manager_stalled' || opts.kind === 'manager_session_aged') return `${opts.kind}:${opts.taskId}`;
+  if (opts.kind === 'manager_recovered') return `${opts.kind}:${opts.taskId}:${opts.sessionId}`;
   return `${opts.kind}:${opts.subChatId}:${opts.slug}`;
 }
 

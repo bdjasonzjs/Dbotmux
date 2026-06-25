@@ -12,6 +12,7 @@ import { listMessagesAsc, getMessageDetail } from '../im/lark/client.js';
 import { resolveBotIdent } from '../core/main-bot-playbook.js';
 import { parseApiMessage, isPureCardUpgradeFallback } from '../im/lark/message-parser.js';
 import type { ObserverExecutors, JudgeContext, JudgeResult } from './subtask-observer.js';
+import { recoverManagerSessionViaDaemon } from './manager-auto-recover.js';
 
 /** afterMessageId 翻页扫到尾仍找不到 (消息被删/cursor 失效)。重试不会变好 → 不空返。 */
 export class CursorNotFoundError extends Error {
@@ -186,6 +187,9 @@ export function makeObserverExecutors(): ObserverExecutors {
     },
     async judge(ctx) {
       return cocoJudge(JUDGE_PROMPT(ctx));
+    },
+    async recoverManagerSession(req) {
+      return recoverManagerSessionViaDaemon(req);
     },
   };
 }

@@ -21,12 +21,22 @@ import {
 import {
   listSubTasks, listObservations, listCommands, commitObservationTransaction,
   helpReportDelivery, staleHelpCommandIds, latestHelpReport,
+  getSubTask,
   enqueueNudgeAndUpdateStats, escalateStalledTask, enqueueCommand,
   CursorConflictError, InvalidCursorCommitError, VersionConflictError, OBSERVER_STATUSES,
   type SubTask, type SubTaskStatus, type Signal, type HelpDelivery, type OutboxCommand,
 } from './subtask-store.js';
 import * as sessionStore from './session-store.js';
-import { publishManagerSessionAged, publishManagerStalled } from './root-inbox-publisher.js';
+import { publishManagerRecovered, publishManagerSessionAged, publishManagerStalled } from './root-inbox-publisher.js';
+import * as rootInbox from './root-inbox-store.js';
+import {
+  buildManagerRecoverPrompt,
+  managerAutoRecoverEnabled,
+  planManagerAutoRecover,
+  type ManagerRecoverReason,
+  type RecoverManagerSessionRequest,
+  type RecoverManagerSessionResult,
+} from './manager-auto-recover.js';
 import type { Session } from '../types.js';
 
 export interface JudgeContext {
@@ -54,6 +64,8 @@ export interface ObserverExecutors {
   /** coco 按 goal+历史判进展。判不出(LLM 失败/parse 失败/timeout) 返 null →
    *  observer skip 本 tick、**不推进 cursor** (review Blocker 3)，下轮重读这批。 */
   judge(ctx: JudgeContext): Promise<JudgeResult | null>;
+  /** Optional daemon-layer recover hook. Default absence keeps observer alert-only. */
+  recoverManagerSession?(req: RecoverManagerSessionRequest): Promise<RecoverManagerSessionResult>;
 }
 
 /** 节流：同子任务最短观测间隔 (避免忙群一直跑 coco)。 */
@@ -176,7 +188,7 @@ export async function runObserverTick(now: Date, exec: ObserverExecutors): Promi
   const stats = { checked: 0, committed: 0, errors: 0 };
   for (const t of listSubTasks({ statuses: OBSERVER_STATUSES })) {
     try {
-      const managerDid = await handleManagerHealth(t, now);
+      const managerDid = await handleManagerHealth(t, now, exec);
       const did = await tickOne(t, now, exec);
       stats.checked += 1;
       if (managerDid || did) stats.committed += 1;
@@ -188,7 +200,7 @@ export async function runObserverTick(now: Date, exec: ObserverExecutors): Promi
   return stats;
 }
 
-async function handleManagerHealth(t: SubTask, now: Date): Promise<boolean> {
+async function handleManagerHealth(t: SubTask, now: Date, exec: ObserverExecutors): Promise<boolean> {
   if (t.reportingMode !== 'manager') return false;
   const larkAppId = managerAlertLarkAppId(t);
   let did = false;
@@ -202,6 +214,7 @@ async function handleManagerHealth(t: SubTask, now: Date): Promise<boolean> {
     });
     did = did || res.inserted;
     if (res.inserted) logger.info(`[subtask-observer] ${t.taskId} manager stalled → RootInbox(manager_stalled)`);
+    did = (await maybeAutoRecoverManager(t, null, 'manager_stalled', now, larkAppId, exec)) || did;
   }
 
   if (health.kind !== 'none') return did;
@@ -218,8 +231,52 @@ async function handleManagerHealth(t: SubTask, now: Date): Promise<boolean> {
     });
     did = did || res.inserted;
     if (res.inserted) logger.info(`[subtask-observer] ${t.taskId} manager session aged → RootInbox(manager_session_aged)`);
+    did = (await maybeAutoRecoverManager(t, session, 'manager_session_aged', now, larkAppId, exec)) || did;
   }
   return did;
+}
+
+async function maybeAutoRecoverManager(
+  t: SubTask,
+  candidateSession: Session | null,
+  reason: ManagerRecoverReason,
+  now: Date,
+  larkAppId: string,
+  exec?: Pick<ObserverExecutors, 'recoverManagerSession'>,
+): Promise<boolean> {
+  if (!exec?.recoverManagerSession) return false;
+  const fresh = getSubTask(t.taskId) ?? t;
+  const session = candidateSession ?? findActiveSessionForTask(fresh);
+  const doubleCheck = reason === 'manager_stalled'
+    ? planManagerHealth(fresh, now).kind === 'escalate_ceo'
+    : planManagerSessionAging(fresh, session, hasPendingManagerWork(fresh), now).kind === 'alert';
+  const decision = planManagerAutoRecover({
+    optIn: managerAutoRecoverEnabled(),
+    doubleCheck,
+    sessionId: session?.sessionId,
+    lastRecoveredAt: latestManagerRecoveredAt(fresh.taskId),
+    now,
+  });
+  if (decision.kind !== 'recover' || !session) return false;
+  const prompt = buildManagerRecoverPrompt({ task: fresh, session, reason, recoverId: decision.recoverId });
+  const result = await exec.recoverManagerSession({ task: fresh, session, reason, recoverId: decision.recoverId, prompt });
+  const status = result.ok
+    ? `成功，新 session=${result.newSessionId ?? '(unknown)'}`
+    : `失败：${result.error ?? 'unknown'}`;
+  const res = await publishManagerRecovered({
+    task: fresh,
+    larkAppId,
+    sessionId: session.sessionId,
+    summary: `经理任务 ${fresh.taskId} 触发自动恢复（${reason}）：已 kill/delete 旧 session=${session.sessionId}，respawn ${status}。recoverId=${decision.recoverId}`,
+  });
+  logger.info(`[subtask-observer] ${fresh.taskId} manager auto-recover ${status}`);
+  return res.inserted || result.ok;
+}
+
+function latestManagerRecoveredAt(taskId: string): string | null {
+  const prefix = `manager_recovered:${taskId}:`;
+  const items = rootInbox.listAll().filter(it => it.kind === 'manager_recovered' && it.id.startsWith(prefix));
+  return items[0]?.lastUpdatedAt ?? null;
 }
 
 function managerAlertLarkAppId(t: SubTask): string {

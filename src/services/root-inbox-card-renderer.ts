@@ -22,6 +22,7 @@ const KIND_EMOJI: Record<rootInbox.RootInboxKind, string> = {
   request_decision: '❓',
   manager_stalled: '🚨',
   manager_session_aged: '⏳',
+  manager_recovered: '🔄',
   tilly_digest: '🐶',
   tilly_alert: '🚨',
 };
@@ -32,6 +33,7 @@ const KIND_LABEL: Record<rootInbox.RootInboxKind, string> = {
   request_decision: '需要松松决策',
   manager_stalled: '经理卡死告警',
   manager_session_aged: '经理会话老化告警',
+  manager_recovered: '经理会话自动恢复',
   tilly_digest: '缇蕾每日扫读',
   tilly_alert: '缇蕾健康检查',
 };

@@ -7,14 +7,18 @@ import * as groupsStore from '../services/groups-store.js';
 import { createGroupWithBots } from '../services/group-creator.js';
 import * as oncallStore from '../services/oncall-store.js';
 import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
+import * as messageQueue from '../services/message-queue.js';
 import * as scheduler from './scheduler.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, forceDestroySessionRuntime, forkWorker } from './worker-pool.js';
 import { getChatMode, replyMessage, sendMessage } from '../im/lark/client.js';
-import { resumeSession } from './session-manager.js';
+import { buildNewTopicPrompt, rememberLastCliInput, resumeSession } from './session-manager.js';
 import { getCliDisplayName } from '../im/lark/card-builder.js';
 import { locateLimiter } from './dashboard-locate.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { validateWorkingDir } from './working-dir.js';
+import { getBot } from '../bot-registry.js';
+import { localeForBot } from '../i18n/index.js';
+import { sessionAnchorId, sessionKey, type DaemonSession } from './types.js';
 import {
   composeRowFromActive,
   composeRowFromClosed,
@@ -110,6 +114,78 @@ ipcRoute('GET', '/api/sessions/:sessionId', (_req, res, params) => {
 ipcRoute('POST', '/api/sessions/:sessionId/close', async (_req, res, params) => {
   const r = await closeSession(params.sessionId);
   jsonRes(res, 200, r);
+});
+
+ipcRoute('POST', '/api/sessions/:sessionId/manager-recover', async (req, res, params) => {
+  const reg = getActiveSessionsRegistry();
+  if (!reg) return jsonRes(res, 503, { ok: false, error: 'registry_unavailable' });
+  const old = findActiveBySessionId(params.sessionId);
+  if (!old) return jsonRes(res, 404, { ok: false, error: 'not_found' });
+  let body: { prompt?: unknown; taskId?: unknown; reason?: unknown; recoverId?: unknown };
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const userPrompt = typeof body.prompt === 'string' && body.prompt.trim()
+    ? body.prompt
+    : `【botmux manager auto-recover】旧 session ${old.session.sessionId} 已被自动恢复，请继续推进当前任务。`;
+
+  const oldAnchor = sessionAnchorId(old);
+  const oldKey = sessionKey(oldAnchor, old.larkAppId);
+  const bot = getBot(old.larkAppId);
+  forceDestroySessionRuntime(old);
+  reg.delete(oldKey);
+  sessionStore.closeSession(old.session.sessionId);
+
+  const session = sessionStore.createSession(old.chatId, old.session.rootMessageId, `AutoRecover: ${old.session.title}`, old.session.chatType);
+  const now = Date.now();
+  session.larkAppId = old.larkAppId;
+  session.ownerOpenId = old.session.ownerOpenId;
+  session.lastCallerOpenId = old.session.lastCallerOpenId;
+  session.lastMessageAt = new Date(now).toISOString();
+  session.scope = old.scope;
+  session.workingDir = old.session.workingDir ?? old.workingDir;
+  session.cliId = old.session.cliId;
+  session.modelOverride = old.session.modelOverride;
+  sessionStore.updateSession(session);
+
+  const ds: DaemonSession = {
+    session,
+    worker: null,
+    workerPort: null,
+    workerToken: null,
+    larkAppId: old.larkAppId,
+    chatId: old.chatId,
+    chatType: old.chatType,
+    scope: old.scope,
+    spawnedAt: Date.parse(session.createdAt) || now,
+    cliVersion: old.cliVersion,
+    lastMessageAt: now,
+    hasHistory: false,
+    workingDir: old.workingDir,
+    ownerOpenId: old.ownerOpenId,
+  };
+  const anchor = sessionAnchorId(ds);
+  messageQueue.ensureQueue(anchor);
+  reg.set(sessionKey(anchor, old.larkAppId), ds);
+  const cliInput = buildNewTopicPrompt(
+    userPrompt,
+    session.sessionId,
+    bot.config.cliId,
+    bot.config.cliPathOverride,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    { name: bot.botName, openId: bot.botOpenId },
+    localeForBot(old.larkAppId),
+    undefined,
+    session.chatId,
+    old.larkAppId,
+  );
+  rememberLastCliInput(ds, userPrompt, cliInput);
+  forkWorker(ds, cliInput, false);
+
+  dashboardEventBus.publish({ type: 'session.exited', body: { sessionId: old.session.sessionId, reason: 'manager_auto_recover' } });
+  dashboardEventBus.publish({ type: 'session.spawned', body: { session: composeRowFromActive(ds) } });
+  jsonRes(res, 200, { ok: true, oldSessionId: old.session.sessionId, newSessionId: session.sessionId });
 });
 
 /**

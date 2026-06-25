@@ -515,6 +515,27 @@ export function killWorker(ds: DaemonSession): void {
   ds.workerToken = null;
 }
 
+export function forceDestroySessionRuntime(ds: DaemonSession): void {
+  clearUsageLimitState(ds);
+  const w = ds.worker;
+  if (w && !w.killed) {
+    try { w.kill('SIGKILL'); } catch { /* already gone */ }
+  }
+  ds.worker = null;
+  ds.workerPort = null;
+  ds.workerToken = null;
+  if (ds.session.pid) {
+    try {
+      process.kill(-ds.session.pid, 'SIGKILL');
+    } catch {
+      try { process.kill(ds.session.pid, 'SIGKILL'); } catch { /* already gone */ }
+    }
+  }
+  try {
+    TmuxBackend.killSession(TmuxBackend.sessionName(ds.session.sessionId));
+  } catch { /* no tmux session */ }
+}
+
 function armWorkerKillBackstop(w: ChildProcess, label: string): void {
   const sigterm = setTimeout(() => {
     if (w.exitCode === null && w.signalCode === null) {

@@ -67,6 +67,7 @@ beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), 'sto-test-'));
   __resetForTesting();
   sessionStore.init();
+  delete process.env.BOTMUX_MANAGER_AUTO_RECOVER;
 });
 
 afterEach(() => {
@@ -703,13 +704,59 @@ describe('manager self-heal step2+3 wiring', () => {
 
     const now = new Date(start.getTime() + 13 * 60 * 60_000);
     vi.setSystemTime(now);
-    await runObserverTick(now, mkExec({ messages: [] }));
+    const exec = mkExec({ messages: [] }) as any;
+    exec.recoverManagerSession = vi.fn();
+    await runObserverTick(now, exec);
     const item = rootInbox.lookup(`manager_session_aged:${t.taskId}`);
     expect(item?.kind).toBe('manager_session_aged');
     expect(item?.summary).toContain('默认仅告警');
+    expect(exec.recoverManagerSession).not.toHaveBeenCalled();
 
     await runObserverTick(new Date(now.getTime() + 2 * MIN_OBSERVE_INTERVAL_MS), mkExec({ messages: [] }));
     expect(rootInbox.lookup(`manager_session_aged:${t.taskId}`)?.updateCount).toBe(1);
+  });
+
+  it('auto-recover opt-in：double-check 后 kill/delete/respawn hook，并写 manager_recovered RootInbox', async () => {
+    process.env.BOTMUX_MANAGER_AUTO_RECOVER = '1';
+    const start = new Date('2026-06-24T00:00:00Z');
+    const t = await mkManagerTask('observing', start, 'mgr-recover');
+    sessionStore.init('app_mgr');
+    const s = sessionStore.createSession(t.chatId, 'om_root', 'manager session');
+    sessionStore.updateSession({
+      ...s,
+      larkAppId: 'app_mgr',
+      createdAt: start.toISOString(),
+      lastMessageAt: new Date(start.getTime() + 30 * 60_000).toISOString(),
+    });
+    sessionStore.init('app_observer');
+    await enqueueCommand({
+      taskId: t.taskId,
+      direction: 'parent_to_child',
+      targetChatId: t.chatId,
+      commandType: 'request_report',
+      payload: { requestId: 'req_recover' },
+      idempotencyKey: 'req-report-recover',
+    });
+
+    const exec = mkExec({ messages: [] }) as any;
+    exec.recoverManagerSession = vi.fn(async (req: any) => ({
+      ok: true,
+      oldSessionId: req.session.sessionId,
+      newSessionId: 'new_clean_session',
+    }));
+    const now = new Date(start.getTime() + 13 * 60 * 60_000);
+    vi.setSystemTime(now);
+    await runObserverTick(now, exec);
+
+    expect(exec.recoverManagerSession).toHaveBeenCalledTimes(1);
+    expect(exec.recoverManagerSession.mock.calls[0][0].reason).toBe('manager_session_aged');
+    expect(exec.recoverManagerSession.mock.calls[0][0].prompt).toContain('botmux manager auto-recover');
+    const recovered = rootInbox.listOpen().find(it => it.kind === 'manager_recovered');
+    expect(recovered?.id).toBe(`manager_recovered:${t.taskId}:${s.sessionId}`);
+    expect(recovered?.summary).toContain('new_clean_session');
+
+    await runObserverTick(new Date(now.getTime() + 2 * MIN_OBSERVE_INTERVAL_MS), exec);
+    expect(exec.recoverManagerSession).toHaveBeenCalledTimes(1);
   });
 
   it('manager aging 只认 manager main app 的 session，同 chat 其它 app session 不触发', async () => {

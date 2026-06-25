@@ -52,6 +52,7 @@ export interface PublishManagerAlertOpts {
   task: SubTask;
   summary: string;
   larkAppId: string;
+  sessionId?: string;
 }
 
 /** Publish a progress report to RootInbox + mainTopic. */
@@ -72,11 +73,17 @@ export async function publishManagerSessionAged(opts: PublishManagerAlertOpts): 
   return publishManagerAlert('manager_session_aged', opts);
 }
 
+export async function publishManagerRecovered(opts: PublishManagerAlertOpts & { sessionId: string }): Promise<PublishResult> {
+  return publishManagerAlert('manager_recovered', opts);
+}
+
 async function publishManagerAlert(
-  kind: 'manager_stalled' | 'manager_session_aged',
+  kind: 'manager_stalled' | 'manager_session_aged' | 'manager_recovered',
   opts: PublishManagerAlertOpts,
 ): Promise<PublishResult> {
-  const id = rootInbox.buildId({ kind, taskId: opts.task.taskId });
+  const id = kind === 'manager_recovered'
+    ? rootInbox.buildId({ kind, taskId: opts.task.taskId, sessionId: opts.sessionId ?? 'unknown' })
+    : rootInbox.buildId({ kind, taskId: opts.task.taskId });
   const existing = rootInbox.lookupOpenByBaseId(id);
   if (existing) {
     const dest = resolveRootDestination(opts.task, opts.larkAppId);
