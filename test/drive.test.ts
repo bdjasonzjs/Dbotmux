@@ -8,8 +8,16 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 let tempDir: string;
+const mockWriteRelayRecord = vi.hoisted(() => vi.fn());
+
 vi.mock('../src/config.js', () => ({ config: { get session() { return { dataDir: tempDir }; } } }));
 vi.mock('../src/utils/logger.js', () => ({ logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } }));
+vi.mock('../src/services/base-relay.js', () => ({
+  writeRelayRecord: (...args: any[]) => mockWriteRelayRecord(...args),
+}));
+vi.mock('../src/core/main-bot-playbook.js', () => ({
+  resolveBotIdent: () => ({ larkAppId: 'cli_tilly', openId: 'ou_tilly', name: '缇蕾' }),
+}));
 
 async function fresh() {
   vi.resetModules();
@@ -35,7 +43,11 @@ function mkExec(over: any = {}) {
   };
 }
 
-beforeEach(() => { tempDir = mkdtempSync(join(tmpdir(), 'drive-')); });
+beforeEach(() => {
+  tempDir = mkdtempSync(join(tmpdir(), 'drive-'));
+  mockWriteRelayRecord.mockReset();
+  mockWriteRelayRecord.mockResolvedValue({ ok: true, recordId: 'rec_drive_1' });
+});
 afterEach(() => { rmSync(tempDir, { recursive: true, force: true }); });
 
 describe('runDriveTick', () => {
@@ -149,6 +161,36 @@ describe('runDriveTick', () => {
     const st = store.getDriveState('oc_a')!;
     expect(st.nudgeCount).toBe(0);          // 窗口重置
     expect(st.lastNudgeSignature).toBe(null);
+  });
+
+  it('daemon 集成路径：runDriveTick 使用 drive-executors 写急急如律令 relay record', async () => {
+    const { drive, policy, store } = await fresh();
+    const { makeDriveExecutors } = await import('../src/services/drive-executors.js');
+    policy.setPolicy('oc_live', { driveOn: true, driveGoal: '推进目标X', driveTargetSummonName: '克劳德' });
+    store.saveDriveState({
+      chatId: 'oc_live',
+      lastSubstantiveActivityAt: new Date(T0 - 40 * 60_000).toISOString(),
+      episodeAnchorAt: new Date(T0 - 40 * 60_000).toISOString(),
+      nudgeCount: 0,
+      lastDriveNudgeAt: null,
+      lastNudgeSignature: null,
+      dateKey: store.dateKeyOf(new Date(T0)),
+      sentToday: 0,
+    });
+
+    const exec = {
+      ...makeDriveExecutors(),
+      fetchMessages: vi.fn(async () => []),
+      judge: vi.fn(async () => ({ shouldNudge: true, nudgeText: '请继续推进目标X' })),
+    };
+    const r = await drive.runDriveTick(new Date(T0), exec, opts);
+
+    expect(r.nudged).toBe(1);
+    expect(mockWriteRelayRecord).toHaveBeenCalledOnce();
+    expect(mockWriteRelayRecord).toHaveBeenCalledWith({
+      targetChatId: 'oc_live',
+      text: '急急如律令：【克劳德】请继续推进目标X',
+    });
   });
 });
 
