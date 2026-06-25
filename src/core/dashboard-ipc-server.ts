@@ -159,7 +159,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/manager-recover', async (req, res, pa
     cliVersion: old.cliVersion,
     lastMessageAt: now,
     hasHistory: false,
-    workingDir: old.workingDir,
+    workingDir: session.workingDir,
     ownerOpenId: old.ownerOpenId,
   };
   const anchor = sessionAnchorId(ds);
