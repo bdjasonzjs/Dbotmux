@@ -119,6 +119,35 @@ describe('状态机（含 review Blocker 2 路径）', () => {
     expect(isTransitionAllowed('reported_done', 'finished')).toBe(true);
     expect(isTransitionAllowed('finished', 'observing')).toBe(false);
   });
+  it('manager 独立状态机：不允许进入 paused', async () => {
+    const t = await createSubTask({
+      chatId: 'oc_mgr_state', parentChatId: 'oc_parent', parentMessageId: 'om_src',
+      goal: '经理群', acceptance: null, bots: BOTS,
+      requester: 'ou_jason', createdBy: 'ou_claude', idempotencyKey: 'mgr-state',
+      reportingMode: 'manager',
+    });
+    await transitionStatus(t.taskId, 'observing');
+    const before = getSubTask(t.taskId)!;
+    expect(await transitionStatus(t.taskId, 'paused')).toBeNull();
+    expect(getSubTask(t.taskId)!.status).toBe('observing');
+    expect(getSubTask(t.taskId)!.version).toBe(before.version);
+  });
+  it('manager 原子观测事务：statusTo=paused 时整事务 abort', async () => {
+    const t = await createSubTask({
+      chatId: 'oc_mgr_commit', parentChatId: 'oc_parent', parentMessageId: 'om_src',
+      goal: '经理群', acceptance: null, bots: BOTS,
+      requester: 'ou_jason', createdBy: 'ou_claude', idempotencyKey: 'mgr-commit',
+      reportingMode: 'manager',
+    });
+    await transitionStatus(t.taskId, 'observing');
+    const res = await commitObservationTransaction({
+      taskId: t.taskId, readFromCursor: null, readToCursor: 'm1', analyzedMessageIds: ['m1'],
+      summary: '卡住了', signal: 'need_help', statusTo: 'paused',
+    });
+    expect(res).toBeNull();
+    expect(listObservations(t.taskId)).toHaveLength(0);
+    expect(getSubTask(t.taskId)!.status).toBe('observing');
+  });
   it('非法转移 → null 不写', async () => {
     const t = await mkObserving();
     await transitionStatus(t.taskId, 'reported_done');

@@ -16,7 +16,7 @@ vi.mock('../src/utils/logger.js', () => ({
 import {
   createSubTask, transitionStatus, getSubTask, listCommands, listObservations,
   commitObservationTransaction, getCommand, updateCommand, latestHelpReport, enqueueCommand, __resetForTesting,
-  type SubTaskBot, type HelpDelivery,
+  updateSubTask, type SubTaskBot, type HelpDelivery,
 } from '../src/services/subtask-store.js';
 import {
   runObserverTick, planCommit, hasNewHelpProgress, hasBlockedHelpProgress, shouldStaleRereport,
@@ -623,11 +623,17 @@ describe('manager self-heal step2+3 wiring', () => {
       rootChatId: 'oc_root',
     });
     await transitionStatus(t.taskId, 'observing');
-    if (status !== 'observing') await transitionStatus(t.taskId, status);
+    if (status === 'paused') {
+      await updateSubTask(t.taskId, { reportingMode: 'executor' });
+      await transitionStatus(t.taskId, 'paused');
+      await updateSubTask(t.taskId, { reportingMode: 'manager' });
+    } else if (status !== 'observing') {
+      await transitionStatus(t.taskId, status);
+    }
     return getSubTask(t.taskId)!;
   }
 
-  it('manager paused 卡死超 2h → 写 manager_stalled RootInbox；重复 tick 不重复上浮/更新', async () => {
+  it('legacy manager paused 卡死超 2h → 写 manager_stalled RootInbox；重复 tick 不重复上浮/更新', async () => {
     const start = new Date('2026-06-24T00:00:00Z');
     const t = await mkManagerTask('paused', start, 'mgr-stalled');
     sessionStore.init('app_mgr');

@@ -111,6 +111,10 @@ export function isManager(t: SubTask): boolean {
   return t.reportingMode === 'manager';
 }
 
+function isManagerTransitionAllowed(t: SubTask, to: SubTaskStatus): boolean {
+  return !(isManager(t) && to === 'paused');
+}
+
 /** 双层汇报推送门控：某条 child→parent 上报是否应**实时**推父群 (急急如律令)。
  *  - executor (缺省)：恒 true —— 行为与存量字节级一致。
  *  - manager：恒 false —— **任何** report_help/report_done 都不实时惊动父群。
@@ -412,6 +416,10 @@ export async function transitionStatus(
       logger.warn(`[subtask-store] illegal transition ${cur.status} → ${to} for ${taskId}; rejected`);
       return { result: null, dirty: false };
     }
+    if (!isManagerTransitionAllowed(cur, to)) {
+      logger.warn(`[subtask-store] manager transition ${cur.status} → ${to} for ${taskId}; rejected`);
+      return { result: null, dirty: false };
+    }
     if (opts?.expectedVersion != null && cur.version !== opts.expectedVersion) {
       throw new VersionConflictError(taskId, opts.expectedVersion, cur.version);
     }
@@ -473,6 +481,10 @@ export async function commitObservationTransaction(opts: {
     }
     if (opts.statusTo && !isTransitionAllowed(cur.status, opts.statusTo)) {
       logger.warn(`[subtask-store] commit: illegal transition ${cur.status} → ${opts.statusTo} for ${opts.taskId}; abort`);
+      return { result: null, dirty: false };
+    }
+    if (opts.statusTo && !isManagerTransitionAllowed(cur, opts.statusTo)) {
+      logger.warn(`[subtask-store] commit: manager transition ${cur.status} → ${opts.statusTo} for ${opts.taskId}; abort`);
       return { result: null, dirty: false };
     }
     // cursor 硬校验 (review blocker)：
@@ -690,6 +702,10 @@ export async function transitionAndEnqueueCommand(opts: {
           logger.warn(`[subtask-store] transitionAndEnqueue dup-heal: illegal ${cur.status} → ${want} for ${opts.taskId}; abort`);
           return { result: null, dirty: false };
         }
+        if (!isManagerTransitionAllowed(cur, want)) {
+          logger.warn(`[subtask-store] transitionAndEnqueue dup-heal: manager ${cur.status} → ${want} for ${opts.taskId}; abort`);
+          return { result: null, dirty: false };
+        }
         s.subtasks[idx] = { ...cur, status: want, version: cur.version + 1, updatedAt: new Date().toISOString() };
         logger.info(`[subtask-store] transitionAndEnqueue ${opts.taskId}: dup cmd ${dup.cmdId}, 补状态 ${cur.status}→${want}`);
         return { result: { task: s.subtasks[idx], command: dup }, dirty: true };
@@ -704,6 +720,10 @@ export async function transitionAndEnqueueCommand(opts: {
     const to = opts.resolveTo ? opts.resolveTo(cur.status) : null;
     if (to && to !== cur.status && !isTransitionAllowed(cur.status, to)) {
       logger.warn(`[subtask-store] transitionAndEnqueue: illegal ${cur.status} → ${to} for ${opts.taskId}; abort`);
+      return { result: null, dirty: false };
+    }
+    if (to && to !== cur.status && !isManagerTransitionAllowed(cur, to)) {
+      logger.warn(`[subtask-store] transitionAndEnqueue: manager ${cur.status} → ${to} for ${opts.taskId}; abort`);
       return { result: null, dirty: false };
     }
     const now = new Date().toISOString();

@@ -127,7 +127,8 @@ export type ManagerSessionAgingAction =
   | { kind: 'alert'; ageMs: number; idleMs: number; recover: false };
 
 /** 经理存活检测（纯函数，可单测）—— 与 stall-nudge 互补：
- *  stall-nudge 管「执行者超时静默」(planStallNudge)；本函数管「经理被 paused/reported_help 卡死躺尸」。
+ *  stall-nudge 管「执行者超时静默」(planStallNudge)；本函数管「经理被 reported_help 卡死躺尸」。
+ *  paused 只作为历史存量兼容扫描，新状态机不再允许 manager 进入 paused。
  *  这就是 managerExemptFromStall 注释承诺的「另起一套、基于卡死状态而非超时静默」的经理存活检测。
  *  判定：reportingMode==='manager' 且 status∈{paused,reported_help} 且 (now − updatedAt) > 阈值
  *    → escalate_ceo（默认只上浮告警 CEO、不自动 resume，宁稳勿乱、防误伤正在合理等待的任务）。
@@ -666,13 +667,11 @@ export function planCommit(
       }
       return rest;
     }
-    // 经理群上报泄漏修复：need_help 也是 routine（need_help ≠ urgent）——剥掉 report_help（状态转移保留），
-    // observation 仍按 signal='need_help' 写入，由定期 digest 携带「⚠️ 受阻」。manager 唯一实时路径=report_urgent。
-    if (plan.report?.commandType === 'report_help') {
+    // 经理群上报泄漏修复：need_help 也是 routine（need_help ≠ urgent）——剥掉 report_help；
+    // 且 manager 是独立状态机，任何 need_help 决策都不能进入 paused，只能进入 reported_help/digest。
+    if (signal === 'need_help') {
       const { report: _drop, ...rest } = plan;
-      if (signal === 'need_help' && rest.statusTo === 'paused') {
-        rest.statusTo = 'reported_help';
-      }
+      if (rest.statusTo === 'paused') rest.statusTo = 'reported_help';
       return rest;
     }
   }
