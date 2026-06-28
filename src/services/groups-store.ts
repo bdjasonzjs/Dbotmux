@@ -10,6 +10,26 @@
  * proxy selection happens at the route layer.
  */
 import { getBotClient } from '../bot-registry.js';
+import { logger } from '../utils/logger.js';
+
+/**
+ * 从飞书 232043 错误里解析出被点名的非法 user id。典型成因：bot 的 open_id 被当成「人类成员」塞进
+ * user_id_list（飞书规定 bot 只能进 bot_id_list），飞书拒绝整个建群请求。
+ * 错误文案形如：`...invalid user ids: [ou_xxx, ou_yyy]`。
+ */
+export function parseInvalidUserIds232043(err: unknown): string[] {
+  const anyErr = err as any;
+  const code = anyErr?.response?.data?.code ?? anyErr?.code;
+  const msg: string =
+    anyErr?.response?.data?.msg ?? (err instanceof Error ? err.message : String(err ?? '')) ?? '';
+  // 收紧：必须是 232043（code 字段或文案里的字面量），不只凭 "invalid user ids" 文案 —— 避免误把
+  // 别的 code 的错误也当成可剔除重试（蔻黛复审 non-blocking 建议）。
+  const is232043 = code === 232043 || /\b232043\b/.test(msg);
+  if (!is232043) return [];
+  const m = /invalid user ids:\s*\[([^\]]*)\]/i.exec(msg);
+  if (!m) return [];
+  return m[1].split(',').map(s => s.trim()).filter(Boolean);
+}
 
 export interface ChatBrief {
   chatId: string;
@@ -92,21 +112,52 @@ export async function createChat(
   // Filter out the creator from bot_id_list — Lark errors if the inviter
   // appears in their own invite list.
   const otherBots = opts.botIds.filter(id => id !== creatorLarkAppId);
-  const userIds = (opts.userIds ?? []).filter(Boolean);
-  const data: Record<string, unknown> = {};
-  if (opts.name) data.name = opts.name;
-  if (otherBots.length > 0) data.bot_id_list = otherBots;
-  if (userIds.length > 0) data.user_id_list = userIds;
-  const params: Record<string, unknown> = {};
-  if (userIds.length > 0) params.user_id_type = 'open_id';
-  const res: any = await (client as any).im.v1.chat.create({ data, params });
+  let userIds = (opts.userIds ?? []).filter(Boolean);
+  let droppedUserIds: string[] = []; // 232043 重试时剔除的非法 user id，需回传给上层（见返回值）
+
+  const buildReq = () => {
+    const data: Record<string, unknown> = {};
+    if (opts.name) data.name = opts.name;
+    if (otherBots.length > 0) data.bot_id_list = otherBots;
+    if (userIds.length > 0) data.user_id_list = userIds;
+    const params: Record<string, unknown> = {};
+    if (userIds.length > 0) params.user_id_type = 'open_id';
+    return { data, params };
+  };
+
+  let res: any;
+  try {
+    const { data, params } = buildReq();
+    res = await (client as any).im.v1.chat.create({ data, params });
+  } catch (err) {
+    // 飞书 232043：user_id_list 含非法 user id —— 最常见是某个 bot 的 open_id 被当成「人类成员」
+    // 塞进来（飞书规定 bot 只能进 bot_id_list），于是整个建群请求被拒、群没建成。这会让「成员里
+    // 含 bot 的群」用 subtask-start 拆子群 100% 失败。
+    // 协议边界兜底：解析飞书点名的非法 id，从 user_id_list 剔除后**重试一次**（建群失败时未创建任何
+    // 群，重试不会建出重复群）。与「上游为什么会把 bot id 混进 user 列表」解耦——保证含 bot 群也能建。
+    const invalid = parseInvalidUserIds232043(err);
+    const dropped = userIds.filter(id => invalid.includes(id));
+    if (dropped.length === 0) throw err; // 非此原因 / 无可剔除项 → 原样抛出
+    droppedUserIds = dropped;
+    userIds = userIds.filter(id => !invalid.includes(id));
+    logger.warn(
+      `[groups-store] createChat 飞书 232043：user_id_list 含非法 id ${JSON.stringify(dropped)}` +
+      `（疑似 bot 的 open_id 被误当人类成员），已剔除并重试一次。`,
+    );
+    const { data, params } = buildReq();
+    res = await (client as any).im.v1.chat.create({ data, params });
+  }
   if (res.code !== 0 && res.code !== undefined) {
     throw new Error(`Failed to create chat: ${res.msg ?? 'unknown'} (code: ${res.code})`);
   }
+  // 把重试剔除的 id 与飞书第二次响应的 invalid_user_id_list 合并去重，继续通过 invalidUserIds 暴露 ——
+  // 上层(group-creator transfer/notify、daemon userInvited)据此判断"该 id 未入群"，避免误报邀请成功
+  // （蔻黛复审 B1）。
+  const larkInvalidUsers: string[] = res.data?.invalid_user_id_list ?? [];
   return {
     chatId: res.data?.chat_id,
     invalidBotIds: res.data?.invalid_bot_id_list ?? [],
-    invalidUserIds: res.data?.invalid_user_id_list ?? [],
+    invalidUserIds: Array.from(new Set([...larkInvalidUsers, ...droppedUserIds])),
   };
 }
 

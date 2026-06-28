@@ -47,7 +47,7 @@ vi.mock('../src/bot-registry.js', () => ({
   })),
 }));
 
-import { listChats, isInChat, addBotToChat, createChat, transferChatOwner } from '../src/services/groups-store.js';
+import { listChats, isInChat, addBotToChat, createChat, transferChatOwner, parseInvalidUserIds232043 } from '../src/services/groups-store.js';
 
 describe('groups-store wrappers', () => {
   beforeEach(() => { chatCreateStub.mockClear(); chatUpdateStub.mockClear(); });
@@ -178,5 +178,62 @@ describe('groups-store wrappers', () => {
     const callArgs = chatCreateStub.mock.calls[0][0];
     expect(callArgs.data.user_id_list).toBeUndefined();
     expect(callArgs.params?.user_id_type).toBeUndefined();
+  });
+
+  // ── 飞书 232043：bot 的 open_id 被误塞进 user_id_list → 剔除后重试一次（含 bot 成员的群也能建子群）──
+  it('createChat 232043: drops the bot open_id from user_id_list and retries (含 bot 群可建)', async () => {
+    const err: any = new Error('Request failed with status code 400');
+    err.response = { data: { code: 232043, msg: 'Your request contains unavailable ids, ext=invalid user ids: [ou_bot]' } };
+    chatCreateStub
+      .mockRejectedValueOnce(err)
+      .mockResolvedValueOnce({ code: 0, data: { chat_id: 'oc_retry_ok', invalid_bot_id_list: [], invalid_user_id_list: [] } });
+    const r = await createChat('cli_creator', { botIds: ['cli_creator', 'cli_bot'], userIds: ['ou_human', 'ou_bot'] });
+    expect(r.chatId).toBe('oc_retry_ok');
+    expect(chatCreateStub).toHaveBeenCalledTimes(2);
+    // 第二次（重试）请求里 ou_bot 已被剔除，只剩真人
+    const retryArgs = chatCreateStub.mock.calls[1][0];
+    expect(retryArgs.data.user_id_list).toEqual(['ou_human']);
+    // B1（蔻黛复审）：被剔除的 ou_bot 必须回传到 invalidUserIds，上层才不会误判它已入群
+    expect(r.invalidUserIds).toContain('ou_bot');
+  });
+
+  it('createChat 232043: dropped id 与飞书第二次响应的 invalid_user_id_list 合并去重回传', async () => {
+    const err: any = new Error('Request failed with status code 400');
+    err.response = { data: { code: 232043, msg: 'invalid user ids: [ou_bot]' } };
+    chatCreateStub
+      .mockRejectedValueOnce(err)
+      .mockResolvedValueOnce({ code: 0, data: { chat_id: 'oc_ok2', invalid_bot_id_list: [], invalid_user_id_list: ['ou_ghost'] } });
+    const r = await createChat('cli_creator', { botIds: ['cli_creator'], userIds: ['ou_human', 'ou_bot', 'ou_ghost'] });
+    expect(new Set(r.invalidUserIds)).toEqual(new Set(['ou_bot', 'ou_ghost']));
+  });
+
+  it('createChat 232043: 若非法 id 不在 userIds（无可剔除）→ 原样抛出，不无限重试', async () => {
+    const err: any = new Error('Request failed with status code 400');
+    err.response = { data: { code: 232043, msg: 'invalid user ids: [ou_unrelated]' } };
+    chatCreateStub.mockRejectedValueOnce(err);
+    await expect(
+      createChat('cli_creator', { botIds: ['cli_creator'], userIds: ['ou_human'] }),
+    ).rejects.toThrow(/status code 400/);
+    expect(chatCreateStub).toHaveBeenCalledTimes(1); // 没有可剔除项 → 不重试
+  });
+
+  it('createChat 非 232043 的错误原样抛出（不吞）', async () => {
+    chatCreateStub.mockRejectedValueOnce(new Error('network down'));
+    await expect(
+      createChat('cli_creator', { botIds: ['cli_creator'], userIds: ['ou_human'] }),
+    ).rejects.toThrow(/network down/);
+    expect(chatCreateStub).toHaveBeenCalledTimes(1);
+  });
+
+  it('parseInvalidUserIds232043 提取被点名的非法 id（多种形态）', () => {
+    const e1: any = new Error('x'); e1.response = { data: { code: 232043, msg: 'invalid user ids: [ou_a, ou_b]' } };
+    expect(parseInvalidUserIds232043(e1)).toEqual(['ou_a', 'ou_b']);
+    // code 在 message 文本里
+    expect(parseInvalidUserIds232043(new Error('(code: 232043) invalid user ids: [ou_x]'))).toEqual(['ou_x']);
+    // 非 232043 → 空
+    expect(parseInvalidUserIds232043(new Error('some other error'))).toEqual([]);
+    // 收紧后：仅有 "invalid user ids" 文案但无 232043（code 也不是）→ 不当可剔除项
+    const eNo: any = new Error('invalid user ids: [ou_z]'); eNo.response = { data: { code: 999, msg: 'invalid user ids: [ou_z]' } };
+    expect(parseInvalidUserIds232043(eNo)).toEqual([]);
   });
 });
