@@ -3410,11 +3410,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       taskteamObserveTickInFlight = true;
       try {
         const { runTaskTeamObserverTick } = await import('./services/taskteam-observer.js');
-        const { defaultObserverDeps } = await import('./services/taskteam-deps.js');
+        const { defaultObserverDeps, resolveTaskTeamTypeForInstance } = await import('./services/taskteam-deps.js');
         const { makeTaskTeamObserveExecutors } = await import('./services/taskteam-observe-executors.js');
         const { resolveBotIdent } = await import('./core/main-bot-playbook.js');
         const observerApp = resolveBotIdent('tilly').larkAppId;
-        const stats = await runTaskTeamObserverTick(new Date(), defaultObserverDeps(), makeTaskTeamObserveExecutors(observerApp));
+        // 注入 resolveType（修 Blocker1）：detect 据 instance.typeId 接入真实事件 registry（type.events 自定义 behavior）。
+        const stats = await runTaskTeamObserverTick(new Date(), defaultObserverDeps(), makeTaskTeamObserveExecutors(observerApp, { resolveType: resolveTaskTeamTypeForInstance }));
         if (stats.detected + stats.events + stats.errors > 0) {
           logger.info(`[taskteam-observer] tick: scanned=${stats.scanned} gatedOut=${stats.gatedOut} detected=${stats.detected} events=${stats.events} errors=${stats.errors}`);
         }

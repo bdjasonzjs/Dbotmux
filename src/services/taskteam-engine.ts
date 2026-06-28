@@ -37,11 +37,19 @@ export type TaskTeamEventType =
   | 'stall';
 
 export interface TeamEvent {
-  type: TaskTeamEventType;
+  // 内置事件保留 union 字面量（类型安全 + 自动补全，不裸字符串化）；type.events 声明的领域无关自定义事件
+  // 经 `string & {}` 兜底放行（设计 §8②：生产侧能产出新类型，但内置仍受 union 保护）。
+  type: TaskTeamEventType | (string & {});
   fromRoleInstanceId?: TaskTeamRoleInstanceId;
   fromSlotId?: TaskTeamSlotId;
   reason?: string;
   payload?: Record<string, unknown>;
+  /**
+   * per-event 稳定来源 id（阶段1 内核③ / 约束1，治丢事件）。消息事件取触发它的那条消息 id；
+   * timer/stall 等无消息事件取 window/episode id（绝不退回 round）。进默认幂等 key，使「一批消息里多个同类
+   * behavior」不再因共享 round/cursor 撞 key 被去重吞掉。缺省（显式入口/测试无来源）时 emit 回退 r{round}。
+   */
+  sourceEventId?: string;
 }
 
 // 引擎决策的单条投递命令（enqueueTaskTeamAction 的输入形态；不含 actionId/status/时间戳——那些是 store 侧副作用）
@@ -97,6 +105,9 @@ export function decideTeamActions(input: DecideTeamActionsInput): TeamDecision {
   });
 
   const emit = (rulesToFire: TaskTeamCollabRule[], keyRound: number): TeamActionDecision[] => {
+    // per-event 来源段（约束1）：优先 event.sourceEventId（消息 id / window-episode id），缺省回退
+    // r{keyRound}（显式入口/测试无来源；round 确定性 → 重放仍幂等）。key 含 event.type+source+ruleId+target。
+    const seg = event.sourceEventId ?? `r${keyRound}`;
     const acts: TeamActionDecision[] = [];
     for (const rule of rulesToFire) {
       for (const ri of instancesForSlot(rule.whoSlot)) {
@@ -106,7 +117,7 @@ export function decideTeamActions(input: DecideTeamActionsInput): TeamDecision {
           targetRoleInstanceId: ri.roleInstanceId,
           sourceRoleInstanceId: event.fromRoleInstanceId,
           payload: event.payload,
-          idempotencyKey: `${instance.teamId}:r${keyRound}:${event.type}:${rule.ruleId}:${ri.roleInstanceId}`,
+          idempotencyKey: `${instance.teamId}:${event.type}:${seg}:${rule.ruleId}:${ri.roleInstanceId}`,
         });
       }
     }
@@ -195,8 +206,21 @@ export function decideTeamActions(input: DecideTeamActionsInput): TeamDecision {
     }
 
     default: {
-      // 通用：submit / report / ask-help / consult / stall / escalate … → 命中规则即投递
+      // 通用：submit / report / ask-help / consult / stall / escalate / 自定义事件 … → 命中规则即投递。
       const acts = emit(matched, round);
+      // 显式 transition（阶段1④ / 约束2）：仅 default/custom event 读规则声明的 transition。
+      // 一次事件命中的 transition 必须 0 或 1 个（互斥/多 transition 由 validator 拦截）；
+      // 运行时兜底——若未过 validator 仍配了多个，去重后唯一才采纳，冲突则保守不跃迁（不静默乱跳）。
+      const declaredStatuses = [...new Set(matched.filter(r => r.transition).map(r => r.transition!.status))];
+      if (declaredStatuses.length === 1) {
+        return { actions: acts, nextStatus: declaredStatuses[0] };
+      }
+      if (declaredStatuses.length > 1) {
+        // 冲突配置（validator 应已拦截）：保守只投递、不做任何状态跃迁。
+        return { actions: acts };
+      }
+      // 迁移期 fallback（约束2）：未声明显式 transition 的规则保留旧隐式（request-review→reviewing），
+      // 保开发团队 seed（submit→reviewing）行为逐字不漂。
       if (acts.some(a => a.actionType === 'request-review')) {
         return { actions: acts, nextStatus: 'reviewing', reviewState: enterReview() };
       }

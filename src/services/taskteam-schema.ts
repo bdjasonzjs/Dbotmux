@@ -87,11 +87,21 @@ export interface TaskTeamTriggerCondition {
   fromSlotId?: TaskTeamSlotId;
 }
 
+// 显式状态跃迁（阶段1 内核④）——把状态机推进从「按 command 名隐式决定」解耦成规则可显式声明、validator 可校验。
+// 迁移期红线（设计 §8 约束2）：仅 default/custom event 读 transition；legacy 事件
+// （team-started/review-pass/review-reject/accept）仍走引擎 special case、不读 transition。
+// 一次事件命中的 transition 必须 0 或 1 个（runtime 一次只落一个 {status} patch），冲突由 validator 拦截。
+export interface TaskTeamStateTransition {
+  status: TaskTeamStatus; // 命中该规则后小组应跃迁到的状态
+}
+
 export interface TaskTeamCollabRule {
   ruleId: TaskTeamRuleId;
   when: TaskTeamTriggerCondition; // when.event 是触发的角色行为 / 生命周期事件
   whoSlot: TaskTeamSlotId; // 投递目标席位
   do: TaskTeamDeliveryCommand; // 引擎命中规则时产出的投递命令（非角色行为）
+  /** 可选显式状态跃迁（阶段1④）。仅 default/custom event 生效；未声明则 default 分支沿用旧隐式（request-review→reviewing）。 */
+  transition?: TaskTeamStateTransition;
 }
 
 export interface TaskTeamCollabPolicy {
@@ -102,12 +112,20 @@ export interface TaskTeamCollabPolicy {
   reviewOrder: TaskTeamSlotId[];
 }
 
+// 事件声明（阶段1 内核②）——见 taskteam-event-registry.ts。在此前置声明以避免循环 import。
+export interface TaskTeamEventDecl {
+  type: string;
+  producer: 'lifecycle' | 'behavior' | 'timer';
+}
+
 export interface TaskTeamType {
   typeId: TaskTeamTypeId;
   name: string;
   roleSlots: TaskTeamRoleSlot[];
   rules: TaskTeamRuleId[];
   policy: TaskTeamCollabPolicy;
+  /** 可选事件 registry 声明（阶段1②）：本 type 额外可产出/可判读的领域无关自定义事件。不设则只用内置事件集。 */
+  events?: TaskTeamEventDecl[];
 }
 
 // 可分享 shape：进 TemplateBundle，绝不含运行态 / app-scoped 身份（§2.5 / 细节 review H3）

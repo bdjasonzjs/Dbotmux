@@ -63,6 +63,27 @@ describe('taskteam-admin (batch5 §5)', () => {
     await expect(admin.adminRestoreSnapshot({})).rejects.toThrow(admin.TaskTeamBadRequestError);
   });
 
+  it('adminUpsertRule guard：改坏已被 type 引用的 rule（非法 do）阻断落库（修 reviewer P1-a）', async () => {
+    const { admin } = await fresh();
+    const policy = { reviewRounds: 1, reviewQuorum: 1, maxRework: 1, escalateAfterStallMs: 0, reviewOrder: [] };
+    // 建 type 引用 tt_rule_g（rule 尚不存在 → 仅 warning，放行）
+    await admin.adminUpsertType({ teamType: { typeId: 'tt_type_g', name: 'G', roleSlots: [{ slotId: 'tt_slot_g', roleId: 'tt_role_g' }], rules: ['tt_rule_g'], policy } } as never);
+    // 合法 rule 落库
+    await admin.adminUpsertRule({ rule: { ruleId: 'tt_rule_g', when: { event: 'submit' }, whoSlot: 'tt_slot_g', do: 'report' } } as never);
+    expect(admin.listTaskTeamConfig().rules.find(r => r.ruleId === 'tt_rule_g')?.do).toBe('report');
+    // 把已被引用的 rule 改成非法 do → 阻断落库（throw），磁盘仍是旧合法值
+    await expect(
+      admin.adminUpsertRule({ rule: { ruleId: 'tt_rule_g', when: { event: 'submit' }, whoSlot: 'tt_slot_g', do: 'bogus' } } as never),
+    ).rejects.toThrow();
+    expect(admin.listTaskTeamConfig().rules.find(r => r.ruleId === 'tt_rule_g')?.do).toBe('report');
+  });
+
+  it('adminUpsertRule guard：未被任何 type 引用的增量 rule 不触发 per-type 校验（增量顺序不受影响）', async () => {
+    const { admin } = await fresh();
+    const r = await admin.adminUpsertRule({ rule: { ruleId: 'tt_rule_free', when: { event: 'submit' }, whoSlot: 'tt_slot_x', do: 'report' } } as never);
+    expect(r).toMatchObject({ ok: true, ruleId: 'tt_rule_free' });
+  });
+
   it('adminUpsertType rejects roleSlots missing slotId/roleId (批7 P2 防御纵深)', async () => {
     const { admin } = await fresh();
     const goodPolicy = { reviewRounds: 1, reviewQuorum: 1, maxRework: 1, escalateAfterStallMs: 0, reviewOrder: [] };

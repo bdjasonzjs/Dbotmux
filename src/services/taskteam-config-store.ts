@@ -14,6 +14,15 @@ import type {
   TaskTeamRuleId,
   TaskTeamType,
 } from './taskteam-schema.js';
+import { assertValidTaskTeamConfig, type TaskTeamConfigIssue } from './taskteam-validator.js';
+
+// 写路径 validator 守卫（阶段1①）：落库前闭环校验，有 error 抛 TaskTeamConfigValidationError、warning 记日志、不静默。
+function guardConfig(store: TaskTeamConfigFile, where: string): void {
+  const warnings: TaskTeamConfigIssue[] = assertValidTaskTeamConfig(store); // 有 error 直接抛（mutate 内抛 → 不落库）
+  if (warnings.length) {
+    logger.warn(`[taskteam-config-store] ${where}: ${warnings.length} 条配置告警: ${warnings.map(w => w.message).join('; ')}`);
+  }
+}
 
 const STORE_FILE = 'taskteam-config.json';
 
@@ -99,6 +108,7 @@ export async function replaceTaskTeamConfig(next: TaskTeamConfigFile): Promise<T
     store.teamTypes = next.teamTypes;
     store.orgStructures = next.orgStructures;
     store.orgRuntimeBindings = next.orgRuntimeBindings;
+    guardConfig(store, 'replaceTaskTeamConfig'); // import/restore 落库前闭环校验
     return { result: store, dirty: true };
   });
 }
@@ -117,6 +127,10 @@ export async function upsertTaskTeamRule(rule: TaskTeamCollabRule): Promise<Task
     const idx = store.rules.findIndex(r => r.ruleId === rule.ruleId);
     if (idx >= 0) store.rules[idx] = rule;
     else store.rules.push(rule);
+    // 修 reviewer P1-a：单独改规则也走 validator 守卫——已被某 type.rules 引用的 rule 被改坏（非法 do /
+    // transition 冲突 / 非法 status）会在此阻断落库，不再拖到下次 type upsert / replace 才暴露。
+    // 未被任何 type 引用的增量 rule 不会触发 per-type 校验 → 增量创建顺序不受影响。
+    guardConfig(store, `upsertTaskTeamRule ${rule.ruleId}`);
     return { result: rule, dirty: true };
   });
 }
@@ -126,6 +140,7 @@ export async function upsertTaskTeamType(teamType: TaskTeamType): Promise<TaskTe
     const idx = store.teamTypes.findIndex(t => t.typeId === teamType.typeId);
     if (idx >= 0) store.teamTypes[idx] = teamType;
     else store.teamTypes.push(teamType);
+    guardConfig(store, `upsertTaskTeamType ${teamType.typeId}`); // create/upsert type 落库前闭环校验
     return { result: teamType, dirty: true };
   });
 }
