@@ -449,6 +449,10 @@ const BOTMUX_INJECTED_ENV_KEYS = [
   'BOTMUX',
   'SESSION_DATA_DIR',
   'IS_SANDBOX',
+  // session-marker 的 legacy 兜底要求 CLI 能看到 BOTMUX_SESSION_ID；tmux 后端只注入白名单变量，
+  // 过去漏了它 → tmux pane 里 env 兜底落空。注入它兜底成立（注入值是 spawn 时正确值；即便
+  // 后续 daemon 重启变旧，session-marker 也以进程树 marker 为准、env 仅兜底，故注入它安全）。
+  'BOTMUX_SESSION_ID',
 ] as const;
 
 /**

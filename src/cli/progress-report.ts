@@ -8,6 +8,7 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { resolveSessionId } from './session-marker.js';
 
 const REGISTRY_DIR = join(homedir(), '.botmux', 'data', 'dashboard-daemons');
 const DATA_DIR = join(homedir(), '.botmux', 'data');
@@ -47,8 +48,9 @@ function parseArgs(argv: string[]): Args | { error: string } {
       default: return { error: `未知参数: ${cur}` };
     }
   }
-  if (!a.sessionId) a.sessionId = process.env.BOTMUX_SESSION_ID;
-  if (!a.sessionId) return { error: 'missing session id (expected --session-id or BOTMUX_SESSION_ID env)' };
+  // flag 缺省 → 进程树 marker(真值) > env BOTMUX_SESSION_ID(legacy)。根治 stale-env 错群。
+  if (!a.sessionId) a.sessionId = resolveSessionId() ?? undefined;
+  if (!a.sessionId) return { error: 'missing session id (expected --session-id; 通常由进程树 marker / BOTMUX_SESSION_ID 自动解析)' };
   if (!a.summary) return { error: '缺 --summary' };
   if (!a.slug)    return { error: '缺 --slug (stable dedup key, e.g. "milestone-1" / "auth-design-q1")' };
   return a as Args;

@@ -8,6 +8,7 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { resolveSessionIdWithSource, type SessionIdSource } from './session-marker.js';
 
 const REGISTRY_DIR = join(homedir(), '.botmux', 'data', 'dashboard-daemons');
 const DATA_DIR = join(homedir(), '.botmux', 'data');
@@ -107,9 +108,9 @@ export function findClaudeDaemonPort(sessionId?: string): number | null {
   return selected && !('error' in selected) ? selected.port : null;
 }
 
-function parseBody(argv: string[]): { body: Record<string, unknown>; sessionSource: 'flag' | 'env' } | { error: string } {
+function parseBody(argv: string[]): { body: Record<string, unknown>; sessionSource: SessionIdSource } | { error: string } {
   const body: Record<string, unknown> = {};
-  let sessionSource: 'flag' | 'env' = 'env';
+  let sessionSource: SessionIdSource = 'none';
   let i = 0;
   while (i < argv.length) {
     const a = argv[i];
@@ -128,8 +129,12 @@ function parseBody(argv: string[]): { body: Record<string, unknown>; sessionSour
   // ref (alias c/k/t/claude/codex/tilly, or any registered bot name/appId) and
   // parses an optional `ref:role` suffix; unknown ref / bad role → 400 there.
   // So `--bots claude:main,克隆2:collab` flows straight through.
-  if (!body.sessionId) body.sessionId = process.env.BOTMUX_SESSION_ID;
-  if (!body.sessionId) return { error: 'missing --session-id <sid> or env BOTMUX_SESSION_ID' };
+  // flag 缺省 → 进程树 marker(真值) > env BOTMUX_SESSION_ID(legacy)。根治 stale-env 错群。
+  if (!body.sessionId) {
+    const r = resolveSessionIdWithSource();
+    if (r.sessionId) { body.sessionId = r.sessionId; sessionSource = r.source; }
+  }
+  if (!body.sessionId) return { error: 'missing --session-id <sid> (进程树 marker / env BOTMUX_SESSION_ID 均无)' };
   return { body, sessionSource };
 }
 
@@ -230,9 +235,12 @@ export async function cmdSubtaskOrch(verb: string, argv: string[]): Promise<void
 
   const json = await res.json().catch(() => ({ ok: false, error: 'invalid_json_response' }));
   if (!res.ok || (json as any).ok === false) {
-    const sourceHint = parsed.sessionSource === 'env'
-      ? 'session came from BOTMUX_SESSION_ID; pass --session-id for the current chat or unset stale BOTMUX_SESSION_ID'
-      : 'session came from --session-id';
+    const sourceHint =
+      parsed.sessionSource === 'env'
+        ? 'session came from BOTMUX_SESSION_ID (legacy fallback; 进程树无 marker)；env 可能残留旧值指错群，pass --session-id 或修复 marker'
+        : parsed.sessionSource === 'marker'
+          ? 'session came from 进程树 marker (实际所属会话)'
+          : 'session came from --session-id';
     (json as any).diagnostic = [sourceHint, selected.diagnostic].filter(Boolean).join('; ');
   }
   const rendered = verb === 'start' ? renderStartDryRun(json) : null;

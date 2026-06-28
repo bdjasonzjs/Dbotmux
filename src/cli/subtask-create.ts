@@ -19,6 +19,7 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { resolveSessionId } from './session-marker.js';
 
 // Type-only import OK (compiled away — does not violate import contract).
 // Used purely for shape of the request body.
@@ -96,12 +97,13 @@ function parseArgs(argv: string[]): SubtaskCreateArgs | { error: string } {
         return { error: `未知参数: ${a}` };
     }
   }
-  // sessionId precedence: flag > env
+  // sessionId precedence: flag > 进程树 marker(真值) > env BOTMUX_SESSION_ID(legacy 兜底)。
+  // 不再只信易残留旧值的 env —— 根治「daemon/会话重启后 env 指错群、子任务汇报发错群」。
   if (!args.sessionId) {
-    args.sessionId = process.env.BOTMUX_SESSION_ID;
+    args.sessionId = resolveSessionId() ?? undefined;
   }
   if (!args.sessionId) {
-    return { error: 'missing session id (expected --session-id <sid> or env BOTMUX_SESSION_ID — runtime should inject env on worker spawn)' };
+    return { error: 'missing session id (expected --session-id <sid>; 通常由进程树 marker 或 env BOTMUX_SESSION_ID 自动解析)' };
   }
   if (!args.purpose) return { error: '缺 --purpose' };
   if (!args.taskType) return { error: '缺 --task-type' };

@@ -36,6 +36,7 @@ describe('buildBotmuxEnvAssignments()', () => {
       BOTMUX: '1',
       SESSION_DATA_DIR: '/home/u/.botmux/data',
       IS_SANDBOX: '1',
+      BOTMUX_SESSION_ID: 'sid_xyz',
       // None of the rest should appear — those come from rcfile.
       PATH: '/usr/bin',
       HOME: '/home/u',
@@ -50,7 +51,15 @@ describe('buildBotmuxEnvAssignments()', () => {
       'BOTMUX=1',
       'SESSION_DATA_DIR=/home/u/.botmux/data',
       'IS_SANDBOX=1',
+      'BOTMUX_SESSION_ID=sid_xyz',
     ]);
+  });
+
+  it('forwards BOTMUX_SESSION_ID so session-marker 的 env 兜底在 tmux pane 内成立 (review Blocker 1)', () => {
+    // 过去白名单漏了 BOTMUX_SESSION_ID → tmux 后端 CLI 拿不到该 env、session-marker 的 env
+    // 兜底落空。注入它兜底才真成立（marker 仍优先，stale 注入值会被 marker 覆盖）。
+    const out = buildBotmuxEnvAssignments({ BOTMUX_SESSION_ID: 'sid_from_worker', LARK_APP_ID: 'cli_abc' });
+    expect(out).toContain('BOTMUX_SESSION_ID=sid_from_worker');
   });
 
   it('skips entries whose value is undefined (e.g. IS_SANDBOX outside root mode)', () => {

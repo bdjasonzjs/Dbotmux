@@ -6,6 +6,9 @@ import { join } from 'node:path';
 let fakeHome: string;
 let dataDir: string;
 let registryDir: string;
+// session-marker 解析会读 SESSION_DATA_DIR 去进程树找 marker；测试里隔离到空的 fakeHome，
+// 否则会捞到真实运行环境的 marker，破坏 env/flag 这几条用例的 hermetic 性。
+const ORIG_SESSION_DATA_DIR = process.env.SESSION_DATA_DIR;
 
 vi.mock('node:os', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:os')>();
@@ -20,6 +23,7 @@ beforeEach(() => {
   dataDir = join(fakeHome, '.botmux', 'data');
   registryDir = join(dataDir, 'dashboard-daemons');
   mkdirSync(registryDir, { recursive: true });
+  process.env.SESSION_DATA_DIR = dataDir; // 空 → 无 marker → 隔离进程树 marker 解析
   exitCode.value = 0;
   vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
     exitCode.value = code ?? 0;
@@ -38,6 +42,8 @@ afterEach(() => {
   delete process.env.BOTMUX_SESSION_ID;
   delete process.env.BOTMUX_SUBTASK_DAEMON_APP_ID;
   delete process.env.LARK_APP_ID;
+  if (ORIG_SESSION_DATA_DIR === undefined) delete process.env.SESSION_DATA_DIR;
+  else process.env.SESSION_DATA_DIR = ORIG_SESSION_DATA_DIR;
   (process as any).exit = origExit;
 });
 
