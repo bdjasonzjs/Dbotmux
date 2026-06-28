@@ -14,6 +14,7 @@ import { parseBotSelection } from '../setup/bot-config-editor.js';
 import { defaultBotsJsonPath } from '../services/bot-inventory.js';
 import { cloneBot } from '../services/bot-clone.js';
 import { findClaudeDaemonPort } from './subtask-orch.js';
+import { resolveSessionId } from './session-marker.js';
 
 export async function cmdBot(sub: string, args: string[]): Promise<void> {
   if (sub === 'ceo-spawn') { await cmdBotCeoSpawn(args); return; }
@@ -104,8 +105,9 @@ async function cmdBotCeoSpawn(args: string[]): Promise<void> {
   try { body = parseCeoSpawnArgs(args); }
   catch (err: any) { console.error(`❌ ${err?.message ?? err}`); process.exit(2); }
   if (!body.goal) { console.error('❌ missing --goal'); process.exit(2); }
-  if (!body.sessionId) body.sessionId = process.env.BOTMUX_SESSION_ID;
-  if (!body.sessionId) { console.error('❌ missing --session-id <sid> or env BOTMUX_SESSION_ID'); process.exit(2); }
+  // flag 缺省 → 进程树 marker(真值) > env BOTMUX_SESSION_ID(legacy)。根治 stale-env 错群。
+  if (!body.sessionId) body.sessionId = resolveSessionId() ?? undefined;
+  if (!body.sessionId) { console.error('❌ missing --session-id <sid> (进程树 marker / env BOTMUX_SESSION_ID 均无)'); process.exit(2); }
 
   const port = findClaudeDaemonPort();
   if (!port) { console.error('❌ 找不到 Claude daemon（无新鲜注册）'); process.exit(1); }

@@ -13,6 +13,9 @@ import { join } from 'node:path';
 
 let fakeHome: string;
 let registryDir: string;
+// session-marker 解析会读 SESSION_DATA_DIR 去进程树找 marker；测试里隔离到空的 fakeHome，
+// 否则会捞到真实运行环境的 marker，破坏 flag/env/缺失 这几条用例的 hermetic 性。
+const ORIG_SESSION_DATA_DIR = process.env.SESSION_DATA_DIR;
 
 vi.mock('node:os', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:os')>();
@@ -26,6 +29,7 @@ beforeEach(() => {
   fakeHome = mkdtempSync(join(tmpdir(), 'cli-st-home-'));
   registryDir = join(fakeHome, '.botmux', 'data', 'dashboard-daemons');
   mkdirSync(registryDir, { recursive: true });
+  process.env.SESSION_DATA_DIR = join(fakeHome, '.botmux', 'data'); // 空 → 无 marker → 隔离
   exitCode.value = 0;
   vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
     exitCode.value = code ?? 0;
@@ -39,6 +43,8 @@ afterEach(() => {
   rmSync(fakeHome, { recursive: true, force: true });
   vi.restoreAllMocks();
   delete process.env.BOTMUX_SESSION_ID;
+  if (ORIG_SESSION_DATA_DIR === undefined) delete process.env.SESSION_DATA_DIR;
+  else process.env.SESSION_DATA_DIR = ORIG_SESSION_DATA_DIR;
   (process as any).exit = origExit;
 });
 
