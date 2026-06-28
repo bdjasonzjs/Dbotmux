@@ -164,6 +164,190 @@ describe('tilly-llm-analyzer (P3 commit #3)', () => {
     expect(r.todos[0].summary).toBe('real');
   });
 
+  it('scout identity guard: @松松 is not @main-Claude-CEO', async () => {
+    const songSong = 'ou_974b9321334628537abee157413b33b6';
+    const fakeCodex = makeFakeCodex(JSON.stringify({
+      todos: [
+        { summary: '@松松 的消息不应升级主话题', sourceChatId: 'oc_x', sourceMessageId: 'om_song', priority: 'high' },
+      ],
+      progress: [], blockers: [], noteworthy: [],
+    }));
+    const { analyzeMessages } = await freshImport();
+    const r = await analyzeMessages([
+      {
+        messageId: 'om_song',
+        chatId: 'oc_x',
+        chatName: '群X',
+        chatType: 'group',
+        senderId: 'u1',
+        senderType: 'user',
+        msgType: 'text',
+        content: `<at user_id="${songSong}">松松</at> 看下这个`,
+        createTime: '23:00',
+        mentions: [{ name: '松松', openId: songSong }],
+      },
+    ], { codexPath: fakeCodex });
+    expect(r.ok).toBe(true);
+    expect(r.todos).toEqual([]);
+  });
+
+  it('scout identity guard: active local Claude session handles non-CEO @Claude in that chat', async () => {
+    const cloneClaude = 'ou_clone_claude';
+    const fakeCodex = makeFakeCodex(JSON.stringify({
+      blockers: [
+        { summary: '@克劳德 但本群已有分身接管', sourceChatId: 'oc_x', sourceMessageId: 'om_clone', priority: 'high' },
+      ],
+      todos: [], progress: [], noteworthy: [],
+    }));
+    const { analyzeMessages } = await freshImport();
+    const r = await analyzeMessages([
+      {
+        messageId: 'om_clone',
+        chatId: 'oc_x',
+        chatName: '群X',
+        chatType: 'group',
+        senderId: 'u1',
+        senderType: 'user',
+        msgType: 'text',
+        content: `<at user_id="${cloneClaude}">克劳德</at> 这里卡住了`,
+        createTime: '23:00',
+        mentions: [{ name: '克劳德', openId: cloneClaude }],
+      },
+    ], {
+      codexPath: fakeCodex,
+      mainClaudeCeoAppId: 'cli_main_ceo',
+      activeSessionsForChat: chatId => chatId === 'oc_x'
+        ? [{ status: 'active', cliId: 'claude-code', larkAppId: 'cli_a9771799e8bb5bc3', sessionId: 's_clone' }]
+        : [],
+    });
+    expect(r.ok).toBe(true);
+    expect(r.blockers).toEqual([]);
+  });
+
+  it('scout identity guard: main CEO active session alone is not treated as local resident clone', async () => {
+    const cloneClaude = 'ou_clone_claude';
+    const fakeCodex = makeFakeCodex(JSON.stringify({
+      blockers: [
+        { summary: '只有主 CEO session 时不能按分身接管丢弃', sourceChatId: 'oc_x', sourceMessageId: 'om_main_session', priority: 'high' },
+      ],
+      todos: [], progress: [], noteworthy: [],
+    }));
+    const { analyzeMessages } = await freshImport();
+    const r = await analyzeMessages([
+      {
+        messageId: 'om_main_session',
+        chatId: 'oc_x',
+        chatName: '群X',
+        chatType: 'group',
+        senderId: 'u1',
+        senderType: 'user',
+        msgType: 'text',
+        content: `<at user_id="${cloneClaude}">克劳德</at> 这里卡住了`,
+        createTime: '23:00',
+        mentions: [{ name: '克劳德', openId: cloneClaude }],
+      },
+    ], {
+      codexPath: fakeCodex,
+      mainClaudeCeoAppId: 'cli_main_ceo',
+      activeSessionsForChat: () => [{ status: 'active', cliId: 'claude-code', larkAppId: 'cli_main_ceo', sessionId: 's_main' }],
+    });
+    expect(r.ok).toBe(true);
+    expect(r.blockers).toHaveLength(1);
+    expect(r.blockers[0].sourceMessageId).toBe('om_main_session');
+  });
+
+  it('scout identity guard: true @main-Claude-CEO still passes', async () => {
+    const mainClaude = 'ou_65c655b50c0de2f60640960bac0d9112';
+    const fakeCodex = makeFakeCodex(JSON.stringify({
+      todos: [
+        { summary: '真 @主克劳德 CEO 仍保留', sourceChatId: 'oc_x', sourceMessageId: 'om_ceo', priority: 'high' },
+      ],
+      progress: [], blockers: [], noteworthy: [],
+    }));
+    const { analyzeMessages } = await freshImport();
+    const r = await analyzeMessages([
+      {
+        messageId: 'om_ceo',
+        chatId: 'oc_x',
+        chatName: '群X',
+        chatType: 'group',
+        senderId: 'u1',
+        senderType: 'user',
+        msgType: 'text',
+        content: `<at user_id="${mainClaude}">克劳德</at> 这个要主 CEO 处理`,
+        createTime: '23:00',
+        mentions: [{ name: '克劳德', openId: mainClaude }],
+      },
+    ], {
+      codexPath: fakeCodex,
+      mainClaudeCeoAppId: 'cli_main_ceo',
+      activeSessionsForChat: () => [{ status: 'active', cliId: 'claude-code', larkAppId: 'cli_main_ceo', sessionId: 's_main' }],
+    });
+    expect(r.ok).toBe(true);
+    expect(r.todos).toHaveLength(1);
+    expect(r.todos[0].sourceMessageId).toBe('om_ceo');
+  });
+
+  it('scout identity guard: active local Claude session hard-drop wins over true @main-Claude-CEO compensation', async () => {
+    const mainClaude = 'ou_65c655b50c0de2f60640960bac0d9112';
+    const fakeCodex = makeFakeCodex(JSON.stringify({
+      todos: [], progress: [], blockers: [], noteworthy: [],
+    }));
+    const { analyzeMessages } = await freshImport();
+    const r = await analyzeMessages([
+      {
+        messageId: 'om_ceo_in_local_chat',
+        chatId: 'oc_x',
+        chatName: '群X',
+        chatType: 'group',
+        senderId: 'u1',
+        senderType: 'user',
+        msgType: 'text',
+        content: `<at user_id="${mainClaude}">克劳德</at> 这个子群继续看下`,
+        createTime: '23:00',
+        mentions: [{ name: '克劳德', openId: mainClaude }],
+      },
+    ], {
+      codexPath: fakeCodex,
+      mainClaudeCeoAppId: 'cli_main_ceo',
+      activeSessionsForChat: () => [{ status: 'active', cliId: 'claude-code', larkAppId: 'cli_a9771799e8bb5bc3', sessionId: 's_clone' }],
+    });
+    expect(r.ok).toBe(true);
+    expect(r.todos).toEqual([]);
+    expect(r.blockers).toEqual([]);
+    expect(r.progress).toEqual([]);
+    expect(r.noteworthy).toEqual([]);
+  });
+
+  it('scout identity guard: true @main-Claude-CEO is deterministically reported even when LLM misses it', async () => {
+    const mainClaude = 'ou_65c655b50c0de2f60640960bac0d9112';
+    const fakeCodex = makeFakeCodex(JSON.stringify({
+      todos: [], progress: [], blockers: [], noteworthy: [],
+    }));
+    const { analyzeMessages } = await freshImport();
+    const r = await analyzeMessages([
+      {
+        messageId: 'om_ceo_missed',
+        chatId: 'oc_x',
+        chatName: '群X',
+        chatType: 'group',
+        senderId: 'u1',
+        senderType: 'user',
+        msgType: 'text',
+        content: `<at user_id="${mainClaude}">克劳德</at> 这个要主 CEO 处理`,
+        createTime: '23:00',
+        mentions: [{ name: '克劳德', openId: mainClaude }],
+      },
+    ], { codexPath: fakeCodex });
+    expect(r.ok).toBe(true);
+    expect(r.todos).toHaveLength(1);
+    expect(r.todos[0]).toMatchObject({
+      sourceMessageId: 'om_ceo_missed',
+      priority: 'high',
+    });
+    expect(r.todos[0].summary).toContain('@主克劳德 CEO');
+  });
+
   it('P3-rev1 #2: analyzedMessageIds is set + equals what entered prompt', async () => {
     const fakeCodex = makeFakeCodex(JSON.stringify({ todos: [], progress: [], blockers: [], noteworthy: [] }));
     const { analyzeMessages } = await freshImport();
@@ -198,19 +382,20 @@ describe('tilly-llm-analyzer (P3 commit #3)', () => {
     }
   });
 
-  it('G1 (2026-05-25): priority score — @松松 mention 把老消息拉到前面，挤掉新但低优先级的', async () => {
+  it('G1 (2026-05-25): priority score — @主克劳德 CEO mention 把老消息拉到前面，挤掉新但低优先级的', async () => {
     const fakeCodex = makeFakeCodex(JSON.stringify({ todos: [], progress: [], blockers: [], noteworthy: [] }));
     const { analyzeMessages } = await freshImport();
-    const SONGSONG = 'ou_974b9321334628537abee157413b33b6';
-    // 前 5 条 @mention 但 createTime 最老；后 100 条普通新消息。
+    const MAIN_CLAUDE = 'ou_65c655b50c0de2f60640960bac0d9112';
+    // 前 5 条 @主克劳德 CEO 但 createTime 最老；后 100 条普通新消息。
     // newest-first 老算法会丢掉 5 条 mention（被新 100 顶掉）。score 排序后
-    // 5 条 mention (+10) 应在 top，挤掉最旧的 5 条普通消息。
+    // 5 条主 CEO mention (+20) 应在 top，挤掉最旧的 5 条普通消息。
     const messages = [
       ...Array.from({ length: 5 }, (_, i) => ({
-        messageId: `om_mention_${i}`,
+        messageId: `om_ceo_mention_${i}`,
         chatId: 'oc_x', chatName: 'X', chatType: 'group', senderId: 'u1', senderType: 'user',
-        msgType: 'text', content: `<at id=${SONGSONG}></at> 关键事 ${i}`,
+        msgType: 'text', content: `<at user_id="${MAIN_CLAUDE}">克劳德</at> 关键事 ${i}`,
         createTime: `2026-05-25 01:0${i}`,
+        mentions: [{ name: '克劳德', openId: MAIN_CLAUDE }],
       })),
       ...Array.from({ length: 100 }, (_, i) => ({
         messageId: `om_new_${i.toString().padStart(3, '0')}`,
@@ -222,10 +407,51 @@ describe('tilly-llm-analyzer (P3 commit #3)', () => {
     const r = await analyzeMessages(messages, { codexPath: fakeCodex });
     expect(r.analyzedMessageIds).toHaveLength(100);
     for (let i = 0; i < 5; i++) {
-      expect(r.analyzedMessageIds).toContain(`om_mention_${i}`);
+      expect(r.analyzedMessageIds).toContain(`om_ceo_mention_${i}`);
     }
     // 5 条最老的普通新消息被挤掉（om_new_000..004，createTime 在 10:00..10:04）
     expect(r.analyzedMessageIds).not.toContain('om_new_000');
+  });
+
+  it('scout budget guard: @松松 noise cannot crowd out true @main-Claude-CEO over 100-message cap', async () => {
+    const songSong = 'ou_974b9321334628537abee157413b33b6';
+    const mainClaude = 'ou_65c655b50c0de2f60640960bac0d9112';
+    const fakeCodex = makeFakeCodex(JSON.stringify({
+      todos: [
+        { summary: '真 @主克劳德 CEO 仍应命中', sourceChatId: 'oc_x', sourceMessageId: 'om_true_ceo', priority: 'high' },
+      ],
+      progress: [], blockers: [], noteworthy: [],
+    }));
+    const { analyzeMessages } = await freshImport();
+    const messages = [
+      ...Array.from({ length: 120 }, (_, i) => ({
+        messageId: `om_song_noise_${i.toString().padStart(3, '0')}`,
+        chatId: 'oc_x',
+        chatName: 'X',
+        chatType: 'group',
+        senderId: 'u1',
+        senderType: 'user',
+        msgType: 'text',
+        content: `<at user_id="${songSong}">松松</at> 普通追问 ${i}`,
+        createTime: `2026-05-25 12:${(i % 60).toString().padStart(2, '0')}`,
+        mentions: [{ name: '松松', openId: songSong }],
+      })),
+      {
+        messageId: 'om_true_ceo',
+        chatId: 'oc_x',
+        chatName: 'X',
+        chatType: 'group',
+        senderId: 'u2',
+        senderType: 'user',
+        msgType: 'text',
+        content: `<at user_id="${mainClaude}">克劳德</at> 需要主 CEO 接管`,
+        createTime: '2026-05-25 01:00',
+        mentions: [{ name: '克劳德', openId: mainClaude }],
+      },
+    ];
+    const r = await analyzeMessages(messages, { codexPath: fakeCodex });
+    expect(r.analyzedMessageIds).toContain('om_true_ceo');
+    expect(r.todos.map(t => t.sourceMessageId)).toEqual(['om_true_ceo']);
   });
 
   describe('v2.1 commit 4: KNOWN_HANDLED_TOPICS prompt 注入', () => {

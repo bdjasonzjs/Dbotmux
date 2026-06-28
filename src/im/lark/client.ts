@@ -1,5 +1,8 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { dirname, extname, basename, join } from 'node:path';
+import { homedir } from 'node:os';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { Client, LoggerLevel } from '@larksuiteoapi/node-sdk';
 import { getBotClient, getAllBots, getBot } from '../../bot-registry.js';
 import { loadBotConfigs } from '../../bot-registry.js';
@@ -324,16 +327,53 @@ export async function getMessageDetail(
   return res.data;
 }
 
-export async function getMessageDetailAsOwnerUser(
-  larkAppId: string,
-  messageId: string,
-  options: { userCardContent?: boolean } = {},
-): Promise<any> {
-  const userCardContent = options.userCardContent ?? true;
-  const res = await feishuUserGet(larkAppId, `/im/v1/messages/${encodeURIComponent(messageId)}`, {
-    ...(userCardContent ? { card_msg_content_type: 'user_card_content' } : {}),
+// ─── observer owner-read 复用 lark-cli 的 user 授权 ─────────────────────────
+// botmux 自身没有 owner user token（user-token.json 不存在）时，observer 读不了
+// 缇蕾不在的外部群（lark 230002）。lark-cli 里克劳德 app 已有松松 user 授权且自动 refresh，
+// 复用这条已验证能读外部群的路。lark-cli 输出已是解析后的文本，统一封成 msg_type=text +
+// body.content={text}，让上游 parseApiMessage/decodeMsgText 零改动即可消费。
+const execFileAsync = promisify(execFile);
+// daemon(PM2)的 PATH 未必含 ~/.npm-global/bin，默认用绝对路径，可被 env 覆盖。
+const LARK_CLI_BIN = process.env.BOTMUX_LARK_CLI_BIN || join(homedir(), '.npm-global', 'bin', 'lark-cli');
+
+function larkCliTimeToMs(s: unknown): string {
+  if (typeof s !== 'string' || !s) return String(Date.now());
+  const t = Date.parse(s.includes('T') ? s : s.replace(' ', 'T'));
+  return Number.isFinite(t) ? String(t) : String(Date.now());
+}
+function larkCliMsgToCompat(m: any): any {
+  const text = typeof m?.content === 'string' ? m.content : (m?.content == null ? '' : JSON.stringify(m.content));
+  return {
+    message_id: m?.message_id,
+    msg_type: 'text',
+    body: { content: JSON.stringify({ text }) },
+    create_time: larkCliTimeToMs(m?.create_time),
+    update_time: larkCliTimeToMs(m?.update_time ?? m?.create_time),
+    sender: { id: m?.sender?.id, sender_type: m?.sender?.sender_type, id_type: m?.sender?.id_type },
+    deleted: !!m?.deleted,
+  };
+}
+async function larkCliExec(args: string[]): Promise<any> {
+  const { stdout } = await execFileAsync(LARK_CLI_BIN, [...args, '--as', 'user', '--format', 'json'], {
+    encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, env: { ...process.env, LARK_CLI_NO_PROXY: '1' },
   });
-  return res.data;
+  const j = JSON.parse(stdout);
+  if (!j?.ok) throw new Error(`lark-cli read failed: ${j?.error?.message ?? 'unknown'} (code: ${j?.error?.code ?? '?'})`);
+  return j.data;
+}
+async function larkCliListMessages(chatId: string, sort: 'asc' | 'desc', pageSize: number): Promise<any[]> {
+  const data = await larkCliExec(['im', '+chat-messages-list', '--chat-id', chatId, '--page-size', String(Math.min(pageSize, LARK_MESSAGE_LIST_MAX_PAGE)), '--sort', sort]);
+  return (data?.messages ?? []).map(larkCliMsgToCompat);
+}
+
+export async function getMessageDetailAsOwnerUser(
+  _larkAppId: string,
+  messageId: string,
+  _options: { userCardContent?: boolean } = {},
+): Promise<any> {
+  const data = await larkCliExec(['im', '+messages-mget', '--message-ids', messageId]);
+  const items = ((data?.items ?? data?.messages) ?? []).map(larkCliMsgToCompat);
+  return { items };
 }
 
 export async function downloadMessageResource(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file', savePath: string): Promise<void> {
@@ -634,23 +674,11 @@ async function feishuUserGet(larkAppId: string, path: string, params: Record<str
  *  Used only as a fallback for external-watch/taskteam observer cases where the
  *  observer bot is not in the target chat but the owner user is. */
 export async function listChatMessagesAsOwnerUser(
-  larkAppId: string, chatId: string, pageSize: number = 50,
+  _larkAppId: string, chatId: string, pageSize: number = 50,
 ): Promise<any[]> {
-  const allMessages: any[] = [];
-  let pageToken: string | undefined;
-  do {
-    const res = await feishuUserGet(larkAppId, '/im/v1/messages', {
-      container_id_type: 'chat',
-      container_id: chatId,
-      page_size: Math.min(pageSize, LARK_MESSAGE_LIST_MAX_PAGE),
-      sort_type: 'ByCreateTimeDesc',
-      page_token: pageToken,
-    });
-    if (res.data?.items) allMessages.push(...res.data.items);
-    pageToken = res.data?.page_token;
-    if (allMessages.length >= pageSize) break;
-  } while (pageToken);
-  return allMessages.slice(0, pageSize).reverse();
+  // Desc(最新在前) → reverse 成 chronological(老→新)，对齐 bot 版 listChatMessages 的返回顺序。
+  const msgs = await larkCliListMessages(chatId, 'desc', pageSize);
+  return msgs.slice(0, pageSize).reverse();
 }
 
 /** 子任务观测专用：从 startTimeSec 起、**ByCreateTimeAsc(老→新)** 拉一页消息。
@@ -679,18 +707,15 @@ export async function listMessagesAsc(
 }
 
 export async function listMessagesAscAsOwnerUser(
-  larkAppId: string, chatId: string,
+  _larkAppId: string, chatId: string,
   opts: { startTimeSec?: string; pageSize?: number; pageToken?: string } = {},
 ): Promise<{ items: any[]; nextPageToken: string | null }> {
-  const res = await feishuUserGet(larkAppId, '/im/v1/messages', {
-    container_id_type: 'chat',
-    container_id: chatId,
-    page_size: Math.min(opts.pageSize ?? 40, LARK_MESSAGE_LIST_MAX_PAGE),
-    sort_type: 'ByCreateTimeAsc',
-    start_time: opts.startTimeSec,
-    page_token: opts.pageToken,
-  });
-  return { items: res.data?.items ?? [], nextPageToken: res.data?.has_more ? (res.data?.page_token ?? null) : null };
+  // lark-cli 复用路径：必须取「最近 pageSize 条」(desc 拉取再 reverse 成 老→新)，**不是** asc 直拉——
+  // asc 直拉会从群最早的消息开始，cursor(最近那条)落在窗口外 → fetchSince found 失败 → 误判 CursorInvalid。
+  // observer 的 fetchSince 按 message_id 精确切 cursor；cursor 真超出最近 pageSize 条才 CursorInvalid → 跳最新
+  // (外部群监控不补历史)。单页 LARK_MESSAGE_LIST_MAX_PAGE 上限足够覆盖一个 tick 的增量。
+  const msgs = await larkCliListMessages(chatId, 'desc', opts.pageSize ?? 40);
+  return { items: msgs.reverse(), nextPageToken: null };
 }
 
 export interface AmbientChatMessageOptions {

@@ -3151,7 +3151,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         // (store 层 filter)，runtime narrow 给 TS 一个 anchor。
         const knownHandled = listRecentHandledHigh({ maxAgeHours: 24, limit: 20 })
           .filter((i): i is typeof i & { status: 'processed' | 'dismissed' } => i.status === 'processed' || i.status === 'dismissed');
-        const digest = await analyzeMessages(fresh, { knownHandled });
+        const digest = await analyzeMessages(fresh, {
+          knownHandled,
+          mainClaudeCeoAppId: claudeIdent.larkAppId,
+        });
         if (!digest.ok) {
           tickFailed = true;
           tickFailReason = `LLM analyze: ${digest.error}`;

@@ -8,11 +8,17 @@
  */
 import { spawn } from 'node:child_process';
 import { logger } from '../utils/logger.js';
-import { listMessagesAsc, getMessageDetail } from '../im/lark/client.js';
+import {
+  listMessagesAsc,
+  getMessageDetail,
+  listMessagesAscAsOwnerUser,
+  getMessageDetailAsOwnerUser,
+} from '../im/lark/client.js';
 import { resolveBotIdent } from '../core/main-bot-playbook.js';
 import { parseApiMessage, isPureCardUpgradeFallback } from '../im/lark/message-parser.js';
 import type { ObserverExecutors, JudgeContext, JudgeResult } from './subtask-observer.js';
 import { recoverManagerSessionViaDaemon } from './manager-auto-recover.js';
+import { shouldTryOwnerUserMessageReadFallback, isCursorGoneError } from './taskteam-observe-executors.js';
 
 /** afterMessageId 翻页扫到尾仍找不到 (消息被删/cursor 失效)。重试不会变好 → 不空返。 */
 export class CursorNotFoundError extends Error {
@@ -127,6 +133,29 @@ async function cocoJudge(prompt: string): Promise<JudgeResult | null> {
   }
 }
 
+/** observer 缇蕾 bot 读不到「自己不在的外部群」(lark 230002 等) 时，复用 owner user 授权
+ *  (lark-cli) 兜底——镜像 taskteam-observe-executors 的同名逻辑，复用其已验证的判定谓词，
+ *  仅日志前缀不同。cursor 永久失效 / 非权限类错误照常抛出，不被兜底掩盖。 */
+async function withOwnerUserFallback<T>(
+  label: string,
+  botRead: () => Promise<T>,
+  ownerRead: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await botRead();
+  } catch (err) {
+    if (isCursorGoneError(err) || !shouldTryOwnerUserMessageReadFallback(err)) throw err;
+    try {
+      const result = await ownerRead();
+      logger.info(`[subtask-observe-exec] ${label}: observer bot read failed; used owner user token fallback (${err instanceof Error ? err.message : err})`);
+      return result;
+    } catch (ownerErr) {
+      logger.warn(`[subtask-observe-exec] ${label}: owner user fallback failed: ${ownerErr instanceof Error ? ownerErr.message : ownerErr}`);
+      throw err;
+    }
+  }
+}
+
 export function makeObserverExecutors(): ObserverExecutors {
   const tilly = resolveBotIdent('tilly');
   return {
@@ -134,7 +163,11 @@ export function makeObserverExecutors(): ObserverExecutors {
       // afterMessageId 的 create_time → start_time (秒)。无 cursor 从头读。
       let startTimeSec: string | undefined;
       if (afterMessageId) {
-        const detail = await getMessageDetail(tilly.larkAppId, afterMessageId, { userCardContent: false });
+        const detail = await withOwnerUserFallback(
+          `cursor-detail ${afterMessageId}`,
+          () => getMessageDetail(tilly.larkAppId, afterMessageId, { userCardContent: false }),
+          () => getMessageDetailAsOwnerUser(tilly.larkAppId, afterMessageId, { userCardContent: false }),
+        );
         const ct = detail?.items?.[0]?.create_time; // ms 字符串
         // P1: create_time 缺/NaN 也必须抛 (别退化成从头读伪装连续)
         if (!ct || !Number.isFinite(Number(ct))) {
@@ -152,7 +185,11 @@ export function makeObserverExecutors(): ObserverExecutors {
       let reachedTail = false; // 只有真翻到群尾 (nextPageToken==null) 才置 true
       while (pages < MAX_PAGES) {
         pages += 1;
-        const { items, nextPageToken } = await listMessagesAsc(tilly.larkAppId, chatId, { startTimeSec, pageSize: limit, pageToken });
+        const { items, nextPageToken } = await withOwnerUserFallback(
+          `list ${chatId}`,
+          () => listMessagesAsc(tilly.larkAppId, chatId, { startTimeSec, pageSize: limit, pageToken }),
+          () => listMessagesAscAsOwnerUser(tilly.larkAppId, chatId, { startTimeSec, pageSize: limit, pageToken }),
+        );
         for (const m of items) {
           if (!found) {
             if (m.message_id === afterMessageId) found = true; // 切到它，之后才开始收

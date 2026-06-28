@@ -39,6 +39,7 @@ export interface TillyMessage {
   createTime: string;
   threadId?: string;
   appLink?: string;
+  mentions?: Array<{ key?: string; name?: string; openId?: string }>;
 }
 
 export interface FetchOpts {
@@ -145,6 +146,13 @@ function toISO8601(d: Date): string {
 
 function normalizeMessage(raw: any): TillyMessage | null {
   if (!raw || typeof raw !== 'object' || !raw.message_id) return null;
+  const mentions = Array.isArray(raw.mentions)
+    ? raw.mentions.map((m: any) => ({
+        key: typeof m?.key === 'string' ? m.key : undefined,
+        name: typeof m?.name === 'string' ? m.name : undefined,
+        openId: typeof m?.id?.open_id === 'string' ? m.id.open_id : undefined,
+      })).filter((m: any) => m.key || m.name || m.openId)
+    : undefined;
   return {
     messageId: raw.message_id,
     chatId: raw.chat_id ?? '',
@@ -157,6 +165,7 @@ function normalizeMessage(raw: any): TillyMessage | null {
     createTime: raw.create_time ?? '',
     threadId: raw.thread_id || undefined,
     appLink: raw.message_app_link || undefined,
+    mentions,
   };
 }
 

@@ -106,13 +106,24 @@ const OWNER_USER_FALLBACK_CODES: ReadonlySet<number> = new Set([
   99991663, // no permission
   232024,  // bot not in chat / cannot operate target chat
   230020,  // message/chat not visible to current app
+  230002,  // Bot/User can NOT be out of the chat（observer bot 不在被监控的外部群）
 ]);
 
 export function shouldTryOwnerUserMessageReadFallback(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
+  // ① lark 业务码：from message `(code: NNN)`（client 自己格式化的错误）
   const m = /\(code:\s*(\d+)\)/.exec(msg);
   if (m && OWNER_USER_FALLBACK_CODES.has(Number(m[1]))) return true;
-  return /permission|not in chat|not.*member|not visible|forbidden|Bot is NOT in the group/i.test(msg);
+  // ② lark SDK 对「bot 不在群」等返回 HTTP 4xx → 抛裸 AxiosError，lark code 不在 message 里、
+  //    而在 err.response.data.code；显式从 axios 结构里取码判断。
+  const respCode = (err as any)?.response?.data?.code;
+  if (typeof respCode === 'number' && OWNER_USER_FALLBACK_CODES.has(respCode)) return true;
+  // ③ 关键词（含 230002 文案）
+  if (/permission|not in chat|not.*member|not visible|forbidden|Bot is NOT in the group|can ?not be out of the chat/i.test(msg)) return true;
+  // ④ 兜底：observer 读群时 SDK 抛的裸 HTTP 4xx（lark code 既不在 message 也取不到结构）。
+  //    observer 读失败一律尝试 owner-user 兜底；owner 读也失败会抛回原 err，不掩盖真错。
+  if ((err as any)?.isAxiosError === true || /\bstatus code 4\d\d\b/i.test(msg)) return true;
+  return false;
 }
 
 async function withOwnerUserFallback<T>(

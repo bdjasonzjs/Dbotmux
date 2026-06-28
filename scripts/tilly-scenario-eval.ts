@@ -68,6 +68,10 @@ async function main() {
         ownerProfile: OWNER_PROFILE,
         dynamicContext: EMPTY_HOT,
         memoryToday: sc.memoryToday,   // undefined → buildMemoryTodayBlock 会读 temp dir (空) → "今日还未累积"
+        mainClaudeCeoAppId: 'cli_main_claude_ceo',
+        activeSessionsForChat: chatId => chatId === 'oc_active_claude_session'
+          ? [{ status: 'active', cliId: 'claude-code', larkAppId: 'cli_a9771799e8bb5bc3', sessionId: 'tilly-eval-local-claude' }]
+          : [],
       });
 
       const reportedIds = new Set<string>([

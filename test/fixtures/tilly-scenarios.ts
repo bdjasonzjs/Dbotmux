@@ -31,12 +31,20 @@ export interface Scenario {
 }
 
 const SONGSONG = 'ou_974b9321334628537abee157413b33b6';
+const MAIN_CLAUDE_CEO = 'ou_65c655b50c0de2f60640960bac0d9112';
+const LOCAL_CLAUDE = 'ou_local_claude_session';
 
 // helper: 造一条消息
 function msg(
   id: string, chatName: string, sender: string, text: string,
   label: 'signal' | 'noise', rationale: string,
-  opts: { chatId?: string; senderType?: string; msgType?: string; createTime?: string } = {},
+  opts: {
+    chatId?: string;
+    senderType?: string;
+    msgType?: string;
+    createTime?: string;
+    mentions?: Array<{ key?: string; name?: string; openId?: string }>;
+  } = {},
 ): ScenarioMessage {
   return {
     messageId: id,
@@ -48,6 +56,7 @@ function msg(
     msgType: opts.msgType ?? 'text',
     content: text,
     createTime: opts.createTime ?? '2026-05-29 10:00',
+    mentions: opts.mentions,
     label,
     rationale,
   };
@@ -74,7 +83,7 @@ export const SCENARIOS: Scenario[] = [
     messages: [
       msg('om_n2_1', '日常摸鱼群', 'colleagueA', '周五啦 下班冲', 'noise', '闲聊'),
       msg('om_n2_2', '前端技术交流', 'colleagueC', 'pnpm 和 npm workspace 哪个好用', 'noise', '工具咨询'),
-      msg('om_s2_1', '豆包CUA-非GUI工具', 'pmLin', `<at user_id="${SONGSONG}">松松</at> non-GUI 工具的埋点方案，A（前端埋）还是 B（服务端埋）你拍一下，今天要定`, 'signal', '直接 @松松 求决策, 且是他业务(豆包 CUA non-GUI 工具)'),
+      msg('om_s2_1', '豆包CUA-非GUI工具', 'pmLin', `<at user_id="${SONGSONG}">松松</at> non-GUI 工具的埋点方案，A（前端埋）还是 B（服务端埋）你拍一下，今天要定`, 'noise', '@松松 不等于 @主克劳德 CEO, scout 不应升级主话题', { mentions: [{ name: '松松', openId: SONGSONG }] }),
       msg('om_n2_3', '基础架构群', 'rdY', 'CI 跑挂了我看看', 'noise', '别人的事'),
     ],
   },
@@ -84,7 +93,7 @@ export const SCENARIOS: Scenario[] = [
     name: '松松自己PR被打回',
     description: 'reviewer 打回松松的 MR 且列了改动点, 该进 todo',
     messages: [
-      msg('om_s3_1', 'CUA 代码 review', 'weixu', `<at user_id="${SONGSONG}">松松</at> 你那个 CUA 协议分层的 MR 我 review 了，AskHuman 兜底那块有个 race，先打回了，你看下评论改完再合`, 'signal', '松松自己的 MR 被 reviewer 打回 + 明确改动点'),
+      msg('om_s3_1', 'CUA 代码 review', 'weixu', `<at user_id="${SONGSONG}">松松</at> 你那个 CUA 协议分层的 MR 我 review 了，AskHuman 兜底那块有个 race，先打回了，你看下评论改完再合`, 'noise', '@松松 的 MR 提醒由源群处理, 不等价 @主克劳德 CEO', { mentions: [{ name: '松松', openId: SONGSONG }] }),
       msg('om_n3_1', '日常摸鱼群', 'colleagueB', '哈哈哈这个表情包绝了', 'noise', '闲聊'),
       msg('om_n3_2', '前端技术交流', 'colleagueE', 'TS 5.5 的 infer 有人用过吗', 'noise', '技术闲聊, 没 @松松'),
     ],
@@ -97,7 +106,7 @@ export const SCENARIOS: Scenario[] = [
     messages: [
       msg('om_n4_1', 'CUA 开发', 'rdZ', '现在这个 CUA 方案对普通用户来说太复杂了，得等安全的同学给个处理办法才能继续', 'noise', '设计/产品讨论 + 等别人, 不是松松的 blocker'),
       msg('om_n4_2', 'Flux Island', 'rdW', 'brew 装的 Codex CLI 现在识别不到，配置读取也异常，hooks 适配还是卡着', 'noise', '工具环境问题, 跟松松自己的代码无关'),
-      msg('om_n4_3', 'CUA RD联调群', 'qaM', `埋点这块进度怎么样了 <at user_id="${SONGSONG}">松松</at> 看下`, 'noise', '顺手 @松松 周知/追问, 不是求他亲自决策; 他进群一眼能看见'),
+      msg('om_n4_3', 'CUA RD联调群', 'qaM', `埋点这块进度怎么样了 <at user_id="${SONGSONG}">松松</at> 看下`, 'noise', '顺手 @松松 周知/追问, 且 @松松 不等于 @主克劳德 CEO', { mentions: [{ name: '松松', openId: SONGSONG }] }),
       msg('om_n4_4', '某基础组件群', 'rdN', '这个 storybook 组件 blocked 我了，谁 review 下 PR', 'noise', '别人自己 blocked + 跟豆包 CUA/AI 工作流无关'),
     ],
   },
@@ -135,7 +144,7 @@ export const SCENARIOS: Scenario[] = [
 [noteworthy] (0)
 </MEMORY_TODAY>`,
     messages: [
-      msg('om_s6_1', 'ty问题', 'rdT', `定位到了！ClientHeartbeat 是在 Chromium 网络层 ERR_FAILED(-2) 挂的，根因在客户端网络请求侧不是服务端。<at user_id="${SONGSONG}">松松</at> 你白天在追这个，同步给你`, 'signal', '同一线但有根因新证据 + @松松, dedup 例外该输出'),
+      msg('om_s6_1', 'ty问题', 'rdT', `定位到了！ClientHeartbeat 是在 Chromium 网络层 ERR_FAILED(-2) 挂的，根因在客户端网络请求侧不是服务端。<at user_id="${SONGSONG}">松松</at> 你白天在追这个，同步给你`, 'noise', '同一线有新证据但只 @松松, 不升级主克劳德 CEO', { mentions: [{ name: '松松', openId: SONGSONG }] }),
       msg('om_n6_1', '前端技术交流', 'colleagueE', 'vite 6 出了', 'noise', '技术闲聊'),
     ],
     softNote: '边界 case: coco 判 drop (因为同 topic) 也不算硬错, 但理想该输出 (有新证据例外)',
@@ -146,8 +155,20 @@ export const SCENARIOS: Scenario[] = [
     name: '松松发布的版本线上报错',
     description: '松松上午发的 528 版本线上 /do 接口报错, 该进 blocker',
     messages: [
-      msg('om_s7_1', 'CUA 线上告警', 'oncallBot', `线上 CUA 服务 528 版本（<at user_id="${SONGSONG}">松松</at> 上午发的）/do 接口 500 飙升，现在影响联调，需要决定回滚还是 hotfix`, 'signal', '松松自己发布的版本线上出事 + 需要他决定回滚/hotfix'),
+      msg('om_s7_1', 'CUA 线上告警', 'oncallBot', `线上 CUA 服务 528 版本（<at user_id="${SONGSONG}">松松</at> 上午发的）/do 接口 500 飙升，现在影响联调，需要决定回滚还是 hotfix`, 'noise', '@松松 线上告警不能被误当作 @主克劳德 CEO high-prio', { mentions: [{ name: '松松', openId: SONGSONG }] }),
       msg('om_n7_1', '日常摸鱼群', 'colleagueB', '谁约了今晚的团建', 'noise', '闲聊'),
+    ],
+  },
+
+  // ── 场景 8: 本次事故回归 — @松松 / 常驻分身 / 真主CEO 三分法 ─────
+  {
+    name: '主克劳德CEO_mention边界回归',
+    description: '@松松 不升级；本群常驻 Claude 分身被 @ 不升级；常驻分身群内即使显式 @主CEO 也不升级；无分身群真 @主克劳德 CEO 仍命中',
+    messages: [
+      msg('om_n8_song', '误报样本群', 'rdA', `<at user_id="${SONGSONG}">松松</at> 这个点需要你看一下`, 'noise', '@松松 不是 @主克劳德 CEO', { chatId: 'oc_tilly_fp_song', mentions: [{ name: '松松', openId: SONGSONG }] }),
+      msg('om_n8_local_claude', '常驻分身群', 'rdB', `<at user_id="${LOCAL_CLAUDE}">克劳德</at> 这个子群里的任务继续看下`, 'noise', '群内已有 active claude session 时由常驻分身处理, scout 不升级主话题', { chatId: 'oc_active_claude_session', mentions: [{ name: '克劳德', openId: LOCAL_CLAUDE }] }),
+      msg('om_n8_main_ceo_with_local_session', '常驻分身群', 'rdB', `<at user_id="${MAIN_CLAUDE_CEO}">克劳德</at> 这个子群里的任务也继续看下`, 'noise', '群内已有 active claude session 时 hard drop 先于主 CEO mention 补偿', { chatId: 'oc_active_claude_session', mentions: [{ name: '克劳德', openId: MAIN_CLAUDE_CEO }] }),
+      msg('om_s8_main_ceo', '主CEO求助群', 'rdC', `<at user_id="${MAIN_CLAUDE_CEO}">克劳德</at> 这里需要主 CEO 判断是否接管，当前子群无人处理`, 'signal', '真实 @主克劳德 CEO open_id, 应命中', { chatId: 'oc_main_ceo_hit', mentions: [{ name: '克劳德', openId: MAIN_CLAUDE_CEO }] }),
     ],
   },
 ];
