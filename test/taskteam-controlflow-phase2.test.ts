@@ -147,6 +147,75 @@ describe('块1 · judge 受限数据槽配置化（不破防注入）', () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────
+// 块1b：事件级 attribution policy（MoA 外部群消息能产出业务事件 · reviewer High）
+// ─────────────────────────────────────────────────────────────────────────
+describe('块1b · attribution policy（external 让外部群消息产出业务事件，做实 MoA 初衷）', () => {
+  // MoA 监控 type：new-bug 声明 external（外部群成员/非绑定 sender 可触发）；notify 规则不依赖 fromSlot
+  const moaType = (): TaskTeamType => ({
+    typeId: 'tt_type_p2', name: 'MoA 监控',
+    roleSlots: [{ slotId: 'tt_slot_analyst', roleId: 'tt_role_analyst' }],
+    rules: ['tt_rule_notify_bug'],
+    policy: { reviewRounds: 0, reviewQuorum: 1, maxRework: 0, escalateAfterStallMs: 0, reviewOrder: [] },
+    events: [{ type: 'new-bug', producer: 'behavior', attribution: 'external' }],
+  });
+  const notifyRule: TaskTeamCollabRule = { ruleId: 'tt_rule_notify_bug', when: { event: 'new-bug', status: 'running' }, whoSlot: 'tt_slot_analyst', do: 'notify' };
+  const moaInstance = () => instance({
+    roleInstances: [ri('tt_ri_analyst', 'tt_slot_analyst', 'tt_role_analyst', 'ou_analyst')],
+    status: 'running',
+  });
+
+  it('外部群 unknown sender → judge 判出 new-bug（无 by，仅 source）→ detect 真产出 external 事件（无 role 归因）', async () => {
+    // 非绑定 sender（外部群普通人），judge 只给 type+source（不归因到任何 role）
+    const fetchExt: TaskTeamFetchSinceFn = async () => ({ messages: [{ id: 'om_ext_1', text: '线上又崩了 P0', senderId: 'ou_outsider_not_bound' }] });
+    const judge: TaskTeamJudgeFn = async () => [{ type: 'new-bug', source: 'M1' }];
+    const type = moaType();
+    const exec = makeTaskTeamObserveExecutors('cli_o', { judge, fetchSince: fetchExt, resolveType: () => type });
+    const res = await exec.detect(moaInstance(), null);
+    expect(res.events).toHaveLength(1); // 不再 detect=1 events=0
+    expect(res.events[0]).toMatchObject({ type: 'new-bug', attribution: 'external', sourceEventId: 'om_ext_1' });
+    expect(res.events[0].fromRoleInstanceId).toBeUndefined(); // 无 role actor，显式标记 external
+  });
+
+  it('下游：external 事件喂引擎 → 命中 when:{event:new-bug} 的 notify 规则、投递 analyst、不 NPE', () => {
+    const type = moaType();
+    const roles = [role('tt_role_analyst')];
+    const inst = moaInstance();
+    const externalEvent = { type: 'new-bug', attribution: 'external' as const, sourceEventId: 'om_ext_1' }; // 无 fromRoleInstanceId/fromSlotId
+    const d = decideTeamActions({ instance: inst, type, roles, rules: [notifyRule], event: externalEvent });
+    expect(d.actions).toHaveLength(1);
+    expect(d.actions[0]).toMatchObject({ actionType: 'notify', targetRoleInstanceId: 'tt_ri_analyst' });
+    expect(d.actions[0].sourceRoleInstanceId).toBeUndefined(); // 源无 role，安全
+    expect(d.nextStatus).toBeUndefined(); // notify 不隐式跃迁
+    // dispatcher 渲染不依赖 source role → 不报错、@ 目标席位
+    const action = { actionType: 'notify', targetRoleInstanceId: 'tt_ri_analyst', payload: d.actions[0].payload } as unknown as TaskTeamAction;
+    expect(renderTaskTeamCommand(action, inst)).toContain('<at user_id="ou_analyst"></at>');
+  });
+
+  it('安全不放松：external 事件缺 source → detect 仍丢弃（防注入，source 强制保留）', async () => {
+    const fetchExt: TaskTeamFetchSinceFn = async () => ({ messages: [{ id: 'om_ext_1', text: 'x', senderId: 'ou_outsider' }] });
+    const judge: TaskTeamJudgeFn = async () => [{ type: 'new-bug' }]; // 无 source
+    const type = moaType();
+    const exec = makeTaskTeamObserveExecutors('cli_o', { judge, fetchSince: fetchExt, resolveType: () => type });
+    const res = await exec.detect(moaInstance(), null);
+    expect(res.events).toEqual([]); // 缺 source → 丢
+  });
+
+  it('validator：external 事件被依赖 when.fromSlotId 的 rule 引用 → error', () => {
+    const type: TaskTeamType = {
+      ...moaType(),
+      roleSlots: [{ slotId: 'tt_slot_analyst', roleId: 'tt_role_analyst' }, { slotId: 'tt_slot_x', roleId: 'tt_role_analyst' }],
+      rules: ['tt_rule_bad'],
+    };
+    const badRule: TaskTeamCollabRule = { ruleId: 'tt_rule_bad', when: { event: 'new-bug', status: 'running', fromSlotId: 'tt_slot_x' }, whoSlot: 'tt_slot_analyst', do: 'notify' };
+    const cfg: TaskTeamConfigFile = {
+      version: 1, roles: [role('tt_role_analyst')], rules: [badRule], teamTypes: [type], orgStructures: [], orgRuntimeBindings: [], updatedAt: 't',
+    };
+    const v = validateTaskTeamConfig(cfg);
+    expect(v.errors.some(e => e.code === 'external-event-fromslot')).toBe(true);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
 // 块2：领域无关动作 notify / wake-role / route-to-owner
 // ─────────────────────────────────────────────────────────────────────────
 describe('块2 · 领域无关动作（不隐式跃迁 + dispatch 字段）', () => {

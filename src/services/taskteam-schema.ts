@@ -146,10 +146,20 @@ export interface TaskTeamCollabPolicy {
   reviewOrder: TaskTeamSlotId[];
 }
 
+// 事件归因策略（阶段2 §2.2 High：让 MoA 外部群消息能产出业务事件）——
+//   · 'role'     = 必须归因到本组 role instance（缺 role 即丢，开发协作事件默认此值，行为不变）。
+//   · 'external' = 外部参与者（owner/外部群成员/非绑定 sender）也可触发；**source 仍强制**（防注入），
+//                  但不要求 fromRoleInstanceId/fromSlotId——source-only 即可产事件（MoA new-bug 用此）。
+//   · 'none'     = 无具体 actor（团队级/系统级事件）；同样 source-only、无 role 归因。
+// 关键：external/none 事件**不能被依赖 when.fromSlotId 的 rule 引用**（无可靠 fromSlot，validator 拦）。
+export type TaskTeamEventAttribution = 'role' | 'external' | 'none';
+
 // 事件声明（阶段1 内核②）——见 taskteam-event-registry.ts。在此前置声明以避免循环 import。
 export interface TaskTeamEventDecl {
   type: string;
   producer: 'lifecycle' | 'behavior' | 'timer';
+  /** 可选归因策略（阶段2）。不设时：内置事件按 registry 默认（开发协作=role、stall=none）、自定义 behavior 默认 role。 */
+  attribution?: TaskTeamEventAttribution;
 }
 
 // judge 受限数据槽（阶段2 §2.2）——把判读 prompt 的「可判读事件描述 + 决策提示 + 输出事件白名单」下沉为

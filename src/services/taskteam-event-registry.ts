@@ -10,7 +10,7 @@
 //    typo 在 validator 报错而非运行时静默丢。
 
 import type { TaskTeamEventType } from './taskteam-engine.js';
-import type { TaskTeamEventDecl, TaskTeamType } from './taskteam-schema.js';
+import type { TaskTeamEventAttribution, TaskTeamEventDecl, TaskTeamType } from './taskteam-schema.js';
 
 // 事件的「产出方」：谁能在运行时真正产生该事件——validator 用它做生产侧覆盖检查。
 // canonical 声明 shape 在 taskteam-schema.ts（TaskTeamType.events 引用），此处只取其 producer 字段类型。
@@ -85,4 +85,30 @@ export function isProducibleForType(type: TypeWithEvents, eventType: string): bo
   if (detectableEventsForType(type).has(eventType)) return true;
   if (BUILTIN_TIMER_EVENT_TYPES.has(eventType)) return true;
   return false;
+}
+
+// 内置事件的默认归因策略（阶段2 §2.2 High）。开发协作 behavior 都是 'role'（保持现状）；
+// stall 是 clock 产的无 actor 事件 = 'none'；生命周期事件不经 judge 归因、取 'role' 兜底无副作用。
+const BUILTIN_EVENT_ATTRIBUTION: Readonly<Record<string, TaskTeamEventAttribution>> = {
+  submit: 'role',
+  'review-pass': 'role',
+  'review-reject': 'role',
+  'ask-help': 'role',
+  report: 'role',
+  consult: 'role',
+  escalate: 'role',
+  stall: 'none',
+};
+
+/**
+ * 某事件在该 type 下的归因策略（阶段2 §2.2 High）：
+ *  - type.events 显式声明的 attribution 优先；
+ *  - 否则内置事件查 BUILTIN_EVENT_ATTRIBUTION（开发协作=role、stall=none）；
+ *  - 自定义 behavior 未声明 attribution → 默认 'role'（最严，不放松现有行为）。
+ * type 缺省（单测/未接 config）时只查内置表。
+ */
+export function attributionForEvent(type: TypeWithEvents | undefined, eventType: string): TaskTeamEventAttribution {
+  const decl = type?.events?.find(d => d.type === eventType);
+  if (decl?.attribution) return decl.attribution;
+  return BUILTIN_EVENT_ATTRIBUTION[eventType] ?? 'role';
 }

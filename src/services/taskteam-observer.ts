@@ -71,7 +71,8 @@ export function maybeStallEvent(
   const ref = Date.parse(anchor);
   if (!Number.isFinite(ref)) return null;
   if (now.getTime() - ref < ms) return null; // 未到停滞阈值
-  return { type: 'stall', sourceEventId: `stall:${team.teamId}:${ref}` };
+  // attribution='none'：clock 产的无 actor 事件，下游一眼识别无 role 归因（阶段2 §2.2 High）。
+  return { type: 'stall', sourceEventId: `stall:${team.teamId}:${ref}`, attribution: 'none' };
 }
 
 export function observedChatIdForTaskTeam(team: Pick<TaskTeamInstance, 'chatId' | 'targetExternalChatId'>): string {

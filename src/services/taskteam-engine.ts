@@ -50,6 +50,14 @@ export interface TeamEvent {
    * behavior」不再因共享 round/cursor 撞 key 被去重吞掉。缺省（显式入口/测试无来源）时 emit 回退 r{round}。
    */
   sourceEventId?: string;
+  /**
+   * 归因策略标记（阶段2 §2.2 High）——由 mapBehaviorToEvent 按事件 attributionPolicy 显式填上，**让下游一眼识别**
+   * 此事件有没有 role actor，而非靠「fromRoleInstanceId 恰好 undefined」去猜：
+   *  - 'role'：有 fromRoleInstanceId/fromSlotId（开发协作事件，行为不变）。
+   *  - 'external'：外部参与者触发，**有 sourceEventId、无 fromRoleInstanceId/fromSlotId**（MoA 外部群 new-bug）。
+   *  - 'none'：无 actor（clock stall 等）。缺省（显式入口/旧路径）按 'role' 语义处理（不破坏现状）。
+   */
+  attribution?: 'role' | 'external' | 'none';
 }
 
 // 引擎决策的单条投递命令（enqueueTaskTeamAction 的输入形态；不含 actionId/status/时间戳——那些是 store 侧副作用）

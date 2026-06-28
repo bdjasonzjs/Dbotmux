@@ -24,6 +24,7 @@ import type { TaskTeamObserverExecutors, TaskTeamDetectResult } from './taskteam
 import type { TaskTeamInstance, TaskTeamType } from './taskteam-schema.js';
 import type { TeamEvent } from './taskteam-engine.js';
 import {
+  attributionForEvent,
   BUILTIN_DETECTABLE_EVENT_TYPES,
   BUILTIN_TIMER_EVENT_TYPES,
   detectableEventsForType,
@@ -425,6 +426,12 @@ export interface MapBehaviorContext {
   sourceEventId?: string;
   /** 该 type 的可判读事件集（内置 detectable ∪ type.events 声明的 behavior 事件）。缺省 = 内置 detectable。 */
   detectable?: ReadonlySet<string>;
+  /**
+   * 该事件的归因策略（阶段2 §2.2 High）。由 detect 按 attributionForEvent(type, b.type) 注入。
+   *  - 'role'（缺省）：必须归因到 role instance，否则丢弃（开发协作事件，行为不变）。
+   *  - 'external'/'none'：允许 source-only——by 可缺/ext，不强填 fromRoleInstanceId，**不因缺 role 丢**（MoA 外部群消息）。
+   */
+  attribution?: 'role' | 'external' | 'none';
 }
 
 /**
@@ -433,7 +440,9 @@ export interface MapBehaviorContext {
  *    ⚠️ stall **不在 detectable 集**（修 reviewer Blocker：stall 只能由 clock 产）→ judge 输出 stall 一律在此丢弃。
  *  - 归因：by = 短稳定别名 `R{序号}`（按位置确定性解析回 roleInstances[序号-1]）；也兼容直接给 roleInstanceId / slotId。
  *    LLM 只回显眼前看得见的 2 字符别名，**不抄任何 open_id**——根治 sender 截断失配。
- *  - 角色行为归因不到具体 roleInstance → 丢弃（不伪造来源）。
+ *  - attribution（阶段2 §2.2 High）：'role' 归因不到 role instance → 丢弃；'external'/'none' 允许 source-only、
+ *    不因缺 role 丢（让 MoA 外部群普通人/外部成员的消息也能产出业务事件）。返回的 TeamEvent **显式带 attribution 标记**，
+ *    下游一眼识别有无 role actor（不靠 fromRoleInstanceId undefined 猜）。安全不放松：external 的 source 强制仍在 detect 层把关。
  *  - sourceEventId（约束1）：由 ctx 注入（detect 解析 source 别名得来）；缺省不带（单测纯映射场景）。
  */
 export function mapBehaviorToEvent(
@@ -444,6 +453,7 @@ export function mapBehaviorToEvent(
   const detectable = ctx.detectable ?? BUILTIN_DETECTABLE_EVENT_TYPES;
   if (!detectable.has(b.type)) return null; // 含 stall：不在 detectable → judge 伪造的 stall 在此丢弃
   const type = b.type;
+  const attribution = ctx.attribution ?? 'role';
 
   let ri = undefined;
   if (b.by) {
@@ -458,10 +468,12 @@ export function mapBehaviorToEvent(
     if (!ri) ri = instance.roleInstances.find((r) => r.slotId === b.by);
   }
 
-  if (!ri) return null; // 归因不到角色的行为 → 丢弃（judge 判读路径所有事件都须可归因）
+  // role 事件归因不到具体 roleInstance → 丢弃（不伪造来源）；external/none 允许 source-only、不丢。
+  if (!ri && attribution === 'role') return null;
 
   return {
     type,
+    attribution, // 显式标记，下游据此安全处理无 role actor 的事件
     ...(ri ? { fromRoleInstanceId: ri.roleInstanceId, fromSlotId: ri.slotId } : {}),
     ...(b.reason ? { reason: b.reason } : {}),
     ...(ctx.sourceEventId ? { sourceEventId: ctx.sourceEventId } : {}),
@@ -578,7 +590,10 @@ export function makeTaskTeamObserveExecutors(
           logger.warn(`[taskteam-observe-exec] ${instance.teamId}: 丢弃缺/非法 source 的 message behavior type=${b.type} source=${b.source ?? '∅'}（防同批同类撞幂等 key）`);
           continue;
         }
-        const ev = mapBehaviorToEvent(instance, b, { sourceEventId: resolved, detectable });
+        // 阶段2 §2.2 High：按事件 attribution 分流——external/none 允许外部群非绑定 sender 的消息产出业务事件
+        // （source 仍强制，已在上面把关）；role 事件维持归因不到即丢。
+        const attribution = attributionForEvent(type, b.type);
+        const ev = mapBehaviorToEvent(instance, b, { sourceEventId: resolved, detectable, attribution });
         if (ev) events.push(ev);
       }
       return { events, cursor: reached }; // 判读成功（含空）→ 推进到已读边界

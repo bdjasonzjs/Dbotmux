@@ -21,6 +21,7 @@ import type {
   TaskTeamType,
 } from './taskteam-schema.js';
 import {
+  attributionForEvent,
   detectableEventsForType,
   isProducibleForType,
   knownEventsForType,
@@ -138,6 +139,14 @@ function validateType(
     if (!slotIds.has(rule.whoSlot)) add('warning', 'rule-whoslot-missing', `规则 ${ruleId} 的 whoSlot ${rule.whoSlot} 不在本 type.roleSlots`, ruleId);
     if (rule.when.fromSlotId !== undefined && !slotIds.has(rule.when.fromSlotId)) {
       add('warning', 'rule-fromslot-missing', `规则 ${ruleId} 的 when.fromSlotId ${rule.when.fromSlotId} 不在本 type.roleSlots`, ruleId);
+    }
+    // 3a-2. external/none 事件无可靠 fromSlot（阶段2 §2.2 High）——依赖 when.fromSlotId 的 rule 引用它=永远不命中
+    //   （引擎按 role 匹配 fromSlot，external 事件无 fromSlotId）→ error，杜绝静默零事件。
+    if (rule.when.fromSlotId !== undefined) {
+      const evAttr = attributionForEvent(type, rule.when.event);
+      if (evAttr !== 'role') {
+        add('error', 'external-event-fromslot', `规则 ${ruleId} 依赖 when.fromSlotId 但事件 "${rule.when.event}" attribution=${evAttr}（external/none 无可靠 fromSlot，引擎永不命中）`, ruleId);
+      }
     }
 
     // 3b. do 合法

@@ -68,8 +68,8 @@ describe('taskteam detect() — 别名归因 + 已读边界 cursor', () => {
     expect(res.cursor).toBe('om_2');
     // source 别名 M1/M2 解析回真实 message id om_1/om_2 → 进 sourceEventId（per-event 稳定来源）。
     expect(res.events).toEqual([
-      { type: 'submit', fromRoleInstanceId: 'tt_ri_dev', fromSlotId: 'tt_slot_dev', reason: '提交了 MR', sourceEventId: 'om_1' },
-      { type: 'review-reject', fromRoleInstanceId: 'tt_ri_rev', fromSlotId: 'tt_slot_rev', sourceEventId: 'om_2' },
+      { type: 'submit', attribution: 'role', fromRoleInstanceId: 'tt_ri_dev', fromSlotId: 'tt_slot_dev', reason: '提交了 MR', sourceEventId: 'om_1' },
+      { type: 'review-reject', attribution: 'role', fromRoleInstanceId: 'tt_ri_rev', fromSlotId: 'tt_slot_rev', sourceEventId: 'om_2' },
     ]);
   });
 
@@ -111,7 +111,7 @@ describe('taskteam detect() — 别名归因 + 已读边界 cursor', () => {
     const exec = makeTaskTeamObserveExecutors('cli_observer', { judge, fetchSince: twoMsgs, resolveType: () => customType });
     const res = await exec.detect(instanceFixture(), 'om_cursor');
     expect(res.events).toEqual([
-      { type: 'flag-anomaly', fromRoleInstanceId: 'tt_ri_dev', fromSlotId: 'tt_slot_dev', sourceEventId: 'om_1' },
+      { type: 'flag-anomaly', attribution: 'role', fromRoleInstanceId: 'tt_ri_dev', fromSlotId: 'tt_slot_dev', sourceEventId: 'om_1' },
     ]);
     // 不注入 resolveType（仅内置集）时同样的自定义 behavior 会被丢弃
     const resBuiltin = await execWith(judge).detect(instanceFixture(), 'om_cursor');
@@ -148,8 +148,8 @@ describe('taskteam detect() — 别名归因 + 已读边界 cursor', () => {
     ];
     const res = await execWith(judge).detect(instanceFixture(), 'om_cursor');
     expect(res.events).toEqual([
-      { type: 'submit', fromRoleInstanceId: 'tt_ri_dev', fromSlotId: 'tt_slot_dev', sourceEventId: 'om_1' },
-      { type: 'report', fromRoleInstanceId: 'tt_ri_rev', fromSlotId: 'tt_slot_rev', sourceEventId: 'om_2' },
+      { type: 'submit', attribution: 'role', fromRoleInstanceId: 'tt_ri_dev', fromSlotId: 'tt_slot_dev', sourceEventId: 'om_1' },
+      { type: 'report', attribution: 'role', fromRoleInstanceId: 'tt_ri_rev', fromSlotId: 'tt_slot_rev', sourceEventId: 'om_2' },
     ]);
   });
 
@@ -167,7 +167,7 @@ describe('taskteam detect() — 别名归因 + 已读边界 cursor', () => {
       { type: 'submit', by: 'R1', source: 'M1' },
     ];
     const res = await execWith(judge).detect(instanceFixture(), 'om_cursor');
-    expect(res.events).toEqual([{ type: 'submit', fromRoleInstanceId: 'tt_ri_dev', fromSlotId: 'tt_slot_dev', sourceEventId: 'om_1' }]);
+    expect(res.events).toEqual([{ type: 'submit', attribution: 'role', fromRoleInstanceId: 'tt_ri_dev', fromSlotId: 'tt_slot_dev', sourceEventId: 'om_1' }]);
     expect(res.cursor).toBe('om_2');
   });
 
@@ -217,7 +217,7 @@ describe('mapBehaviorToEvent — 纯映射单元', () => {
   const inst = instanceFixture();
   it('别名 R1 → roleInstances[0]（真实长 open_id 无关，按位置解析）', () => {
     expect(mapBehaviorToEvent(inst, { type: 'submit', by: 'R1' }))
-      .toEqual({ type: 'submit', fromRoleInstanceId: 'tt_ri_dev', fromSlotId: 'tt_slot_dev' });
+      .toEqual({ type: 'submit', attribution: 'role', fromRoleInstanceId: 'tt_ri_dev', fromSlotId: 'tt_slot_dev' });
   });
   it('未知 type → null', () => {
     expect(mapBehaviorToEvent(inst, { type: 'team-started', by: 'R1' } as TaskTeamDetectedBehavior)).toBeNull();
@@ -231,14 +231,29 @@ describe('mapBehaviorToEvent — 纯映射单元', () => {
   });
   it('ctx.sourceEventId 注入 → 进 TeamEvent.sourceEventId（约束1）', () => {
     expect(mapBehaviorToEvent(inst, { type: 'submit', by: 'R1' }, { sourceEventId: 'om_42' }))
-      .toEqual({ type: 'submit', fromRoleInstanceId: 'tt_ri_dev', fromSlotId: 'tt_slot_dev', sourceEventId: 'om_42' });
+      .toEqual({ type: 'submit', attribution: 'role', fromRoleInstanceId: 'tt_ri_dev', fromSlotId: 'tt_slot_dev', sourceEventId: 'om_42' });
   });
   it('ctx.detectable 扩展 → 生产侧能产出 type 声明的新事件（registry②）；不在集内仍丢弃', () => {
     const detectable = new Set(['submit', 'flag-anomaly']); // type.events 声明的自定义 behavior 事件
     expect(mapBehaviorToEvent(inst, { type: 'flag-anomaly', by: 'R1' }, { detectable }))
-      .toEqual({ type: 'flag-anomaly', fromRoleInstanceId: 'tt_ri_dev', fromSlotId: 'tt_slot_dev' });
+      .toEqual({ type: 'flag-anomaly', attribution: 'role', fromRoleInstanceId: 'tt_ri_dev', fromSlotId: 'tt_slot_dev' });
     // 默认内置集不含 flag-anomaly → 丢弃（typo/未声明在 validator 兜底报错）
     expect(mapBehaviorToEvent(inst, { type: 'flag-anomaly', by: 'R1' })).toBeNull();
+  });
+  it('阶段2 High：attribution=external → source-only（无 by/无 role）也产事件、标记 external、无 fromRoleInstanceId', () => {
+    const detectable = new Set(['new-bug']);
+    const ev = mapBehaviorToEvent(inst, { type: 'new-bug' }, { detectable, attribution: 'external', sourceEventId: 'om_7' });
+    expect(ev).toEqual({ type: 'new-bug', attribution: 'external', sourceEventId: 'om_7' });
+    expect(ev?.fromRoleInstanceId).toBeUndefined(); // 下游一眼识别无 role actor
+  });
+  it('阶段2 High：attribution=external 但 by 命中真实 role → 仍带上 role 归因（不强制丢 role）', () => {
+    const detectable = new Set(['new-bug']);
+    const ev = mapBehaviorToEvent(inst, { type: 'new-bug', by: 'R1' }, { detectable, attribution: 'external', sourceEventId: 'om_7' });
+    expect(ev).toEqual({ type: 'new-bug', attribution: 'external', fromRoleInstanceId: 'tt_ri_dev', fromSlotId: 'tt_slot_dev', sourceEventId: 'om_7' });
+  });
+  it('阶段2 High：attribution=role（缺省）+ 无 role → 仍丢弃（开发协作事件行为不变）', () => {
+    const detectable = new Set(['new-bug']);
+    expect(mapBehaviorToEvent(inst, { type: 'new-bug' }, { detectable, attribution: 'role' })).toBeNull();
   });
 });
 
