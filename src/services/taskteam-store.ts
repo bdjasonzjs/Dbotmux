@@ -117,6 +117,8 @@ export async function createTaskTeam(opts: {
       progress: '',
       reviewState: { round: 0, reworkCount: 0, votes: [] },
       cursor: opts.cursor,
+      // 阶段2 停滞窗口锚初值 = 建群时刻（无活动起点）；之后只在真实观测到新活动时重置。
+      lastObservedActivityAt: now,
       version: 1,
       createdAt: now,
       updatedAt: now,
@@ -169,7 +171,15 @@ export async function recordTaskTeamVote(teamId: TaskTeamId, vote: TaskTeamRevie
 // 纯新增函数，不改动既有 store 行为（批1 已关，仅追加）。
 export async function applyTeamDecisionState(
   teamId: TaskTeamId,
-  patch: { status?: TaskTeamStatus; reviewState?: TaskTeamInstance['reviewState']; progress?: string; cursor?: string },
+  patch: {
+    status?: TaskTeamStatus;
+    reviewState?: TaskTeamInstance['reviewState'];
+    progress?: string;
+    cursor?: string;
+    // 阶段2：停滞窗口锚（reviewer Medium）。**只在观测到真实新活动时由调用方显式传入**（cursor 推进路径），
+    // 普通状态写入不传 → 锚不被刷新（停滞窗内 sourceEventId 稳定）。
+    lastObservedActivityAt?: string;
+  },
 ): Promise<TaskTeamInstance> {
   return mutate(store => {
     const idx = store.teams.findIndex(t => t.teamId === teamId);
@@ -181,6 +191,7 @@ export async function applyTeamDecisionState(
       reviewState: patch.reviewState ?? cur.reviewState,
       progress: patch.progress ?? cur.progress,
       cursor: patch.cursor ?? cur.cursor,
+      lastObservedActivityAt: patch.lastObservedActivityAt ?? cur.lastObservedActivityAt,
       version: cur.version + 1,
       updatedAt: new Date().toISOString(),
     };

@@ -103,20 +103,27 @@ export interface TaskTeamStateTransition {
 // 领域无关动作的补充投递语义（阶段2 §2.3）——全可选，向后兼容。
 // 现有开发团队规则不带 action，行为逐字不变；新动作（notify/wake-role/route-to-owner）按需补字段。
 // 这些字段只影响「投递怎么发」（IO 渲染/路由层 dispatch-executors 读），不参与引擎决策与幂等键，故不破坏重放安全。
+//
+// ⚠️ 阶段2 落地口径（reviewer High 修订）——区分**已做实** vs **字段预留**：
+//   · 已做实（本阶段真实生效）：targetType(slot/user/chat) + targetChatId + targetOpenId + ack
+//     —— notify 投到指定群 / @ 指定人、route-to-owner @ owner open_id、ack 渲染「请回执」；可靠投递由 outbox 兜底。
+//   · 字段预留（schema 占位，**行为待阶段3/4** 审批/值班状态原语；当前 dispatch **不**据此改行为）：
+//     visibility（不做可见性过滤）/ wakeRoot（不真去 root summon）/ escalation（无 SLA 升级）/
+//     targetType='owner' 的「root 唤醒」语义（仅 @owner，不触发 root summon）。配了也只是数据、无副作用。
 export interface TaskTeamActionSpec {
-  /** 目标类型：slot=沿用 whoSlot 寻址席位（缺省）/ user=指定 open_id / chat=指定群 / owner=转交 owner。 */
+  /** 目标类型：slot=沿用 whoSlot 寻址席位（缺省）/ user=@指定 open_id / chat=指定群 / owner=@owner（已做实，无 root 唤醒副作用）。 */
   targetType?: 'slot' | 'user' | 'chat' | 'owner';
-  /** targetType=chat 时投递到的群（覆盖小组自身 chatId）。 */
+  /** 【已做实】targetType=chat 时投递到的群（覆盖小组自身 chatId）。 */
   targetChatId?: string;
-  /** targetType=user/owner 时 @ / 路由到的 open_id。 */
+  /** 【已做实】targetType=user/owner 时 @ / 路由到的 open_id。 */
   targetOpenId?: string;
-  /** 是否要求接收方回执（ack）。渲染层提示「请回执」，可被上层用作 SLA 计时锚。 */
+  /** 【已做实】是否要求接收方回执（ack）。渲染层提示「请回执」。 */
   ack?: boolean;
-  /** 投递可见性口径（沿用角色可见性枚举）。 */
+  /** 【字段预留·待阶段3/4】投递可见性口径；当前 dispatch 不做可见性过滤。 */
   visibility?: TaskTeamVisibility;
-  /** 是否唤醒 root（CEO / 根群）——route-to-owner / 升级场景用。 */
+  /** 【字段预留·待阶段3/4】是否唤醒 root（CEO/根群）；当前不真去 root summon。 */
   wakeRoot?: boolean;
-  /** 升级策略：none=不升级 / notify-owner=不达再通知 owner / sla=按 SLA 升级。 */
+  /** 【字段预留·待阶段3/4】升级策略；当前无 SLA 升级实现。 */
   escalation?: 'none' | 'notify-owner' | 'sla';
 }
 
@@ -225,6 +232,13 @@ export interface TaskTeamInstance {
     votes: TaskTeamReviewVote[];
   };
   cursor?: string;
+  /**
+   * 阶段2 停滞窗口锚（reviewer Medium 修订）：observer stall gate 用它（而非 updatedAt）算停滞时长。
+   * **只在真实观测到新活动时重置**（cursor 推进 = 群里有新消息被 drain），**不被普通状态写入刷新**——
+   * 故 stall rule 自带 transition 写状态（刷新 updatedAt）不会移动本锚 → sourceEventId 稳定 → 停滞窗内只升级一次。
+   * 缺省（旧实例 / 未观测过）时 maybeStallEvent 回退 updatedAt。
+   */
+  lastObservedActivityAt?: string;
   version: number;
   createdAt: string;
   updatedAt: string;

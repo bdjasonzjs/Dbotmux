@@ -114,16 +114,15 @@ describe('块1 · judge 受限数据槽配置化（不破防注入）', () => {
     expect(captured!.decisionHints).toEqual(['只关注 P0/P1', '已知 bug 不重复报']);
   });
 
-  it('防注入：outputEventRegistry 只能收窄，不能扩展到未声明事件', async () => {
+  it('防注入·fail-closed：outputEventRegistry 与可判读集无交集 → 空允许集（绝不回退完整集）', async () => {
     let captured: TaskTeamJudgeContext | undefined;
     const judge: TaskTeamJudgeFn = async (ctx) => { captured = ctx; return [{ type: 'submit', by: 'R1', source: 'M1' }]; };
-    // registry 声明一个不在可判读集里的越权事件 → 无交集 → 回退完整可判读集（不放行越权事件）
+    // registry 全是不在可判读集里的越权/typo 事件 → 交集空 → fail-closed 成空允许集（不静默放宽成全集）
     const type = typeWithJudge({ outputEventRegistry: ['__attacker_event__'] });
     const exec = makeTaskTeamObserveExecutors('cli_o', { judge, fetchSince: fetchOne, resolveType: () => type });
     const res = await exec.detect(instance(), null);
-    expect(captured!.detectableEvents).toContain('submit'); // 回退内置可判读集，越权事件不出现
-    expect(captured!.detectableEvents).not.toContain('__attacker_event__');
-    expect(res.events.map(e => e.type)).toEqual(['submit']); // submit 仍在白名单内，被正常接收
+    expect(captured!.detectableEvents).toEqual([]); // 空允许集，**不**回退 full set
+    expect(res.events).toEqual([]); // 连 submit 也因空白名单被丢（fail-closed）
   });
 
   it('防注入：registry 收窄后，白名单外的 judge 输出被丢弃', async () => {
@@ -196,7 +195,7 @@ describe('块2 · 领域无关动作（不隐式跃迁 + dispatch 字段）', ()
     expect(k1).not.toBe(k2);
   });
 
-  it('rule.action 字段随命令进 payload.__delivery（targetType/ack/可见性/root 唤醒/升级）', () => {
+  it('rule.action 字段随命令进 payload.__delivery（targetType/ack + 预留字段透传）', () => {
     const rules: TaskTeamCollabRule[] = [
       {
         ruleId: 'tt_rule_route', when: { event: 'new-bug', status: 'running' }, whoSlot: 'tt_slot_analyst', do: 'route-to-owner',
@@ -206,7 +205,41 @@ describe('块2 · 领域无关动作（不隐式跃迁 + dispatch 字段）', ()
     const { type, roles, inst } = customEventType(rules);
     const d = decideTeamActions({ instance: inst, type, roles, rules, event: { type: 'new-bug', sourceEventId: 'om_1' } });
     const delivery = (d.actions[0].payload as Record<string, unknown>).__delivery as Record<string, unknown>;
+    // targetType/targetOpenId/ack 已做实；wakeRoot/escalation 仅作字段透传（行为待阶段3/4，不产生副作用）
     expect(delivery).toMatchObject({ targetType: 'owner', targetOpenId: 'ou_owner', ack: true, wakeRoot: true, escalation: 'notify-owner' });
+  });
+
+  it('防注入 High：event.payload 自带 __delivery 但规则无 action → 引擎剥除、不进投递路由', () => {
+    const rules: TaskTeamCollabRule[] = [
+      { ruleId: 'tt_rule_notify', when: { event: 'new-bug', status: 'running' }, whoSlot: 'tt_slot_analyst', do: 'notify' },
+    ];
+    const { type, roles, inst } = customEventType(rules);
+    // 外部消息派生事件挟带伪造 __delivery（targetChatId 想把通知劫持到恶意群）
+    const d = decideTeamActions({
+      instance: inst, type, roles, rules,
+      event: { type: 'new-bug', sourceEventId: 'om_1', payload: { foo: 1, __delivery: { targetType: 'chat', targetChatId: 'oc_evil' } } },
+    });
+    const payload = d.actions[0].payload as Record<string, unknown> | undefined;
+    expect(payload?.__delivery).toBeUndefined();      // __delivery 被剥除
+    expect(payload?.foo).toBe(1);                      // 其余 payload 原样保留
+    const action = { actionType: 'notify', targetRoleInstanceId: 'tt_ri_analyst', payload } as unknown as TaskTeamAction;
+    expect(targetChatIdFor(action, inst)).toBe('oc_self'); // 路由未被篡改 → 回落小组自身 chatId
+  });
+
+  it('防注入 High：规则 action 优先，event.payload 伪造的 __delivery 被配置覆盖', () => {
+    const rules: TaskTeamCollabRule[] = [
+      {
+        ruleId: 'tt_rule_notify', when: { event: 'new-bug', status: 'running' }, whoSlot: 'tt_slot_analyst', do: 'notify',
+        action: { targetType: 'chat', targetChatId: 'oc_legit' },
+      },
+    ];
+    const { type, roles, inst } = customEventType(rules);
+    const d = decideTeamActions({
+      instance: inst, type, roles, rules,
+      event: { type: 'new-bug', sourceEventId: 'om_1', payload: { __delivery: { targetType: 'chat', targetChatId: 'oc_evil' } } },
+    });
+    const action = { actionType: 'notify', targetRoleInstanceId: 'tt_ri_analyst', payload: d.actions[0].payload } as unknown as TaskTeamAction;
+    expect(targetChatIdFor(action, inst)).toBe('oc_legit'); // 配置侧 rule.action 胜出，伪造值不生效
   });
 
   it('dispatch 渲染：notify + ack + targetType=user → @ 指定 open_id + 回执提示', () => {
@@ -266,8 +299,8 @@ describe('块3 · 停滞触发器（clock 产 stall，window id 不撞幂等）'
     updatedAt: '2026-06-20T00:00:00.000Z',
   });
 
-  it('maybeStallEvent：到点产 stall（window id = stall:teamId:updatedAt ts，绝不退回 round）', () => {
-    const team = stalledTeam();
+  it('maybeStallEvent：到点产 stall（window id = stall:teamId:停滞锚 ts，绝不退回 round；缺锚回退 updatedAt）', () => {
+    const team = stalledTeam(); // 未设 lastObservedActivityAt → 锚回退 updatedAt
     const base = Date.parse(team.updatedAt);
     expect(maybeStallEvent(new Date(base + 999), team, stallType(1000))).toBeNull(); // 未到点
     const ev = maybeStallEvent(new Date(base + 2000), team, stallType(1000));
@@ -285,7 +318,20 @@ describe('块3 · 停滞触发器（clock 产 stall，window id 不撞幂等）'
     const base = Date.parse(team.updatedAt);
     const e1 = maybeStallEvent(new Date(base + 2000), team, stallType(1000))!;
     const e2 = maybeStallEvent(new Date(base + 9000), team, stallType(1000))!;
-    expect(e1.sourceEventId).toBe(e2.sourceEventId); // updatedAt 未动 → 同窗同源 → 引擎 emit 同 key → outbox 去重
+    expect(e1.sourceEventId).toBe(e2.sourceEventId); // 锚未动 → 同窗同源 → 引擎 emit 同 key → outbox 去重
+  });
+
+  it('reviewer Medium：锚用 lastObservedActivityAt，updatedAt 被状态写入刷新也不移动停滞窗', () => {
+    const base = Date.parse('2026-06-20T00:00:00.000Z');
+    // 模拟 stall rule 自带 transition 刷新了 updatedAt（晚 5h），但 lastObservedActivityAt 仍锚在 base
+    const team = instance({
+      roleInstances: [ri('tt_ri_obs', 'tt_slot_obs', 'tt_role_obs', 'ou_obs')],
+      lastObservedActivityAt: '2026-06-20T00:00:00.000Z',
+      updatedAt: '2026-06-20T05:00:00.000Z',
+    });
+    const ev = maybeStallEvent(new Date(base + 2000), team, stallType(1000));
+    // 若错用 updatedAt(base+5h) 则 now-updatedAt<0 不会产；用锚(base) → 已过 2000>1000ms → 产，且 sourceEventId 锚在 base
+    expect(ev).toMatchObject({ type: 'stall', sourceEventId: `stall:tt_team_p2:${base}` });
   });
 
   it('observer tick：无新动静 + 到停滞点 → clock 产 stall 并 applyTeamEvent，stats.stalls=1', async () => {
@@ -340,6 +386,48 @@ describe('块3 · 停滞触发器（clock 产 stall，window id 不撞幂等）'
     const s = await runTaskTeamObserverTick(new Date(base + 2000), deps, exec);
     expect(s.stalls).toBe(0);
     expect(s.gatedOut).toBe(1);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// validator：阶段2 新增校验（outputEventRegistry typo / timer transition 自环）
+// ─────────────────────────────────────────────────────────────────────────
+describe('validator · 阶段2 新增校验', () => {
+  function cfgWith(typeOver: Partial<TaskTeamType>, rules: TaskTeamCollabRule[]): TaskTeamConfigFile {
+    const type: TaskTeamType = {
+      typeId: 'tt_type_p2', name: 'MoA',
+      roleSlots: [{ slotId: 'tt_slot_obs', roleId: 'tt_role_obs' }],
+      rules: rules.map(r => r.ruleId),
+      policy: { reviewRounds: 0, reviewQuorum: 1, maxRework: 0, escalateAfterStallMs: 1000, reviewOrder: [] },
+      ...typeOver,
+    };
+    return { version: 1, roles: [role('tt_role_obs', { isObserver: true, actions: ['escalate'] })], rules, teamTypes: [type], orgStructures: [], orgRuntimeBindings: [], updatedAt: 't' };
+  }
+
+  it('outputEventRegistry 全 typo（与可判读集交集空）→ warning（empty + unknown），非 error', () => {
+    const rules: TaskTeamCollabRule[] = [
+      { ruleId: 'tt_rule_stall', when: { event: 'stall', status: 'running' }, whoSlot: 'tt_slot_obs', do: 'escalate' },
+    ];
+    const v = validateTaskTeamConfig(cfgWith({ judge: { outputEventRegistry: ['__typo__'] } }, rules));
+    expect(v.warnings.some(w => w.code === 'judge-output-registry-unknown')).toBe(true);
+    expect(v.warnings.some(w => w.code === 'judge-output-registry-empty')).toBe(true);
+    expect(v.errors.filter(e => e.code.startsWith('judge-output'))).toEqual([]);
+  });
+
+  it('timer 事件（stall）规则 transition 回到仍可命中状态 → error（防 clock 反复刷）', () => {
+    const rules: TaskTeamCollabRule[] = [
+      { ruleId: 'tt_rule_stall', when: { event: 'stall', status: 'running' }, whoSlot: 'tt_slot_obs', do: 'escalate', transition: { status: 'running' } },
+    ];
+    const v = validateTaskTeamConfig(cfgWith({}, rules));
+    expect(v.errors.some(e => e.code === 'timer-transition-self-loop')).toBe(true);
+  });
+
+  it('timer 事件 stall 规则 transition 指到不再命中的终态（blocked）→ 无 self-loop error', () => {
+    const rules: TaskTeamCollabRule[] = [
+      { ruleId: 'tt_rule_stall', when: { event: 'stall', status: 'running' }, whoSlot: 'tt_slot_obs', do: 'escalate', transition: { status: 'blocked' } },
+    ];
+    const v = validateTaskTeamConfig(cfgWith({}, rules));
+    expect(v.errors.filter(e => e.code === 'timer-transition-self-loop')).toEqual([]);
   });
 });
 

@@ -52,10 +52,12 @@ export interface TaskTeamObserverStats {
 
 /**
  * 停滞触发器（阶段2 §2.1，复活 escalateAfterStallMs）——**由 clock/cheap gate 产出，不靠 LLM 判「长时间」**。
- * 规则：type.policy.escalateAfterStallMs 配了正数，且自上次活动（team.updatedAt）已超过该阈值 → 产 stall 事件。
- * 来源 id（约束1）：用 window/episode id（`stall:<teamId>:<updatedAt 时间戳>`），**绝不退回 round**——
- * 同一停滞窗内 updatedAt 不变 → sourceEventId 稳定 → 幂等 key 稳定 → outbox 去重，停滞窗内只升级一次；
- * 活动恢复后 updatedAt 推进 → 新窗 → 新 sourceEventId，不会与上一窗撞 key。
+ * 规则：type.policy.escalateAfterStallMs 配了正数，且自**上次观测到真实新活动**（team.lastObservedActivityAt，
+ * 缺省回退 updatedAt）已超过该阈值 → 产 stall 事件。
+ * 来源 id（约束1）：window/episode id = `stall:<teamId>:<停滞锚时间戳>`，**绝不退回 round**。
+ * reviewer Medium 修订：锚改用 **lastObservedActivityAt**（只在 cursor 推进=真实新消息时重置，普通状态写入不刷新），
+ * 而非 updatedAt——故 stall rule 自带 transition 写状态刷新 updatedAt 也不会移动锚 → sourceEventId 稳定 →
+ * 幂等 key 稳定 → outbox 去重，停滞窗内只升级一次；真实活动恢复后锚推进 → 新窗 → 新 sourceEventId，不撞上一窗。
  * 状态门由引擎规则（when.status）把关，本函数只负责「到点产事件」。
  */
 export function maybeStallEvent(
@@ -65,7 +67,8 @@ export function maybeStallEvent(
 ): TeamEvent | null {
   const ms = type?.policy?.escalateAfterStallMs;
   if (!ms || ms <= 0) return null; // 未配置停滞阈值 → 不产（向后兼容）
-  const ref = Date.parse(team.updatedAt);
+  const anchor = team.lastObservedActivityAt ?? team.updatedAt; // 停滞窗口锚（缺省回退 updatedAt）
+  const ref = Date.parse(anchor);
   if (!Number.isFinite(ref)) return null;
   if (now.getTime() - ref < ms) return null; // 未到停滞阈值
   return { type: 'stall', sourceEventId: `stall:${team.teamId}:${ref}` };

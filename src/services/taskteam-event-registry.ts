@@ -26,7 +26,9 @@ export const BUILTIN_LIFECYCLE_EVENT_TYPES: ReadonlySet<TaskTeamEventType> = new
   'rework',
 ]);
 
-// observer judge 可判读产出的角色行为子集（镜像旧 observe-executors DETECTABLE 白名单，去掉对 union 的硬依赖）。
+// observer judge **可判读**产出的角色行为子集（消息派生事件）。
+// ⚠️ 阶段2 修 reviewer Blocker：`stall` **不在此集**——stall 是计时/停滞事件，只能由 clock（maybeStallEvent）
+// 产出，**绝不许 LLM judge 伪造**（否则块3「真由 clock 产」claim 被打脸）。stall 只登记在 TIMER 集。
 export const BUILTIN_DETECTABLE_EVENT_TYPES: ReadonlySet<string> = new Set<string>([
   'submit',
   'review-pass',
@@ -35,10 +37,10 @@ export const BUILTIN_DETECTABLE_EVENT_TYPES: ReadonlySet<string> = new Set<strin
   'report',
   'consult',
   'escalate',
-  'stall',
 ]);
 
-// 廉价 gate / clock 产出的无消息事件（设计：stall 由 stall gate 产出，阶段2 接 type.policy；阶段1 先登记产出方）。
+// 廉价 gate / clock 产出的无消息事件（stall 由 observer stall gate 接 type.policy.escalateAfterStallMs 产出）。
+// 这些事件**不进 judge detectable 集**——judge 输出的同名事件在 detect 层被显式丢弃。
 export const BUILTIN_TIMER_EVENT_TYPES: ReadonlySet<string> = new Set<string>(['stall']);
 
 // 全部内置已知事件（TaskTeamEventType union 的运行时镜像）——validator typo 检测的兜底基线。

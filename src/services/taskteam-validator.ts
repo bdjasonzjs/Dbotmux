@@ -20,7 +20,12 @@ import type {
   TaskTeamStatus,
   TaskTeamType,
 } from './taskteam-schema.js';
-import { isProducibleForType, knownEventsForType } from './taskteam-event-registry.js';
+import {
+  detectableEventsForType,
+  isProducibleForType,
+  knownEventsForType,
+  timerEventsForType,
+} from './taskteam-event-registry.js';
 
 export interface TaskTeamConfigIssue {
   severity: 'error' | 'warning';
@@ -100,7 +105,25 @@ function validateType(
 
   const known = knownEventsForType(type);
   const declaredEventTypes = new Set((type.events ?? []).map(d => d.type));
+  const timerEvents = timerEventsForType(type); // clock 产出（stall + 自定义 timer）——judge 不可产
   const referencedRules: TaskTeamCollabRule[] = [];
+
+  // 2b. judge 受限数据槽 outputEventRegistry 校验（阶段2 §2.2，reviewer Medium：fail-closed 配套提示）：
+  //   - 每个 registry 条目都该 ∈ 该 type 的「可判读集」（detectableEventsForType）；不在 = typo → warning。
+  //   - 收窄后交集为空（detect 已 fail-closed 成空允许集、judge 啥都产不出）→ warning，别让 typo 静默成「永远零事件」。
+  const registry = type.judge?.outputEventRegistry;
+  if (registry && registry.length) {
+    const detectable = detectableEventsForType(type);
+    const intersect = registry.filter(e => detectable.has(e));
+    for (const e of registry) {
+      if (!detectable.has(e)) {
+        add('warning', 'judge-output-registry-unknown', `judge.outputEventRegistry 的 "${e}" 不在本 type 可判读事件集（typo / 未声明 behavior）——收窄白名单会忽略它`);
+      }
+    }
+    if (intersect.length === 0) {
+      add('warning', 'judge-output-registry-empty', `judge.outputEventRegistry 与可判读集交集为空——fail-closed 后 judge 永远产不出事件（疑似全 typo）`);
+    }
+  }
 
   // 3. type.rules 闭合 + 逐条规则校验
   for (const ruleId of type.rules) {
@@ -136,6 +159,15 @@ function validateType(
       }
       if (TRANSITION_BLIND_LEGACY_EVENTS.has(rule.when.event)) {
         add('warning', 'transition-on-legacy', `规则 ${ruleId} 在 legacy 事件 "${rule.when.event}" 上声明 transition——引擎 special case 不读，无效（迁移留阶段4）`, ruleId);
+      }
+      // 3d-2. 停滞/计时触发器防重复刷（reviewer Medium）：timer 事件（stall 等）由 clock 反复到点产出，
+      //   若其规则 transition 回到一个**仍能命中本规则**的状态（transition.status === when.status，或 when.status
+      //   未指定=任意状态都命中），停滞窗内会被反复触发刷状态/刷升级 → 报错，要求把 transition 指到一个不再命中的终态。
+      if (timerEvents.has(rule.when.event)) {
+        const staysMatchable = rule.when.status === undefined || rule.transition.status === rule.when.status;
+        if (staysMatchable) {
+          add('error', 'timer-transition-self-loop', `规则 ${ruleId}（计时事件 "${rule.when.event}"）的 transition 回到仍可命中本规则的状态（${rule.transition.status}）——clock 反复到点会重复触发，必须指到不再命中的状态`, ruleId);
+        }
       }
     }
 

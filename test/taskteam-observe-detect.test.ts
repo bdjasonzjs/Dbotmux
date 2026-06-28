@@ -153,9 +153,10 @@ describe('taskteam detect() — 别名归因 + 已读边界 cursor', () => {
     ]);
   });
 
-  it('stall 团队级可不带归因仍保留（无消息事件 → sourceEventId 用 window/episode id，绝不退回 round）', async () => {
+  it('阶段2 Blocker：judge 伪造的 stall（clock-only 事件）一律丢弃，detect 不产任何事件', async () => {
     const res = await execWith(async () => [{ type: 'stall', reason: '原地打转' }]).detect(instanceFixture(), 'om_cursor');
-    expect(res.events).toEqual([{ type: 'stall', reason: '原地打转', sourceEventId: 'win:om_2' }]);
+    expect(res.events).toEqual([]); // stall 只能由 clock（maybeStallEvent）产，judge 输出被丢弃
+    expect(res.cursor).toBe('om_2'); // 已判读 → cursor 仍推进
   });
 
   it('未知 type（生命周期/非法）丢弃，cursor 仍推进', async () => {
@@ -224,8 +225,9 @@ describe('mapBehaviorToEvent — 纯映射单元', () => {
   it('非 stall 且 by 越界 → null', () => {
     expect(mapBehaviorToEvent(inst, { type: 'report', by: 'R9' })).toBeNull();
   });
-  it('stall 无归因 → 保留', () => {
-    expect(mapBehaviorToEvent(inst, { type: 'stall' })).toEqual({ type: 'stall' });
+  it('阶段2 Blocker：stall 不在 detectable 集 → mapBehaviorToEvent 一律丢弃（只能 clock 产）', () => {
+    expect(mapBehaviorToEvent(inst, { type: 'stall' })).toBeNull();
+    expect(mapBehaviorToEvent(inst, { type: 'stall', by: 'R1', source: 'M1' })).toBeNull();
   });
   it('ctx.sourceEventId 注入 → 进 TeamEvent.sourceEventId（约束1）', () => {
     expect(mapBehaviorToEvent(inst, { type: 'submit', by: 'R1' }, { sourceEventId: 'om_42' }))

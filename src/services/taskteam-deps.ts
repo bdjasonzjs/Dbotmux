@@ -91,9 +91,13 @@ export function defaultObserverDeps(): TaskTeamObserverDeps {
   return {
     ...defaultRuntimeDeps(),
     listActiveTeams: () => listActiveTaskTeams(),
-    // cursor 推进也走 per-team 锁，避免与 applyTeamEvent 的状态提交 last-writer-wins 互相覆盖
+    // cursor 推进也走 per-team 锁，避免与 applyTeamEvent 的状态提交 last-writer-wins 互相覆盖。
+    // cursor 推进 = 群里有真实新消息被 drain → **同时重置停滞窗口锚**（reviewer Medium）：停滞从此刻重新计时，
+    // 且普通状态写入不刷新本锚 → 停滞窗内 sourceEventId 稳定、只升级一次。
     advanceCursor: async (teamId: TaskTeamId, cursor: string) => {
-      await withTeamLock(teamId, () => applyTeamDecisionState(teamId, { cursor }));
+      await withTeamLock(teamId, () =>
+        applyTeamDecisionState(teamId, { cursor, lastObservedActivityAt: new Date().toISOString() }),
+      );
     },
     // 阶段2 停滞触发器：让 observer tick 取 type.policy.escalateAfterStallMs 做停滞 gate。
     resolveType: resolveTaskTeamTypeForInstance,

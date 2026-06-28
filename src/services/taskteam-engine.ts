@@ -108,13 +108,17 @@ export function decideTeamActions(input: DecideTeamActionsInput): TeamDecision {
     // per-event 来源段（约束1）：优先 event.sourceEventId（消息 id / window-episode id），缺省回退
     // r{keyRound}（显式入口/测试无来源；round 确定性 → 重放仍幂等）。key 含 event.type+source+ruleId+target。
     const seg = event.sourceEventId ?? `r${keyRound}`;
+    // 修 reviewer High（防注入）：__delivery 是**配置侧专属**控制字段，**绝不能从事件 payload 进**——
+    // 外部消息派生事件若挟带 payload.__delivery（伪造 targetChatId 等）会篡改投递路由。先从 event.payload
+    // **剥掉** __delivery，只允许 rule.action（配置）写入。无 rule.action 的命令 payload 不含 __delivery。
+    const basePayload = stripDeliverySpec(event.payload);
     const acts: TeamActionDecision[] = [];
     for (const rule of rulesToFire) {
       // 阶段2：领域无关动作的补充投递语义（rule.action）随命令带进 payload.__delivery（仅 IO 渲染/路由层读，
-      // 不参与决策与幂等键）。无 action 的规则 payload 原样透传——开发团队行为逐字不变。
+      // 不参与决策与幂等键）。无 action 的规则 payload 用剥净后的 base——开发团队行为逐字不变。
       const payload = rule.action
-        ? { ...(event.payload ?? {}), __delivery: rule.action }
-        : event.payload;
+        ? { ...(basePayload ?? {}), __delivery: rule.action }
+        : basePayload;
       for (const ri of instancesForSlot(rule.whoSlot)) {
         acts.push({
           actionType: rule.do,
@@ -232,6 +236,18 @@ export function decideTeamActions(input: DecideTeamActionsInput): TeamDecision {
       return { actions: acts };
     }
   }
+}
+
+/**
+ * 防注入：从事件 payload 剥掉 `__delivery`（保留键名常量一致：dispatch-executors.deliverySpecOf 也读这个键）。
+ * __delivery 只允许由 rule.action（配置侧）写入；事件 payload（可能源自外部消息）里的同名键一律剥除，
+ * 杜绝外部消息伪造投递路由（targetChatId / targetOpenId 等）。
+ */
+function stripDeliverySpec(payload: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (!payload || !('__delivery' in payload)) return payload;
+  const { __delivery: _drop, ...rest } = payload;
+  void _drop;
+  return rest;
 }
 
 // maxRework 耗尽兜底：escalate 给 observer 席（isObserver 角色）；无 observer 则空 actions，仅靠 nextStatus=blocked 表达
