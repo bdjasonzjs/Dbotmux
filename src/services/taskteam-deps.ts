@@ -17,7 +17,15 @@ import { createTaskTeam as runtimeCreateTaskTeam } from './taskteam-runtime.js';
 import type { CreateTaskTeamDeps, TaskTeamRuntimeDeps } from './taskteam-runtime.js';
 import type { TaskTeamObserverDeps } from './taskteam-observer.js';
 import type { OnboardingDeps } from './taskteam-onboard.js';
-import type { TaskTeamId } from './taskteam-schema.js';
+import type { TaskTeamId, TaskTeamInstance, TaskTeamType } from './taskteam-schema.js';
+
+/**
+ * observer detect 注入用：按 instance.typeId 从 config 解析其 TaskTeamType（修 reviewer Blocker1）——
+ * 让 detect 接入真实事件 registry（type.events 声明的自定义 behavior 能被 judge 产出、渲染进 prompt）。
+ */
+export function resolveTaskTeamTypeForInstance(instance: TaskTeamInstance): TaskTeamType | undefined {
+  return readTaskTeamConfig().teamTypes.find(t => t.typeId === instance.typeId);
+}
 
 // per-team 跨进程串行化锁。锁文件路径独立于 store 文件（taskteams.json / taskteam-outbox.json），
 // 避免与 store 自身 mutate 的 withFileLock 同路径重入死锁。
@@ -83,9 +91,15 @@ export function defaultObserverDeps(): TaskTeamObserverDeps {
   return {
     ...defaultRuntimeDeps(),
     listActiveTeams: () => listActiveTaskTeams(),
-    // cursor 推进也走 per-team 锁，避免与 applyTeamEvent 的状态提交 last-writer-wins 互相覆盖
+    // cursor 推进也走 per-team 锁，避免与 applyTeamEvent 的状态提交 last-writer-wins 互相覆盖。
+    // cursor 推进 = 群里有真实新消息被 drain → **同时重置停滞窗口锚**（reviewer Medium）：停滞从此刻重新计时，
+    // 且普通状态写入不刷新本锚 → 停滞窗内 sourceEventId 稳定、只升级一次。
     advanceCursor: async (teamId: TaskTeamId, cursor: string) => {
-      await withTeamLock(teamId, () => applyTeamDecisionState(teamId, { cursor }));
+      await withTeamLock(teamId, () =>
+        applyTeamDecisionState(teamId, { cursor, lastObservedActivityAt: new Date().toISOString() }),
+      );
     },
+    // 阶段2 停滞触发器：让 observer tick 取 type.policy.escalateAfterStallMs 做停滞 gate。
+    resolveType: resolveTaskTeamTypeForInstance,
   };
 }

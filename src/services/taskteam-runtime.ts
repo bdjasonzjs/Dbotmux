@@ -121,7 +121,13 @@ export async function applyTeamEvent(
 // 角色行为 / 生命周期事件的便捷构造（事件入口用）
 export function teamEvent(
   type: TeamEvent['type'],
-  opts: { fromRoleInstanceId?: TeamEvent['fromRoleInstanceId']; fromSlotId?: TeamEvent['fromSlotId']; reason?: string; payload?: Record<string, unknown> } = {},
+  opts: {
+    fromRoleInstanceId?: TeamEvent['fromRoleInstanceId'];
+    fromSlotId?: TeamEvent['fromSlotId'];
+    reason?: string;
+    payload?: Record<string, unknown>;
+    sourceEventId?: string; // 约束1：消息 id / window-episode id；缺省时 emit 回退 r{round}
+  } = {},
 ): TeamEvent {
   return { type, ...opts };
 }

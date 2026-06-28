@@ -6,7 +6,7 @@
 import { applyTeamEvent } from './taskteam-runtime.js';
 import type { TaskTeamRuntimeDeps } from './taskteam-runtime.js';
 import type { TeamEvent } from './taskteam-engine.js';
-import type { TaskTeamId, TaskTeamInstance } from './taskteam-schema.js';
+import type { TaskTeamId, TaskTeamInstance, TaskTeamType } from './taskteam-schema.js';
 import { logger } from '../utils/logger.js';
 
 /** detect 判读结果：判读出的 TeamEvent[] + 推进到的 cursor（detect 实际读到的最后一条边界）。 */
@@ -37,6 +37,8 @@ export interface TaskTeamObserverExecutors {
 export interface TaskTeamObserverDeps extends TaskTeamRuntimeDeps {
   listActiveTeams(): TaskTeamInstance[];
   advanceCursor(teamId: TaskTeamId, cursor: string): Promise<void>;
+  /** 阶段2 计时触发器：按 instance 解析其 TaskTeamType，取 policy.escalateAfterStallMs 做停滞 gate。不设则不产 stall。 */
+  resolveType?(instance: TaskTeamInstance): TaskTeamType | undefined;
 }
 
 export interface TaskTeamObserverStats {
@@ -44,7 +46,33 @@ export interface TaskTeamObserverStats {
   gatedOut: number; // 廉价 gate 命中、零模型调用
   detected: number; // 调了 detect 的次数
   events: number; // 应用的 TeamEvent 数
+  stalls: number; // 阶段2：clock/gate 到点产出的 stall 事件数
   errors: number;
+}
+
+/**
+ * 停滞触发器（阶段2 §2.1，复活 escalateAfterStallMs）——**由 clock/cheap gate 产出，不靠 LLM 判「长时间」**。
+ * 规则：type.policy.escalateAfterStallMs 配了正数，且自**上次观测到真实新活动**（team.lastObservedActivityAt，
+ * 缺省回退 updatedAt）已超过该阈值 → 产 stall 事件。
+ * 来源 id（约束1）：window/episode id = `stall:<teamId>:<停滞锚时间戳>`，**绝不退回 round**。
+ * reviewer Medium 修订：锚改用 **lastObservedActivityAt**（只在 cursor 推进=真实新消息时重置，普通状态写入不刷新），
+ * 而非 updatedAt——故 stall rule 自带 transition 写状态刷新 updatedAt 也不会移动锚 → sourceEventId 稳定 →
+ * 幂等 key 稳定 → outbox 去重，停滞窗内只升级一次；真实活动恢复后锚推进 → 新窗 → 新 sourceEventId，不撞上一窗。
+ * 状态门由引擎规则（when.status）把关，本函数只负责「到点产事件」。
+ */
+export function maybeStallEvent(
+  now: Date,
+  team: TaskTeamInstance,
+  type: TaskTeamType | undefined,
+): TeamEvent | null {
+  const ms = type?.policy?.escalateAfterStallMs;
+  if (!ms || ms <= 0) return null; // 未配置停滞阈值 → 不产（向后兼容）
+  const anchor = team.lastObservedActivityAt ?? team.updatedAt; // 停滞窗口锚（缺省回退 updatedAt）
+  const ref = Date.parse(anchor);
+  if (!Number.isFinite(ref)) return null;
+  if (now.getTime() - ref < ms) return null; // 未到停滞阈值
+  // attribution='none'：clock 产的无 actor 事件，下游一眼识别无 role 归因（阶段2 §2.2 High）。
+  return { type: 'stall', sourceEventId: `stall:${team.teamId}:${ref}`, attribution: 'none' };
 }
 
 export function observedChatIdForTaskTeam(team: Pick<TaskTeamInstance, 'chatId' | 'targetExternalChatId'>): string {
@@ -57,8 +85,7 @@ export async function runTaskTeamObserverTick(
   deps: TaskTeamObserverDeps,
   exec: TaskTeamObserverExecutors,
 ): Promise<TaskTeamObserverStats> {
-  const stats: TaskTeamObserverStats = { scanned: 0, gatedOut: 0, detected: 0, events: 0, errors: 0 };
-  void now; // 预留：将来按 cursor 时间窗 / 节流；当前廉价 gate 由 peek 决定
+  const stats: TaskTeamObserverStats = { scanned: 0, gatedOut: 0, detected: 0, events: 0, stalls: 0, errors: 0 };
   for (const team of deps.listActiveTeams()) {
     stats.scanned += 1;
     try {
@@ -68,6 +95,13 @@ export async function runTaskTeamObserverTick(
       const peeked = await exec.peek(observedChatId, cursor);
       if (!peeked.hasNew) {
         stats.gatedOut += 1;
+        // 阶段2 停滞触发器：无新动静时由 clock/gate 判是否到 escalateAfterStallMs 阈值，到点产 stall（非 LLM）。
+        const stallEvent = maybeStallEvent(now, team, deps.resolveType?.(team));
+        if (stallEvent) {
+          await applyTeamEvent(deps, team.teamId, stallEvent);
+          stats.events += 1;
+          stats.stalls += 1;
+        }
         continue;
       }
       stats.detected += 1;

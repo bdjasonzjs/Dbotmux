@@ -59,24 +59,70 @@ function execWith(judge: TaskTeamJudgeFn, fetchSince: TaskTeamFetchSinceFn = two
 }
 
 describe('taskteam detect() — 别名归因 + 已读边界 cursor', () => {
-  it('judge 用别名 by:R1/R2 → 映射成带 fromRoleInstanceId/fromSlotId 的 TeamEvent（真实长 open_id 也归因正确）', async () => {
+  it('judge 用别名 by:R1/R2 + source:M1/M2 → 映射成带 fromRoleInstanceId/fromSlotId + sourceEventId(真实 message id) 的 TeamEvent（约束1）', async () => {
     const judge: TaskTeamJudgeFn = async () => [
-      { type: 'submit', by: 'R1', reason: '提交了 MR' },
-      { type: 'review-reject', by: 'R2' },
+      { type: 'submit', by: 'R1', source: 'M1', reason: '提交了 MR' },
+      { type: 'review-reject', by: 'R2', source: 'M2' },
     ];
     const res = await execWith(judge).detect(instanceFixture(), 'om_cursor');
     expect(res.cursor).toBe('om_2');
+    // source 别名 M1/M2 解析回真实 message id om_1/om_2 → 进 sourceEventId（per-event 稳定来源）。
     expect(res.events).toEqual([
-      { type: 'submit', fromRoleInstanceId: 'tt_ri_dev', fromSlotId: 'tt_slot_dev', reason: '提交了 MR' },
-      { type: 'review-reject', fromRoleInstanceId: 'tt_ri_rev', fromSlotId: 'tt_slot_rev' },
+      { type: 'submit', attribution: 'role', fromRoleInstanceId: 'tt_ri_dev', fromSlotId: 'tt_slot_dev', reason: '提交了 MR', sourceEventId: 'om_1' },
+      { type: 'review-reject', attribution: 'role', fromRoleInstanceId: 'tt_ri_rev', fromSlotId: 'tt_slot_rev', sourceEventId: 'om_2' },
     ]);
   });
 
-  it('渲染给 judge 的消息用短别名 [R1]/[R2] 前缀，绝不出现（截断的）真实 open_id', async () => {
+  it('约束1 坑①：一批消息里两个同类 behavior（不同 source）→ 各归各自 message id，sourceEventId 互不相同（不再共享 reached cursor 撞 key）', async () => {
+    const judge: TaskTeamJudgeFn = async () => [
+      { type: 'submit', by: 'R1', source: 'M1' },
+      { type: 'submit', by: 'R1', source: 'M2' },
+    ];
+    const res = await execWith(judge).detect(instanceFixture(), 'om_cursor');
+    expect(res.events.map(e => e.sourceEventId)).toEqual(['om_1', 'om_2']); // 不同来源 → 不同 key
+  });
+
+  it('约束1 防注入+Blocker2：message behavior 给非系统别名(自造 id)/缺 source → 丢弃，绝不用模型自造 id、绝不回退共享 win id', async () => {
+    const judge: TaskTeamJudgeFn = async () => [
+      { type: 'submit', by: 'R1', source: 'om_evil_injected' }, // 不是 M{k} 别名 → 解析不到 → 丢弃
+      { type: 'report', by: 'R2' }, // 完全没给 source → 丢弃
+    ];
+    const res = await execWith(judge).detect(instanceFixture(), 'om_cursor');
+    expect(res.events).toEqual([]); // 两条都被丢弃；om_evil_injected 绝不进 sourceEventId
+    expect(JSON.stringify(res.events)).not.toContain('om_evil_injected');
+  });
+
+  it('约束1 坑①(Blocker2)：两个缺 source 的同类 submit → 都被丢弃，绝不产出两个同 key action', async () => {
+    const judge: TaskTeamJudgeFn = async () => [
+      { type: 'submit', by: 'R1' }, // 缺 source
+      { type: 'submit', by: 'R1' }, // 缺 source（旧实现会共享 win:om_2 撞 key 吞第二条）
+    ];
+    const res = await execWith(judge).detect(instanceFixture(), 'om_cursor');
+    expect(res.events).toEqual([]); // 强 source 约束在 detect 层阻断，不再让同类事件共享 window id
+  });
+
+  it('Blocker1：resolveType 注入 + judge 返回 type.events 声明的自定义 behavior → detect 真实产出该 TeamEvent', async () => {
+    const judge: TaskTeamJudgeFn = async () => [{ type: 'flag-anomaly', by: 'R1', source: 'M1' }];
+    const customType = {
+      typeId: 'tt_type_demo', name: 'demo', roleSlots: [], rules: [],
+      policy: { reviewRounds: 1, reviewQuorum: 1, maxRework: 1, escalateAfterStallMs: 0, reviewOrder: [] },
+      events: [{ type: 'flag-anomaly', producer: 'behavior' as const }],
+    };
+    const exec = makeTaskTeamObserveExecutors('cli_observer', { judge, fetchSince: twoMsgs, resolveType: () => customType });
+    const res = await exec.detect(instanceFixture(), 'om_cursor');
+    expect(res.events).toEqual([
+      { type: 'flag-anomaly', attribution: 'role', fromRoleInstanceId: 'tt_ri_dev', fromSlotId: 'tt_slot_dev', sourceEventId: 'om_1' },
+    ]);
+    // 不注入 resolveType（仅内置集）时同样的自定义 behavior 会被丢弃
+    const resBuiltin = await execWith(judge).detect(instanceFixture(), 'om_cursor');
+    expect(resBuiltin.events).toEqual([]);
+  });
+
+  it('渲染给 judge 的消息用短别名 [M1|R1]/[M2|R2] 前缀，绝不出现（截断的）真实 open_id', async () => {
     let seen: any;
     await execWith(async (ctx) => { seen = ctx; return []; }).detect(instanceFixture(), 'om_cursor');
-    expect(seen.newMessages).toContain('[R1] 我提交了 MR');
-    expect(seen.newMessages).toContain('[R2] 我看过了，打回');
+    expect(seen.newMessages).toContain('[M1|R1] 我提交了 MR');
+    expect(seen.newMessages).toContain('[M2|R2] 我看过了，打回');
     expect(seen.newMessages).not.toContain(DEV_OID);
     expect(seen.newMessages).not.toContain(DEV_OID.slice(0, 16)); // 截断片段也不该出现
     expect(seen.roster.map((r: any) => r.alias)).toEqual(['R1', 'R2']);
@@ -95,32 +141,33 @@ describe('taskteam detect() — 别名归因 + 已读边界 cursor', () => {
     expect(res).toEqual({ events: [], cursor: 'om_ext_1' });
   });
 
-  it('by 兼容直接给 roleInstanceId / slotId', async () => {
+  it('by 兼容直接给 roleInstanceId / slotId（带 source → 解析回真实 message id）', async () => {
     const judge: TaskTeamJudgeFn = async () => [
-      { type: 'submit', by: 'tt_ri_dev' },
-      { type: 'report', by: 'tt_slot_rev' },
+      { type: 'submit', by: 'tt_ri_dev', source: 'M1' },
+      { type: 'report', by: 'tt_slot_rev', source: 'M2' },
     ];
     const res = await execWith(judge).detect(instanceFixture(), 'om_cursor');
     expect(res.events).toEqual([
-      { type: 'submit', fromRoleInstanceId: 'tt_ri_dev', fromSlotId: 'tt_slot_dev' },
-      { type: 'report', fromRoleInstanceId: 'tt_ri_rev', fromSlotId: 'tt_slot_rev' },
+      { type: 'submit', attribution: 'role', fromRoleInstanceId: 'tt_ri_dev', fromSlotId: 'tt_slot_dev', sourceEventId: 'om_1' },
+      { type: 'report', attribution: 'role', fromRoleInstanceId: 'tt_ri_rev', fromSlotId: 'tt_slot_rev', sourceEventId: 'om_2' },
     ]);
   });
 
-  it('stall 团队级可不带归因仍保留', async () => {
+  it('阶段2 Blocker：judge 伪造的 stall（clock-only 事件）一律丢弃，detect 不产任何事件', async () => {
     const res = await execWith(async () => [{ type: 'stall', reason: '原地打转' }]).detect(instanceFixture(), 'om_cursor');
-    expect(res.events).toEqual([{ type: 'stall', reason: '原地打转' }]);
+    expect(res.events).toEqual([]); // stall 只能由 clock（maybeStallEvent）产，judge 输出被丢弃
+    expect(res.cursor).toBe('om_2'); // 已判读 → cursor 仍推进
   });
 
   it('未知 type（生命周期/非法）丢弃，cursor 仍推进', async () => {
     const judge: TaskTeamJudgeFn = async () => [
-      { type: 'team-started', by: 'R1' },
-      { type: 'accept', by: 'R1' },
-      { type: 'garbage', by: 'R1' },
-      { type: 'submit', by: 'R1' },
+      { type: 'team-started', by: 'R1', source: 'M1' },
+      { type: 'accept', by: 'R1', source: 'M1' },
+      { type: 'garbage', by: 'R1', source: 'M1' },
+      { type: 'submit', by: 'R1', source: 'M1' },
     ];
     const res = await execWith(judge).detect(instanceFixture(), 'om_cursor');
-    expect(res.events).toEqual([{ type: 'submit', fromRoleInstanceId: 'tt_ri_dev', fromSlotId: 'tt_slot_dev' }]);
+    expect(res.events).toEqual([{ type: 'submit', attribution: 'role', fromRoleInstanceId: 'tt_ri_dev', fromSlotId: 'tt_slot_dev', sourceEventId: 'om_1' }]);
     expect(res.cursor).toBe('om_2');
   });
 
@@ -170,7 +217,7 @@ describe('mapBehaviorToEvent — 纯映射单元', () => {
   const inst = instanceFixture();
   it('别名 R1 → roleInstances[0]（真实长 open_id 无关，按位置解析）', () => {
     expect(mapBehaviorToEvent(inst, { type: 'submit', by: 'R1' }))
-      .toEqual({ type: 'submit', fromRoleInstanceId: 'tt_ri_dev', fromSlotId: 'tt_slot_dev' });
+      .toEqual({ type: 'submit', attribution: 'role', fromRoleInstanceId: 'tt_ri_dev', fromSlotId: 'tt_slot_dev' });
   });
   it('未知 type → null', () => {
     expect(mapBehaviorToEvent(inst, { type: 'team-started', by: 'R1' } as TaskTeamDetectedBehavior)).toBeNull();
@@ -178,8 +225,35 @@ describe('mapBehaviorToEvent — 纯映射单元', () => {
   it('非 stall 且 by 越界 → null', () => {
     expect(mapBehaviorToEvent(inst, { type: 'report', by: 'R9' })).toBeNull();
   });
-  it('stall 无归因 → 保留', () => {
-    expect(mapBehaviorToEvent(inst, { type: 'stall' })).toEqual({ type: 'stall' });
+  it('阶段2 Blocker：stall 不在 detectable 集 → mapBehaviorToEvent 一律丢弃（只能 clock 产）', () => {
+    expect(mapBehaviorToEvent(inst, { type: 'stall' })).toBeNull();
+    expect(mapBehaviorToEvent(inst, { type: 'stall', by: 'R1', source: 'M1' })).toBeNull();
+  });
+  it('ctx.sourceEventId 注入 → 进 TeamEvent.sourceEventId（约束1）', () => {
+    expect(mapBehaviorToEvent(inst, { type: 'submit', by: 'R1' }, { sourceEventId: 'om_42' }))
+      .toEqual({ type: 'submit', attribution: 'role', fromRoleInstanceId: 'tt_ri_dev', fromSlotId: 'tt_slot_dev', sourceEventId: 'om_42' });
+  });
+  it('ctx.detectable 扩展 → 生产侧能产出 type 声明的新事件（registry②）；不在集内仍丢弃', () => {
+    const detectable = new Set(['submit', 'flag-anomaly']); // type.events 声明的自定义 behavior 事件
+    expect(mapBehaviorToEvent(inst, { type: 'flag-anomaly', by: 'R1' }, { detectable }))
+      .toEqual({ type: 'flag-anomaly', attribution: 'role', fromRoleInstanceId: 'tt_ri_dev', fromSlotId: 'tt_slot_dev' });
+    // 默认内置集不含 flag-anomaly → 丢弃（typo/未声明在 validator 兜底报错）
+    expect(mapBehaviorToEvent(inst, { type: 'flag-anomaly', by: 'R1' })).toBeNull();
+  });
+  it('阶段2 High：attribution=external → source-only（无 by/无 role）也产事件、标记 external、无 fromRoleInstanceId', () => {
+    const detectable = new Set(['new-bug']);
+    const ev = mapBehaviorToEvent(inst, { type: 'new-bug' }, { detectable, attribution: 'external', sourceEventId: 'om_7' });
+    expect(ev).toEqual({ type: 'new-bug', attribution: 'external', sourceEventId: 'om_7' });
+    expect(ev?.fromRoleInstanceId).toBeUndefined(); // 下游一眼识别无 role actor
+  });
+  it('阶段2 High：attribution=external 但 by 命中真实 role → 仍带上 role 归因（不强制丢 role）', () => {
+    const detectable = new Set(['new-bug']);
+    const ev = mapBehaviorToEvent(inst, { type: 'new-bug', by: 'R1' }, { detectable, attribution: 'external', sourceEventId: 'om_7' });
+    expect(ev).toEqual({ type: 'new-bug', attribution: 'external', fromRoleInstanceId: 'tt_ri_dev', fromSlotId: 'tt_slot_dev', sourceEventId: 'om_7' });
+  });
+  it('阶段2 High：attribution=role（缺省）+ 无 role → 仍丢弃（开发协作事件行为不变）', () => {
+    const detectable = new Set(['new-bug']);
+    expect(mapBehaviorToEvent(inst, { type: 'new-bug' }, { detectable, attribution: 'role' })).toBeNull();
   });
 });
 

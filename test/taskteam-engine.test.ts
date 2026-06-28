@@ -302,6 +302,68 @@ describe('decideTeamActions', () => {
     expect(decide(fix, awaiting, { type: 'accept' }).nextStatus).toBe('done');
   });
 
+  // ── 阶段1④ 显式 transition（default/custom event 解耦动作与状态跃迁，约束2）──
+  it('explicit transition on a custom event drives nextStatus without implicit reviewing (阶段1④)', () => {
+    const fix = twoLayerFixture();
+    // 自定义事件 monitor-flag：do=report（非 request-review）、显式声明 transition→blocked
+    const rules: TaskTeamCollabRule[] = [
+      { ruleId: 'tt_rule_flag', when: { event: 'monitor-flag', status: 'running' }, whoSlot: 'tt_slot_obs', do: 'report', transition: { status: 'blocked' } },
+    ];
+    const type = { ...fix.type, rules: rules.map(r => r.ruleId) };
+    const inst: TaskTeamInstance = { ...fix.instance, status: 'running' };
+    const d = decideTeamActions({ instance: inst, type, roles: fix.roles, rules, event: { type: 'monitor-flag', fromRoleInstanceId: 'tt_ri_dev', fromSlotId: 'tt_slot_dev' } });
+    expect(d.actions).toEqual([expect.objectContaining({ actionType: 'report', targetRoleInstanceId: 'tt_ri_obs' })]);
+    expect(d.nextStatus).toBe('blocked'); // 走显式 transition
+    expect(d.reviewState).toBeUndefined(); // 不触发 enterReview（与 review 状态机解耦）
+  });
+
+  it('custom event with do=request-review but explicit transition does NOT force reviewing (审批/巡检不被拽进两层 review)', () => {
+    const fix = twoLayerFixture();
+    // 「请某角色看一下」用 request-review 命令，但显式 transition 让它停在 running（不进 reviewing 状态机）
+    const rules: TaskTeamCollabRule[] = [
+      { ruleId: 'tt_rule_look', when: { event: 'please-look', status: 'running' }, whoSlot: 'tt_slot_arch', do: 'request-review', transition: { status: 'running' } },
+    ];
+    const type = { ...fix.type, rules: rules.map(r => r.ruleId) };
+    const inst: TaskTeamInstance = { ...fix.instance, status: 'running' };
+    const d = decideTeamActions({ instance: inst, type, roles: fix.roles, rules, event: { type: 'please-look', fromRoleInstanceId: 'tt_ri_dev', fromSlotId: 'tt_slot_dev' } });
+    expect(d.nextStatus).toBe('running'); // 显式 transition 压过隐式 request-review→reviewing
+    expect(d.reviewState).toBeUndefined();
+  });
+
+  it('default event WITHOUT explicit transition keeps legacy implicit request-review→reviewing (迁移期 fallback, seed 行为不漂)', () => {
+    const fix = twoLayerFixture(); // seed 风格：submit 规则无 transition，do=request-review
+    const inst: TaskTeamInstance = { ...fix.instance, status: 'running' };
+    const d = decide(fix, inst, { type: 'submit', fromRoleInstanceId: 'tt_ri_dev', fromSlotId: 'tt_slot_dev' });
+    expect(d.nextStatus).toBe('reviewing'); // 未声明 transition → 旧隐式仍生效
+    expect(d.reviewState?.round).toBe(1); // enterReview
+  });
+
+  it('conflicting explicit transitions on a co-matched event → conservative no transition (validator 该拦，runtime 兜底不乱跳)', () => {
+    const fix = twoLayerFixture();
+    const rules: TaskTeamCollabRule[] = [
+      { ruleId: 'tt_rule_a', when: { event: 'x-evt', status: 'running' }, whoSlot: 'tt_slot_obs', do: 'report', transition: { status: 'blocked' } },
+      { ruleId: 'tt_rule_b', when: { event: 'x-evt', status: 'running' }, whoSlot: 'tt_slot_arch', do: 'report', transition: { status: 'done' } },
+    ];
+    const type = { ...fix.type, rules: rules.map(r => r.ruleId) };
+    const inst: TaskTeamInstance = { ...fix.instance, status: 'running' };
+    const d = decideTeamActions({ instance: inst, type, roles: fix.roles, rules, event: { type: 'x-evt' } });
+    expect(d.actions).toHaveLength(2); // 两条都投递
+    expect(d.nextStatus).toBeUndefined(); // 冲突 → 不跃迁
+  });
+
+  it('sourceEventId flows into the idempotencyKey (约束1: per-event 区分同类事件)', () => {
+    const fix = twoLayerFixture();
+    const inst: TaskTeamInstance = { ...fix.instance, status: 'running' };
+    const k1 = decideTeamActions({ instance: inst, type: fix.type, roles: fix.roles, rules: fix.rules, event: { type: 'submit', fromRoleInstanceId: 'tt_ri_dev', fromSlotId: 'tt_slot_dev', sourceEventId: 'om_aaa' } }).actions[0].idempotencyKey;
+    const k2 = decideTeamActions({ instance: inst, type: fix.type, roles: fix.roles, rules: fix.rules, event: { type: 'submit', fromRoleInstanceId: 'tt_ri_dev', fromSlotId: 'tt_slot_dev', sourceEventId: 'om_bbb' } }).actions[0].idempotencyKey;
+    expect(k1).toContain('om_aaa');
+    expect(k2).toContain('om_bbb');
+    expect(k1).not.toBe(k2); // 不同来源 → 不同 key → outbox 不去重吞掉第二个同类事件
+    // 无 source 时回退 r{round}，重放仍幂等
+    const kNoSrc = decideTeamActions({ instance: inst, type: fix.type, roles: fix.roles, rules: fix.rules, event: { type: 'submit', fromRoleInstanceId: 'tt_ri_dev', fromSlotId: 'tt_slot_dev' } }).actions[0].idempotencyKey;
+    expect(kNoSrc).toContain(':r0:');
+  });
+
   it('does not silently swallow a met quorum with no routing rule (M1)', () => {
     const fix = twoLayerFixture();
     // 去掉 detail-pass 的路由规则，制造"审查员 pass 达 quorum 但无下一步规则"
