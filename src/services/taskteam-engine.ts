@@ -110,13 +110,18 @@ export function decideTeamActions(input: DecideTeamActionsInput): TeamDecision {
     const seg = event.sourceEventId ?? `r${keyRound}`;
     const acts: TeamActionDecision[] = [];
     for (const rule of rulesToFire) {
+      // 阶段2：领域无关动作的补充投递语义（rule.action）随命令带进 payload.__delivery（仅 IO 渲染/路由层读，
+      // 不参与决策与幂等键）。无 action 的规则 payload 原样透传——开发团队行为逐字不变。
+      const payload = rule.action
+        ? { ...(event.payload ?? {}), __delivery: rule.action }
+        : event.payload;
       for (const ri of instancesForSlot(rule.whoSlot)) {
         acts.push({
           actionType: rule.do,
           targetSlotId: rule.whoSlot,
           targetRoleInstanceId: ri.roleInstanceId,
           sourceRoleInstanceId: event.fromRoleInstanceId,
-          payload: event.payload,
+          payload,
           idempotencyKey: `${instance.teamId}:${event.type}:${seg}:${rule.ruleId}:${ri.roleInstanceId}`,
         });
       }

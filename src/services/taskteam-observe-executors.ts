@@ -76,6 +76,9 @@ export interface TaskTeamJudgeContext {
   }>;
   newMessages: string; // 渲染后的增量「[Mk|别名/ext] 正文」，老→新（别名由代码按 senderId→角色确定性打上）
   detectableEvents: string[]; // 本 type 可判读事件集（内置 ∪ type.events 声明 behavior），prompt 据此动态渲染（修 Blocker1）
+  // 阶段2 §2.2 受限数据槽（per-type 配置化，模板作者只能填这些，动不了安全骨架）：
+  eventDescriptions?: Record<string, string>; // 覆盖/补充内置事件人话描述（按 type 取，渲染进可判读事件列表）
+  decisionHints?: string[]; // 判读决策提示（逐条渲染进 prompt，引导 judge 怎么判；非完整 prompt）
 }
 
 /** 角色别名（短稳定、可被 LLM 可靠回显）：席位在 roleInstances 里的 1-based 序号 → R1/R2…。 */
@@ -304,9 +307,21 @@ function buildJudgePrompt(ctx: TaskTeamJudgeContext): string {
     .map((r) => `- ${r.alias} = 角色 ${clean(r.roleName, 24)}（slot ${r.slotId}）`)
     .join('\n');
   // 修 Blocker1：可判读事件列表从 registry 动态渲染（含 type.events 声明的自定义 behavior），而非写死内置 8 种。
-  const eventList = ctx.detectableEvents
-    .map((t) => `- "${t}": ${BUILTIN_EVENT_DESC[t] ?? '本任务小组声明的可判读事件'}`)
+  // 阶段2 §2.2：事件描述优先取 per-type 受限数据槽（eventDescriptions），缺省回退内置 BUILTIN_EVENT_DESC。
+  // 槽值经 clean() 清洗（剥控制字符/尖括号、截断），模板作者只能填描述、动不了安全骨架。
+  const descOf = (t: string): string => {
+    const slot = ctx.eventDescriptions?.[t];
+    if (typeof slot === 'string' && slot.trim()) return clean(slot, 120);
+    return BUILTIN_EVENT_DESC[t] ?? '本任务小组声明的可判读事件';
+  };
+  const eventList = ctx.detectableEvents.map((t) => `- "${t}": ${descOf(t)}`).join('\n');
+  // 阶段2 §2.2：决策提示（受限数据槽，逐条 clean 后渲染；非完整 prompt，UNTRUSTED/工具禁用/schema 不可配置）。
+  const hints = (ctx.decisionHints ?? [])
+    .map((h) => clean(h, 160))
+    .filter((h) => h.trim())
+    .map((h) => `- ${h}`)
     .join('\n');
+  const hintsBlock = hints ? `\n【判读提示（任务小组配置，参考即可）】\n${hints}\n` : '';
   return `你是任务小组的观测者，在判读一个任务小组子群里**这批新消息**反映出哪些「角色行为」。只输出 JSON。
 
 【任务目标】${clean(ctx.goal, 300)}
@@ -319,7 +334,7 @@ ${roster || '(空)'}
 
 【可判读的角色行为 type（只用这些，判不出就别给）】
 ${eventList}
-
+${hintsBlock}
 【输出 JSON 数组，严格这个 schema（无行为就输出 []）】
 by = 体现该行为的那条消息前缀里的席位别名（如 R1）——直接抄前缀里的 Rn，别抄任何长 id。
 source = 体现该行为的那条消息前缀里的消息别名（如 M1）——直接抄前缀里的 Mk，**只能用 Mk 别名，绝不要自己写任何 message_id / open_id**。
@@ -456,6 +471,7 @@ function buildJudgeContext(
   instance: TaskTeamInstance,
   messages: TaskTeamFetchedMessage[],
   detectable: ReadonlySet<string>,
+  judgeSlots?: TaskTeamType['judge'],
 ): TaskTeamJudgeContext {
   // senderId → 角色别名（确定性，代码里做）：席位绑定 bot 的 open_id 命中即用其位置别名 R{n}。
   const aliasBySender = new Map<string, string>();
@@ -482,6 +498,9 @@ function buildJudgeContext(
     // 别名前缀由代码确定性打上（[Mk|Rn]/[Mk|ext]）：Mk=消息别名(source)、Rn=席位别名(by)，LLM 只回显别名、不抄长 id。
     newMessages: messages.map((m, i) => `[${messageAlias(i)}|${prefixFor(m.senderId)}] ${m.text}`).join('\n'),
     detectableEvents: [...detectable],
+    // 阶段2 §2.2 受限数据槽（per-type 配置；安全骨架仍不可配置）：
+    eventDescriptions: judgeSlots?.eventDescriptions,
+    decisionHints: judgeSlots?.decisionHints,
   };
 }
 
@@ -521,8 +540,15 @@ export function makeTaskTeamObserveExecutors(
 
       // 修 Blocker1：按 instance.typeId 接入真实 registry——可判读集（含 type.events 声明 behavior）+ 无消息事件集。
       const type = resolveType?.(instance);
-      const detectable = type ? detectableEventsForType(type) : BUILTIN_DETECTABLE_EVENT_TYPES;
+      let detectable: ReadonlySet<string> = type ? detectableEventsForType(type) : BUILTIN_DETECTABLE_EVENT_TYPES;
       const noSourceTypes = type ? timerEventsForType(type) : BUILTIN_TIMER_EVENT_TYPES;
+      // 阶段2 §2.2：outputEventRegistry 受限数据槽——只能收窄到「registry ∩ 可判读集」，绝不越权扩展到
+      // 未声明事件（防注入：模板作者动不了 detectable 白名单的上界）。空/无交集时回退完整可判读集。
+      const registry = type?.judge?.outputEventRegistry;
+      if (registry && registry.length) {
+        const narrowed = new Set(registry.filter((e) => detectable.has(e)));
+        if (narrowed.size) detectable = narrowed;
+      }
 
       // 约束1：消息别名 M{k} → 真实 message id（系统给定的合法 source 集；judge 只能从中取，自生 id 解析不到）。
       const sourceById = new Map<string, string>();
@@ -530,7 +556,7 @@ export function makeTaskTeamObserveExecutors(
       // 无消息事件（stall/timer）才用的 window/episode id：取本批次已读边界（绝不退回 round）。
       const episodeId = `win:${reached}`;
 
-      const behaviors = await judge(buildJudgeContext(instance, messages, detectable));
+      const behaviors = await judge(buildJudgeContext(instance, messages, detectable, type?.judge));
       if (behaviors === null) {
         // judge 判不出（LLM/parse 失败）→ 瞬时，抛错让 tick 持 cursor 重试（修 P1#1，镜像 subtask）。
         throw new Error(`taskteam judge unavailable for ${instance.teamId} (LLM/parse failure)`);

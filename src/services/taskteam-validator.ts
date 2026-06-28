@@ -46,6 +46,8 @@ export class TaskTeamConfigValidationError extends Error {
 
 const VALID_DELIVERY_COMMANDS: ReadonlySet<string> = new Set<TaskTeamDeliveryCommand>([
   'kickoff', 'request-review', 'nudge', 'escalate', 'report', 'finish',
+  // 阶段2 领域无关动作（§2.3）
+  'notify', 'wake-role', 'route-to-owner',
 ]);
 const VALID_STATUSES: ReadonlySet<string> = new Set<TaskTeamStatus>([
   'forming', 'running', 'reviewing', 'blocked', 'awaiting-acceptance', 'done', 'archived',

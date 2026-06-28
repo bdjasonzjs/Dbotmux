@@ -163,6 +163,37 @@ export async function upsertTaskTeamOrgRuntimeBinding(binding: TaskTeamOrgRuntim
   });
 }
 
+// 阶段2 块4：现有「两层 review 开发团队」抽成一份**具名 type 常量**。
+// canonical typeId / roleSlot 顺序 / 引用的 ruleId / policy **一律不动**（golden test deepEqual 钉死，
+// 被 onboarding types[0] sample + dashboard 按 roleSlots 顺序渲染 + 现有实例按 typeId 查 type 引用）。
+// 要新名字只能加 display（本阶段不加，避免动 canonical 形态破坏 golden）。
+export const TT_TYPE_TWO_LAYER_REVIEW: TaskTeamType['typeId'] = 'tt_type_two_layer_review';
+
+export const TWO_LAYER_REVIEW_TEAM_TYPE: TaskTeamType = {
+  typeId: TT_TYPE_TWO_LAYER_REVIEW,
+  name: '两层 review 任务小组',
+  roleSlots: [
+    { slotId: 'tt_slot_developer_main', roleId: 'tt_role_developer', label: 'main' },
+    { slotId: 'tt_slot_architect_main', roleId: 'tt_role_architect', label: 'architecture-review' },
+    { slotId: 'tt_slot_detail_reviewer_main', roleId: 'tt_role_detail_reviewer', label: 'detail-review' },
+    { slotId: 'tt_slot_observer_main', roleId: 'tt_role_observer', label: 'observer' },
+  ],
+  rules: [
+    'tt_rule_submit_to_architect',
+    'tt_rule_architect_pass_to_detail',
+    'tt_rule_detail_pass_to_acceptance',
+    'tt_rule_reject_to_rework',
+    'tt_rule_observer_stall_report',
+  ],
+  policy: {
+    reviewRounds: 2,
+    reviewQuorum: 1,
+    maxRework: 3,
+    escalateAfterStallMs: 30 * 60 * 1000,
+    reviewOrder: ['tt_slot_architect_main', 'tt_slot_detail_reviewer_main'],
+  },
+};
+
 export function defaultTaskTeamSeed(): Omit<TaskTeamConfigFile, 'version' | 'updatedAt'> {
   const developer = 'tt_role_developer';
   const architect = 'tt_role_architect';
@@ -234,26 +265,8 @@ export function defaultTaskTeamSeed(): Omit<TaskTeamConfigFile, 'version' | 'upd
       // 卡顿 → 盯梢席 escalate 上报卡点
       { ruleId: rules[4], when: { event: 'stall', status: 'running' }, whoSlot: 'tt_slot_observer_main', do: 'escalate' },
     ],
-    teamTypes: [
-      {
-        typeId: 'tt_type_two_layer_review',
-        name: '两层 review 任务小组',
-        roleSlots: [
-          { slotId: 'tt_slot_developer_main', roleId: developer, label: 'main' },
-          { slotId: 'tt_slot_architect_main', roleId: architect, label: 'architecture-review' },
-          { slotId: 'tt_slot_detail_reviewer_main', roleId: detailReviewer, label: 'detail-review' },
-          { slotId: 'tt_slot_observer_main', roleId: observer, label: 'observer' },
-        ],
-        rules,
-        policy: {
-          reviewRounds: 2,
-          reviewQuorum: 1,
-          maxRework: 3,
-          escalateAfterStallMs: 30 * 60 * 1000,
-          reviewOrder: ['tt_slot_architect_main', 'tt_slot_detail_reviewer_main'],
-        },
-      },
-    ],
+    // 块4：引用具名 type 常量（深拷贝，保持「每次调用返回独立对象」语义，避免共享可变态）。
+    teamTypes: [structuredClone(TWO_LAYER_REVIEW_TEAM_TYPE)],
     orgStructures: [
       {
         companyName: '一人公司',

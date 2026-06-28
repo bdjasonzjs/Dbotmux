@@ -95,5 +95,7 @@ export function defaultObserverDeps(): TaskTeamObserverDeps {
     advanceCursor: async (teamId: TaskTeamId, cursor: string) => {
       await withTeamLock(teamId, () => applyTeamDecisionState(teamId, { cursor }));
     },
+    // 阶段2 停滞触发器：让 observer tick 取 type.policy.escalateAfterStallMs 做停滞 gate。
+    resolveType: resolveTaskTeamTypeForInstance,
   };
 }

@@ -4,7 +4,7 @@
 import { sendMessage } from '../im/lark/client.js';
 import { getTaskTeam } from './taskteam-store.js';
 import type { TaskTeamDispatchExecutors, TaskTeamSendResult } from './taskteam-dispatcher.js';
-import type { TaskTeamAction, TaskTeamId, TaskTeamInstance } from './taskteam-schema.js';
+import type { TaskTeamAction, TaskTeamActionSpec, TaskTeamId, TaskTeamInstance } from './taskteam-schema.js';
 
 const COMMAND_LABEL: Record<string, string> = {
   kickoff: '开工',
@@ -13,16 +13,39 @@ const COMMAND_LABEL: Record<string, string> = {
   escalate: '上报卡点',
   report: '进度 / 待验收',
   finish: '收尾',
+  // 阶段2 领域无关动作（§2.3）
+  notify: '通知',
+  'wake-role': '唤醒角色',
+  'route-to-owner': '转交 owner',
 };
 
+/** 从 action.payload 取阶段2 的领域无关投递补充语义（engine 写进 payload.__delivery）。无则 undefined。 */
+export function deliverySpecOf(action: TaskTeamAction): TaskTeamActionSpec | undefined {
+  const d = (action.payload as Record<string, unknown> | undefined)?.__delivery;
+  return d && typeof d === 'object' ? (d as TaskTeamActionSpec) : undefined;
+}
+
 export function renderTaskTeamCommand(action: TaskTeamAction, instance: TaskTeamInstance): string {
+  const delivery = deliverySpecOf(action);
   const ri = instance.roleInstances.find(r => r.roleInstanceId === action.targetRoleInstanceId);
-  const botOpenId = ri?.binding?.botOpenId;
-  const mention = botOpenId ? `<at user_id="${botOpenId}"></at> ` : '';
+  // 目标 @：user/owner 类显式 open_id 优先；否则 @ 目标席位绑定的 bot（席位寻址，沿用旧行为）。
+  const mentionOpenId =
+    (delivery?.targetType === 'user' || delivery?.targetType === 'owner') && delivery.targetOpenId
+      ? delivery.targetOpenId
+      : ri?.binding?.botOpenId;
+  const mention = mentionOpenId ? `<at user_id="${mentionOpenId}"></at> ` : '';
   const label = COMMAND_LABEL[action.actionType] ?? action.actionType;
   const summary = typeof action.payload?.summary === 'string' ? action.payload.summary : '';
   const body = summary ? `：${summary}` : '';
-  return `${mention}【任务小组·${label}】${body}`.trim();
+  const ackHint = delivery?.ack ? '（请回执 ack）' : '';
+  return `${mention}【任务小组·${label}】${body}${ackHint}`.trim();
+}
+
+/** 投递目标群：targetType=chat 的显式 targetChatId 覆盖；否则小组自身 chatId。 */
+export function targetChatIdFor(action: TaskTeamAction, instance: TaskTeamInstance): string | null {
+  const delivery = deliverySpecOf(action);
+  if (delivery?.targetType === 'chat' && delivery.targetChatId) return delivery.targetChatId;
+  return instance.chatId || null;
 }
 
 export function makeTaskTeamDispatchExecutors(senderLarkAppId: string): TaskTeamDispatchExecutors {
@@ -30,9 +53,11 @@ export function makeTaskTeamDispatchExecutors(senderLarkAppId: string): TaskTeam
     async send(action: TaskTeamAction): Promise<TaskTeamSendResult> {
       const instance = getTaskTeam(action.teamId);
       if (!instance) return { ok: false, error: `team ${action.teamId} not found`, retriable: false };
-      if (!instance.chatId) return { ok: false, error: `team ${action.teamId} has no chatId`, retriable: false };
+      // 阶段2：targetType=chat 可把 notify/route 投到外部群（targetChatId）；否则发小组自身 chatId。
+      const chatId = targetChatIdFor(action, instance);
+      if (!chatId) return { ok: false, error: `team ${action.teamId} has no target chatId`, retriable: false };
       try {
-        const messageId = await sendMessage(senderLarkAppId, instance.chatId, renderTaskTeamCommand(action, instance));
+        const messageId = await sendMessage(senderLarkAppId, chatId, renderTaskTeamCommand(action, instance));
         return { ok: true, messageId };
       } catch (err) {
         return { ok: false, error: String(err), retriable: true };
