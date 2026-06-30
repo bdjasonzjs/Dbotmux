@@ -7,6 +7,7 @@ import { withFileLock } from '../utils/file-lock.js';
 import type {
   TaskTeamCompanyId,
   TaskTeamDepartmentId,
+  TaskTeamE2eConfig,
   TaskTeamId,
   TaskTeamInstance,
   TaskTeamInstanceFile,
@@ -96,6 +97,7 @@ export async function createTaskTeam(opts: {
   deptId?: TaskTeamDepartmentId;
   chatId: string;
   targetExternalChatId?: string;
+  e2eConfig?: TaskTeamE2eConfig;
   goal: string;
   acceptance: string;
   roleInstances: TaskTeamRoleInstance[];
@@ -110,6 +112,7 @@ export async function createTaskTeam(opts: {
       deptId: opts.deptId,
       chatId: opts.chatId,
       ...(opts.targetExternalChatId ? { targetExternalChatId: opts.targetExternalChatId } : {}),
+      ...(opts.e2eConfig ? { e2eConfig: opts.e2eConfig } : {}),
       goal: opts.goal,
       acceptance: opts.acceptance,
       roleInstances: opts.roleInstances,
@@ -205,6 +208,7 @@ const ACTIVE_TEAM_STATUSES: ReadonlySet<TaskTeamStatus> = new Set([
   'forming',
   'running',
   'reviewing',
+  'e2e-verifying', // observer 在 e2e 验证态仍需盯群、判读豆包M 的 e2e 回报
   'blocked',
   'awaiting-acceptance',
 ]);

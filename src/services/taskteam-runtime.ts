@@ -12,6 +12,7 @@ import type {
   TaskTeamCollabRule,
   TaskTeamDepartmentId,
   TaskTeamCompanyId,
+  TaskTeamE2eConfig,
   TaskTeamId,
   TaskTeamInstance,
   TaskTeamReviewVote,
@@ -149,6 +150,7 @@ export interface CreateTaskTeamDeps extends TaskTeamRuntimeDeps {
     deptId?: TaskTeamDepartmentId;
     chatId: string;
     targetExternalChatId?: string;
+    e2eConfig?: TaskTeamE2eConfig;
     goal: string;
     acceptance: string;
     roleInstances: TaskTeamRoleInstance[];
@@ -167,6 +169,8 @@ export interface CreateTaskTeamParams {
   sourceChatId?: string | null;
   /** 可选：observer 监控的外部群；不设则默认监控任务小组自己的群。运行态绑定，不进模板。 */
   targetExternalChatId?: string;
+  /** 可选：实例级 e2e 验证四项配置（tt_type_dev_with_e2e 用）。运行态绑定，不进模板。 */
+  e2eConfig?: TaskTeamE2eConfig;
   /** 建群时把这些真人 open_id 拉进群（dashboard「用模板建真群」用——把当前用户拉进去）。可选、向后兼容。 */
   userOpenIds?: string[];
 }
@@ -195,6 +199,7 @@ export async function createTaskTeam(
     deptId: params.deptId,
     chatId,
     targetExternalChatId: params.targetExternalChatId,
+    e2eConfig: params.e2eConfig,
     goal: params.goal,
     acceptance: params.acceptance,
     roleInstances: params.roleInstances,

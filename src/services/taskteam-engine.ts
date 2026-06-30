@@ -225,13 +225,23 @@ export function decideTeamActions(input: DecideTeamActionsInput): TeamDecision {
     if (acts.length === 0) {
       return { actions: [], reviewState: { round, reworkCount, votes } };
     }
+    // 显式 transition 优先（与 decideDefault 一致的口径）：命中的 review-pass 规则若声明 transition，按它跃迁。
+    // 这让「详细 review 通过 → 进入独立 e2e 验证态」这类**配置声明**的阶段隔离成立，而无需给引擎加 type 专属分支。
+    // 向后兼容红线：dev-team two_layer 的 review-pass 规则**不声明 transition** → declared 为空 → 走下面旧的
+    // action-type 推导（request-review→reviewing / report→awaiting-acceptance），行为逐字不变（behavior-golden 锁死）。
+    const declaredStatuses = [...new Set(matched.filter(r => r.transition).map(r => r.transition!.status))];
     const startsNextReview = acts.some(a => a.actionType === 'request-review');
     const reportsAcceptance = acts.some(a => a.actionType === 'report');
-    const nextStatus: TaskTeamStatus | undefined = startsNextReview
-      ? 'reviewing'
-      : reportsAcceptance
-        ? 'awaiting-acceptance'
-        : undefined;
+    const nextStatus: TaskTeamStatus | undefined =
+      declaredStatuses.length === 1
+        ? declaredStatuses[0]
+        : declaredStatuses.length > 1
+          ? undefined // 冲突（validator 应已拦）：保守只投递、不跃迁
+          : startsNextReview
+            ? 'reviewing'
+            : reportsAcceptance
+              ? 'awaiting-acceptance'
+              : undefined;
     return { actions: acts, nextStatus, reviewState: enterReview() };
   };
 

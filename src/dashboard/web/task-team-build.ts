@@ -13,6 +13,7 @@ interface Role { roleId: string; name?: string; isObserver?: boolean }
 interface AvailBot { larkAppId: string; botName: string; botOpenId?: string; isClone?: boolean; online?: boolean; usable?: boolean }
 
 const CHEAP_RE = /coco|trae|tilly|haiku/i;
+const TT_DEV_WITH_E2E = 'tt_type_dev_with_e2e'; // 需求开发+e2e 验证类型：建组时必须连 e2e 四项一起配（后端 fail-fast 兜底）
 
 export function renderTaskTeamBuildPage(root: HTMLElement): (() => void) {
   let types: TeamType[] = [];
@@ -22,6 +23,11 @@ export function renderTaskTeamBuildPage(root: HTMLElement): (() => void) {
   const pick: Record<string, string> = {}; // slotId -> appId
   let goal = '';
   let targetExternalChatId = '';
+  // e2e 四项（仅 dev_with_e2e 类型采集）：装哪个包 / 哪个分支编前端 / 测哪些 case+预期 / 用哪个 skill
+  let e2eClientPackage = '';
+  let e2eFrontendBranch = '';
+  let e2eCases = '';
+  let e2eSkill = '';
   let busy = false;
   let result: { ok: boolean; html: string } | null = null;
 
@@ -29,6 +35,9 @@ export function renderTaskTeamBuildPage(root: HTMLElement): (() => void) {
   const isObserver = (roleId: string) => !!roles.find(r => r.roleId === roleId)?.isObserver;
   const usableBots = () => bots.filter(b => b.usable);
   const currentType = () => types.find(t => t.typeId === typeId);
+  const isDevWithE2e = () => typeId === TT_DEV_WITH_E2E;
+  // dev_with_e2e 必须填齐三项必填（skill 可空，后端默认 doubao-desktop-cdp-verification）
+  const e2eReady = () => !isDevWithE2e() || (!!e2eClientPackage.trim() && !!e2eFrontendBranch.trim() && !!e2eCases.trim());
 
   function allSlotsPicked(): boolean {
     const t = currentType();
@@ -72,7 +81,14 @@ export function renderTaskTeamBuildPage(root: HTMLElement): (() => void) {
         ${typeId ? `<div class="ttb-section"><div class="ttw-field"><span>② 给每个角色挑机器人</span></div>${noBots}<div class="ttb-slots">${slotRows}</div></div>` : ''}
         ${typeId ? `<label class="ttw-field"><span>③ 给个小目标（可空）</span><input id="ttb-goal" value="${esc(goal)}" placeholder="例如：跑通一次「交活→把关→完成」" /></label>` : ''}
         ${typeId ? `<label class="ttw-field"><span>④ 监控外部群 chatId（可空）</span><input id="ttb-target-chat" value="${esc(targetExternalChatId)}" placeholder="留空则监控新建的小组群；例如 oc_xxx" /></label>` : ''}
-        <button class="ttw-save ttb-build" ${!allSlotsPicked() || busy ? 'disabled' : ''}>${busy ? '建群中…' : '建这个真群'}</button>
+        ${isDevWithE2e() ? `<div class="ttb-section">
+          <div class="ttw-field"><span>⑤ e2e 验证四项（此类型必填，真机 e2e 关会 @ 验证员发这些）</span></div>
+          <label class="ttw-field"><span>· 装哪个客户端包</span><input id="ttb-e2e-pkg" value="${esc(e2eClientPackage)}" placeholder="豆包 native 包/版本/安装方式；依赖 native 改动要点明" /></label>
+          <label class="ttw-field"><span>· 用哪个分支编本地前端</span><input id="ttb-e2e-branch" value="${esc(e2eFrontendBranch)}" placeholder="分支名，如 computer-use/pip（worktree 用 flow_web_1~4）" /></label>
+          <label class="ttw-field"><span>· 测哪些 case + 预期</span><input id="ttb-e2e-cases" value="${esc(e2eCases)}" placeholder="点哪里/发什么 prompt/走什么流程；看到什么=对/=错" /></label>
+          <label class="ttw-field"><span>· 验证用哪个 skill（可空）</span><input id="ttb-e2e-skill" value="${esc(e2eSkill)}" placeholder="默认 doubao-desktop-cdp-verification" /></label>
+        </div>` : ''}
+        <button class="ttw-save ttb-build" ${!allSlotsPicked() || !e2eReady() || busy ? 'disabled' : ''}>${busy ? '建群中…' : '建这个真群'}</button>
         ${result ? `<div class="ttb-result ${result.ok ? 'ok' : 'err'}">${result.html}</div>` : ''}
       </div>
     </section>`;
@@ -85,6 +101,8 @@ export function renderTaskTeamBuildPage(root: HTMLElement): (() => void) {
     q<HTMLSelectElement>('#ttb-type')?.addEventListener('change', e => {
       typeId = (e.target as HTMLSelectElement).value;
       for (const k of Object.keys(pick)) delete pick[k];
+      // 切类型清空 e2e 四项（仅 dev_with_e2e 用），避免残留串到别的类型
+      e2eClientPackage = ''; e2eFrontendBranch = ''; e2eCases = ''; e2eSkill = '';
       // 聪明默认：observer 角色自动选一个便宜引擎 bot
       const t = currentType();
       if (t) for (const s of t.roleSlots) {
@@ -106,6 +124,12 @@ export function renderTaskTeamBuildPage(root: HTMLElement): (() => void) {
     });
     q<HTMLInputElement>('#ttb-goal')?.addEventListener('input', e => { goal = (e.target as HTMLInputElement).value; });
     q<HTMLInputElement>('#ttb-target-chat')?.addEventListener('input', e => { targetExternalChatId = (e.target as HTMLInputElement).value; });
+    // e2e 四项输入：直接更新变量 + 同步建群按钮可用态（不 rerender，避免输入框失焦/丢光标）。
+    const syncBuildBtn = () => { const b = q<HTMLButtonElement>('.ttb-build'); if (b) b.disabled = !allSlotsPicked() || !e2eReady() || busy; };
+    q<HTMLInputElement>('#ttb-e2e-pkg')?.addEventListener('input', e => { e2eClientPackage = (e.target as HTMLInputElement).value; syncBuildBtn(); });
+    q<HTMLInputElement>('#ttb-e2e-branch')?.addEventListener('input', e => { e2eFrontendBranch = (e.target as HTMLInputElement).value; syncBuildBtn(); });
+    q<HTMLInputElement>('#ttb-e2e-cases')?.addEventListener('input', e => { e2eCases = (e.target as HTMLInputElement).value; syncBuildBtn(); });
+    q<HTMLInputElement>('#ttb-e2e-skill')?.addEventListener('input', e => { e2eSkill = (e.target as HTMLInputElement).value; });
     q<HTMLButtonElement>('.ttb-build')?.addEventListener('click', () => { void doBuild(); });
   }
 
@@ -113,9 +137,17 @@ export function renderTaskTeamBuildPage(root: HTMLElement): (() => void) {
     if (busy || !allSlotsPicked()) return;
     busy = true; result = null; rerender();
     try {
+      const e2eConfig = isDevWithE2e()
+        ? {
+            clientPackage: e2eClientPackage.trim(),
+            frontendBranch: e2eFrontendBranch.trim(),
+            cases: e2eCases.trim(),
+            ...(e2eSkill.trim() ? { skill: e2eSkill.trim() } : {}),
+          }
+        : undefined;
       const r = await fetch('/api/taskteam-create', {
         method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ typeId, selectedBotBySlot: pick, goal: goal || undefined, targetExternalChatId: targetExternalChatId.trim() || undefined }),
+        body: JSON.stringify({ typeId, selectedBotBySlot: pick, goal: goal || undefined, targetExternalChatId: targetExternalChatId.trim() || undefined, e2eConfig }),
       });
       const data = await r.json().catch(() => ({}));
       busy = false;
@@ -128,6 +160,8 @@ export function renderTaskTeamBuildPage(root: HTMLElement): (() => void) {
         result = { ok: false, html: `✕ 有角色没配好机器人：${esc((data.problems || []).map((p: { slotId: string; reason: string }) => `${p.slotId}(${p.reason})`).join('，'))}` };
       } else if (r.status === 409 && data.error === 'no_operator_open_id') {
         result = { ok: false, html: `✕ ${esc(data.hint || '所选机器人没有可邀请的 owner，先给它绑 owner/allowedUsers')}` };
+      } else if (r.status === 400 && data.error === 'e2e_config_required') {
+        result = { ok: false, html: `✕ 该类型必须填齐 e2e 四项，缺：${esc((data.missing || []).join('、'))}。${esc(data.hint || '')}` };
       } else {
         result = { ok: false, html: `✕ 建群失败：${esc(data.error || ('HTTP ' + r.status))}` };
       }

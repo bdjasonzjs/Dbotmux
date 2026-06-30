@@ -1457,6 +1457,21 @@ ipcRoute('POST', '/api/taskteam-create', async (req, res) => {
   try { body = await readJsonBody(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
   try {
+    // 同模板建组路径一致的 fail-fast（修 reviewer 非阻塞①：让"所有 API 入口"字面成立）——
+    // raw 手写 roleInstances 入口也禁止建出缺 e2e 四项的 dev_with_e2e 实例。
+    const rawBody = body as { typeId?: string; e2eConfig?: unknown };
+    const { TT_TYPE_DEV_WITH_E2E, missingE2eConfigFields } = await import('./services/taskteam-dev-with-e2e.js');
+    if (rawBody?.typeId === TT_TYPE_DEV_WITH_E2E) {
+      const missing = missingE2eConfigFields(rawBody.e2eConfig);
+      if (missing.length) {
+        return jsonRes(res, 400, {
+          ok: false,
+          error: 'e2e_config_required',
+          missing,
+          hint: 'tt_type_dev_with_e2e 必须提供 e2eConfig 四项：clientPackage / frontendBranch / cases 必填，skill 可选（默认 doubao-desktop-cdp-verification）。',
+        });
+      }
+    }
     const { createTaskTeam } = await import('./services/taskteam-runtime.js');
     const { defaultCreateTaskTeamDeps } = await import('./services/taskteam-deps.js');
     const team = await createTaskTeam(defaultCreateTaskTeamDeps(), body);
@@ -1480,6 +1495,8 @@ ipcRoute('POST', '/api/taskteam-types', async (_req, res) => {
     } catch { /* best-effort discovery; unusable bots remain visible with no openId */ }
     const bots = buildTaskTeamAvailableBots(listBots(), info);
     await seedDefaultTaskTeamConfig();
+    const { seedDevWithE2eType } = await import('./services/taskteam-dev-with-e2e.js');
+    await seedDevWithE2eType(); // 让 dev_with_e2e 类型出现在可创建类型发现里
     return jsonRes(res, 200, { ok: true, result: summarizeTaskTeamTypes(readTaskTeamConfig(), bots) });
   } catch (err: any) {
     const status = err && err.name === 'HttpError' ? err.status : 500;
@@ -1498,6 +1515,7 @@ ipcRoute('POST', '/api/taskteam-create-from-template', async (req, res) => {
     goal?: string;
     acceptance?: string;
     targetExternalChatId?: string;
+    e2eConfig?: import('./services/taskteam-schema.js').TaskTeamE2eConfig;
     creatorLarkAppId?: string;
     userOpenIds?: string[];
     notifyOwnerOpenId?: string;
@@ -1514,9 +1532,25 @@ ipcRoute('POST', '/api/taskteam-create-from-template', async (req, res) => {
     const { listBots } = await import('./services/bot-inventory.js');
     const { buildRoleInstancesFromTemplate, buildTaskTeamAvailableBots } = await import('./services/taskteam-template-create.js');
     await seedDefaultTaskTeamConfig();
+    const { seedDevWithE2eType, TT_TYPE_DEV_WITH_E2E, missingE2eConfigFields } = await import('./services/taskteam-dev-with-e2e.js');
+    await seedDevWithE2eType(); // 幂等安装 dev_with_e2e 类型，供建组（含其 e2e_runner 角色/规则）
     const cfg = readTaskTeamConfig();
     const type = cfg.teamTypes.find(t => t.typeId === body.typeId);
     if (!type) return jsonRes(res, 404, { ok: false, error: `unknown typeId: ${body.typeId}` });
+
+    // fail-fast（修 reviewer P1②）：dev_with_e2e 必须连 e2e 四项一起配，禁止建出缺配置实例
+    // （否则 e2e 关只能发"请 owner 补"兜底，且子群规则不允许直接惊动 owner）。堵死所有入口（dashboard/CLI/API）。
+    if (body.typeId === TT_TYPE_DEV_WITH_E2E) {
+      const missing = missingE2eConfigFields(body.e2eConfig);
+      if (missing.length) {
+        return jsonRes(res, 400, {
+          ok: false,
+          error: 'e2e_config_required',
+          missing,
+          hint: 'tt_type_dev_with_e2e 必须提供 e2eConfig 四项：clientPackage(装哪个包) / frontendBranch(哪个分支编前端) / cases(测哪些 case+预期) 为必填，skill 可选（默认 doubao-desktop-cdp-verification）。',
+        });
+      }
+    }
 
     // 真实可用 bot：bots-info.json（跨进程真实 botOpenId）。usable = botOpenId 非空。
     let info: Array<{ larkAppId: string; botOpenId: string | null; botName: string | null }> = [];
@@ -1577,6 +1611,7 @@ ipcRoute('POST', '/api/taskteam-create-from-template', async (req, res) => {
       goal: body.goal ?? '示例小目标：跑通一次「交活→把关→完成」',
       acceptance: body.acceptance ?? '示例小组完整跑通一轮 review',
       targetExternalChatId: body.targetExternalChatId,
+      e2eConfig: body.e2eConfig,
       roleInstances: roleInstances as never,
       creatorLarkAppId,
       userOpenIds,

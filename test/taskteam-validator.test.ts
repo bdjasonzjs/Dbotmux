@@ -124,9 +124,17 @@ describe('validateTaskTeamConfig — 闭环 + 事件 registry + 显式 transitio
   });
 
   it('legacy 事件上声明 transition → warning transition-on-legacy（引擎 special case 不读）', () => {
-    const cfg = baseConfig({ rules: [{ ruleId: 'tt_rule_x', when: { event: 'review-pass' }, whoSlot: 'tt_slot_obs', do: 'report', transition: { status: 'done' } }] });
+    // review-reject 仍是 transition-blind legacy（引擎 decideReviewReject 不读 transition）→ 声明 transition 无效告警。
+    const cfg = baseConfig({ rules: [{ ruleId: 'tt_rule_x', when: { event: 'review-reject' }, whoSlot: 'tt_slot_obs', do: 'report', transition: { status: 'done' } }] });
     const v = validateTaskTeamConfig(cfg);
     expect(v.warnings.some(w => w.code === 'transition-on-legacy')).toBe(true);
+  });
+
+  it('review-pass 上声明 transition 不再告警（decideReviewPass 在达 quorum 推进时会读它——dev_with_e2e 进 e2e-verifying 用此）', () => {
+    const cfg = baseConfig({ rules: [{ ruleId: 'tt_rule_x', when: { event: 'review-pass' }, whoSlot: 'tt_slot_obs', do: 'report', transition: { status: 'e2e-verifying' } }] });
+    const v = validateTaskTeamConfig(cfg);
+    expect(v.warnings.some(w => w.code === 'transition-on-legacy')).toBe(false);
+    expect(v.errors.some(e => e.code === 'transition-bad-status')).toBe(false); // e2e-verifying 是合法状态
   });
 
   it('同事件可同时命中的两条规则声明互斥 transition → error transition-conflict（约束2：一次事件 0 或 1 个）', () => {

@@ -41,6 +41,7 @@ export type TaskTeamStatus =
   | 'forming'
   | 'running'
   | 'reviewing'
+  | 'e2e-verifying' // 详细 review 通过后、等真机 e2e 验证回报的独立阶段（tt_type_dev_with_e2e）；与 reviewing 隔离，避免重复 detail-pass 再次派 e2e。stall 仅在 running 触发，故本态天然豁免 stall-nudge（豆包M 离线不刷屏）。
   | 'blocked'
   | 'awaiting-acceptance'
   | 'done'
@@ -113,6 +114,13 @@ export interface TaskTeamStateTransition {
 export interface TaskTeamActionSpec {
   /** 目标类型：slot=沿用 whoSlot 寻址席位（缺省）/ user=@指定 open_id / chat=指定群 / owner=@owner（已做实，无 root 唤醒副作用）。 */
   targetType?: 'slot' | 'user' | 'chat' | 'owner';
+  /**
+   * 【已做实】渲染种类提示（dispatch 层据此追加 type-specific 文案/数据，**通用**——不耦合具体角色 id）。
+   *  - 'e2e-kickoff'：notify 渲染时把实例 `e2eConfig` 四项追加进消息体（@ e2e 验证员发派 e2e 任务）。
+   *  - 'e2e-fail-rework'：nudge 文案追加「先自查能修就修、修不了向上反馈、失败详情见群内回报」。
+   * 由 rule.action（配置侧）写入；引擎 stripDeliverySpec 保证它**绝不**从事件 payload（可能源自外部消息）混入。
+   */
+  kind?: 'e2e-kickoff' | 'e2e-fail-rework';
   /** 【已做实】targetType=chat 时投递到的群（覆盖小组自身 chatId）。 */
   targetChatId?: string;
   /** 【已做实】targetType=user/owner 时 @ / 路由到的 open_id。 */
@@ -187,6 +195,19 @@ export interface TaskTeamType {
   judge?: TaskTeamJudgeSlots;
 }
 
+// 实例级 e2e 验证配置（tt_type_dev_with_e2e）——task-specific，每个任务不同；运行态绑定，不进 TemplateBundle。
+// 四项含义见 shared_knowledge `cua/doubao-desktop-e2e-kickoff-template.md`。触发 e2e 关时由 dispatch 渲染进 @豆包M 的 notify。
+export interface TaskTeamE2eConfig {
+  /** ① 装哪个客户端包（豆包 native 包/版本/安装方式；依赖 native 改动时点明需要哪个带改动的包）。 */
+  clientPackage: string;
+  /** ② 用哪个分支编译本地前端资源（worktree 用 flow_web_1~4，禁自 clone 大仓）。 */
+  frontendBranch: string;
+  /** ③ 测哪些 case + 预期（点哪里/发什么 prompt/走什么流程，看到什么=对/=错）。 */
+  cases: string;
+  /** ④ 验证用哪个 skill（默认 doubao-desktop-cdp-verification）。 */
+  skill?: string;
+}
+
 // 可分享 shape：进 TemplateBundle，绝不含运行态 / app-scoped 身份（§2.5 / 细节 review H3）
 export interface TaskTeamOrgStructureShape {
   companyName: string;
@@ -230,6 +251,8 @@ export interface TaskTeamInstance {
   chatId: string;
   /** 可选：observer 实际监控的外部群。不设则沿用小组自己的 chatId。运行态绑定，不进 TemplateBundle。 */
   targetExternalChatId?: string;
+  /** 可选：实例级 e2e 验证配置（tt_type_dev_with_e2e 用）。触发 e2e 关时 dispatch 渲染进 @豆包M 的 notify。运行态绑定，不进 TemplateBundle。 */
+  e2eConfig?: TaskTeamE2eConfig;
   goal: string;
   acceptance: string;
   roleInstances: TaskTeamRoleInstance[];

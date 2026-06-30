@@ -56,11 +56,13 @@ const VALID_DELIVERY_COMMANDS: ReadonlySet<string> = new Set<TaskTeamDeliveryCom
   'notify', 'wake-role', 'route-to-owner',
 ]);
 const VALID_STATUSES: ReadonlySet<string> = new Set<TaskTeamStatus>([
-  'forming', 'running', 'reviewing', 'blocked', 'awaiting-acceptance', 'done', 'archived',
+  'forming', 'running', 'reviewing', 'e2e-verifying', 'blocked', 'awaiting-acceptance', 'done', 'archived',
 ]);
 // 引擎 special-case、不读显式 transition 的 legacy 事件（约束2）——在这些事件上声明 transition 无效。
+// 注：review-pass 已**不在**此列——decideReviewPass 在达 quorum 推进时会读命中规则的 transition（详细 review 通过 →
+// 进入独立 e2e-verifying 态即用此）；team-started/review-reject/accept 仍走 special case、不读 transition。
 const TRANSITION_BLIND_LEGACY_EVENTS: ReadonlySet<string> = new Set<string>([
-  'team-started', 'review-pass', 'review-reject', 'accept',
+  'team-started', 'review-reject', 'accept',
 ]);
 
 /** 校验整份 config 的闭环 + 事件 registry + 显式 transition 红线。纯函数、无 IO，可单测。 */
