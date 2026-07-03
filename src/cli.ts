@@ -2831,6 +2831,56 @@ async function cmdChatMode(rest: string[]): Promise<void> {
   process.stdout.write(`${positional}\n`);
 }
 
+// ─── Context-delivery subcommand（上下文注入文件引用化 灰度开关，设计 §3.4） ─────
+
+async function cmdContextDelivery(rest: string[]): Promise<void> {
+  process.env.SESSION_DATA_DIR ??= resolveDataDir();
+  const store = await import('./services/context-delivery-store.js');
+  const isGlobal = rest.includes('--global');
+  const clear = rest.includes('--clear');
+  // 抽 positional（inline|file）时跳过带值 flag。
+  const VALUE_FLAGS = new Set(['--chat-id', '--session-id']);
+  let positional: string | undefined;
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i];
+    if (a.startsWith('--')) { if (VALUE_FLAGS.has(a)) i++; continue; }
+    positional = a; break;
+  }
+  let chatId = argValue(rest, '--chat-id');
+  if (!chatId && !isGlobal) {
+    const { session } = await resolveSessionAppId(argValue(rest, '--session-id'));
+    chatId = session.chatId;
+  }
+  if (!chatId && !isGlobal) {
+    console.error('无法确定 chatId（在群内 CLI 会话运行，或传 --chat-id <oc> / --global）');
+    process.exit(1);
+  }
+  if (clear) {
+    if (isGlobal || !chatId) { console.error('--clear 只能清 per-chat 覆盖（配 --chat-id）'); process.exit(1); }
+    const removed = store.clearContextDelivery(chatId);
+    console.error(removed ? `✅ 已清除群 ${chatId} 的 contextDelivery 覆盖（回到全局默认）` : `群 ${chatId} 本就没有覆盖`);
+    return;
+  }
+  if (!positional) {
+    // 无参 = 查询当前生效模式（含来源）
+    const { mode, source } = store.getContextDeliveryWithSource(chatId);
+    console.log(`${mode} (source=${source})`);
+    return;
+  }
+  if (positional !== 'inline' && positional !== 'file') {
+    console.error('用法: botmux context-delivery [inline|file] [--chat-id <oc>] [--global] [--clear]（无参 = 查询）');
+    process.exit(1);
+  }
+  if (isGlobal) {
+    store.setGlobalContextDelivery(positional);
+    console.error(`✅ 全局默认 contextDelivery = ${positional}（per-chat 覆盖仍优先；下一轮消息起生效）`);
+  } else {
+    store.setContextDelivery(chatId!, positional);
+    console.error(`✅ 群 ${chatId} contextDelivery = ${positional}（下一轮消息起生效）`);
+  }
+  process.stdout.write(`${positional}\n`);
+}
+
 // ─── Create-group subcommand ─────────────────────────────────────────────────
 
 async function cmdCreateGroup(rest: string[]): Promise<void> {
@@ -3397,6 +3447,7 @@ switch (command) {
   case 'create-group': await cmdCreateGroup(process.argv.slice(3)); break;
   case 'create-company': await cmdCreateCompany(process.argv.slice(3)); break;
   case 'chat-mode': await cmdChatMode(process.argv.slice(3)); break;
+  case 'context-delivery': await cmdContextDelivery(process.argv.slice(3)); break;
   case 'subtask-create': {
     const { cmdSubtaskCreate } = await import('./cli/subtask-create.js');
     await cmdSubtaskCreate(process.argv.slice(3));

@@ -126,16 +126,23 @@ describe('PR-4 — worker-pool env injection contract', () => {
 
 describe('PR-6 — main-bot routing injected per-round (follow-up path too)', () => {
   // 主话题主 bot 多轮对话后会丢 <main_bot_routing>（只首轮注入）→ 复杂任务不再拉子群。
-  // 契约：buildFollowUpContent 也必须调用 buildMainBotPromptBlock（gate 自带，只对主 bot 生效）。
-  it('buildFollowUpContent calls buildMainBotPromptBlock (so the block is re-injected each round)', () => {
-    const src = readFileSync(join(__dirname, '..', 'src', 'core', 'session-manager.ts'), 'utf-8');
-    const fnStart = src.indexOf('export function buildFollowUpContent');
-    expect(fnStart).toBeGreaterThan(-1);
-    // 取该函数体到下一个 top-level export 之前，确认注入点在 follow-up 函数内部。
-    const after = src.slice(fnStart);
-    const nextExport = after.indexOf('\nexport ', 1);
-    const body = nextExport > -1 ? after.slice(0, nextExport) : after;
-    expect(body).toContain('buildMainBotPromptBlock(');
+  // 契约（行为级）：buildFollowUpContent 每轮重注入 main_bot_routing（gate 自带，只对主 bot 生效）。
+  // 原为源码文本断言「函数体里调用了 buildMainBotPromptBlock(」——上下文块收敛进
+  // ContextProvider registry（context-providers.ts）后注入改经 buildContextBlocks 装配，
+  // 文本断言失效但契约本身没变，升级为直接断言 follow-up 输出。
+  it('re-injects <main_bot_routing> in follow-up output for the main bot', async () => {
+    fakeMainTopic = 'oc_flumy';
+    const { buildFollowUpContent } = await freshImport();
+    const out = buildFollowUpContent('下一轮消息', 'sess_pr6', { chatId: 'oc_flumy', larkAppId: 'cli_claude', cliId: 'claude-code' });
+    expect(out).toContain('<main_bot_routing>');
+    expect(out).toContain('botmux subtask-start');
+  });
+
+  it('does not inject <main_bot_routing> for a non-main bot on follow-up', async () => {
+    fakeMainTopic = 'oc_flumy';
+    const { buildFollowUpContent } = await freshImport();
+    const out = buildFollowUpContent('下一轮消息', 'sess_pr6', { chatId: 'oc_flumy', larkAppId: 'cli_codex', cliId: 'codex' });
+    expect(out).not.toContain('<main_bot_routing>');
   });
 });
 
