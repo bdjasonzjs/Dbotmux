@@ -16,6 +16,7 @@ import { autoBindOncallFromDefault } from './services/oncall-store.js';
 import * as scheduleStore from './services/schedule-store.js';
 import * as messageQueue from './services/message-queue.js';
 import { buildAmbientForSpawn } from './services/chat-recent-context.js';
+import { gcContextFiles } from './services/context-file-manager.js';
 import { parseEventMessage, resolveNonsupportMessage, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
 import { expandMergeForward } from './im/lark/merge-forward.js';
 import { buildQuoteHint } from './im/lark/quote-hint.js';
@@ -2906,6 +2907,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
   // Restore active sessions from previous run
   restoreActiveSessions(activeSessions);
+
+  // 上下文文件引用化：启动时清理长期未更新的 ~/.botmux/context 文件（设计 §3.2 GC，
+  // 内部全兜底，绝不阻塞启动）。
+  gcContextFiles();
 
   await attachColdWorkflowRuns(cfg.larkAppId);
 

@@ -121,6 +121,11 @@ export interface CliAdapter {
   readonly supportsModelOverride?: boolean;
   readonly supportsReasoningEffort?: boolean;
 
+  /** 上下文文件引用化（context file delivery）能力 gate：该 CLI 是否跑在 daemon 本机、
+   *  能直接 Read daemon 写下的本地上下文文件。缺省 = true（当前全部 8 个 CLI 都是本机进程）。
+   *  跨机器 bot（如豆包M 这类远端执行引擎）接入时显式声明 false → 自动回落 inline 全量注入。 */
+  readonly readsLocalFilesystem?: boolean;
+
   /** When true, the adapter passes the initial prompt via CLI args (e.g. -i).
    *  The worker skips queuing the prompt for stdin write. */
   readonly passesInitialPromptViaArgs?: boolean;
