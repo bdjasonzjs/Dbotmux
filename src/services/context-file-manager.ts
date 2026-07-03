@@ -82,7 +82,13 @@ export function materializeContextFile(chatId: string, appId: string, sections: 
     const key = cacheKey(chatId, appId);
 
     if (lastVersionCache.get(key) === version) {
-      return { path, version }; // 内容没变：零 IO
+      // 内容没变且文件仍在：零写 IO（一次 stat 不算写）。必须确认文件还在——
+      // stub 是 bot 拿到上下文的唯一通道，文件被外部清理（人工/脚本误删，或
+      // 另一 daemon 启动 GC 按 mtime 清掉长期内容稳定的活跃群文件）后若继续
+      // 发 stub 就等于丢上下文（蔻黛克斯 review P1）。缺失 → 掉缓存走补写自愈。
+      if (existsSync(path)) return { path, version };
+      logger.warn(`[context-file] cached file missing, rewriting: chat=${chatId.slice(0, 12)} bot=${appId} version=${version}`);
+      lastVersionCache.delete(key);
     }
 
     // 缓存 miss（重启后首轮 / 内容变化）：读现有文件比对，相同则只回填缓存不写盘

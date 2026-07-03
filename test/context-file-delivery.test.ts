@@ -142,12 +142,23 @@ describe('context-file-manager（物化 + 版本 + 零 IO）', () => {
     expect(content).toContain('<output_discipline>');
   });
 
-  it('内容不变 → 零 IO（缓存命中后连文件缺失都不会补写），version 稳定', () => {
+  it('内容不变且文件仍在 → 零写 IO（不触碰文件内容），version 稳定', () => {
     const m1 = materializeContextFile('oc_m', APP, SECTIONS)!;
-    rmSync(m1.path); // 删掉文件：若第二次调用发生写盘，文件会重新出现
+    // 手动把文件内容改成 sentinel：若第二次调用发生重写，sentinel 会被覆盖
+    writeFileSync(m1.path, 'SENTINEL-no-rewrite', 'utf-8');
     const m2 = materializeContextFile('oc_m', APP, SECTIONS)!;
     expect(m2.version).toBe(m1.version);
-    expect(existsSync(m1.path)).toBe(false); // 没有发生任何写 IO
+    expect(readFileSync(m1.path, 'utf-8')).toBe('SENTINEL-no-rewrite'); // 缓存命中未重写
+  });
+
+  it('缓存命中但文件被外部删除 → 自动补写（stub 绝不指向不存在的文件，review P1）', () => {
+    const m1 = materializeContextFile('oc_m', APP, SECTIONS)!;
+    rmSync(m1.path); // 模拟人工清理 / 其它 daemon GC 误删
+    const m2 = materializeContextFile('oc_m', APP, SECTIONS)!;
+    expect(m2).not.toBeNull();
+    expect(m2!.version).toBe(m1.version);
+    expect(existsSync(m1.path)).toBe(true); // 文件已补写回来
+    expect(readFileSync(m1.path, 'utf-8')).toContain('<output_discipline>');
   });
 
   it('进程重启（缓存清空）后内容不变 → 读现有文件比对，不重写', () => {

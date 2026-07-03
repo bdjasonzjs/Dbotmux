@@ -417,5 +417,8 @@ export function buildContextBlocks(ctx: BuildCtx): string[] {
     logger.warn(`[context-providers] materialize failed for chat ${ctx.chatId}, falling back to inline delivery this turn`);
     return inlineAll();
   }
+  // stub 固定放在本组块的首位、inline 型 provider 输出跟在其后——当前四个内置 provider
+  // 全是 file 型，inlineParts 恒空。未来注册 inline 型 provider 时注意：这里不保持
+  // 它与 file 型块之间的注册顺序交错（组内顺序 = stub 先、inline 后），若顺序敏感需重看。
   return [renderContextRefStub(mat.path, mat.version), ...inlineParts];
 }
