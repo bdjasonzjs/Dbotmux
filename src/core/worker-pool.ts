@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { ensureSkills } from '../skills/installer.js';
 import { randomBytes } from 'node:crypto';
 import { config } from '../config.js';
+import { ensureCommandGuardShims, resolveWorkerSecurityEnv } from '../security/worker-security.js';
 import * as sessionStore from '../services/session-store.js';
 import { persistStreamCardState } from './session-manager.js';
 import { updateMessage, deleteMessage, MessageWithdrawnError } from '../im/lark/client.js';
@@ -730,7 +731,10 @@ function doForkWorker(ds: DaemonSession, prompt: string, resume = false, followu
   // Prepend ~/.botmux/bin to PATH so CLIs can call `botmux send` etc.
   // The wrapper script there is written by the daemon at startup.
   const botmuxBinDir = join(homedir(), '.botmux', 'bin');
-  const pathWithBotmux = `${botmuxBinDir}:${process.env.PATH ?? ''}`;
+  const securityEnv = resolveWorkerSecurityEnv();
+  const guardDir = ensureCommandGuardShims();
+  const pathPrefixes = [guardDir, botmuxBinDir].filter(Boolean) as string[];
+  const pathWithBotmux = `${pathPrefixes.join(':')}:${process.env.PATH ?? ''}`;
 
   let worker: ChildProcess & BootSlot;
   try {
@@ -739,6 +743,7 @@ function doForkWorker(ds: DaemonSession, prompt: string, resume = false, followu
     cwd,
     env: {
       ...process.env,
+      ...securityEnv,
       PATH: pathWithBotmux,
       CLAUDECODE: undefined,
       BOTMUX: '1',  // Marker so user scripts/skills can detect a botmux-spawned CLI
@@ -1510,6 +1515,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     cwd: adopted.cwd ?? ds.workingDir ?? process.cwd(),
     env: {
       ...process.env,
+      ...resolveWorkerSecurityEnv(),
       CLAUDECODE: undefined,
       BOTMUX: '1',
       LARK_APP_ID: botCfg.larkAppId,

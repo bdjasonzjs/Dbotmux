@@ -37,11 +37,24 @@ describe('buildBotmuxEnvAssignments()', () => {
       SESSION_DATA_DIR: '/home/u/.botmux/data',
       IS_SANDBOX: '1',
       BOTMUX_SESSION_ID: 'sid_xyz',
+      HTTP_PROXY: 'http://restricted-proxy:7890',
+      HTTPS_PROXY: 'http://restricted-proxy:7890',
+      ALL_PROXY: 'http://restricted-proxy:7890',
+      FTP_PROXY: 'http://restricted-proxy:7890',
+      http_proxy: 'http://restricted-proxy:7890',
+      https_proxy: 'http://restricted-proxy:7890',
+      all_proxy: 'http://restricted-proxy:7890',
+      ftp_proxy: 'http://restricted-proxy:7890',
+      NO_PROXY: 'localhost,code.byted.org',
+      no_proxy: 'localhost,code.byted.org',
+      BOTMUX_EGRESS_POLICY: 'restricted-proxy',
+      BOTMUX_EGRESS_ALLOW_HOSTS: 'code.byted.org,bits.bytedance.net',
+      BOTMUX_PATH_PREFIX: '/home/u/.botmux/security-bin',
+      BOTMUX_COMMAND_GUARD: '1',
       // None of the rest should appear — those come from rcfile.
       PATH: '/usr/bin',
       HOME: '/home/u',
       NVM_BIN: '/home/u/.nvm/versions/node/v20/bin',
-      HTTP_PROXY: 'http://proxy:8080',
       LANG: 'en_US.UTF-8',
     });
     expect(out).toEqual([
@@ -52,6 +65,20 @@ describe('buildBotmuxEnvAssignments()', () => {
       'SESSION_DATA_DIR=/home/u/.botmux/data',
       'IS_SANDBOX=1',
       'BOTMUX_SESSION_ID=sid_xyz',
+      'HTTP_PROXY=http://restricted-proxy:7890',
+      'HTTPS_PROXY=http://restricted-proxy:7890',
+      'ALL_PROXY=http://restricted-proxy:7890',
+      'FTP_PROXY=http://restricted-proxy:7890',
+      'http_proxy=http://restricted-proxy:7890',
+      'https_proxy=http://restricted-proxy:7890',
+      'all_proxy=http://restricted-proxy:7890',
+      'ftp_proxy=http://restricted-proxy:7890',
+      'NO_PROXY=localhost,code.byted.org',
+      'no_proxy=localhost,code.byted.org',
+      'BOTMUX_EGRESS_POLICY=restricted-proxy',
+      'BOTMUX_EGRESS_ALLOW_HOSTS=code.byted.org,bits.bytedance.net',
+      'BOTMUX_PATH_PREFIX=/home/u/.botmux/security-bin',
+      'BOTMUX_COMMAND_GUARD=1',
     ]);
   });
 
@@ -71,10 +98,9 @@ describe('buildBotmuxEnvAssignments()', () => {
     expect(out.every(s => !s.endsWith('=undefined'))).toBe(true);
   });
 
-  it('does NOT forward arbitrary env even when set (PATH, HTTP_PROXY, ...)', () => {
+  it('does NOT forward arbitrary env even when set, except botmux security env', () => {
     const out = buildBotmuxEnvAssignments({
       PATH: '/should/not/leak',
-      HTTP_PROXY: 'http://should/not/leak',
       LANG: 'should-not-leak',
       LARK_APP_ID: 'kept',
     });
@@ -323,6 +349,67 @@ describe('shell wrapper end-to-end (the contract spawn() builds)', () => {
       );
       expect(result.status).toBe(0);
       expect(result.stdout).toBe(`${tricky}\nline1\nline2\n`);
+    },
+  );
+
+  it.skipIf(!hasEnvBin)(
+    'security PATH prefix lands after rcfile load but before CLI exec',
+    () => {
+      tmpDir = mkdtempSync(join(tmpdir(), 'bmx-guard-path-'));
+      const guardDir = join(tmpDir, 'guard');
+      const { mkdirSync } = require('node:fs') as typeof import('node:fs');
+      mkdirSync(guardDir, { recursive: true });
+      writeFileSync(join(guardDir, 'probe'), '#!/bin/sh\necho guarded-probe\n');
+      chmodSync(join(guardDir, 'probe'), 0o755);
+
+      const result = spawnSync(
+        '/bin/sh',
+        ['-c', SCRIPT, '_',
+          tmpdir(),
+          'BOTMUX=1',
+          '/usr/bin/env', 'probe',
+        ],
+        { encoding: 'utf-8', env: { PATH: '/usr/bin:/bin', BOTMUX_PATH_PREFIX: guardDir } },
+      );
+      expect(result.status).toBe(0);
+      expect(result.stdout.trim()).toBe('guarded-probe');
+    },
+  );
+
+  it.skipIf(!hasBash || !hasEnvBin)(
+    'security PATH prefix is re-applied after .bashrc rebuilds PATH',
+    () => {
+      tmpDir = mkdtempSync(join(tmpdir(), 'bmx-guard-realpath-'));
+      const home = tmpDir;
+      const guardDir = join(home, 'guard');
+      const rcBin = join(home, 'rc-bin');
+      const { mkdirSync } = require('node:fs') as typeof import('node:fs');
+      mkdirSync(guardDir, { recursive: true });
+      mkdirSync(rcBin, { recursive: true });
+      writeFileSync(join(guardDir, 'curl'), '#!/bin/sh\necho guard-curl\n');
+      writeFileSync(join(guardDir, 'python3'), '#!/bin/sh\necho guard-python3\n');
+      writeFileSync(join(rcBin, 'curl'), '#!/bin/sh\necho rc-curl\n');
+      writeFileSync(join(rcBin, 'python3'), '#!/bin/sh\necho rc-python3\n');
+      chmodSync(join(guardDir, 'curl'), 0o755);
+      chmodSync(join(guardDir, 'python3'), 0o755);
+      chmodSync(join(rcBin, 'curl'), 0o755);
+      chmodSync(join(rcBin, 'python3'), 0o755);
+      writeFileSync(join(home, '.bashrc'), `export PATH="${rcBin}:$PATH"\n`);
+
+      const result = spawnSync(
+        '/bin/bash',
+        ['-i', '-c', SCRIPT, '_',
+          home,
+          'BOTMUX=1',
+          '/bin/sh', '-c', 'which curl; which python3',
+        ],
+        { encoding: 'utf-8', env: { HOME: home, PATH: '/usr/bin:/bin', BOTMUX_PATH_PREFIX: guardDir } },
+      );
+      expect(result.status).toBe(0);
+      expect(result.stdout.trim().split('\n')).toEqual([
+        join(guardDir, 'curl'),
+        join(guardDir, 'python3'),
+      ]);
     },
   );
 
