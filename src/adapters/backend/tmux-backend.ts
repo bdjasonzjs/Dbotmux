@@ -453,6 +453,20 @@ const BOTMUX_INJECTED_ENV_KEYS = [
   // 过去漏了它 → tmux pane 里 env 兜底落空。注入它兜底成立（注入值是 spawn 时正确值；即便
   // 后续 daemon 重启变旧，session-marker 也以进程树 marker 为准、env 仅兜底，故注入它安全）。
   'BOTMUX_SESSION_ID',
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+  'ALL_PROXY',
+  'FTP_PROXY',
+  'http_proxy',
+  'https_proxy',
+  'all_proxy',
+  'ftp_proxy',
+  'NO_PROXY',
+  'no_proxy',
+  'BOTMUX_EGRESS_POLICY',
+  'BOTMUX_EGRESS_ALLOW_HOSTS',
+  'BOTMUX_PATH_PREFIX',
+  'BOTMUX_COMMAND_GUARD',
 ] as const;
 
 /**
@@ -483,7 +497,7 @@ export function buildBotmuxEnvAssignments(env: NodeJS.ProcessEnv | undefined): s
  * POSIX-syntax (works in bash/zsh/sh); fish/csh/nu users get remapped to
  * bash/zsh/sh by resolveUserShell() so they hit the same SCRIPT path.
  */
-export const SHELL_WRAPPER_SCRIPT = 'cd -- "$1" && shift && exec /usr/bin/env "$@"';
+export const SHELL_WRAPPER_SCRIPT = 'cd -- "$1" && shift && export PATH="${BOTMUX_PATH_PREFIX:-$HOME/.botmux/security-bin}:$PATH" && exec /usr/bin/env "$@"';
 
 /**
  * Debug variant of the wrapper script — same prelude, but the CLI runs as
