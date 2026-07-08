@@ -10,18 +10,14 @@ import {
 } from '../src/security/worker-security.js';
 
 describe('worker security env', () => {
-  it('clears inherited broad proxy by default and keeps an explicit policy marker', () => {
-    expect(resolveEgressProxyEnv({ HTTPS_PROXY: 'http://127.0.0.1:7890' })).toMatchObject({
-      HTTP_PROXY: '',
-      HTTPS_PROXY: '',
-      ALL_PROXY: '',
-      all_proxy: '',
-      FTP_PROXY: '',
-      ftp_proxy: '',
-      http_proxy: '',
-      https_proxy: '',
-      BOTMUX_EGRESS_POLICY: 'direct-no-inherited-proxy',
-    });
+  it('preserves the inherited proxy by default (never clears it — bots must keep the proxy for stable IP / model reachability)', () => {
+    // 默认（未显式配置受限代理）：不覆盖、不清空任何 proxy env → 返回空对象，worker 继承父进程代理（7890）。
+    // 硬约束：清代理会断 bot 模型 + 招模型厂商封号，绝不能默认清。出口管控在代理层白名单做。
+    const out = resolveEgressProxyEnv({ HTTPS_PROXY: 'http://127.0.0.1:7890' });
+    expect(out).toEqual({});
+    // 明确断言：绝不把继承的 proxy 改写成空串。
+    expect(out).not.toHaveProperty('HTTPS_PROXY', '');
+    expect(out).not.toHaveProperty('BOTMUX_EGRESS_POLICY', 'direct-no-inherited-proxy');
   });
 
   it('injects configured restricted proxy and default no_proxy list', () => {
