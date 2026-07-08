@@ -44,20 +44,12 @@ export function resolveEgressProxyEnv(env: NodeJS.ProcessEnv = process.env): Rec
   const noProxy = env.BOTMUX_EGRESS_NO_PROXY?.trim() || DEFAULT_NO_PROXY;
   const allowHosts = env.BOTMUX_EGRESS_ALLOW_HOSTS?.trim() || DEFAULT_EGRESS_ALLOW_HOSTS;
   if (!proxy) {
-    return {
-      HTTP_PROXY: '',
-      HTTPS_PROXY: '',
-      ALL_PROXY: '',
-      FTP_PROXY: '',
-      http_proxy: '',
-      https_proxy: '',
-      all_proxy: '',
-      ftp_proxy: '',
-      NO_PROXY: noProxy,
-      no_proxy: noProxy,
-      BOTMUX_EGRESS_POLICY: 'direct-no-inherited-proxy',
-      BOTMUX_EGRESS_ALLOW_HOSTS: allowHosts,
-    };
+    // 默认（未显式配置受限代理）：**保留 worker 继承的代理 env**（本机通常是 http://127.0.0.1:7890），
+    // 不覆盖、不清空。硬约束：所有 bot（尤其 claude→Anthropic / codex→OpenAI）必须走该代理，否则本机
+    // IP 不稳会被模型厂商封号；且 chatgpt.com 等只能经代理可达。出口管控应在**代理层白名单**做（放行
+    // 内网+模型、拉黑攻击 IP），**绝不在此清代理**——清代理会断 bot 模型 + 招封号（曾致生产回归事故）。
+    // 只有显式设置 BOTMUX_EGRESS_PROXY 指向受限代理时（下方分支）才改写 worker 的 proxy 路由。
+    return {};
   }
   return {
     HTTP_PROXY: proxy,
