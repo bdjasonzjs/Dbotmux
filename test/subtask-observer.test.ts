@@ -50,7 +50,7 @@ async function mkObserving(chat = 'oc_sub', key = 'k1') {
 
 /** mock executors：fetchSince 返 {messages(老→新连续), complete}，judge 返固定 signal。 */
 function mkExec(over: {
-  messages?: Array<{ id: string; rendered: string }>;
+  messages?: Array<{ id: string; rendered: string; senderId?: string; createdAt?: string }>;
   complete?: boolean;
   judged?: JudgeResult | null;
 }): ObserverExecutors & { fetchSince: ReturnType<typeof vi.fn>; judge: ReturnType<typeof vi.fn> } {
@@ -929,5 +929,92 @@ describe('交付待审豁免 stall-nudge（治 request_review 后"做完没有?"
     await runObserverTick(now, mkExec({ messages: [] }));
     await runObserverTick(new Date(now.getTime() + 2 * MIN_OBSERVE_INTERVAL_MS), mkExec({ messages: [] }));
     expect(listCommands(t.taskId).filter(c => c.commandType === 'request_review')).toHaveLength(2); // 没再多发
+  });
+
+  it('request_review 后 reviewer(collab) 已发实质评审 → 应唤回 executor(main) 消化评审', async () => {
+    const start = new Date('2026-07-10T00:00:00.000Z');
+    const t0 = await createSubTask({
+      chatId: 'oc_review_done', parentChatId: 'oc_parent', parentMessageId: 'om_src',
+      goal: '修 review→executor 断跳', acceptance: null,
+      bots: [
+        { openId: 'ou_executor', name: '执行者', role: 'main' },
+        { openId: 'ou_reviewer', name: 'Reviewer', role: 'collab' },
+      ],
+      requester: 'ou_jason', createdBy: 'ou_executor', idempotencyKey: 'review-done-nudge',
+    });
+    await transitionStatus(t0.taskId, 'observing');
+    const t = getSubTask(t0.taskId)!;
+    await seedReview(t, start.toISOString());
+
+    await runObserverTick(new Date(start.getTime() + 2 * 60_000), mkExec({
+      messages: [{
+        id: 'm_review_report',
+        senderId: 'ou_reviewer',
+        createdAt: new Date(start.getTime() + 60_000).toISOString(),
+        rendered: '评审报告：Findings\n- Blocker: handleReviewHeartbeat 只重催 reviewer，不会唤回 executor。\n建议：识别 reviewer 产出后 nudge main 继续修改。',
+      }],
+      judged: { signal: 'normal', summary: 'reviewer 已给出实质评审，等待 executor 消化' },
+    }));
+
+    const nudges = listCommands(t.taskId).filter(c => c.commandType === 'nudge');
+    expect(nudges).toHaveLength(1);
+    expect(nudges[0].direction).toBe('parent_to_child');
+    expect(nudges[0].payload.targetRole).toBe('main');
+  });
+
+  it('request_review 后 reviewer 仅确认收到/开始审 → 仍不催 executor（anti-spam）', async () => {
+    const start = new Date('2026-07-10T01:00:00.000Z');
+    const t0 = await createSubTask({
+      chatId: 'oc_review_ack', parentChatId: 'oc_parent', parentMessageId: 'om_src',
+      goal: '修 review→executor 断跳', acceptance: null,
+      bots: [
+        { openId: 'ou_executor', name: '执行者', role: 'main' },
+        { openId: 'ou_reviewer', name: 'Reviewer', role: 'collab' },
+      ],
+      requester: 'ou_jason', createdBy: 'ou_executor', idempotencyKey: 'review-ack-no-nudge',
+    });
+    await transitionStatus(t0.taskId, 'observing');
+    const t = getSubTask(t0.taskId)!;
+    await seedReview(t, start.toISOString());
+
+    await runObserverTick(new Date(start.getTime() + 2 * 60_000), mkExec({
+      messages: [{
+        id: 'm_review_ack',
+        senderId: 'ou_reviewer',
+        createdAt: new Date(start.getTime() + 60_000).toISOString(),
+        rendered: '收到，我开始审',
+      }],
+      judged: { signal: 'normal', summary: 'reviewer 已确认开始评审' },
+    }));
+
+    expect(listCommands(t.taskId).filter(c => c.commandType === 'nudge')).toHaveLength(0);
+  });
+
+  it('request_review 后只看到早于本次 request_review 的 reviewer 陈旧评审 → 不解锁待审豁免', async () => {
+    const start = new Date('2026-07-10T02:00:00.000Z');
+    const t0 = await createSubTask({
+      chatId: 'oc_review_stale', parentChatId: 'oc_parent', parentMessageId: 'om_src',
+      goal: '修 review→executor 断跳', acceptance: null,
+      bots: [
+        { openId: 'ou_executor', name: '执行者', role: 'main' },
+        { openId: 'ou_reviewer', name: 'Reviewer', role: 'collab' },
+      ],
+      requester: 'ou_jason', createdBy: 'ou_executor', idempotencyKey: 'review-stale-no-nudge',
+    });
+    await transitionStatus(t0.taskId, 'observing');
+    const t = getSubTask(t0.taskId)!;
+    await seedReview(t, start.toISOString());
+
+    await runObserverTick(new Date(start.getTime() + 2 * 60_000), mkExec({
+      messages: [{
+        id: 'm_previous_review',
+        senderId: 'ou_reviewer',
+        createdAt: new Date(start.getTime() - 60_000).toISOString(),
+        rendered: '评审报告：Findings\n- Blocker: 这是上一轮 request_review 的旧评审，不属于本次请求。\n建议：不能用它唤回 executor。',
+      }],
+      judged: { signal: 'normal', summary: '只读到上一轮旧评审' },
+    }));
+
+    expect(listCommands(t.taskId).filter(c => c.commandType === 'nudge')).toHaveLength(0);
   });
 });

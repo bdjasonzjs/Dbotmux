@@ -53,7 +53,7 @@ export interface FetchResult {
    *  关键 (review Blocker 1)：必须是连续的，cursor 才能安全推到本批最后一条不漏。
    *  优化 #3：带 senderId (消息发送者 open_id/app_id)，用于判"执行者侧实质活动"——
    *  owner(base relay nudge 回声) 的 senderId === task.requester，不算 activity。 */
-  messages: Array<{ id: string; rendered: string; senderId?: string }>;
+  messages: Array<{ id: string; rendered: string; senderId?: string; createdAt?: string }>;
   /** 是否已读到群尾。false = 还有更多 (忙群积压)，本轮只推进到本批末尾，下轮接着读。 */
   complete: boolean;
 }
@@ -338,16 +338,22 @@ async function tickOne(t: SubTask, now: Date, exec: ObserverExecutors): Promise<
   const readToCursor = analyzedMessageIds[analyzedMessageIds.length - 1];
   const renderedNew = ordered.map(m => m.rendered).join('\n');
   if (!fetched.complete) logger.info(`[subtask-observer] ${t.taskId} 积压未读完, 本轮推进到 ${readToCursor?.slice(0, 10)}, 下轮继续`);
+  const latestInitiating = latestInitiatingCommand(t);
+  const latestReviewRequest = latestInitiating?.commandType === 'request_review' ? latestInitiating : null;
+  const reviewSubmission = latestReviewRequest
+    ? findReviewerSubmissionAfterRequest(t, latestReviewRequest, ordered)
+    : null;
 
   // 优化 #3：本批是否含**执行者侧实质活动**——只有**已知 == owner(task.requester)** 的消息才算"非活动"
   // (base relay nudge 回声/owner 系统消息)。sender 未知(undefined) 保守当作执行者活动，绝不误抑真进展。
   // 仅当**整批都是已知 owner 消息**时 hasExecutorActivity=false → 纯回声。
-  const hasExecutorActivity = ordered.some(m => m.senderId !== t.requester);
+  const hasExecutorActivity = ordered.some(m => isExecutorActivityMessage(t, m));
+  const ownerOnlyEcho = ordered.every(m => m.senderId === t.requester);
 
   // 蔻黛克斯 code-review blocker1：纯 owner 系统消息/nudge 回声 (无执行者活动) **绝不进 judge/planCommit**
   // ——否则「任务搞定没有？」可能被误判 need_help/done 触发上报或转态。只推进 cursor 防重读、中性观测、
   // 不上报、不转态、不 reset (hasExecutorActivity=false 已保证不动 baseline/nudge 态)。
-  if (!hasExecutorActivity) {
+  if (ownerOnlyEcho) {
     try {
       const res = await commitObservationTransaction({
         taskId: t.taskId, readFromCursor: t.committedCursor, readToCursor, analyzedMessageIds,
@@ -415,6 +421,9 @@ async function tickOne(t: SubTask, now: Date, exec: ObserverExecutors): Promise<
     });
     if (res == null) { logger.info(`[subtask-observer] ${t.taskId} commit null (非法转移?) skip`); return false; }
     logger.info(`[subtask-observer] ${t.taskId} signal=${judged.signal} → ${plan.statusTo ?? t.status}${plan.report ? ` report=${plan.report.commandType}` : ''}`);
+    if (reviewSubmission) {
+      await nudgeExecutorForReviewSubmission(t, now, latestReviewRequest!, reviewSubmission);
+    }
     return true;
   } catch (err) {
     if (err instanceof CursorConflictError || err instanceof InvalidCursorCommitError || err instanceof VersionConflictError) {
@@ -438,16 +447,7 @@ async function handleStall(t: SubTask, now: Date): Promise<boolean> {
 
   if (t.status === 'paused') return handlePausedHeartbeat(t, now);
 
-  // blocker2 fix: 最近一条非 nudge 发起命令 (kickoff/supplement/request_review)——
-  // sentAt 优先 (已投出)，否则 createdAt (pending)。排除 nudge 自身。
-  const initiating = listCommands(t.taskId).filter(c =>
-    c.direction === 'parent_to_child' && c.commandType !== 'nudge' && c.supersededBy == null);
-  const latestInitiating = initiating.length
-    ? initiating
-        .map(c => ({ c, at: c.sentAt ?? c.createdAt }))
-        .sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0))
-        .at(-1)!.c
-    : null;
+  const latestInitiating = latestInitiatingCommand(t);
 
   // 交付待审豁免（治"做完没有?"刷屏）：最近一条主动命令是 request_review —— 执行者已交付、正等
   // reviewer 评审，这是「待审」而非「停滞」，**绝不催执行者**（observing 下 planStallNudge 本会每
@@ -490,6 +490,90 @@ async function handleStall(t: SubTask, now: Date): Promise<boolean> {
   } catch (err) {
     if (err instanceof VersionConflictError) {
       logger.info(`[subtask-observer] ${t.taskId} stall action version conflict, skip this tick`);
+      return false;
+    }
+    throw err;
+  }
+}
+
+// blocker2 fix: 最近一条非 nudge 发起命令 (kickoff/supplement/request_review)——
+// sentAt 优先 (已投出)，否则 createdAt (pending)。排除 nudge 自身。
+function latestInitiatingCommand(t: SubTask): OutboxCommand | null {
+  const initiating = listCommands(t.taskId).filter(c =>
+    c.direction === 'parent_to_child' && c.commandType !== 'nudge' && c.supersededBy == null);
+  return initiating.length
+    ? initiating
+        .map(c => ({ c, at: c.sentAt ?? c.createdAt }))
+        .sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0))
+        .at(-1)!.c
+    : null;
+}
+
+type ObservedMessage = FetchResult['messages'][number];
+
+function isExecutorActivityMessage(t: SubTask, m: ObservedMessage): boolean {
+  if (!m.senderId) return true;                 // sender 缺失时保守当执行者活动，沿用旧语义防吞真进展。
+  if (m.senderId === t.requester) return false; // owner/base-relay 回声不算执行者活动。
+  const bot = t.bots.find(b => b.openId === m.senderId);
+  if (!bot) return true;                        // 群里其它已知人类/操作者仍按执行侧活动处理。
+  return bot.role === 'main';
+}
+
+function findReviewerSubmissionAfterRequest(
+  t: SubTask,
+  reviewCmd: OutboxCommand,
+  messages: ObservedMessage[],
+): ObservedMessage | null {
+  const baselineMs = new Date(reviewCmd.sentAt ?? reviewCmd.createdAt).getTime();
+  if (!Number.isFinite(baselineMs)) return null;
+  const reviewerIds = new Set(t.bots.filter(b => b.role === 'collab').map(b => b.openId));
+  for (const m of messages) {
+    if (!m.senderId || !reviewerIds.has(m.senderId)) continue;
+    const msgMs = m.createdAt ? new Date(m.createdAt).getTime() : NaN;
+    if (!Number.isFinite(msgMs) || msgMs <= baselineMs) continue;
+    if (isSubstantiveReviewOutput(m.rendered)) return m;
+  }
+  return null;
+}
+
+export function isSubstantiveReviewOutput(rendered: string): boolean {
+  const raw = rendered.replace(/^\[[^\]]+\]\s*/, '').trim();
+  const text = rendered
+    .replace(/^\[[^\]]+\]\s*/, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (text.length < 24) return false;
+  if (/^(收到|已收到|我(先)?看一下|我(先)?开始看|开始审|稍等|ack|reviewing|on it)[。.!！\s]*$/i.test(text)) {
+    return false;
+  }
+  const lower = text.toLowerCase();
+  const hasReviewCue = /(评审|review|finding|blocker|问题|风险|建议|通过|不通过|approve|approved|lgtm|需修改|修改|测试|验证|diff|代码|结论|阻塞)/i.test(lower);
+  const structured = raw.includes('\n') || /(^|[；;。.!！])\s*[-*•]?\s*(blocker|finding|建议|问题|结论)/i.test(text);
+  return hasReviewCue && (text.length >= 40 || structured);
+}
+
+async function nudgeExecutorForReviewSubmission(
+  t: SubTask,
+  now: Date,
+  reviewCmd: OutboxCommand,
+  reviewMessage: ObservedMessage,
+): Promise<boolean> {
+  const fresh = getSubTask(t.taskId);
+  if (!fresh || fresh.status !== 'observing') return false;
+  const submittedAt = reviewMessage.createdAt ?? now.toISOString();
+  try {
+    const r = await enqueueNudgeAndUpdateStats({
+      taskId: fresh.taskId,
+      targetChatId: fresh.chatId,
+      idempotencyKey: `review-submitted-nudge-${fresh.taskId}-${reviewCmd.cmdId}-${reviewMessage.id}`,
+      episodeAnchorAt: submittedAt,
+      expectedVersion: fresh.version,
+    });
+    if (r) logger.info(`[subtask-observer] ${fresh.taskId} reviewer 已产出评审→唤回执行者消化 review`);
+    return r != null;
+  } catch (err) {
+    if (err instanceof VersionConflictError) {
+      logger.info(`[subtask-observer] ${fresh.taskId} review-submitted nudge version conflict, skip this tick`);
       return false;
     }
     throw err;
