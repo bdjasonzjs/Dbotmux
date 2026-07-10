@@ -213,6 +213,9 @@ export function makeObserverExecutors(): ObserverExecutors {
           rendered: await renderMsg(m, tilly.larkAppId),
           // 优化 #3：带发送者 (open_id/app_id)，observer 据此判执行者实质活动 vs owner nudge 回声。
           senderId: m?.sender?.id ?? m?.sender?.sender_id?.open_id ?? undefined,
+          createdAt: m?.create_time && Number.isFinite(Number(m.create_time))
+            ? new Date(Number(m.create_time)).toISOString()
+            : undefined,
         })),
       );
       return {
