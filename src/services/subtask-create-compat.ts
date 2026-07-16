@@ -14,6 +14,12 @@ type NestedSpawnSubTaskResult = {
   isNew: boolean;
 };
 
+const LEGACY_BOT_ROLES = {
+  claude: 'claude:main',
+  codex: 'codex:collab',
+  tilly: 'tilly:observer',
+} as const;
+
 export async function spawnSubTaskCompat(
   request: SpawnSubTaskRequest,
 ): Promise<SpawnSubTaskResult | NestedSpawnSubTaskResult> {
@@ -30,7 +36,7 @@ export async function spawnSubTaskCompat(
     goal: request.purpose,
     acceptance: request.acceptance,
     taskType: request.taskType,
-    bots: request.bots,
+    bots: (request.bots ?? ['claude', 'codex', 'tilly']).map(bot => LEGACY_BOT_ROLES[bot]),
     name: request.name,
     relatedRefs: request.relatedRefs,
     parentDigest: request.parentDigest,

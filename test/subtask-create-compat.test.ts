@@ -56,11 +56,22 @@ describe('spawnSubTaskCompat', () => {
       goal: '修复问题',
       acceptance: '验收标准',
       taskType: 'bug',
-      bots: ['claude', 'codex', 'tilly'],
+      bots: ['claude:main', 'codex:collab', 'tilly:observer'],
       name: '子群',
       relatedRefs: ['mr:1'],
       parentDigest: '摘要',
     });
+  });
+
+  it('经理群省略 bots 时保留 legacy 的 Claude main 角色矩阵', async () => {
+    mockGetSession.mockReturnValue({ sessionId: 'sess', chatId: 'oc_manager' });
+    mockGetByChatId.mockReturnValue({ taskId: 'st_manager', spawnable: true });
+
+    await spawnSubTaskCompat({ ...request, bots: undefined });
+
+    expect(mockCreateSubtask).toHaveBeenCalledWith(expect.objectContaining({
+      bots: ['claude:main', 'codex:collab', 'tilly:observer'],
+    }));
   });
 
   it('未登记普通群仍由 legacy 鉴权拒绝', async () => {
