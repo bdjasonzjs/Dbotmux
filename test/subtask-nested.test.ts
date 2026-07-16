@@ -124,22 +124,23 @@ describe('嵌套 spawn：authzSpawn + depth/rootChatId 落库', () => {
     expect(mockCreateGroup.mock.calls[0][0].userOpenIds).toEqual(['ou_jason']);
   });
 
-  it('跨 app scope 防护 (review blocker)：非 Claude 执行者建孙群 → 不用它会话的 ownerOpenId，回退父任务 requester', async () => {
+  it('非 Claude 执行者建孙群 → 使用 caller app session 的 ownerOpenId', async () => {
     vi.stubEnv('BOTMUX_SPAWN_MIN_INTERVAL_MS', '1');
     await mkTask({ bots: CODEX_MAIN, requester: 'ou_jason_claude_scope' });
     await sleep(10);
-    // codex 会话的 ownerOpenId 是 codex app 视角 id，进 Claude app 建群会邀请失败
     botSession('sess_b', 'oc_b', 'app_codex', 'ou_jason_codex_scope');
     const res = await createSubtask({ sessionId: 'sess_b', goal: '孙任务' });
-    expect(mockCreateGroup.mock.calls[0][0].userOpenIds).toEqual(['ou_jason_claude_scope']);
-    expect(getSubTask(res.taskId)!.requester).toBe('ou_jason_claude_scope');   // 链上 requester 恒为 Claude scope
+    expect(mockCreateGroup.mock.calls[0][0].creatorLarkAppId).toBe('app_codex');
+    expect(mockCreateGroup.mock.calls[0][0].userOpenIds).toEqual(['ou_jason_codex_scope']);
+    expect(getSubTask(res.taskId)!.requester).toBe('ou_jason_codex_scope');
   });
 
-  it('跨 app scope 防护：父任务 requester 是历史占位符 owner 且非 Claude 调用 → userOpenIds 留空不传脏 id', async () => {
+  it('非 Claude session 缺 ownerOpenId → 不回退父任务的 Claude-scope requester', async () => {
     vi.stubEnv('BOTMUX_SPAWN_MIN_INTERVAL_MS', '1');
-    await mkTask({ bots: CODEX_MAIN, requester: 'owner' });
+    await mkTask({ bots: CODEX_MAIN, requester: 'ou_jason_claude_scope' });
     await sleep(10);
-    botSession('sess_b', 'oc_b', 'app_codex', 'ou_jason_codex_scope');
+    const session = botSession('sess_b', 'oc_b', 'app_codex');
+    delete session.ownerOpenId;
     await createSubtask({ sessionId: 'sess_b', goal: '孙任务' });
     expect(mockCreateGroup.mock.calls[0][0].userOpenIds).toBeUndefined();
   });
