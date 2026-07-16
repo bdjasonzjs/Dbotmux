@@ -345,14 +345,11 @@ async function authzSpawn(sessionId: string): Promise<SpawnCtx> {
   if (!mainBot || !taskBotMatchesSession(mainBot, session)) {
     throw new HttpError(403, `only this chat's registered executor (main bot) can spawn (caller larkAppId=${session.larkAppId})`);
   }
-  // owner 链 + 跨 app scope 防护 (蔻黛克斯 review blocker)：open_id 是 app-scoped，而 createSubtask
-  // 固定以 Claude app 建群 (group-creator 合同: userOpenIds 必须 creator scope)。非 Claude 执行者
-  // 会话里的 ownerOpenId 是它自己 app 视角的 id，直接用会让 owner 邀请失败 → base relay 投不进新群。
-  // 所以只有 Claude 会话的 ownerOpenId 可直接用；其余回退父任务 requester —— 整条建树链的 requester
-  // 都由 Claude 链路写入，恒为 Claude scope。'owner' 是历史占位符，视为无效。
+  // group-creator 以 callerBotAppId 建群，ownerOpenId 必须来自同一个 app scope。
+  // 当前 session 的 ownerOpenId 正是 caller app 视角；父任务 requester 只在 Claude 链路下同 scope。
   const claudeApp = resolveBotIdent('claude').larkAppId;
   const inheritedRequester = task.requester && task.requester !== 'owner' ? task.requester : undefined;
-  const ownerOpenId = (callerLarkAppId === claudeApp ? session.ownerOpenId : undefined) ?? inheritedRequester;
+  const ownerOpenId = session.ownerOpenId ?? (callerLarkAppId === claudeApp ? inheritedRequester : undefined);
   return {
     callerChatId: session.chatId, callerBotAppId: callerLarkAppId,
     rootMessageId: session.rootMessageId,

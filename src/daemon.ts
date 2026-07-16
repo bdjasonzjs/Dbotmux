@@ -1425,8 +1425,8 @@ ipcRoute('POST', '/api/spawn-subtask', async (req, res) => {
     return jsonRes(res, 400, { ok: false, error: 'bad_json' });
   }
   try {
-    const { spawnSubTask } = await import('./core/main-bot-playbook.js');
-    const result = await spawnSubTask(body);
+    const { spawnSubTaskCompat } = await import('./services/subtask-create-compat.js');
+    const result = await spawnSubTaskCompat(body);
     return jsonRes(res, 200, { ok: true, ...result });
   } catch (err: any) {
     const status = err && err.name === 'HttpError' ? err.status : 500;
