@@ -23,7 +23,7 @@ import { buildQuoteHint } from './im/lark/quote-hint.js';
 import { logger } from './utils/logger.js';
 import { ensureCjkFontsInstalled } from './utils/font-installer.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
-import type { DaemonToWorker, LarkMessage } from './types.js';
+import type { DaemonToWorker, LarkMessage, Session } from './types.js';
 export type { DaemonSession } from './core/types.js';
 import type { DaemonSession } from './core/types.js';
 import { sessionKey, sessionAnchorId } from './core/types.js';
@@ -189,6 +189,36 @@ const workflowAttemptResumes = new AttemptResumeManager({
 const lastRepoScan = new Map<string, import('./services/project-scanner.js').ProjectInfo[]>();
 const cliVersionCache = new Map<string, { version: string; lastCheckAt: number }>();
 const VERSION_CHECK_INTERVAL = 60_000; // cache 1 min
+const NO_MENTION_REPLY_SENTINEL = '本条消息的回复不圈任何人';
+
+export function hasNoMentionReplySentinel(content: unknown): boolean {
+  return typeof content === 'string' && content.includes(NO_MENTION_REPLY_SENTINEL);
+}
+
+export interface NoMentionReplySignal {
+  content: unknown;
+  senderAppId?: string;
+}
+
+export function applyNoMentionReplySentinelToSession(
+  session: Session,
+  signal: NoMentionReplySignal,
+): boolean {
+  if (!hasNoMentionReplySentinel(signal.content) || session.suppressRelayMentions) return false;
+  session.suppressRelayMentions = true;
+  session.suppressRelayMentionAppId = signal.senderAppId;
+  return true;
+}
+
+export function applyNoMentionReplySentinelToDaemonSession(
+  ds: Pick<DaemonSession, 'session'>,
+  signal: NoMentionReplySignal,
+): boolean {
+  if (!hasNoMentionReplySentinel(signal.content) || ds.session.suppressRelayMentions) return false;
+  ds.session.suppressRelayMentions = true;
+  ds.session.suppressRelayMentionAppId = signal.senderAppId;
+  return true;
+}
 
 function parsePositiveIntEnv(name: string): number {
   const raw = process.env[name];
@@ -2058,6 +2088,10 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   }
 
   const senderOpenId: string | undefined = data.sender?.sender_id?.open_id;
+  const relaySignal: NoMentionReplySignal = {
+    content: parsed.content,
+    senderAppId: lookupForeignBotAppId(senderOpenId, larkAppId),
+  };
   const botCfg = getBot(larkAppId).config;
   logger.info(`New session: "${content.substring(0, 60)}" (scope=${scope}, anchor=${anchor.substring(0, 12)}, resources: ${resources.length}, active: ${getActiveCount()}, messageId: ${messageId}, chatId: ${chatId})`);
 
@@ -2095,6 +2129,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
       session.lastCallerOpenId = senderOpenId;
       session.lastMessageAt = new Date(now).toISOString();
       session.scope = scope;
+      applyNoMentionReplySentinelToSession(session, relaySignal);
       sessionStore.updateSession(session);
       activeSessions.set(sessionKey(anchor, larkAppId), {
         session,
@@ -2158,6 +2193,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   session.ownerOpenId = senderOpenId;
   session.lastMessageAt = new Date(now).toISOString();
   session.scope = scope;
+  applyNoMentionReplySentinelToSession(session, relaySignal);
   sessionStore.updateSession(session);
   messageQueue.ensureQueue(anchor);
   messageQueue.appendMessage(anchor, parsed);
@@ -2299,6 +2335,19 @@ function lookupForeignBotName(senderOpenId: string, larkAppId: string): string {
   return 'Bot';
 }
 
+function lookupForeignBotAppId(senderOpenId: string | undefined, larkAppId: string): string | undefined {
+  if (!senderOpenId) return undefined;
+  const botName = lookupForeignBotName(senderOpenId, larkAppId);
+  try {
+    const infoPath = join(config.session.dataDir, 'bots-info.json');
+    if (!existsSync(infoPath)) return undefined;
+    const entries: Array<{ larkAppId: string; botOpenId: string | null; botName: string | null }> = JSON.parse(readFileSync(infoPath, 'utf-8'));
+    return entries.find(entry => entry.botOpenId === senderOpenId || (botName !== 'Bot' && entry.botName === botName))?.larkAppId;
+  } catch {
+    return undefined;
+  }
+}
+
 async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> {
   const { chatId: ctxChatId, chatType: ctxChatType, scope, anchor, larkAppId } = ctx;
   await resolveNonsupportMessage(data, larkAppId);
@@ -2334,6 +2383,10 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     (isBotSenderType ||
       isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenIdForPrefix));
   const foreignBotName = isForeignBot ? lookupForeignBotName(senderOpenIdForPrefix!, larkAppId) : undefined;
+  const relaySignal: NoMentionReplySignal = {
+    content: parsed.content,
+    senderAppId: lookupForeignBotAppId(senderOpenIdForPrefix, larkAppId),
+  };
   const botSenderPrefix = isForeignBot
     ? `${tr('daemon.foreign_bot_mention_prefix', { botName: foreignBotName! }, localeForBot(larkAppId))}\n`
     : '';
@@ -2457,6 +2510,10 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
 
   let ds = activeSessions.get(sessionKey(anchor, larkAppId));
 
+  if (ds && applyNoMentionReplySentinelToDaemonSession(ds, relaySignal)) {
+    sessionStore.updateSession(ds.session);
+  }
+
   // If another bot already owns this anchor, ignore unmentioned replies here as a
   // second line of defense. Explicit @mentions are still allowed to spin up/take over.
   // For chat-scope: another bot's session in the same chat is keyed by its own chatId.
@@ -2552,6 +2609,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     session.lastCallerOpenId = senderOId;
     session.lastMessageAt = new Date(now).toISOString();
     session.scope = scope;
+    applyNoMentionReplySentinelToSession(session, relaySignal);
     sessionStore.updateSession(session);
 
     // Oncall group: pin working dir from the chat-level binding, even if a

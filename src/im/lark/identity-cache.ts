@@ -30,6 +30,7 @@ export interface IdentityRecord {
   openId: string;
   type: IdentityType;
   name?: string;
+  email?: string;
   source: 'sender' | 'mention' | 'contact_api' | 'bot_cross_ref' | 'bot_info';
   updatedAt: number;
 }
@@ -115,7 +116,7 @@ export function flushIdentityCacheSync(): void {
  */
 export function recordIdentity(
   larkAppId: string,
-  rec: { openId: string; type?: IdentityType; name?: string; source?: IdentityRecord['source'] },
+  rec: { openId: string; type?: IdentityType; name?: string; email?: string; source?: IdentityRecord['source'] },
 ): void {
   if (!rec.openId) return;
   const store = getStore(larkAppId);
@@ -125,12 +126,13 @@ export function recordIdentity(
     openId: rec.openId,
     type: incomingType ?? existing?.type ?? 'unknown',
     name: rec.name ?? existing?.name,
+    email: rec.email ?? existing?.email,
     source: rec.source ?? existing?.source ?? 'sender',
     updatedAt: Date.now(),
   };
   // Skip persist when nothing meaningful changed — avoids disk churn from
   // every sender event re-bumping updatedAt.
-  if (existing && existing.type === merged.type && existing.name === merged.name) {
+  if (existing && existing.type === merged.type && existing.name === merged.name && existing.email === merged.email) {
     return;
   }
   store.set(rec.openId, merged);
@@ -158,22 +160,10 @@ export function getIdentity(larkAppId: string, openId: string): IdentityRecord |
   return getStore(larkAppId).get(openId);
 }
 
-/**
- * Best-effort name resolution. Returns the cached name on hit; on miss for a
- * user open_id, calls `contact.v3.user.get` with a budget and updates the
- * cache. Bots/apps skip the API (no public contact endpoint). Failures
- * (permission denied, network, timeout) degrade silently to `undefined`.
- *
- * When the bot lacks `contact:user.base:readonly`, the first 99991672 from
- * the API trips a per-app circuit breaker so subsequent calls short-circuit
- * without burning quota.
- */
-export async function resolveName(larkAppId: string, openId: string): Promise<string | undefined> {
-  if (!openId) return undefined;
+async function refreshUserIdentity(larkAppId: string, openId: string): Promise<IdentityRecord | undefined> {
   const cached = getIdentity(larkAppId, openId);
-  if (cached?.name) return cached.name;
-  if (cached?.type === 'bot' || cached?.type === 'app') return undefined;
-  if (scopeUnavailable.has(larkAppId)) return undefined;
+  if (cached?.type === 'bot' || cached?.type === 'app') return cached;
+  if (scopeUnavailable.has(larkAppId)) return cached;
 
   const key = `${larkAppId}:${openId}`;
   let pending = inflight.get(key);
@@ -208,7 +198,25 @@ export async function resolveName(larkAppId: string, openId: string): Promise<st
     // rejection and this line.
     if (inflight.get(key) === pending) inflight.delete(key);
   }
-  return getIdentity(larkAppId, openId)?.name;
+  return getIdentity(larkAppId, openId);
+}
+
+/**
+ * Best-effort name resolution. Returns the cached name on hit; on miss for a
+ * user open_id, calls `contact.v3.user.get` with a budget and updates the
+ * cache. Bots/apps skip the API (no public contact endpoint). Failures
+ * (permission denied, network, timeout) degrade silently to `undefined`.
+ *
+ * When the bot lacks `contact:user.base:readonly`, the first 99991672 from
+ * the API trips a per-app circuit breaker so subsequent calls short-circuit
+ * without burning quota.
+ */
+export async function resolveName(larkAppId: string, openId: string): Promise<string | undefined> {
+  if (!openId) return undefined;
+  const cached = getIdentity(larkAppId, openId);
+  if (cached?.name) return cached.name;
+  if (cached?.type === 'bot' || cached?.type === 'app') return undefined;
+  return (await refreshUserIdentity(larkAppId, openId))?.name;
 }
 
 async function fetchUserName(larkAppId: string, openId: string): Promise<void> {
@@ -219,9 +227,11 @@ async function fetchUserName(larkAppId: string, openId: string): Promise<void> {
       params: { user_id_type: 'open_id' },
     });
     if (res?.code === 0) {
-      const name: string | undefined = res.data?.user?.name;
-      if (name) {
-        recordIdentity(larkAppId, { openId, name, type: 'user', source: 'contact_api' });
+      const user = res.data?.user ?? {};
+      const name: string | undefined = user.name;
+      const email: string | undefined = user.email;
+      if (name || email) {
+        recordIdentity(larkAppId, { openId, name, email, type: 'user', source: 'contact_api' });
       }
       return;
     }
@@ -259,6 +269,7 @@ export interface ResolvedSender {
   openId: string;
   type: 'user' | 'bot';
   name?: string;
+  email?: string;
 }
 
 /**
@@ -290,9 +301,13 @@ export async function resolveSender(
 
   recordIdentity(larkAppId, { openId, type, source: 'sender' });
 
-  let name = hint?.name ?? getIdentity(larkAppId, openId)?.name;
-  if (!name && type === 'user') {
-    name = await resolveName(larkAppId, openId);
+  const cached = getIdentity(larkAppId, openId);
+  let name = hint?.name ?? cached?.name;
+  let email = cached?.email;
+  if ((!name || !email) && type === 'user') {
+    const resolved = await refreshUserIdentity(larkAppId, openId);
+    name = name ?? resolved?.name;
+    email = resolved?.email;
   }
-  return { openId, type, name };
+  return { openId, type, name, email };
 }

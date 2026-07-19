@@ -246,12 +246,9 @@ export function hasMarkdown(text: string): boolean {
  */
 export function buildMarkdownCard(md: string, recipientOpenId?: string): string {
   const elements = md ? buildCardBodyElements(md) : [];
-  // 2026-05-25 松松反馈：footer "[botmux] · 发送给 @xxx" 在群聊里造成
-  // 噪音（每张卡都重复同一行小字 + ping owner）。默认关闭；如真有需要
-  // 显示版本/接收方水印，set env `BOTMUX_SHOW_CARD_FOOTER=1`。
-  if (process.env.BOTMUX_SHOW_CARD_FOOTER === '1') {
-    const footerParts = ['[botmux](https://github.com/deepcoldy/botmux)'];
-    if (recipientOpenId) footerParts.push(`发送给：<at id=${recipientOpenId}></at>`);
+  const footerParts = recipientOpenId ? ['[botmux](https://github.com/deepcoldy/botmux)'] : [];
+  if (recipientOpenId) footerParts.push(`发送给：<at id=${recipientOpenId}></at>`);
+  if (footerParts.length > 0) {
     elements.push({ tag: 'hr' });
     elements.push({
       tag: 'markdown',
@@ -325,10 +322,9 @@ export function buildContextualReplyCard(opts: {
     : [{ tag: 'markdown', content: '*(空)*' }];
   for (const el of bodyElements) elements.push(el);
 
-  // 同 buildMarkdownCard：footer 默认关闭，env BOTMUX_SHOW_CARD_FOOTER=1 才显示。
-  if (process.env.BOTMUX_SHOW_CARD_FOOTER === '1') {
-    const footerParts = ['[botmux](https://github.com/deepcoldy/botmux)'];
-    if (recipientOpenId) footerParts.push(`发送给：<at id=${recipientOpenId}></at>`);
+  const footerParts = recipientOpenId ? ['[botmux](https://github.com/deepcoldy/botmux)'] : [];
+  if (recipientOpenId) footerParts.push(`发送给：<at id=${recipientOpenId}></at>`);
+  if (footerParts.length > 0) {
     elements.push({ tag: 'hr' });
     elements.push({
       tag: 'markdown',
