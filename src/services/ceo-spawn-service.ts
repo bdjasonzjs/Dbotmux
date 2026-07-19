@@ -41,7 +41,8 @@ import { ensureClonesAndSpawn, type EnsureSpawnDeps, type EnsureSpawnReq, type E
 import { ceoSpawnKey, getCeoSpawnState, putCeoSpawnState, clearCeoSpawnState } from './ceo-spawn-store.js';
 import {
   resolveReady, activationApproved, parseSeats, resolveCeoOwner, hotRegisterClone,
-  resolveAutoTarget as resolveAutoTargetPure, type BotInfoLite, type ReadySnapshot,
+  resolveAutoTarget as resolveAutoTargetPure, resolveCeoTriggeringSender,
+  type BotInfoLite, type ReadySnapshot,
 } from './ceo-spawn-wiring.js';
 import { logger } from '../utils/logger.js';
 
@@ -113,8 +114,10 @@ export async function ceoSpawn(req: CeoSpawnReq): Promise<EnsureSpawnOutcome> {
   // Owner identity: prefer bot-config allowedUsers owner; fall back to the
   // session owner when allowedUsers is empty (真机 owner-fix #1).
   const owner = resolveCeoOwner(getOwnerOpenId(ceoAppId), session.ownerOpenId);
-  // Triggering human — NO fallback to ownerOpenId (蔻黛 blocker 2, owner-fix).
-  const sender = session.lastCallerOpenId ?? '';
+  // Triggering human — NO fallback to ownerOpenId. Multi-sender batches have
+  // no scalar triggering principal and therefore fail closed for CEO actions.
+  const sender = resolveCeoTriggeringSender(session);
+  if (!sender) throw new HttpError(403, 'session has no single triggering caller; batch turns cannot authorize ceo-spawn');
 
   let seats;
   try {

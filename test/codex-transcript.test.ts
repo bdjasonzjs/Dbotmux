@@ -37,6 +37,14 @@ function assistantFinalResponseItem(text: string, ts = '2026-04-29T07:00:01.000Z
   };
 }
 
+function turnAbortedEventMsg(reason = 'interrupted', ts = '2026-04-29T07:00:01.000Z') {
+  return {
+    timestamp: ts,
+    type: 'event_msg',
+    payload: { type: 'turn_aborted', reason },
+  };
+}
+
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'codex-transcript-'));
   path = join(dir, 'rollout.jsonl');
@@ -186,6 +194,17 @@ describe('drainCodexRollout', () => {
     expect(r.events[1].text).toBe('hi back');
   });
 
+  it('extracts turn_aborted from the real Codex event_msg shape', () => {
+    writeFileSync(path,
+      ev(userResponseItem('prompt before interrupt')) +
+      ev(turnAbortedEventMsg()));
+    const r = drainCodexRollout(path, 0);
+    expect(r.events.map(event => ({ kind: event.kind, text: event.text }))).toEqual([
+      { kind: 'user', text: 'prompt before interrupt' },
+      { kind: 'turn_aborted', text: 'interrupted' },
+    ]);
+  });
+
   it('skips developer role messages', () => {
     writeFileSync(path,
       ev({
@@ -217,7 +236,7 @@ describe('drainCodexRollout', () => {
     expect(r.events[0].text).toBe('done');
   });
 
-  it('skips reasoning / function_call / function_call_output / event_msg', () => {
+  it('skips reasoning / function_call / function_call_output / unrelated event_msg', () => {
     writeFileSync(path,
       ev({ type: 'response_item', payload: { type: 'reasoning' } }) +
       ev({ type: 'response_item', payload: { type: 'function_call', name: 'shell' } }) +

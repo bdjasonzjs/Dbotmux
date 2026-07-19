@@ -8,6 +8,7 @@
 import { botProcessName } from '../setup/bot-config-editor.js';
 import { validateCloneName } from './clone-name.js';
 import type { SeatSpec, AutoTarget } from './ceo-clone-orchestration.js';
+import type { Session } from '../types.js';
 
 export interface BotInfoLite {
   larkAppId: string;
@@ -77,6 +78,16 @@ export function activationApproved(c: ActivationApprovalCheck): boolean {
   if (!c.pendingAppId || c.approvedAppId !== c.pendingAppId) return false;
   if (!c.pendingIsClone) return false;
   return true;
+}
+
+/** Commands that authorize work on behalf of "the current triggering human"
+ * cannot inherit a scalar caller from the previous turn while a multi-sender
+ * batch is active. Batch turns intentionally have no implicit single caller. */
+export function resolveCeoTriggeringSender(
+  session: Pick<Session, 'lastCallerOpenId' | 'suppressImplicitAddressing'>,
+): string | undefined {
+  if (session.suppressImplicitAddressing) return undefined;
+  return session.lastCallerOpenId || undefined;
 }
 
 /**

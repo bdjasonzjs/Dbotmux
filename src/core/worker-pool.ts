@@ -44,6 +44,8 @@ export interface WorkerPoolCallbacks {
   getActiveCount: () => number;
   /** Close a stale session (message withdrawn, etc.) */
   closeSession: (ds: DaemonSession) => void;
+  /** Apply metadata only when the worker really starts a queued input. */
+  inputStarted: (ds: DaemonSession, msg: Extract<WorkerToDaemon, { type: 'input_started' }>) => void;
 }
 
 let callbacks: WorkerPoolCallbacks | undefined;
@@ -101,6 +103,13 @@ function sessionCliId(ds: DaemonSession, botCfg: { cliId: CliId }): CliId {
   return ds.session.cliId ?? botCfg.cliId;
 }
 
+function displayTurnTitle(ds: DaemonSession, effectiveCliId: CliId): string {
+  const base = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
+  return ds.pendingInputCount && ds.pendingInputCount > 0
+    ? `${base} · 排队中 ${ds.pendingInputCount} 条`
+    : base;
+}
+
 export function clearUsageLimitState(ds: DaemonSession): void {
   if (ds.usageLimitRetryTimer) {
     clearTimeout(ds.usageLimitRetryTimer);
@@ -122,7 +131,7 @@ function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
   const bot = getBot(ds.larkAppId);
   const effectiveCliId = sessionCliId(ds, bot.config);
   const readUrl = `http://${config.web.externalHost}:${port}`;
-  const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
+  const turnTitle = displayTurnTitle(ds, effectiveCliId);
   const cardJson = buildStreamingCard(
     ds.session.sessionId,
     sessionAnchorId(ds),
@@ -934,7 +943,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             : undefined;
         if (restoredCardId) {
           try {
-            const initTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
+            const initTitle = displayTurnTitle(ds, effectiveCliId);
             // Reuse persisted nonce so existing card buttons (toggle/etc) keep working.
             if (!ds.streamCardNonce) ds.streamCardNonce = randomBytes(4).toString('hex');
             const initStatus = ds.usageLimit ? 'limited' : 'starting';
@@ -980,7 +989,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         ds.streamCardId = CARD_POSTING_SENTINEL;
         try {
           ds.streamCardNonce = randomBytes(4).toString('hex');
-          const initTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
+          const initTitle = displayTurnTitle(ds, effectiveCliId);
           const initStatus = ds.usageLimit ? 'limited' : 'starting';
           const streamCardJson = buildStreamingCard(
             ds.session.sessionId,
@@ -1047,6 +1056,45 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         break;
       }
 
+      case 'input_queued': {
+        ds.pendingInputCount = msg.pendingCount;
+        // Preserve the active turn and caller; only patch in a queue badge.
+        if (ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL && ds.workerPort) {
+          const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
+          const cardJson = buildStreamingCard(
+            ds.session.sessionId,
+            sessionAnchorId(ds),
+            readUrl,
+            displayTurnTitle(ds, effectiveCliId),
+            ds.lastScreenContent ?? '',
+            ds.lastScreenStatus ?? 'working',
+            effectiveCliId,
+            ds.displayMode ?? 'hidden',
+            ds.streamCardNonce,
+            ds.currentImageKey,
+            isAdopt,
+            showTakeover,
+            loc,
+            cardUsageLimit(ds),
+          );
+          scheduleCardPatch(ds, cardJson);
+        }
+        break;
+      }
+
+      case 'input_started': {
+        ds.pendingInputCount = msg.pendingCount;
+        cb.inputStarted(ds, msg);
+        dashboardEventBus.publish({
+          type: 'session.update',
+          body: {
+            sessionId: ds.session.sessionId,
+            patch: { title: displayTurnTitle(ds, effectiveCliId), lastMessageAt: ds.lastMessageAt },
+          },
+        });
+        break;
+      }
+
       case 'cli_session_id': {
         ds.session.cliSessionId = msg.cliSessionId;
         sessionStore.updateSession(ds.session);
@@ -1079,7 +1127,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         }
 
         const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
-        const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
+        const turnTitle = displayTurnTitle(ds, effectiveCliId);
         const mode: DisplayMode = ds.displayMode ?? 'hidden';
 
         if (ds.streamCardPending || !ds.streamCardId) {
@@ -1172,7 +1220,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         if ((ds.displayMode ?? 'hidden') !== 'screenshot') break;
         if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || !ds.workerPort) break;
         const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
-        const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
+        const turnTitle = displayTurnTitle(ds, effectiveCliId);
         const cardJson = buildStreamingCard(
           ds.session.sessionId,
           sessionAnchorId(ds),
@@ -1257,7 +1305,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           // Freeze the streaming card
           if (ds.streamCardId && ds.workerPort) {
             const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
-            const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
+            const turnTitle = displayTurnTitle(ds, effectiveCliId);
             const frozenCard = buildStreamingCard(
               ds.session.sessionId, sessionAnchorId(ds), readUrl, turnTitle,
               ds.lastScreenContent ?? '', 'idle', effectiveCliId,
@@ -1294,7 +1342,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           // Freeze the last streaming card so it doesn't stay at "working" forever
           if (ds.streamCardId && ds.workerPort) {
             const readUrl = `http://${config.web.externalHost}:${ds.workerPort}`;
-            const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
+            const turnTitle = displayTurnTitle(ds, effectiveCliId);
             const frozenCard = buildStreamingCard(
               ds.session.sessionId, sessionAnchorId(ds), readUrl, turnTitle,
               ds.lastScreenContent ?? '', 'idle', effectiveCliId,
@@ -1446,6 +1494,14 @@ function deliverFinalOutput(
       // they use the contextual card so the user prompt sits in a
       // blockquote and only the assistant body goes through full markdown
       // rendering.
+      // 合并冲突的显式裁决（2026-07-19）：本行**恒为 undefined**，不要改回
+      // `msg.suppressImplicitAddressing ? undefined : ds.session.ownerOpenId`。
+      // 「回复不隐式 @ 任何人」是本机长期生效的既定行为（原先靠 dist 补丁强制
+      // recipientOpenId=undefined，本次已还原成源码）。批次改动那一侧是基于**打补丁前**
+      // 的基线写的，它的三元表达式会让普通单条 turn 重新 @ 回 owner —— 那是行为回归。
+      // 批次语义（批次 turn 不得隐式 @）是这条的子集，恒 undefined 已覆盖；
+      // suppressImplicitAddressing 仍在 reply-addressing / ceo-spawn-wiring 等处生效。
+      const implicitRecipient = undefined;
       const cardJson = msg.kind === 'local-turn' || msg.kind === 'local-turn-headless'
         ? buildContextualReplyCard({
             title: msg.kind === 'local-turn-headless'
@@ -1454,9 +1510,9 @@ function deliverFinalOutput(
             userText: msg.kind === 'local-turn' ? msg.userText ?? '' : undefined,
             assistantText: msg.content,
             assistantLabel: getCliDisplayName(effectiveCliId),
-            recipientOpenId: undefined,
+            recipientOpenId: implicitRecipient,
           })
-        : buildMarkdownCard(msg.content, undefined);
+        : buildMarkdownCard(msg.content, implicitRecipient);
       await cb.sessionReply(sessionAnchorId(ds), cardJson, 'interactive', ds.larkAppId);
       ds.lastBridgeEmittedUuid = msg.lastUuid;
       logger.info(`[${t}] Bridge final_output forwarded (turn ${msg.turnId.substring(0, 8)}, ${msg.content.length} chars, kind=${msg.kind ?? 'bridge'}, attempt ${attempt + 1})`);

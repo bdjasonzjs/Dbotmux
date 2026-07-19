@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { shouldSuppressBridgeEmit, type BridgeSendMarker } from '../src/services/bridge-fallback-gate.js';
+import { resolveBridgeGateWindow, shouldSuppressBridgeEmit, type BridgeSendMarker } from '../src/services/bridge-fallback-gate.js';
 
 const turn = (markTimeMs: number | undefined, isLocal: boolean | undefined = false) =>
   ({ markTimeMs, isLocal });
@@ -67,5 +67,23 @@ describe('shouldSuppressBridgeEmit', () => {
   it('non-adopt: multiple markers — any one inside window triggers suppress', () => {
     const markers: BridgeSendMarker[] = [{ sentAtMs: 50 }, { sentAtMs: 175 }, { sentAtMs: 500 }];
     expect(shouldSuppressBridgeEmit(turn(100), 200, markers, false)).toBe(true);
+  });
+
+  it('uses actual transcript start when a parked turn is revived after its original mark', () => {
+    const window = resolveBridgeGateWindow(
+      { markTimeMs: 100, startedAtMs: 230 },
+      [{ markTimeMs: 200 }],
+    );
+    expect(window).toEqual({ markTimeMs: 230, nextBoundaryMs: undefined });
+    expect(shouldSuppressBridgeEmit(turn(window.markTimeMs), window.nextBoundaryMs, [{ sentAtMs: 215 }], false)).toBe(false);
+    expect(shouldSuppressBridgeEmit(turn(window.markTimeMs), window.nextBoundaryMs, [{ sentAtMs: 235 }], false)).toBe(true);
+  });
+
+  it('uses the next actual transcript start as the upper boundary for batched ready turns', () => {
+    const window = resolveBridgeGateWindow(
+      { markTimeMs: 200, startedAtMs: 210 },
+      [{ markTimeMs: 100, startedAtMs: 230 }],
+    );
+    expect(window).toEqual({ markTimeMs: 210, nextBoundaryMs: 230 });
   });
 });

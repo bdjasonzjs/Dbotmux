@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   resolveReady, activationApproved, parseSeats, resolveCeoOwner, hotRegisterClone, resolveAutoTarget,
+  resolveCeoTriggeringSender,
   type ReadySnapshot, type ActivationApprovalCheck, type AutoTargetResolveDeps,
 } from '../src/services/ceo-spawn-wiring.js';
 import { parseCeoSpawnArgs } from '../src/cli/bot-clone.js';
@@ -68,6 +69,14 @@ describe('activationApproved (design pt2: explicit owner-scope, not just a flag)
   // is absent — no ownerOpenId fallback) → deploy gate must deny.
   it('sender undefined (unreliable caller) → false', () => {
     expect(activationApproved({ ...good(), senderOpenId: undefined })).toBe(false);
+  });
+  it('batch turn cannot inherit a stale owner as triggering sender', () => {
+    const senderOpenId = resolveCeoTriggeringSender({
+      lastCallerOpenId: 'ou_owner',
+      suppressImplicitAddressing: true,
+    });
+    expect(senderOpenId).toBeUndefined();
+    expect(activationApproved({ ...good(), senderOpenId })).toBe(false);
   });
 });
 

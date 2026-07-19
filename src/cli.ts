@@ -2422,6 +2422,7 @@ function argValues(args: string[], ...flags: string[]): string[] {
 // daemon's bridge fallback path can produce identical cards. cmdSend
 // keeps using `buildCardBodyElements` and `hasMarkdown` from there.
 import { buildCardBodyElements, hasMarkdown } from './im/lark/md-card.js';
+import { buildFooterAddressing } from './services/reply-addressing.js';
 
 /**
  * Decide who the reply card should @ in its footer.
@@ -2473,16 +2474,6 @@ function stripFooterLikeBotMentions(text: string): string {
   return text.replace(/(发送给|cc)[：:]\s*@/g, '$1：');
 }
 
-function buildFooterAddressing(
-  s: { larkAppId?: string; ownerOpenId?: string; lastCallerOpenId?: string },
-  oncall: { workingDir: string } | undefined,
-): { sendTo: string | undefined; cc: string[] } {
-  const owner = s.ownerOpenId;
-  const caller = s.lastCallerOpenId ?? owner;
-  const sendTo = oncall ? caller : owner;
-  if (isKnownBotOpenIdForApp(s.larkAppId, sendTo)) return { sendTo: undefined, cc: [] };
-  return { sendTo, cc: [] };
-}
 
 async function cmdSend(rest: string[]): Promise<void> {
   // Safety gate: a CLI agent running inside a workflow subagent (Slice F)
@@ -2743,7 +2734,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       // Top-level publish and no-footer replies have no addressing side effects.
       const addressing = sendTopLevel || noFooter
         ? { sendTo: undefined as string | undefined, cc: [] as string[] }
-        : buildFooterAddressing(s, oncallEntry);
+        : buildFooterAddressing(s, oncallEntry, isKnownBotOpenIdForApp);
       if (addressing.sendTo) footerParts.push(`发送给：<at id=${addressing.sendTo}></at>`);
       if (addressing.cc.length > 0) {
         footerParts.push(`cc：${addressing.cc.map(id => `<at id=${id}></at>`).join(' ')}`);
@@ -2796,7 +2787,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       if (!noFooter) {
         const addressing = sendTopLevel
           ? { sendTo: undefined as string | undefined, cc: [] as string[] }
-          : buildFooterAddressing(s, oncallEntry);
+          : buildFooterAddressing(s, oncallEntry, isKnownBotOpenIdForApp);
         if (addressing.sendTo || addressing.cc.length > 0) {
           if (postContent.length > 0) postContent.push([{ tag: 'text', text: '' }]);
           if (addressing.sendTo) {

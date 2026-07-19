@@ -4,14 +4,15 @@
  * Codex stores each session's full transcript at
  *   ~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<ts>-<cliSessionId>.jsonl
  * and creates the file lazily on the first user submit. Inside, the bridge
- * fallback only cares about two `response_item.payload.type === 'message'`
- * shapes:
+ * fallback primarily cares about two `response_item.payload.type === 'message'`
+ * shapes, plus one terminal `event_msg`:
  *
  *   - role=user             → the user's prompt text (input_text content)
  *   - role=assistant +
  *     phase=final_answer    → the model's final reply (output_text content)
+ *   - type=turn_aborted     → the current turn ended without a final reply
  *
- * Why these and not `event_msg`:
+ * Why final text comes from `response_item`, not `event_msg`:
  *   - `response_item` is the canonical transcript record; `event_msg` is a
  *     UI-event stream that can carry the same final text via two channels
  *     (`agent_message phase=final_answer` AND `task_complete.last_agent_message`).
@@ -20,7 +21,9 @@
  *   - Skipping role=developer (system instructions), phase=commentary
  *     (mid-turn status), reasoning, and function_call* keeps the bridge
  *     focused on what the user actually said and what the model finally
- *     answered — same scope as the Claude bridge.
+ *     answered — same scope as the Claude bridge. `turn_aborted` is the
+ *     deliberate exception because it has no response_item equivalent and
+ *     is required to release a started turn that can never receive a final.
  *
  * Pure I/O. Attribution belongs in CodexBridgeQueue.
  */
@@ -111,10 +114,11 @@ export interface CodexBridgeEvent {
   timestampMs: number;
   /** Discriminator for the queue layer:
    *   - 'user' starts a pending Lark turn (fingerprint-matched)
-   *   - 'assistant_final' closes the currently-collecting turn */
-  kind: 'user' | 'assistant_final';
-  /** Concatenated text from the message's content blocks (input_text for
-   *  user, output_text for assistant). */
+   *   - 'assistant_final' closes the currently-collecting turn
+   *   - 'turn_aborted' terminates it without an assistant reply */
+  kind: 'user' | 'assistant_final' | 'turn_aborted';
+  /** Concatenated message text (input_text for user, output_text for
+   * assistant); for turn_aborted this carries the terminal reason. */
   text: string;
 }
 
@@ -129,7 +133,7 @@ export interface CodexBridgeEvent {
  *  undefined when either side is missing — typically a fresh session whose
  *  user typed something but the model hasn't replied yet. */
 export function extractLastCodexTurn(
-  events: readonly { kind: 'user' | 'assistant_final'; text: string }[],
+  events: readonly { kind: 'user' | 'assistant_final' | 'turn_aborted'; text: string }[],
 ): { userText: string; assistantText: string } | undefined {
   let assistantIdx = -1;
   for (let i = events.length - 1; i >= 0; i--) {
@@ -258,11 +262,18 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
     cursor += lineByteLen;
     let obj: any;
     try { obj = JSON.parse(line); } catch { continue; }
+    const ts = typeof obj?.timestamp === 'string' ? Date.parse(obj.timestamp) : NaN;
+    const timestampMs = Number.isFinite(ts) ? ts : Date.now();
+    if (obj?.type === 'event_msg' && obj.payload?.type === 'turn_aborted') {
+      const reason = typeof obj.payload.reason === 'string' && obj.payload.reason.trim()
+        ? obj.payload.reason.trim()
+        : 'turn_aborted';
+      events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'turn_aborted', text: reason });
+      continue;
+    }
     if (obj?.type !== 'response_item') continue;
     const p = obj.payload;
     if (!p || typeof p !== 'object' || p.type !== 'message') continue;
-    const ts = typeof obj.timestamp === 'string' ? Date.parse(obj.timestamp) : NaN;
-    const timestampMs = Number.isFinite(ts) ? ts : Date.now();
     if (p.role === 'user') {
       const text = joinTextBlocks(p.content, 'input_text');
       if (!text) continue;

@@ -139,6 +139,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/manager-recover', async (req, res, pa
   session.larkAppId = old.larkAppId;
   session.ownerOpenId = old.session.ownerOpenId;
   session.lastCallerOpenId = old.session.lastCallerOpenId;
+  session.suppressImplicitAddressing = old.session.suppressImplicitAddressing;
   session.lastMessageAt = new Date(now).toISOString();
   session.scope = old.scope;
   session.workingDir = old.session.workingDir ?? old.workingDir;

@@ -1,0 +1,21 @@
+{
+  "rootChatId": "",
+  "nodes": [
+    {
+      "chatId": "oc_new",
+      "name": "oc_new",
+      "chatType": "group",
+      "originType": "bot_spawned",
+      "parentChatId": null,
+      "tags": [],
+      "metrics": {
+        "lastMessageAt": "2026-06-28T15:45:37.584Z",
+        "messages24h": 0,
+        "hasUnansweredPing": false
+      },
+      "summary": ""
+    }
+  ],
+  "edges": [],
+  "updatedAt": "2026-06-28T15:45:37.584Z"
+}

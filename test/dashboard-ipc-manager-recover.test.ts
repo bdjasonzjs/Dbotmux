@@ -16,6 +16,7 @@ const oldDs = {
     larkAppId: 'app_mgr',
     ownerOpenId: 'ou_owner',
     lastCallerOpenId: 'ou_owner',
+    suppressImplicitAddressing: true,
     workingDir: '/repo/mgr',
     cliId: 'codex',
   },
@@ -117,6 +118,7 @@ describe('POST /api/sessions/:sessionId/manager-recover', () => {
     expect(createSession).toHaveBeenCalledWith('oc_mgr', 'om_root', 'AutoRecover: 经理任务', 'group');
     const cleanSession = updateSession.mock.calls[0][0];
     expect(cleanSession.workingDir).toBe('/repo/mgr');
+    expect(cleanSession.suppressImplicitAddressing).toBe(true);
     expect(forkWorker).toHaveBeenCalledTimes(1);
     const forkedDs = forkWorker.mock.calls[0][0];
     expect(forkedDs.session.sessionId).toBe('new_session');

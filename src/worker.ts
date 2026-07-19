@@ -12,12 +12,12 @@
  *   6. On 'close', kills CLI and exits
  *   7. On 'restart', kills CLI and re-spawns with --resume
  */
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { mkdirSync, writeFileSync, unlinkSync, existsSync, statSync, readdirSync, readlinkSync, readFileSync, watch as fsWatch, createWriteStream, type FSWatcher, type WriteStream } from 'node:fs';
 import { join } from 'node:path';
 import { drainTranscript, joinAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
-import { shouldSuppressBridgeEmit, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
+import { resolveBridgeGateWindow, shouldSuppressBridgeEmit, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import {
   shouldRunQuietRotation,
   evaluatePidResolverPullback,
@@ -31,6 +31,24 @@ import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, 
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
 import { baselineJsonlCursor } from './services/jsonl-cursor.js';
 import { scheduleSubmitFailureRechecks, SUBMIT_RECHECK_DELAYS_MS, SUBMIT_RECHECK_TOTAL_MS } from './services/submit-failure-recheck.js';
+import {
+  CODEX_BATCH_RETAINED_MAX_BYTES,
+  CODEX_BATCH_RETAINED_MAX_FILES,
+  deleteCodexBatchFile,
+  describeCodexBatch,
+  hasBatchReceipt,
+  makePendingInput,
+  pruneRetainedCodexBatchFiles,
+  tryPrepareCodexBatch,
+  type PendingInput,
+  type PendingInputMetadata,
+} from './services/codex-input-batch.js';
+import type { CodexBatchLifecycleEvent } from './services/codex-batch-lifecycle.js';
+import { CodexBatchTurnCoordinator } from './services/codex-batch-turn-coordinator.js';
+import {
+  createCodexTurnSubmitFailureHooks,
+  type CodexOrdinaryTurnRetentionEvent,
+} from './services/codex-turn-submit-failure.js';
 import { dirname } from 'node:path';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -65,7 +83,6 @@ import { uploadImageBuffer } from './utils/lark-upload.js';
 import { config } from './config.js';
 import * as sessionStore from './services/session-store.js';
 import * as pty from 'node-pty';
-import { createHash } from 'node:crypto';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -93,7 +110,58 @@ function cliName(): string { return CLI_DISPLAY_NAMES[lastInitConfig?.cliId ?? '
 let isPromptReady = false;
 /** Mutex for async flushPending — prevents concurrent flush loops. */
 let isFlushing = false;
-const pendingMessages: string[] = [];
+const pendingMessages: PendingInput[] = [];
+let codexBatchTurns!: CodexBatchTurnCoordinator;
+function handleCodexBatchLifecycleEvent(event: CodexBatchLifecycleEvent): void {
+  if (event.type === 'prune_failed') {
+    log(`Codex batch retention prune failed: ${event.message}`);
+    send({
+      type: 'user_notify',
+      message: `⚠️ Codex 批次有界保留清理失败：${event.message}。未自动重发，请检查会话私有批文件目录。`,
+    });
+    return;
+  }
+  const batch = event.record.descriptor;
+  if (event.type === 'unconfirmed') {
+    const snapshot = codexBatchTurns.snapshot();
+    log(`Codex batch submit/receipt unconfirmed (batch_id=${batch.batchId}, reason=${event.record.reason ?? 'unknown'}, retained=${snapshot.recordCount}/${CODEX_BATCH_RETAINED_MAX_FILES}, bytes=${snapshot.recordBytes}/${CODEX_BATCH_RETAINED_MAX_BYTES}, no_resend=true)`);
+    send({
+      type: 'user_notify',
+      message: `⚠️ Codex 批次未确认：batch_id=${batch.batchId}，原因 ${event.record.reason ?? 'unknown'}。该批不计为已消费，也不会自动重发；私有文件按每会话最多 ${CODEX_BATCH_RETAINED_MAX_FILES} 份 / ${Math.round(CODEX_BATCH_RETAINED_MAX_BYTES / 1024 / 1024)} MiB 有界保留：${batch.path}`,
+    });
+    return;
+  }
+  if (event.type === 'evicted') {
+    log(`Codex batch lifecycle evicted oldest descriptor (batch_id=${batch.batchId}, state=${event.record.state}, file_deleted=${event.fileDeleted}, no_resend=true)`);
+    send({
+      type: 'user_notify',
+      message: `⚠️ Codex 批次有界保留达到上限，已淘汰最旧记录：batch_id=${batch.batchId}，文件清理=${event.fileDeleted ? '成功' : '失败'}；未自动重发。`,
+    });
+    return;
+  }
+  log(`Codex batch confirmed but private file cleanup failed (batch_id=${batch.batchId}, path=${batch.path})`);
+  send({
+    type: 'user_notify',
+    message: `⚠️ Codex 批次已确认，但私有批文件清理失败：batch_id=${batch.batchId}，路径 ${batch.path}。保留策略仍会限制后续文件数量。`,
+  });
+}
+
+function handleCodexOrdinaryTurnRetentionEvent(event: CodexOrdinaryTurnRetentionEvent): void {
+  if (event.cause === 'turn_aborted') {
+    log(`Codex ordinary turn aborted (turnId=${event.turnId}, state=${event.state}, reason=${event.reason ?? 'unknown'}, no_resend=true)`);
+    send({
+      type: 'user_notify',
+      message: `⚠️ Codex 单条消息已中断（原因 ${event.reason ?? 'unknown'}），未产生最终回复。归因记录已清理且未自动重发；后续排队消息会继续处理。`,
+    });
+    return;
+  }
+  const limit = event.cause === 'ttl' ? '寿命上限' : '数量上限';
+  log(`Codex ordinary failed mark evicted (turnId=${event.turnId}, cause=${event.cause}, state=${event.state}, reason=${event.reason ?? 'unknown'}, no_resend=true)`);
+  send({
+    type: 'user_notify',
+    message: `⚠️ Codex 单条消息的未确认归因记录已达到${limit}并清理（原因 ${event.reason ?? 'unknown'}）。未自动重发；若输入仍停在终端，请人工核对后再决定是否提交。`,
+  });
+}
 
 type RuntimeScreenStatus = Exclude<ScreenStatus, 'limited'>;
 
@@ -246,6 +314,14 @@ let codexBridgeOffset = 0;
 let codexBridgePendingTail = '';
 let codexBridgeBaselineDone = false;
 const codexBridgeQueue = new CodexBridgeQueue();
+/** Every live and retained entry is bounded and descriptor-only; the
+ * coordinator also parks failed marks so they cannot poison later turns. */
+codexBatchTurns = new CodexBatchTurnCoordinator(codexBridgeQueue, {
+  removeFile: deleteCodexBatchFile,
+  pruneFiles: protectedPaths => pruneRetainedCodexBatchFiles(sessionId, protectedPaths),
+  onEvent: handleCodexBatchLifecycleEvent,
+  onOrdinaryEvent: handleCodexOrdinaryTurnRetentionEvent,
+});
 let codexBridgeWatcher: FSWatcher | null = null;
 let codexBridgeTimer: NodeJS.Timeout | null = null;
 const codexBridgeCompletedTurnIds = new Set<string>();
@@ -377,7 +453,7 @@ function maybeEmitAdoptPreamble(events: TranscriptEvent[]): void {
  *  对齐 maybeEmitAdoptPreamble；区别只在事件取出方式（codex/coco 是结构化
  *  event，不需要走 claude 那套 jsonl turn assembly）。 */
 function maybeEmitCodexAdoptPreamble(
-  history: readonly { kind: 'user' | 'assistant_final'; text: string }[],
+  history: readonly { kind: 'user' | 'assistant_final' | 'turn_aborted'; text: string }[],
 ): void {
   if (!lastInitConfig?.adoptMode) return;
   if (lastInitConfig?.adoptRestoredFromMetadata) return;
@@ -1322,6 +1398,10 @@ function structuredBridgeIsCodex(): boolean {
   return lastInitConfig?.cliId === 'codex';
 }
 
+function codexInputBatchEnabled(): boolean {
+  return !/^(0|false|off)$/i.test(process.env.BOTMUX_CODEX_INPUT_BATCH?.trim() ?? '1');
+}
+
 function structuredBridgeIngestPath(path: string, offset: number) {
   return structuredBridgeIsCodex()
     ? drainCodexRollout(path, offset)
@@ -1338,9 +1418,9 @@ function codexBridgeStartTimer(): void {
   // the next emit chance would be at the next idle — i.e. the user has
   // to send another message before the previous turn's fallback shows
   // up. Emitting here when isPromptReady=true closes that window.
-  // Codex's queue only releases turns on `assistant_final` (the model's
-  // declared end-of-turn), so a tick-driven emit can't accidentally
-  // publish a half-streamed response.
+  // Codex's queue only emits turns on `assistant_final`; `turn_aborted`
+  // releases a blocker without emitting content. A tick-driven emit still
+  // cannot publish a half-streamed response.
   codexBridgeTimer = setInterval(() => {
     try {
       if (!codexBridgeRolloutPath) {
@@ -1383,6 +1463,7 @@ function codexBridgeStartTimer(): void {
           codexBridgeAttach(path, mode);
         }
       }
+      codexBatchTurns.pruneOrdinaryTurnMarks();
       codexBridgeIngest();
       if (isPromptReady) emitReadyCodexTurns();
     } catch (err: any) {
@@ -1415,7 +1496,7 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'fre
     const cutoff = (codexAdoptStartMs ?? Date.now()) - 5_000;
     const { history, live } = splitCodexEventsByCutoff(result.events, cutoff);
     codexBridgeQueue.absorb(history);
-    codexBridgeQueue.ingest(live);
+    codexBridgeApplyEvents(live);
     codexBridgeOffset = result.newOffset;
     codexBridgePendingTail = result.pendingTail;
     codexBridgeBaselineDone = true;
@@ -1479,15 +1560,22 @@ function codexBridgeIngest(): void {
   const result = structuredBridgeIngestPath(codexBridgeRolloutPath, codexBridgeOffset);
   codexBridgeOffset = result.newOffset;
   codexBridgePendingTail = result.pendingTail;
-  codexBridgeQueue.ingest(result.events);
+  codexBridgeApplyEvents(result.events);
   // Transcript-driven idle: an `assistant_final` event is the CLI declaring
   // end-of-turn, far more reliable than the screen-pattern heuristic
   // (CoCo's status bar varies by --yolo flag, version, theme; codex has
   // its own moving targets). Pushing idle here lets the bridge emit
   // immediately instead of waiting for readyPattern + quiescence to
   // converge. Idempotent — IdleDetector.fireIdle no-ops while already idle.
-  if (result.events.some(e => e.kind === 'assistant_final')) {
+  if (result.events.some(e => e.kind === 'assistant_final' || e.kind === 'turn_aborted')) {
     idleDetector?.fireIdle();
+  }
+}
+
+function codexBridgeApplyEvents(events: Parameters<CodexBridgeQueue['ingest']>[0]): void {
+  codexBridgeQueue.ingest(events);
+  for (const aborted of codexBridgeQueue.drainAbortedTurns()) {
+    codexBatchTurns.markTranscriptAborted(aborted.turnId, aborted.reason);
   }
 }
 
@@ -1510,6 +1598,7 @@ function codexBridgeTurnHasSubmitOrResponse(turnId: string | undefined, markTime
 
 function codexBridgeDrainAndMaybeEmit(): void {
   if (!codexBridgeFallbackActive()) return;
+  codexBatchTurns.pruneOrdinaryTurnMarks();
   if (codexBridgeRolloutPath && codexBridgeBaselineDone) {
     try { codexBridgeIngest(); } catch (err: any) { log(`Codex bridge ingest error: ${err.message}`); }
   }
@@ -1525,17 +1614,32 @@ function emitReadyCodexTurns(): void {
   // should reach the thread. Skip marker IO entirely.
   const markers = adoptMode ? [] : readSendMarkers();
   const remaining = codexBridgeQueue.peek();
-  const nextPendingMarkTimeMs = remaining.length > 0 ? remaining[0].markTimeMs : undefined;
   for (let i = 0; i < ready.length; i++) {
     const turn = ready[i];
     if (!turn.finalText) continue;
+    const batchRecord = codexBatchTurns.get(turn.turnId);
+    const batch = batchRecord?.descriptor;
+    if (batch) {
+      if (hasBatchReceipt(turn.finalText, batch.batchId, batch.count)) {
+        const confirmed = codexBatchTurns.confirm(turn.turnId);
+        const deleted = confirmed?.fileDeleted ?? false;
+        const disk = pruneRetainedCodexBatchFiles(sessionId);
+        log(`Codex batch receipt confirmed (batch_id=${batch.batchId}, ${batch.count}/${batch.count}, file_deleted=${deleted}, retained_files=${disk.retainedCount})`);
+      } else {
+        // The turn ended without a normative success receipt. The unified
+        // registry retains the descriptor/file under the same hard caps as
+        // submitted:false rechecks, and never auto-resends the payload.
+        codexBatchTurns.markSubmitUnconfirmed(turn.turnId, `missing_receipt_expected_${batch.count}/${batch.count}`);
+      }
+    }
+    codexBatchTurns.markTranscriptCompleted(turn.turnId);
     codexBridgeCompletedTurnIds.add(turn.turnId);
     if (codexBridgeCompletedTurnIds.size > 200) {
       const oldest = codexBridgeCompletedTurnIds.values().next().value;
       if (oldest) codexBridgeCompletedTurnIds.delete(oldest);
     }
-    const nextBoundaryMs = (i + 1 < ready.length ? ready[i + 1].markTimeMs : nextPendingMarkTimeMs);
-    if (shouldSuppressBridgeEmit({ markTimeMs: turn.markTimeMs, isLocal: turn.isLocal }, nextBoundaryMs, markers, adoptMode)) {
+    const gateWindow = resolveBridgeGateWindow(turn, [...ready.slice(i + 1), ...remaining]);
+    if (shouldSuppressBridgeEmit({ markTimeMs: gateWindow.markTimeMs, isLocal: turn.isLocal }, gateWindow.nextBoundaryMs, markers, adoptMode)) {
       log(`Codex bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (gate)`);
       continue;
     }
@@ -1556,7 +1660,13 @@ function emitReadyCodexTurns(): void {
       });
       continue;
     }
-    send({ type: 'final_output', content: turn.finalText, lastUuid: turn.turnId, turnId: turn.turnId });
+    send({
+      type: 'final_output',
+      content: turn.finalText,
+      lastUuid: turn.turnId,
+      turnId: turn.turnId,
+      suppressImplicitAddressing: !!batch,
+    });
   }
 }
 
@@ -1574,6 +1684,7 @@ function stopCodexBridge(): void {
   codexBridgePendingTail = '';
   codexBridgeBaselineDone = false;
   codexBridgeQueue.clearPending();
+  codexBatchTurns.clear();
   codexBridgeCompletedTurnIds.clear();
   codexBridgeQueue.setLocalTurns(false);
   codexBridgePendingSessionId = undefined;
@@ -2215,6 +2326,8 @@ function scheduleSubmitFailureNotify(
   failureReason?: string,
   turnSeq = usageLimitTracker.currentTurn(),
   shouldSuppress?: () => boolean,
+  onUnconfirmed?: (reason: string) => void,
+  onSuppressed?: () => void,
 ): void {
   const preview = msg.length > 60 ? msg.slice(0, 60) + '…' : msg;
   const dropBridgeMark = (): void => {
@@ -2226,6 +2339,7 @@ function scheduleSubmitFailureNotify(
     }
   };
   if (failureReason) {
+    onUnconfirmed?.(`submit_impossible:${failureReason}`);
     dropBridgeMark();
     log(`writeInput: submit impossible — notifying user immediately. reason="${failureReason}" preview="${preview}"`);
     send({
@@ -2236,15 +2350,18 @@ function scheduleSubmitFailureNotify(
   }
   const notifyMissing = (waitMs: number, label: string): void => {
     if (usageLimitTracker.detectedThisTurn(turnSeq)) {
+      onSuppressed?.();
       dropBridgeMark();
       log(`Deferred recheck missing but usage limit was detected for this turn — suppressing submit warning. preview="${preview}"`);
       return;
     }
     if (shouldSuppress?.()) {
+      onSuppressed?.();
       dropBridgeMark();
       log(`Deferred recheck missing but submit/response was already observed — suppressing submit warning. preview="${preview}"`);
       return;
     }
+    onUnconfirmed?.(`recheck_exhausted:${label}`);
     dropBridgeMark();
     log(`Deferred recheck still missing after ${waitMs}ms — notifying user. preview="${preview}"`);
     send({
@@ -2269,6 +2386,7 @@ function scheduleSubmitFailureNotify(
     },
     shouldSuppress,
     onSuppressed: attempt => {
+      onSuppressed?.();
       dropBridgeMark();
       log(`Deferred recheck suppressed on attempt ${attempt}/${SUBMIT_RECHECK_DELAYS_MS.length}: submit/response already observed. preview="${preview}"`);
     },
@@ -2308,8 +2426,29 @@ async function flushPending(): Promise<void> {
 
   try {
     while (pendingMessages.length > 0 && backend && cliAdapter) {
-      const msg = pendingMessages.shift()!;
+      // Codex-only backlog collapse. Snapshot creation consumes nothing on
+      // failure; in that case the following shift is the exact legacy FIFO
+      // path (one ordinary input for this idle cycle).
+      const batch = structuredBridgeIsCodex() && codexInputBatchEnabled()
+        ? tryPrepareCodexBatch(sessionId, pendingMessages, {
+            onError: error => log(`Codex batch snapshot failed; preserving queue and falling back to one-item FIFO: ${(error as Error)?.message ?? String(error)}`),
+          })
+        : null;
+      const pendingInput = batch ? null : pendingMessages.shift()!;
+      const msg = batch?.stub ?? pendingInput!.content;
       const turnSeq = usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
+      renderer?.markNewTurn();
+      const metadata = pendingInput?.metadata;
+      send({
+        type: 'input_started',
+        ids: batch?.ids ?? (metadata ? [metadata.messageId] : []),
+        title: batch?.title ?? metadata?.title,
+        pendingCount: pendingMessages.length,
+        callers: batch?.callers ?? (metadata?.sender.openId ? [metadata.sender.openId] : []),
+        originalContent: batch ? `batch_id=${batch.batchId} N=${batch.count}` : (metadata?.originalContent ?? msg),
+        cliInput: msg,
+        batch: batch ? { batchId: batch.batchId, count: batch.count, path: batch.path } : undefined,
+      });
       // Bridge fallback: mark immediately before writeInput. Doing it here
       // (instead of at enqueue time) means markTimeMs anchors to the
       // moment the message actually starts hitting the PTY — so any
@@ -2320,6 +2459,7 @@ async function flushPending(): Promise<void> {
       let bridgeTurnId: string | undefined;
       let codexBridgeTurnId: string | undefined;
       let codexBridgeMarkTimeMs: number | undefined;
+      let codexSubmitFailure: ReturnType<typeof createCodexTurnSubmitFailureHooks> | undefined;
       if (claudeBridgeActive) {
         try { bridgeIngest(); } catch { /* best-effort */ }
         bridgeTurnId = bridgeMarkPendingTurn(msg);
@@ -2330,6 +2470,10 @@ async function flushPending(): Promise<void> {
         // after still fingerprint-matches this turn.
         codexBridgeMarkTimeMs = Date.now();
         codexBridgeTurnId = codexBridgeMarkPendingTurn(msg, codexBridgeMarkTimeMs);
+        if (codexBridgeTurnId) {
+          codexSubmitFailure = createCodexTurnSubmitFailureHooks(codexBatchTurns, codexBridgeTurnId);
+          if (batch) codexBatchTurns.track(codexBridgeTurnId, describeCodexBatch(batch));
+        }
       }
       log(`Writing to PTY (flush): "${msg.substring(0, 80)}"`);
       // Defense in depth: TmuxPipeBackend's send methods no longer throw on a
@@ -2347,7 +2491,20 @@ async function flushPending(): Promise<void> {
         // nulled `backend` and told the user the CLI exited) — nothing more to
         // do. Otherwise surface it as a submit failure so the message isn't
         // silently lost.
-        if (backend) scheduleSubmitFailureNotify(msg, undefined, '会话 JSONL', bridgeTurnId, undefined, turnSeq);
+        if (backend) {
+          codexSubmitFailure?.markRechecking('write_input_threw');
+          scheduleSubmitFailureNotify(
+            msg,
+            undefined,
+            '会话 JSONL',
+            bridgeTurnId,
+            undefined,
+            turnSeq,
+            undefined,
+            codexSubmitFailure?.markUnconfirmed,
+            codexSubmitFailure?.resolveSuppressed,
+          );
+        }
         break;
       }
       // Persist any sessionId the adapter observed via authoritative sources
@@ -2365,6 +2522,12 @@ async function flushPending(): Promise<void> {
       // nulled backend) the user already got a "CLI exited" notice; don't also
       // nag that the submit wasn't confirmed.
       if (result && result.submitted === false && backend) {
+        codexSubmitFailure?.markRechecking();
+        if (batch) {
+          log(`Codex batch submit is inflight_unconfirmed (batch_id=${batch.batchId}, N=${batch.count}, file retained; no automatic resend)`);
+        } else if (codexBridgeTurnId) {
+          log(`Codex ordinary submit is inflight_unconfirmed (turnId=${codexBridgeTurnId}, parked=true, no automatic resend)`);
+        }
         scheduleSubmitFailureNotify(
           msg,
           result.recheck,
@@ -2373,6 +2536,8 @@ async function flushPending(): Promise<void> {
           result.failureReason,
           turnSeq,
           () => codexBridgeTurnHasSubmitOrResponse(codexBridgeTurnId, codexBridgeMarkTimeMs),
+          codexSubmitFailure?.markUnconfirmed,
+          codexSubmitFailure?.resolveSuppressed,
         );
       }
       // Codex bridge: stop after one writeInput per idle cycle. Codex's
@@ -2391,9 +2556,10 @@ async function flushPending(): Promise<void> {
   }
 }
 
-function sendToPty(content: string): void {
+function sendToPty(content: string, metadata?: PendingInputMetadata): void {
   if (!backend || !cliAdapter) return;
-  pendingMessages.push(content);
+  pendingMessages.push(makePendingInput(content, metadata));
+  send({ type: 'input_queued', pendingCount: pendingMessages.length });
   // User-override semantics: a fresh Lark message while a TUI prompt is "active"
   // takes precedence over the AI-detected prompt. The screen analyzer can be
   // wrong (false positive on a question that has no rendered options) and a
@@ -3329,7 +3495,7 @@ process.on('message', async (raw: unknown) => {
         // Bridge mark is deferred to flushPending — see flushPending
         // comment for why marking at enqueue is wrong.
         if (msg.prompt && !cliAdapter?.passesInitialPromptViaArgs) {
-          pendingMessages.push(msg.prompt);
+          pendingMessages.push(makePendingInput(msg.prompt));
         }
 
         send({ type: 'ready', port, token: writeToken });
@@ -3341,13 +3507,23 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'message': {
-      // Mark new turn baseline so the streaming card only shows this turn's content
-      renderer?.markNewTurn();
-      const turnSeq = usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
       // Cancel any active tmux copy-mode scroll so user input reaches the CLI.
       if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
       const content = msg.content;
       if (lastInitConfig?.adoptMode) {
+        // Adopt writes immediately rather than entering pendingMessages, so
+        // this point is its real input-start boundary.
+        renderer?.markNewTurn();
+        const turnSeq = usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
+        send({
+          type: 'input_started',
+          ids: msg.metadata ? [msg.metadata.messageId] : [],
+          title: msg.metadata?.title,
+          pendingCount: pendingMessages.length,
+          callers: msg.metadata?.sender.openId ? [msg.metadata.sender.openId] : [],
+          originalContent: msg.metadata?.originalContent ?? content,
+          cliInput: content,
+        });
         // Bridge mode: capture transcript baseline BEFORE writing to the pane,
         // so any assistant uuids appended after this point are attributed to
         // *this* Lark turn (not local user activity in the pane). Mark may
@@ -3355,6 +3531,7 @@ process.on('message', async (raw: unknown) => {
         // user just won't get a final_output for this message.
         let codexBridgeTurnId: string | undefined;
         let codexBridgeMarkTimeMs: number | undefined;
+        let codexSubmitFailure: ReturnType<typeof createCodexTurnSubmitFailureHooks> | undefined;
         if (bridgeJsonlPath) {
           try { bridgeIngest(); } catch { /* best effort */ }
           bridgeMarkPendingTurn(content);
@@ -3366,6 +3543,9 @@ process.on('message', async (raw: unknown) => {
           try { codexBridgeIngest(); } catch { /* best effort */ }
           codexBridgeMarkTimeMs = Date.now();
           codexBridgeTurnId = codexBridgeMarkPendingTurn(content, codexBridgeMarkTimeMs);
+          if (codexBridgeTurnId) {
+            codexSubmitFailure = createCodexTurnSubmitFailureHooks(codexBatchTurns, codexBridgeTurnId);
+          }
         }
         // Adopt mode write:
         //   - codex routes through cliAdapter.writeInput so the adapter's
@@ -3390,6 +3570,7 @@ process.on('message', async (raw: unknown) => {
                 codexBridgeNotifyCliSessionId(result.cliSessionId);
               }
               if (result && result.submitted === false) {
+                codexSubmitFailure?.markRechecking();
                 scheduleSubmitFailureNotify(
                   content,
                   result.recheck,
@@ -3398,10 +3579,24 @@ process.on('message', async (raw: unknown) => {
                   result.failureReason,
                   turnSeq,
                   () => codexBridgeTurnHasSubmitOrResponse(codexBridgeTurnId, codexBridgeMarkTimeMs),
+                  codexSubmitFailure?.markUnconfirmed,
+                  codexSubmitFailure?.resolveSuppressed,
                 );
               }
             } catch (err: any) {
               log(`Codex adopt writeInput error: ${err.message}`);
+              codexSubmitFailure?.markRechecking('write_input_threw');
+              scheduleSubmitFailureNotify(
+                content,
+                undefined,
+                'Codex history',
+                undefined,
+                undefined,
+                turnSeq,
+                undefined,
+                codexSubmitFailure?.markUnconfirmed,
+                codexSubmitFailure?.resolveSuppressed,
+              );
             }
           } else if ('sendText' in backend && 'sendSpecialKeys' in backend) {
             (backend as any).sendText(content);
@@ -3427,7 +3622,7 @@ process.on('message', async (raw: unknown) => {
         // arrival. Marking now would race with a still-running previous
         // turn whose `botmux send` could sneak its sentAtMs past this
         // turn's markTimeMs and falsely suppress its fallback.
-        sendToPty(content);
+        sendToPty(content, msg.metadata);
       }
       break;
     }

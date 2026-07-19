@@ -1,0 +1,14 @@
+{
+  "chatId": "oc_new",
+  "purpose": "（待 main-bot 自动推断）",
+  "originType": "bot_spawned",
+  "relatedRefs": [],
+  "participants": [],
+  "inheritedFrom": null,
+  "activeTodoRefs": [],
+  "rules": [],
+  "injectionPolicy": "eager",
+  "status": "active",
+  "archivedAt": null,
+  "updatedAt": "2026-06-28T15:45:37.583Z"
+}
