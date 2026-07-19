@@ -7,7 +7,7 @@
 // judge null / judge 抛错）→ **抛错**（tick 持 cursor 重试，不丢窗）；cursor 失效 → 抛 TaskTeamCursorInvalidError
 // （tick 跳最新）；判读成功但无行为 / 归因不到 → events:[]（不伪造事件）。judge 与 fetchSince 可注入，便于单测。
 
-import { spawn } from 'node:child_process';
+import { runCocoText, extractJsonObject } from './coco-cli.js';
 import {
   listChatMessages,
   listChatMessagesAsOwnerUser,
@@ -361,13 +361,14 @@ ${ctx.newMessages}
 只输出 JSON 数组，不要解释。`;
 }
 
-function parseJudgeOutput(stdout: string): TaskTeamDetectedBehavior[] | null {
+/** 入参是 coco 最终回复的**纯文本**（不再是 stdout 包装 JSON）——CLI 契约见 coco-cli.ts。 */
+function parseJudgeOutput(text: string): TaskTeamDetectedBehavior[] | null {
   try {
-    const env = JSON.parse(stdout);
-    const txt = env?.message?.content;
-    if (typeof txt !== 'string') return null;
-    const m = txt.match(/\[[\s\S]*\]/);
-    if (!m) return null;
+    const m = text.match(/\[[\s\S]*\]/);
+    if (!m) {
+      logger.warn(`[taskteam-observe-exec] coco judge output has no JSON array (${text.length} chars)`);
+      return null;
+    }
     const parsed = JSON.parse(m[0]);
     if (!Array.isArray(parsed)) return null;
     const out: TaskTeamDetectedBehavior[] = [];
@@ -388,41 +389,14 @@ function parseJudgeOutput(stdout: string): TaskTeamDetectedBehavior[] | null {
 }
 
 async function cocoJudge(ctx: TaskTeamJudgeContext): Promise<TaskTeamDetectedBehavior[] | null> {
-  const args = [
-    '--print',
-    '--output-format',
-    'json',
-    '--query-timeout',
-    `${Math.floor(JUDGE_TIMEOUT_MS / 1000)}s`,
-    '--disallowed-tool',
-    'Bash,Edit,Replace,Read,Write,Search,WebFetch',
-    buildJudgePrompt(ctx),
-  ];
-  let stdout = '';
-  try {
-    await new Promise<void>((resolve, reject) => {
-      const child = spawn('coco', args, { stdio: ['ignore', 'pipe', 'ignore'] });
-      child.stdout!.on('data', (c: Buffer) => {
-        stdout += c.toString('utf-8');
-      });
-      const timer = setTimeout(() => {
-        child.kill('SIGKILL');
-        reject(new Error('coco judge timeout'));
-      }, JUDGE_TIMEOUT_MS);
-      child.on('error', (e) => {
-        clearTimeout(timer);
-        reject(e);
-      });
-      child.on('exit', (code) => {
-        clearTimeout(timer);
-        code === 0 ? resolve() : reject(new Error(`coco exit ${code}`));
-      });
-    });
-  } catch (err: any) {
-    logger.warn(`[taskteam-observe-exec] coco judge exec failed: ${err?.message ?? err}`);
-    return null;
-  }
-  return parseJudgeOutput(stdout);
+  // CLI 契约统一收在 coco-cli.ts（见那里的事故记录）——这里只管 schema。
+  const raw = await runCocoText({
+    prompt: buildJudgePrompt(ctx),
+    timeoutMs: JUDGE_TIMEOUT_MS,
+    logPrefix: 'taskteam-observe-exec',
+  });
+  if (raw == null) return null;
+  return parseJudgeOutput(raw);
 }
 
 // ─── 判读结果 → TeamEvent 映射（纯函数，可单测）────────────────────────────

@@ -7,7 +7,7 @@
  * `急急如律令：【目标bot】...` 唤醒被推动方。
  * driveSpeakerId：缇蕾的 open_id —— 防自激过滤（缇蕾自己的催促不算"群进展"）。
  */
-import { spawn } from 'node:child_process';
+import { runCocoText, extractJsonObject } from './coco-cli.js';
 import { logger } from '../utils/logger.js';
 import { listChatMessages } from '../im/lark/client.js';
 import { resolveBotIdent } from '../core/main-bot-playbook.js';
@@ -64,42 +64,22 @@ ${rendered}
 
 只输出 JSON, 不要解释。`;
 
+const LOG_PREFIX = 'drive-exec';
+
 async function cocoJudge(prompt: string): Promise<DriveJudgeResult | null> {
-  const args = [
-    '--print', '--output-format', 'json',
-    '--query-timeout', `${Math.floor(JUDGE_TIMEOUT_MS / 1000)}s`,
-    '--disallowed-tool', 'Bash,Edit,Replace,Read,Write,Search,WebFetch',
-    prompt,
-  ];
-  let stdout = '';
-  try {
-    await new Promise<void>((resolve, reject) => {
-      const child = spawn('coco', args, { stdio: ['ignore', 'pipe', 'ignore'] });
-      child.stdout!.on('data', (c: Buffer) => { stdout += c.toString('utf-8'); });
-      const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('coco judge timeout')); }, JUDGE_TIMEOUT_MS);
-      child.on('error', e => { clearTimeout(timer); reject(e); });
-      child.on('exit', code => { clearTimeout(timer); code === 0 ? resolve() : reject(new Error(`coco exit ${code}`)); });
-    });
-  } catch (err: any) {
-    logger.warn(`[drive-exec] coco judge exec failed: ${err?.message ?? err}`);
+  // CLI 契约统一收在 coco-cli.ts（见那里的事故记录）——这里只管 schema。
+  const raw = await runCocoText({ prompt, timeoutMs: JUDGE_TIMEOUT_MS, logPrefix: LOG_PREFIX });
+  if (raw == null) return null;
+  const parsed = extractJsonObject<{ shouldNudge?: unknown; nudgeText?: unknown }>(raw, LOG_PREFIX);
+  if (!parsed) return null;
+  if (typeof parsed.shouldNudge !== 'boolean') {
+    logger.warn(`[${LOG_PREFIX}] coco judge bad shouldNudge: ${String(parsed.shouldNudge).slice(0, 40)}`);
     return null;
   }
-  try {
-    const env = JSON.parse(stdout);
-    const txt = env?.message?.content;
-    if (typeof txt !== 'string') return null;
-    const m = txt.match(/\{[\s\S]*\}/);
-    if (!m) return null;
-    const parsed = JSON.parse(m[0]);
-    if (typeof parsed?.shouldNudge !== 'boolean') return null;
-    return {
-      shouldNudge: parsed.shouldNudge,
-      nudgeText: String(parsed?.nudgeText ?? '').slice(0, 300),
-    };
-  } catch (err: any) {
-    logger.warn(`[drive-exec] coco judge parse failed: ${err?.message ?? err}`);
-    return null;
-  }
+  return {
+    shouldNudge: parsed.shouldNudge,
+    nudgeText: String(parsed.nudgeText ?? '').slice(0, 300),
+  };
 }
 
 export function makeDriveExecutors(): DriveExecutors {

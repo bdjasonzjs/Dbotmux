@@ -7,7 +7,7 @@
  * 纯 IO + LLM, 跟着 tilly-llm-analyzer (coco 调用) + tilly-publisher (主话题
  * 发消息) 既有模式。决策逻辑在 subgroup-watcher.ts (已单测), 这里只接 IO。
  */
-import { spawn } from 'node:child_process';
+import { runCocoText, extractJsonObject } from './coco-cli.js';
 import { logger } from '../utils/logger.js';
 import { listChatMessages, sendMessage } from '../im/lark/client.js';
 import { resolveBotIdent } from '../core/main-bot-playbook.js';
@@ -61,40 +61,20 @@ ${rendered}
 
 只输出 JSON, 不要解释。`;
 
+const LOG_PREFIX = 'subgroup-watcher-exec';
+
 async function cocoJudge(prompt: string): Promise<{ state: ProgressState; reason: string } | null> {
-  const args = [
-    '--print', '--output-format', 'json',
-    '--query-timeout', `${Math.floor(JUDGE_TIMEOUT_MS / 1000)}s`,
-    '--disallowed-tool', 'Bash,Edit,Replace,Read,Write,Search,WebFetch',
-    prompt,
-  ];
-  let stdout = '';
-  try {
-    await new Promise<void>((resolve, reject) => {
-      const child = spawn('coco', args, { stdio: ['ignore', 'pipe', 'ignore'] });
-      child.stdout!.on('data', (c: Buffer) => { stdout += c.toString('utf-8'); });
-      const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('coco judge timeout')); }, JUDGE_TIMEOUT_MS);
-      child.on('error', e => { clearTimeout(timer); reject(e); });
-      child.on('exit', code => { clearTimeout(timer); code === 0 ? resolve() : reject(new Error(`coco exit ${code}`)); });
-    });
-  } catch (err: any) {
-    logger.warn(`[subgroup-watcher-exec] coco judge exec failed: ${err?.message ?? err}`);
+  // CLI 契约统一收在 coco-cli.ts（见那里的事故记录）——这里只管 schema。
+  const raw = await runCocoText({ prompt, timeoutMs: JUDGE_TIMEOUT_MS, logPrefix: LOG_PREFIX });
+  if (raw == null) return null;
+  const parsed = extractJsonObject<{ state?: unknown; reason?: unknown }>(raw, LOG_PREFIX);
+  if (!parsed) return null;
+  const state = parsed.state as ProgressState;
+  if (!['in_progress', 'done', 'stuck', 'need_owner'].includes(state)) {
+    logger.warn(`[${LOG_PREFIX}] coco judge bad state: ${String(parsed.state).slice(0, 40)}`);
     return null;
   }
-  try {
-    const env = JSON.parse(stdout);
-    const txt = env?.message?.content;
-    if (typeof txt !== 'string') return null;
-    const m = txt.match(/\{[\s\S]*\}/);
-    if (!m) return null;
-    const parsed = JSON.parse(m[0]);
-    const state = parsed?.state;
-    if (!['in_progress', 'done', 'stuck', 'need_owner'].includes(state)) return null;
-    return { state, reason: String(parsed?.reason ?? '').slice(0, 200) };
-  } catch (err: any) {
-    logger.warn(`[subgroup-watcher-exec] coco judge parse failed: ${err?.message ?? err}`);
-    return null;
-  }
+  return { state, reason: String(parsed.reason ?? '').slice(0, 200) };
 }
 
 export function makeWatcherExecutors(): WatcherExecutors {
