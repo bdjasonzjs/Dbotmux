@@ -15,11 +15,16 @@ const ROOT = '/tmp/botmux-codex-batch-lifecycle-test';
 
 function descriptor(index: number, sizeBytes = 140_000): CodexBatchDescriptor {
   const path = join(ROOT, `batch-${index}.md`);
-  writeFileSync(path, `batch-${index}`, { mode: 0o600 });
+  writeFileSync(path, Buffer.alloc(sizeBytes, index % 251), { mode: 0o600 });
   return {
     batchId: String(index), count: 3, path,
     createdAtMs: index, sizeBytes,
   };
+}
+
+function diskUsage(): { count: number; bytes: number } {
+  const paths = readdirSync(ROOT).filter(name => name.endsWith('.md')).map(name => join(ROOT, name));
+  return { count: paths.length, bytes: paths.reduce((total, path) => total + statSync(path).size, 0) };
 }
 
 beforeEach(() => {
@@ -59,8 +64,8 @@ describe('Codex worker batch lifecycle', () => {
     expect(snapshot.recordCount).toBeLessThanOrEqual(CODEX_BATCH_RETAINED_MAX_FILES);
     expect(snapshot.recordBytes).toBeLessThanOrEqual(CODEX_BATCH_RETAINED_MAX_BYTES);
     expect(snapshot.records.every(record => !('inputs' in record.descriptor))).toBe(true);
-    expect(readdirSync(ROOT).filter(name => name.endsWith('.md')).length)
-      .toBeLessThanOrEqual(CODEX_BATCH_RETAINED_MAX_FILES);
+    expect(diskUsage().count).toBeLessThanOrEqual(CODEX_BATCH_RETAINED_MAX_FILES);
+    expect(diskUsage().bytes).toBeLessThanOrEqual(CODEX_BATCH_RETAINED_MAX_BYTES);
     expect(events.filter(event => event.type === 'unconfirmed')).toHaveLength(CODEX_BATCH_RETAINED_MAX_FILES + 8);
     expect(events.some(event => event.type === 'evicted')).toBe(true);
     expect(resendCalls).toBe(0);
@@ -80,8 +85,8 @@ describe('Codex worker batch lifecycle', () => {
     expect(snapshot.recordCount).toBeLessThanOrEqual(CODEX_BATCH_RETAINED_MAX_FILES);
     expect(snapshot.recordBytes).toBeLessThanOrEqual(CODEX_BATCH_RETAINED_MAX_BYTES);
     expect(snapshot.records.every(record => record.state === 'rechecking')).toBe(true);
-    expect(readdirSync(ROOT).filter(name => name.endsWith('.md')).length)
-      .toBeLessThanOrEqual(CODEX_BATCH_RETAINED_MAX_FILES);
+    expect(diskUsage().count).toBeLessThanOrEqual(CODEX_BATCH_RETAINED_MAX_FILES);
+    expect(diskUsage().bytes).toBeLessThanOrEqual(CODEX_BATCH_RETAINED_MAX_BYTES);
   });
 
   it('deletes the immutable file after confirmation', () => {
