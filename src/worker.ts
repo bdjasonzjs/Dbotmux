@@ -34,17 +34,16 @@ import { scheduleSubmitFailureRechecks, SUBMIT_RECHECK_DELAYS_MS, SUBMIT_RECHECK
 import {
   CODEX_BATCH_RETAINED_MAX_BYTES,
   CODEX_BATCH_RETAINED_MAX_FILES,
-  boundCodexBatchDescriptors,
   deleteCodexBatchFile,
   describeCodexBatch,
   hasBatchReceipt,
   makePendingInput,
   pruneRetainedCodexBatchFiles,
   tryPrepareCodexBatch,
-  type CodexBatchDescriptor,
   type PendingInput,
   type PendingInputMetadata,
 } from './services/codex-input-batch.js';
+import { CodexBatchLifecycle, type CodexBatchLifecycleEvent } from './services/codex-batch-lifecycle.js';
 import { dirname } from 'node:path';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -107,28 +106,47 @@ let isPromptReady = false;
 /** Mutex for async flushPending — prevents concurrent flush loops. */
 let isFlushing = false;
 const pendingMessages: PendingInput[] = [];
-/** Inflight entries are bounded descriptors only; raw message bodies live in
- *  the private immutable file and are never duplicated in worker memory. */
-const inflightCodexBatches = new Map<string, CodexBatchDescriptor>();
-let retainedUnconfirmedCodexBatches: CodexBatchDescriptor[] = [];
-
-function retainUnconfirmedCodexBatch(batch: CodexBatchDescriptor): { count: number; bytes: number; evicted: string[] } {
-  const bounded = boundCodexBatchDescriptors([...retainedUnconfirmedCodexBatches, batch]);
-  retainedUnconfirmedCodexBatches = bounded.retained;
-  const evicted: string[] = [];
-  for (const oldest of bounded.evicted) {
-    if (deleteCodexBatchFile(oldest.path)) evicted.push(oldest.path);
+function handleCodexBatchLifecycleEvent(event: CodexBatchLifecycleEvent): void {
+  if (event.type === 'prune_failed') {
+    log(`Codex batch retention prune failed: ${event.message}`);
+    send({
+      type: 'user_notify',
+      message: `⚠️ Codex 批次有界保留清理失败：${event.message}。未自动重发，请检查会话私有批文件目录。`,
+    });
+    return;
   }
-  const disk = pruneRetainedCodexBatchFiles(sessionId);
-  const removed = new Set([...evicted, ...disk.deletedPaths]);
-  retainedUnconfirmedCodexBatches = retainedUnconfirmedCodexBatches.filter(item => !removed.has(item.path));
-  const bytes = retainedUnconfirmedCodexBatches.reduce((total, item) => total + item.sizeBytes, 0);
-  return {
-    count: retainedUnconfirmedCodexBatches.length,
-    bytes,
-    evicted: [...removed],
-  };
+  const batch = event.record.descriptor;
+  if (event.type === 'unconfirmed') {
+    const snapshot = codexBatchLifecycle.snapshot();
+    log(`Codex batch submit/receipt unconfirmed (batch_id=${batch.batchId}, reason=${event.record.reason ?? 'unknown'}, retained=${snapshot.recordCount}/${CODEX_BATCH_RETAINED_MAX_FILES}, bytes=${snapshot.recordBytes}/${CODEX_BATCH_RETAINED_MAX_BYTES}, no_resend=true)`);
+    send({
+      type: 'user_notify',
+      message: `⚠️ Codex 批次未确认：batch_id=${batch.batchId}，原因 ${event.record.reason ?? 'unknown'}。该批不计为已消费，也不会自动重发；私有文件按每会话最多 ${CODEX_BATCH_RETAINED_MAX_FILES} 份 / ${Math.round(CODEX_BATCH_RETAINED_MAX_BYTES / 1024 / 1024)} MiB 有界保留：${batch.path}`,
+    });
+    return;
+  }
+  if (event.type === 'evicted') {
+    log(`Codex batch lifecycle evicted oldest descriptor (batch_id=${batch.batchId}, state=${event.record.state}, file_deleted=${event.fileDeleted}, no_resend=true)`);
+    send({
+      type: 'user_notify',
+      message: `⚠️ Codex 批次有界保留达到上限，已淘汰最旧记录：batch_id=${batch.batchId}，文件清理=${event.fileDeleted ? '成功' : '失败'}；未自动重发。`,
+    });
+    return;
+  }
+  log(`Codex batch confirmed but private file cleanup failed (batch_id=${batch.batchId}, path=${batch.path})`);
+  send({
+    type: 'user_notify',
+    message: `⚠️ Codex 批次已确认，但私有批文件清理失败：batch_id=${batch.batchId}，路径 ${batch.path}。保留策略仍会限制后续文件数量。`,
+  });
 }
+
+/** Every live and retained entry is bounded and descriptor-only; raw message
+ * bodies remain solely in the private immutable file. */
+const codexBatchLifecycle = new CodexBatchLifecycle({
+  removeFile: deleteCodexBatchFile,
+  pruneFiles: protectedPaths => pruneRetainedCodexBatchFiles(sessionId, protectedPaths),
+  onEvent: handleCodexBatchLifecycleEvent,
+});
 
 type RuntimeScreenStatus = Exclude<ScreenStatus, 'limited'>;
 
@@ -1568,30 +1586,19 @@ function emitReadyCodexTurns(): void {
   for (let i = 0; i < ready.length; i++) {
     const turn = ready[i];
     if (!turn.finalText) continue;
-    const batch = inflightCodexBatches.get(turn.turnId);
+    const batchRecord = codexBatchLifecycle.get(turn.turnId);
+    const batch = batchRecord?.descriptor;
     if (batch) {
       if (hasBatchReceipt(turn.finalText, batch.batchId, batch.count)) {
-        inflightCodexBatches.delete(turn.turnId);
-        const deleted = deleteCodexBatchFile(batch.path);
+        const confirmed = codexBatchLifecycle.confirm(turn.turnId);
+        const deleted = confirmed?.fileDeleted ?? false;
         const disk = pruneRetainedCodexBatchFiles(sessionId);
         log(`Codex batch receipt confirmed (batch_id=${batch.batchId}, ${batch.count}/${batch.count}, file_deleted=${deleted}, retained_files=${disk.retainedCount})`);
-        if (!deleted) {
-          send({
-            type: 'user_notify',
-            message: `⚠️ Codex 批次已确认，但私有批文件清理失败：batch_id=${batch.batchId}，路径 ${batch.path}。保留策略仍会限制后续文件数量。`,
-          });
-        }
       } else {
-        // The turn ended without a normative success receipt. Move the small
-        // descriptor out of inflight, retain the private file under bounded
-        // count/byte caps, and never auto-resend the payload.
-        inflightCodexBatches.delete(turn.turnId);
-        const retained = retainUnconfirmedCodexBatch(batch);
-        log(`Codex batch receipt missing (batch_id=${batch.batchId}, expected ${batch.count}/${batch.count}, file retained at ${batch.path}, retained=${retained.count}/${CODEX_BATCH_RETAINED_MAX_FILES}, bytes=${retained.bytes}/${CODEX_BATCH_RETAINED_MAX_BYTES}, evicted=${retained.evicted.length})`);
-        send({
-          type: 'user_notify',
-          message: `⚠️ Codex 批次未完成规范回执：batch_id=${batch.batchId}，期望末行 BOTMUX_BATCH_RECEIPT … processed=${batch.count}/${batch.count} status=ok。该批不计为已消费，不会自动重发；私有文件按每会话最多 ${CODEX_BATCH_RETAINED_MAX_FILES} 份 / ${Math.round(CODEX_BATCH_RETAINED_MAX_BYTES / 1024 / 1024)} MiB 有界保留：${batch.path}`,
-        });
+        // The turn ended without a normative success receipt. The unified
+        // registry retains the descriptor/file under the same hard caps as
+        // submitted:false rechecks, and never auto-resends the payload.
+        codexBatchLifecycle.markSubmitUnconfirmed(turn.turnId, `missing_receipt_expected_${batch.count}/${batch.count}`);
       }
     }
     codexBridgeCompletedTurnIds.add(turn.turnId);
@@ -1645,8 +1652,7 @@ function stopCodexBridge(): void {
   codexBridgePendingTail = '';
   codexBridgeBaselineDone = false;
   codexBridgeQueue.clearPending();
-  inflightCodexBatches.clear();
-  retainedUnconfirmedCodexBatches = [];
+  codexBatchLifecycle.clear();
   codexBridgeCompletedTurnIds.clear();
   codexBridgeQueue.setLocalTurns(false);
   codexBridgePendingSessionId = undefined;
@@ -2288,6 +2294,7 @@ function scheduleSubmitFailureNotify(
   failureReason?: string,
   turnSeq = usageLimitTracker.currentTurn(),
   shouldSuppress?: () => boolean,
+  onUnconfirmed?: (reason: string) => void,
 ): void {
   const preview = msg.length > 60 ? msg.slice(0, 60) + '…' : msg;
   const dropBridgeMark = (): void => {
@@ -2299,6 +2306,7 @@ function scheduleSubmitFailureNotify(
     }
   };
   if (failureReason) {
+    onUnconfirmed?.(`submit_impossible:${failureReason}`);
     dropBridgeMark();
     log(`writeInput: submit impossible — notifying user immediately. reason="${failureReason}" preview="${preview}"`);
     send({
@@ -2318,6 +2326,7 @@ function scheduleSubmitFailureNotify(
       log(`Deferred recheck missing but submit/response was already observed — suppressing submit warning. preview="${preview}"`);
       return;
     }
+    onUnconfirmed?.(`recheck_exhausted:${label}`);
     dropBridgeMark();
     log(`Deferred recheck still missing after ${waitMs}ms — notifying user. preview="${preview}"`);
     send({
@@ -2424,7 +2433,7 @@ async function flushPending(): Promise<void> {
         // after still fingerprint-matches this turn.
         codexBridgeMarkTimeMs = Date.now();
         codexBridgeTurnId = codexBridgeMarkPendingTurn(msg, codexBridgeMarkTimeMs);
-        if (batch && codexBridgeTurnId) inflightCodexBatches.set(codexBridgeTurnId, describeCodexBatch(batch));
+        if (batch && codexBridgeTurnId) codexBatchLifecycle.track(codexBridgeTurnId, describeCodexBatch(batch));
       }
       log(`Writing to PTY (flush): "${msg.substring(0, 80)}"`);
       // Defense in depth: TmuxPipeBackend's send methods no longer throw on a
@@ -2442,7 +2451,18 @@ async function flushPending(): Promise<void> {
         // nulled `backend` and told the user the CLI exited) — nothing more to
         // do. Otherwise surface it as a submit failure so the message isn't
         // silently lost.
-        if (backend) scheduleSubmitFailureNotify(msg, undefined, '会话 JSONL', bridgeTurnId, undefined, turnSeq);
+        if (backend) scheduleSubmitFailureNotify(
+          msg,
+          undefined,
+          '会话 JSONL',
+          bridgeTurnId,
+          undefined,
+          turnSeq,
+          undefined,
+          batch && codexBridgeTurnId
+            ? reason => codexBatchLifecycle.markSubmitUnconfirmed(codexBridgeTurnId!, reason)
+            : undefined,
+        );
         break;
       }
       // Persist any sessionId the adapter observed via authoritative sources
@@ -2462,6 +2482,7 @@ async function flushPending(): Promise<void> {
       if (result && result.submitted === false && backend) {
         if (batch) {
           log(`Codex batch submit is inflight_unconfirmed (batch_id=${batch.batchId}, N=${batch.count}, file retained; no automatic resend)`);
+          if (codexBridgeTurnId) codexBatchLifecycle.markRechecking(codexBridgeTurnId);
         }
         scheduleSubmitFailureNotify(
           msg,
@@ -2471,6 +2492,9 @@ async function flushPending(): Promise<void> {
           result.failureReason,
           turnSeq,
           () => codexBridgeTurnHasSubmitOrResponse(codexBridgeTurnId, codexBridgeMarkTimeMs),
+          batch && codexBridgeTurnId
+            ? reason => codexBatchLifecycle.markSubmitUnconfirmed(codexBridgeTurnId!, reason)
+            : undefined,
         );
       }
       // Codex bridge: stop after one writeInput per idle cycle. Codex's

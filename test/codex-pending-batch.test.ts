@@ -156,6 +156,8 @@ describe('Codex pending-input batch collapse', () => {
     expect(hasBatchReceipt(`status=failed\n${receipt}`, '7', 3)).toBe(false);
     expect(hasBatchReceipt(`引用：${receipt}`, '7', 3)).toBe(false);
     expect(hasBatchReceipt(`${receipt}\n但其实未完成`, '7', 3)).toBe(false);
+    expect(hasBatchReceipt(`只读到 1/3，未完成\n${receipt}`, '7', 3)).toBe(false);
+    expect(hasBatchReceipt(`处理失败但仍输出回执\n${receipt}`, '7', 3)).toBe(false);
   });
 
   it('writes private 0700 directories and 0600 immutable files', () => {

@@ -348,6 +348,10 @@ export function batchReceiptLine(batchId: string, count: number): string {
 
 export function hasBatchReceipt(text: string, batchId: string, count: number): boolean {
   if (/\bBLOCKED\b/i.test(text)) return false;
+  // A canonical-looking trailer must not override an explicit failure in the
+  // body. False negatives retain the bounded private snapshot for inspection;
+  // false positives would incorrectly ACK and delete an unconsumed batch.
+  if (/只读到\s*\d+\s*\/\s*\d+|未完成|处理失败|\b(?:incomplete|failed|not\s+completed)\b/i.test(text)) return false;
   for (const match of text.matchAll(/\bstatus\s*=\s*([^\s]+)/gi)) {
     if (match[1]?.toLowerCase() !== 'ok') return false;
   }

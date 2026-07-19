@@ -8,7 +8,7 @@
  */
 import { afterEach, describe, expect, it } from 'vitest';
 import { execFileSync, fork, type ChildProcess } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -42,9 +42,20 @@ describe.skipIf(!enabled)('real Codex worker backlog batch', () => {
 
   it('drains three queued senders as one stub and confirms batch_id + 3/3', async () => {
     const startedAtMs = Date.now();
+    const startedAt = new Date(startedAtMs).toISOString();
     const worktree = process.cwd();
     const workerPath = join(worktree, 'dist', 'worker.js');
+    const cliPath = join(worktree, 'dist', 'cli.js');
     expect(existsSync(workerPath), 'run pnpm build before this opt-in test').toBe(true);
+    expect(existsSync(cliPath), 'run pnpm build before this opt-in test').toBe(true);
+    const headSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: worktree, encoding: 'utf8' }).trim();
+    const gitStatusPorcelain = execFileSync('git', ['status', '--porcelain'], { cwd: worktree, encoding: 'utf8' });
+    const distWorkerSha256 = createHash('sha256').update(readFileSync(workerPath)).digest('hex');
+    const distCliSha256 = createHash('sha256').update(readFileSync(cliPath)).digest('hex');
+    const codexVersion = execFileSync('codex', ['--version'], { encoding: 'utf8' }).trim();
+    expect(gitStatusPorcelain, 'real proof must run from the final clean commit').toBe('');
+    expect(distWorkerSha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(distCliSha256).toMatch(/^[0-9a-f]{64}$/);
 
     tmp = join(tmpdir(), `botmux-real-batch-${randomUUID()}`);
     const dataDir = join(tmp, 'data');
@@ -202,17 +213,25 @@ describe.skipIf(!enabled)('real Codex worker backlog batch', () => {
     expect(visibleMessage?.content).toContain('GAMMA');
     expect(hasBatchReceipt(visibleMessage?.content ?? '', batchStarted!.batch!.batchId, 3)).toBe(true);
     expect(visibleMessage?.content).not.toContain('发送给：');
-    expect(existsSync(batchStarted!.batch!.path)).toBe(false);
+    const batchFileDeleted = !existsSync(batchStarted!.batch!.path);
+    expect(batchFileDeleted).toBe(true);
 
     mkdirSync(dirname(EVIDENCE_PATH), { recursive: true });
     writeFileSync(EVIDENCE_PATH, JSON.stringify({
-      at: new Date().toISOString(),
-      codexVersion: '0.144.6',
+      startedAt,
+      endedAt: new Date().toISOString(),
+      headSha,
+      worktreeClean: gitStatusPorcelain === '',
+      gitStatusPorcelain,
+      distWorkerSha256,
+      distCliSha256,
+      codexVersion,
       sessionId: sid,
       inputQueuedCounts: ipc.filter((m): m is Extract<WorkerToDaemon, { type: 'input_queued' }> => m.type === 'input_queued').map(m => m.pendingCount),
       batchStarted,
       metadataAfterBatch,
       batchFile: batchStarted?.batch?.path,
+      batchFileDeleted,
       batchEndMarker: batchBody.trimEnd().split('\n').at(-1),
       receiptLog: logs.join('').split('\n').find(line => line.includes('Codex batch receipt confirmed')),
       visibleMessage,
