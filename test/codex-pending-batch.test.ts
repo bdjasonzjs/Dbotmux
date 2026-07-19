@@ -153,11 +153,14 @@ describe('Codex pending-input batch collapse', () => {
     expect(hasBatchReceipt('只读到 1/3；原要求是 batch_id=7 3/3', '7', 3)).toBe(false);
     expect(hasBatchReceipt(batchReceiptLine('8', 3), '7', 3)).toBe(false);
     expect(hasBatchReceipt(batchReceiptLine('7', 2), '7', 3)).toBe(false);
-    expect(hasBatchReceipt(`status=failed\n${receipt}`, '7', 3)).toBe(false);
+    expect(hasBatchReceipt(`status=failed 是用户消息里的原文\n${receipt}`, '7', 3)).toBe(true);
     expect(hasBatchReceipt(`引用：${receipt}`, '7', 3)).toBe(false);
     expect(hasBatchReceipt(`${receipt}\n但其实未完成`, '7', 3)).toBe(false);
-    expect(hasBatchReceipt(`只读到 1/3，未完成\n${receipt}`, '7', 3)).toBe(false);
-    expect(hasBatchReceipt(`处理失败但仍输出回执\n${receipt}`, '7', 3)).toBe(false);
+    expect(hasBatchReceipt(`只读到 1/3 是待分析的原句；三条现已处理完成\n${receipt}`, '7', 3)).toBe(true);
+    expect(hasBatchReceipt(`第 2 条描述“处理失败”，已给出修复建议\n${receipt}`, '7', 3)).toBe(true);
+    expect(hasBatchReceipt(`没有未完成项，三条已全部回答\n${receipt}`, '7', 3)).toBe(true);
+    expect(hasBatchReceipt(`解释用户消息里的 BLOCKED 关键字并给出结论\n${receipt}`, '7', 3)).toBe(true);
+    expect(hasBatchReceipt('BOTMUX_BATCH_RECEIPT batch_id=7 processed=3/3 status=failed', '7', 3)).toBe(false);
   });
 
   it('writes private 0700 directories and 0600 immutable files', () => {

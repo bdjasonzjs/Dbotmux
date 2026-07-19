@@ -17,7 +17,7 @@ import { mkdirSync, writeFileSync, unlinkSync, existsSync, statSync, readdirSync
 import { join } from 'node:path';
 import { drainTranscript, joinAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
-import { shouldSuppressBridgeEmit, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
+import { resolveBridgeGateWindow, shouldSuppressBridgeEmit, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import {
   shouldRunQuietRotation,
   evaluatePidResolverPullback,
@@ -43,7 +43,8 @@ import {
   type PendingInput,
   type PendingInputMetadata,
 } from './services/codex-input-batch.js';
-import { CodexBatchLifecycle, type CodexBatchLifecycleEvent } from './services/codex-batch-lifecycle.js';
+import type { CodexBatchLifecycleEvent } from './services/codex-batch-lifecycle.js';
+import { CodexBatchTurnCoordinator } from './services/codex-batch-turn-coordinator.js';
 import { dirname } from 'node:path';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -106,6 +107,7 @@ let isPromptReady = false;
 /** Mutex for async flushPending — prevents concurrent flush loops. */
 let isFlushing = false;
 const pendingMessages: PendingInput[] = [];
+let codexBatchTurns!: CodexBatchTurnCoordinator;
 function handleCodexBatchLifecycleEvent(event: CodexBatchLifecycleEvent): void {
   if (event.type === 'prune_failed') {
     log(`Codex batch retention prune failed: ${event.message}`);
@@ -117,7 +119,7 @@ function handleCodexBatchLifecycleEvent(event: CodexBatchLifecycleEvent): void {
   }
   const batch = event.record.descriptor;
   if (event.type === 'unconfirmed') {
-    const snapshot = codexBatchLifecycle.snapshot();
+    const snapshot = codexBatchTurns.snapshot();
     log(`Codex batch submit/receipt unconfirmed (batch_id=${batch.batchId}, reason=${event.record.reason ?? 'unknown'}, retained=${snapshot.recordCount}/${CODEX_BATCH_RETAINED_MAX_FILES}, bytes=${snapshot.recordBytes}/${CODEX_BATCH_RETAINED_MAX_BYTES}, no_resend=true)`);
     send({
       type: 'user_notify',
@@ -139,14 +141,6 @@ function handleCodexBatchLifecycleEvent(event: CodexBatchLifecycleEvent): void {
     message: `⚠️ Codex 批次已确认，但私有批文件清理失败：batch_id=${batch.batchId}，路径 ${batch.path}。保留策略仍会限制后续文件数量。`,
   });
 }
-
-/** Every live and retained entry is bounded and descriptor-only; raw message
- * bodies remain solely in the private immutable file. */
-const codexBatchLifecycle = new CodexBatchLifecycle({
-  removeFile: deleteCodexBatchFile,
-  pruneFiles: protectedPaths => pruneRetainedCodexBatchFiles(sessionId, protectedPaths),
-  onEvent: handleCodexBatchLifecycleEvent,
-});
 
 type RuntimeScreenStatus = Exclude<ScreenStatus, 'limited'>;
 
@@ -299,6 +293,13 @@ let codexBridgeOffset = 0;
 let codexBridgePendingTail = '';
 let codexBridgeBaselineDone = false;
 const codexBridgeQueue = new CodexBridgeQueue();
+/** Every live and retained entry is bounded and descriptor-only; the
+ * coordinator also parks failed marks so they cannot poison later turns. */
+codexBatchTurns = new CodexBatchTurnCoordinator(codexBridgeQueue, {
+  removeFile: deleteCodexBatchFile,
+  pruneFiles: protectedPaths => pruneRetainedCodexBatchFiles(sessionId, protectedPaths),
+  onEvent: handleCodexBatchLifecycleEvent,
+});
 let codexBridgeWatcher: FSWatcher | null = null;
 let codexBridgeTimer: NodeJS.Timeout | null = null;
 const codexBridgeCompletedTurnIds = new Set<string>();
@@ -1582,15 +1583,14 @@ function emitReadyCodexTurns(): void {
   // should reach the thread. Skip marker IO entirely.
   const markers = adoptMode ? [] : readSendMarkers();
   const remaining = codexBridgeQueue.peek();
-  const nextPendingMarkTimeMs = remaining.length > 0 ? remaining[0].markTimeMs : undefined;
   for (let i = 0; i < ready.length; i++) {
     const turn = ready[i];
     if (!turn.finalText) continue;
-    const batchRecord = codexBatchLifecycle.get(turn.turnId);
+    const batchRecord = codexBatchTurns.get(turn.turnId);
     const batch = batchRecord?.descriptor;
     if (batch) {
       if (hasBatchReceipt(turn.finalText, batch.batchId, batch.count)) {
-        const confirmed = codexBatchLifecycle.confirm(turn.turnId);
+        const confirmed = codexBatchTurns.confirm(turn.turnId);
         const deleted = confirmed?.fileDeleted ?? false;
         const disk = pruneRetainedCodexBatchFiles(sessionId);
         log(`Codex batch receipt confirmed (batch_id=${batch.batchId}, ${batch.count}/${batch.count}, file_deleted=${deleted}, retained_files=${disk.retainedCount})`);
@@ -1598,7 +1598,7 @@ function emitReadyCodexTurns(): void {
         // The turn ended without a normative success receipt. The unified
         // registry retains the descriptor/file under the same hard caps as
         // submitted:false rechecks, and never auto-resends the payload.
-        codexBatchLifecycle.markSubmitUnconfirmed(turn.turnId, `missing_receipt_expected_${batch.count}/${batch.count}`);
+        codexBatchTurns.markSubmitUnconfirmed(turn.turnId, `missing_receipt_expected_${batch.count}/${batch.count}`);
       }
     }
     codexBridgeCompletedTurnIds.add(turn.turnId);
@@ -1606,8 +1606,8 @@ function emitReadyCodexTurns(): void {
       const oldest = codexBridgeCompletedTurnIds.values().next().value;
       if (oldest) codexBridgeCompletedTurnIds.delete(oldest);
     }
-    const nextBoundaryMs = (i + 1 < ready.length ? ready[i + 1].markTimeMs : nextPendingMarkTimeMs);
-    if (shouldSuppressBridgeEmit({ markTimeMs: turn.markTimeMs, isLocal: turn.isLocal }, nextBoundaryMs, markers, adoptMode)) {
+    const gateWindow = resolveBridgeGateWindow(turn, [...ready.slice(i + 1), ...remaining]);
+    if (shouldSuppressBridgeEmit({ markTimeMs: gateWindow.markTimeMs, isLocal: turn.isLocal }, gateWindow.nextBoundaryMs, markers, adoptMode)) {
       log(`Codex bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (gate)`);
       continue;
     }
@@ -1652,7 +1652,7 @@ function stopCodexBridge(): void {
   codexBridgePendingTail = '';
   codexBridgeBaselineDone = false;
   codexBridgeQueue.clearPending();
-  codexBatchLifecycle.clear();
+  codexBatchTurns.clear();
   codexBridgeCompletedTurnIds.clear();
   codexBridgeQueue.setLocalTurns(false);
   codexBridgePendingSessionId = undefined;
@@ -2433,7 +2433,7 @@ async function flushPending(): Promise<void> {
         // after still fingerprint-matches this turn.
         codexBridgeMarkTimeMs = Date.now();
         codexBridgeTurnId = codexBridgeMarkPendingTurn(msg, codexBridgeMarkTimeMs);
-        if (batch && codexBridgeTurnId) codexBatchLifecycle.track(codexBridgeTurnId, describeCodexBatch(batch));
+        if (batch && codexBridgeTurnId) codexBatchTurns.track(codexBridgeTurnId, describeCodexBatch(batch));
       }
       log(`Writing to PTY (flush): "${msg.substring(0, 80)}"`);
       // Defense in depth: TmuxPipeBackend's send methods no longer throw on a
@@ -2460,7 +2460,7 @@ async function flushPending(): Promise<void> {
           turnSeq,
           undefined,
           batch && codexBridgeTurnId
-            ? reason => codexBatchLifecycle.markSubmitUnconfirmed(codexBridgeTurnId!, reason)
+            ? reason => codexBatchTurns.markSubmitUnconfirmed(codexBridgeTurnId!, reason)
             : undefined,
         );
         break;
@@ -2482,7 +2482,7 @@ async function flushPending(): Promise<void> {
       if (result && result.submitted === false && backend) {
         if (batch) {
           log(`Codex batch submit is inflight_unconfirmed (batch_id=${batch.batchId}, N=${batch.count}, file retained; no automatic resend)`);
-          if (codexBridgeTurnId) codexBatchLifecycle.markRechecking(codexBridgeTurnId);
+          if (codexBridgeTurnId) codexBatchTurns.markRechecking(codexBridgeTurnId);
         }
         scheduleSubmitFailureNotify(
           msg,
@@ -2493,7 +2493,7 @@ async function flushPending(): Promise<void> {
           turnSeq,
           () => codexBridgeTurnHasSubmitOrResponse(codexBridgeTurnId, codexBridgeMarkTimeMs),
           batch && codexBridgeTurnId
-            ? reason => codexBatchLifecycle.markSubmitUnconfirmed(codexBridgeTurnId!, reason)
+            ? reason => codexBatchTurns.markSubmitUnconfirmed(codexBridgeTurnId!, reason)
             : undefined,
         );
       }

@@ -40,6 +40,28 @@ export interface BridgeGateInput {
   isLocal: boolean | undefined;
 }
 
+export interface BridgeGateTiming {
+  markTimeMs?: number;
+  startedAtMs?: number;
+}
+
+/** Resolve the marker window from authoritative transcript start times. A
+ * parked submit revived after a later turn must not reuse its stale mark and
+ * accidentally consume the later turn's send marker. */
+export function resolveBridgeGateWindow(
+  turn: BridgeGateTiming,
+  laterTurns: readonly BridgeGateTiming[],
+): { markTimeMs: number | undefined; nextBoundaryMs: number | undefined } {
+  const markTimeMs = turn.startedAtMs ?? turn.markTimeMs;
+  const candidates = laterTurns
+    .map(candidate => candidate.startedAtMs ?? candidate.markTimeMs)
+    .filter((value): value is number => value !== undefined && (markTimeMs === undefined || value > markTimeMs));
+  return {
+    markTimeMs,
+    nextBoundaryMs: candidates.length > 0 ? Math.min(...candidates) : undefined,
+  };
+}
+
 export function shouldSuppressBridgeEmit(
   turn: BridgeGateInput,
   nextBoundaryMs: number | undefined,

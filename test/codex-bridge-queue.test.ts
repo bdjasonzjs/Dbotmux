@@ -59,6 +59,48 @@ describe('CodexBridgeQueue', () => {
     expect(ready.map(t => t.turnId)).toEqual(['t2']);
   });
 
+  it('parks an unconfirmed head so the next turn can finish, then attributes a late manual Enter', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('failed-turn', 'first prompt', 100);
+    expect(q.park('failed-turn')).toBe(true);
+    q.mark('next-turn', 'second prompt', 200);
+
+    q.ingest([userEv('second prompt', 'u-next', 210), asstEv('second reply', 'a-next', 220)]);
+    expect(q.drainEmittable().map(turn => turn.turnId)).toEqual(['next-turn']);
+    expect(q.peek().map(turn => turn.turnId)).toEqual(['failed-turn']);
+
+    q.ingest([userEv('first prompt', 'u-late', 230), asstEv('late first reply', 'a-late', 240)]);
+    const late = q.drainEmittable();
+    expect(late.map(turn => turn.turnId)).toEqual(['failed-turn']);
+    expect(late[0].finalText).toBe('late first reply');
+  });
+
+  it('drops an evicted parked mark without poisoning the next fingerprint', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('evicted-turn', 'old prompt', 100);
+    q.park('evicted-turn');
+    expect(q.drop('evicted-turn')?.turnId).toBe('evicted-turn');
+    q.mark('next-turn', 'next prompt', 200);
+    q.ingest([userEv('next prompt', 'u-after-evict', 210), asstEv('next reply', 'a-after-evict', 220)]);
+    expect(q.drainEmittable().map(turn => turn.turnId)).toEqual(['next-turn']);
+  });
+
+  it('orders multiple ready turns by actual transcript start when a parked turn revives late', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('failed-turn', 'first prompt', 100);
+    q.park('failed-turn');
+    q.mark('next-turn', 'second prompt', 200);
+    q.ingest([
+      userEv('second prompt', 'u-next-batched', 210),
+      asstEv('second reply', 'a-next-batched', 220),
+      userEv('first prompt', 'u-late-batched', 230),
+      asstEv('late first reply', 'a-late-batched', 240),
+    ]);
+    const ready = q.drainEmittable();
+    expect(ready.map(turn => turn.turnId)).toEqual(['next-turn', 'failed-turn']);
+    expect(ready.map(turn => turn.startedAtMs)).toEqual([210, 230]);
+  });
+
   it('drainEmittable holds turn that started but has no finalText yet', () => {
     const q = new CodexBridgeQueue();
     q.mark('t1', 'a query', 100);
