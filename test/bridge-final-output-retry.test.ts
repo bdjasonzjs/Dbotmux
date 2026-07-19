@@ -175,6 +175,9 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     // First attempt is delayed 0ms; flush microtasks + timers
     await vi.advanceTimersByTimeAsync(10);
     expect(sessionReply).toHaveBeenCalledTimes(1);
+    const cardJson = sessionReply.mock.calls[0][1] as string;
+    expect(cardJson).not.toContain('[botmux](');
+    expect(cardJson).not.toContain('<at id=');
     expect(ds.lastBridgeEmittedUuid).toBe('uuid-1');
   });
 

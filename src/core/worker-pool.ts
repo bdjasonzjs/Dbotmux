@@ -1374,7 +1374,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           userText: msg.userText,
           assistantText: msg.assistantText,
           assistantLabel: getCliDisplayName(effectiveCliId),
-          recipientOpenId: ds.session.ownerOpenId,
+          recipientOpenId: undefined,
         });
         cb.sessionReply(sessionAnchorId(ds), cardJson, 'interactive', ds.larkAppId).catch((err: any) => {
           logger.warn(`[${t}] Failed to deliver adopt_preamble to Lark: ${err.message}`);
@@ -1454,9 +1454,9 @@ function deliverFinalOutput(
             userText: msg.kind === 'local-turn' ? msg.userText ?? '' : undefined,
             assistantText: msg.content,
             assistantLabel: getCliDisplayName(effectiveCliId),
-            recipientOpenId: ds.session.ownerOpenId,
+            recipientOpenId: undefined,
           })
-        : buildMarkdownCard(msg.content, ds.session.ownerOpenId);
+        : buildMarkdownCard(msg.content, undefined);
       await cb.sessionReply(sessionAnchorId(ds), cardJson, 'interactive', ds.larkAppId);
       ds.lastBridgeEmittedUuid = msg.lastUuid;
       logger.info(`[${t}] Bridge final_output forwarded (turn ${msg.turnId.substring(0, 8)}, ${msg.content.length} chars, kind=${msg.kind ?? 'bridge'}, attempt ${attempt + 1})`);

@@ -91,6 +91,7 @@ const PM2_NAME = 'botmux';
  * when those external pm2 installations get moved or removed.
  */
 const PM2_HOME = join(CONFIG_DIR, 'pm2');
+const NO_MENTION_REPLY_SENTINEL = '本条消息的回复不圈任何人';
 
 /** `~/.botmux` layout passed to the shared pm2-ecosystem helpers. */
 const ECOSYSTEM_PATHS: EcosystemPaths = {
@@ -1083,7 +1084,8 @@ function cmdUpgrade(): void {
   console.log('🔄 升级中...');
   try {
     execSync('npm install -g botmux@latest', { stdio: 'inherit' });
-    console.log('\n✅ 升级完成。运行 botmux restart 以应用更新。');
+    execSync('node /data00/home/zoujinsong.jason/.codex/skills/botmux-update/scripts/apply-local-patches.mjs', { stdio: 'inherit' });
+    console.log('\n✅ 升级完成，local patches 已重打。运行 botmux restart 以应用更新。');
   } catch {
     console.error('❌ 升级失败，请手动运行: npm install -g botmux@latest');
     process.exit(1);
@@ -1150,6 +1152,9 @@ interface SessionData {
   webPort?: number;
   larkAppId?: string;
   ownerOpenId?: string;
+  lastCallerOpenId?: string;
+  suppressRelayMentions?: boolean;
+  suppressRelayMentionAppId?: string;
 }
 
 /**
@@ -1970,6 +1975,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        --files <path>                  附件（可重复）
        --mention <open_id:name>        @提及（可重复）
        --card | --text                 强制卡片 / 纯文本（默认按 md 语法自动判断）
+       --footer                        附加 botmux/发送给/cc 尾巴（默认不附加）
+       --no-footer                     不附加 botmux/发送给/cc 尾巴（默认行为）
        --top-level                     发顶层消息（不回复进当前话题）
        --chat-id <oc_xxx>              指定目标群（默认当前话题所在群）
   bots list                            列出当前群聊中的机器人（含 open_id）
@@ -2423,14 +2430,58 @@ import { buildCardBodyElements, hasMarkdown } from './im/lark/md-card.js';
  * Oncall chats: `发送给: @<last caller>` (falls back to owner if unknown) —
  *   permission is governed by allowedUsers, so there's no per-chat list to cc.
  */
+function isKnownBotOpenIdForApp(larkAppId: string | undefined, openId: string | undefined): boolean {
+  if (!larkAppId || !openId) return false;
+  try {
+    const dataDir = resolveDataDir();
+    const selfInfoPath = join(dataDir, 'bots-info.json');
+    if (existsSync(selfInfoPath)) {
+      const botEntries: Array<{ larkAppId?: string; botOpenId?: string | null }> = JSON.parse(readFileSync(selfInfoPath, 'utf-8'));
+      for (const entry of botEntries) {
+        if (entry.larkAppId === larkAppId && entry.botOpenId === openId) return true;
+      }
+    }
+    const crossRefPath = join(dataDir, `bot-openids-${larkAppId}.json`);
+    if (existsSync(crossRefPath)) {
+      const crossRef: Record<string, string> = JSON.parse(readFileSync(crossRefPath, 'utf-8'));
+      if (Object.values(crossRef).includes(openId)) return true;
+    }
+  } catch { /* best-effort */ }
+  return false;
+}
+
+function botOpenIdsForAppFromSenderApp(senderAppId: string | undefined, targetAppId: string | undefined): Set<string> {
+  const ids = new Set<string>();
+  if (!senderAppId || !targetAppId) return ids;
+  try {
+    const dataDir = resolveDataDir();
+    const botInfoPath = join(dataDir, 'bots-info.json');
+    type BotInfoEntry = { larkAppId: string; botOpenId: string | null; botName: string | null };
+    const botEntries: BotInfoEntry[] = existsSync(botInfoPath) ? JSON.parse(readFileSync(botInfoPath, 'utf-8')) : [];
+    const target = botEntries.find(entry => entry.larkAppId === targetAppId);
+    if (target?.botOpenId) ids.add(target.botOpenId);
+    const crossRefPath = join(dataDir, `bot-openids-${senderAppId}.json`);
+    if (target?.botName && existsSync(crossRefPath)) {
+      const crossRef: Record<string, string> = JSON.parse(readFileSync(crossRefPath, 'utf-8'));
+      if (crossRef[target.botName]) ids.add(crossRef[target.botName]);
+    }
+  } catch { /* best-effort */ }
+  return ids;
+}
+
+function stripFooterLikeBotMentions(text: string): string {
+  return text.replace(/(发送给|cc)[：:]\s*@/g, '$1：');
+}
+
 function buildFooterAddressing(
-  s: { ownerOpenId?: string; lastCallerOpenId?: string },
+  s: { larkAppId?: string; ownerOpenId?: string; lastCallerOpenId?: string },
   oncall: { workingDir: string } | undefined,
 ): { sendTo: string | undefined; cc: string[] } {
   const owner = s.ownerOpenId;
   const caller = s.lastCallerOpenId ?? owner;
-  if (!oncall) return { sendTo: owner, cc: [] };
-  return { sendTo: caller, cc: [] };
+  const sendTo = oncall ? caller : owner;
+  if (isKnownBotOpenIdForApp(s.larkAppId, sendTo)) return { sendTo: undefined, cc: [] };
+  return { sendTo, cc: [] };
 }
 
 async function cmdSend(rest: string[]): Promise<void> {
@@ -2457,6 +2508,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   const contentFile = argValue(rest, '--content-file');
   const forceCard = rest.includes('--card');
   const forceText = rest.includes('--text');
+  const noFooter = !rest.includes('--footer') || rest.includes('--no-footer');
   // Publish-mode flags: post a fresh top-level message in a chat instead of
   // replying into the bound thread. Lets a session "publish" to a different
   // chat (e.g. a public release-notes group) while keeping its own thread
@@ -2481,7 +2533,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (!existsSync(contentFile)) { console.error(`文件不存在: ${contentFile}`); process.exit(1); }
     content = readFileSync(contentFile, 'utf-8');
   } else {
-    const pos = positionals(rest, ['--card', '--text', '--top-level']);
+    const pos = positionals(rest, ['--card', '--text', '--footer', '--no-footer', '--top-level']);
     if (pos.length > 0) {
       content = pos.join(' ');
     } else {
@@ -2561,6 +2613,17 @@ async function cmdSend(rest: string[]): Promise<void> {
       }
     } catch { /* not JSON, use as-is */ }
 
+    const suppressRelayMentions = Boolean(s.suppressRelayMentions) || text.includes(NO_MENTION_REPLY_SENTINEL);
+    const suppressedRelayAppId = s.suppressRelayMentionAppId ?? (suppressRelayMentions ? 'cli_a9771799e8bb5bc3' : undefined);
+    const suppressedRelayOpenIds = botOpenIdsForAppFromSenderApp(appId, suppressedRelayAppId);
+    if (suppressRelayMentions && suppressedRelayOpenIds.size > 0 && mentions.length > 0) {
+      for (let i = mentions.length - 1; i >= 0; i--) {
+        if (suppressedRelayOpenIds.has(mentions[i].open_id)) {
+          mentions.splice(i, 1);
+        }
+      }
+    }
+
     // Auto-detect @BotName in text and inject as mentions, using the sender
     // app's cross-ref file for per-app-scoped open_ids. Without this, a plain
     // "@Claude" in text only triggers IPC routing but Lark UI shows it as
@@ -2590,6 +2653,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       );
       for (const entry of sortedEntries) {
         if (!entry.botName || entry.larkAppId === appId) continue;
+        if (suppressRelayMentions && suppressedRelayAppId && entry.larkAppId === suppressedRelayAppId) continue;
         const names = [entry.botName, entry.cliId].filter(Boolean) as string[];
         for (const name of names) {
           const escName = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -2675,23 +2739,16 @@ async function cmdSend(rest: string[]): Promise<void> {
 
       const elements = mdWithImages ? buildCardBodyElements(mdWithImages) : [];
 
-      // 2026-05-25 Fix #9 (妹妹找到的第二路径): `botmux send` CLI 自己拼
-      // footer，没走 md-card.ts 的 env gate。统一行为：CLI 这边也按
-      // `BOTMUX_SHOW_CARD_FOOTER=1` env 才显示。注意 `addressing` 里的 cc
-      // 是真有产品语义（让人知道该消息也 cc 给了谁），但目前 footer 也
-      // 把它埋在小字里，跟"version 水印"一起 — 一并按 env gate 控制。
-      // 真要保留 cc 可见性可以以后改成上面 body 末尾正文里加一行。
-      if (process.env.BOTMUX_SHOW_CARD_FOOTER === '1') {
-        const footerParts = ['[botmux](https://github.com/deepcoldy/botmux)'];
-        // Top-level publish has no specific recipient — drop "发送给/cc" addressing
-        // so the message doesn't @ the session owner who isn't even in the target chat.
-        const addressing = sendTopLevel
-          ? { sendTo: undefined as string | undefined, cc: [] as string[] }
-          : buildFooterAddressing(s, oncallEntry);
-        if (addressing.sendTo) footerParts.push(`发送给：<at id=${addressing.sendTo}></at>`);
-        if (addressing.cc.length > 0) {
-          footerParts.push(`cc：${addressing.cc.map(id => `<at id=${id}></at>`).join(' ')}`);
-        }
+      const footerParts = noFooter ? [] : ['[botmux](https://github.com/deepcoldy/botmux)'];
+      // Top-level publish and no-footer replies have no addressing side effects.
+      const addressing = sendTopLevel || noFooter
+        ? { sendTo: undefined as string | undefined, cc: [] as string[] }
+        : buildFooterAddressing(s, oncallEntry);
+      if (addressing.sendTo) footerParts.push(`发送给：<at id=${addressing.sendTo}></at>`);
+      if (addressing.cc.length > 0) {
+        footerParts.push(`cc：${addressing.cc.map(id => `<at id=${id}></at>`).join(' ')}`);
+      }
+      if (footerParts.length > 0) {
         elements.push({ tag: 'hr' });
         elements.push({
           tag: 'markdown',
@@ -2735,8 +2792,8 @@ async function cmdSend(rest: string[]): Promise<void> {
         }
       }
 
-      // 2026-05-25 Fix #9: post 路径同 card 路径，footer 默认关。
-      if (process.env.BOTMUX_SHOW_CARD_FOOTER === '1') {
+      // Post and card output share the same explicit footer flag semantics.
+      if (!noFooter) {
         const addressing = sendTopLevel
           ? { sendTo: undefined as string | undefined, cc: [] as string[] }
           : buildFooterAddressing(s, oncallEntry);

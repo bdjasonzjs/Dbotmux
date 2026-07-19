@@ -34,6 +34,10 @@ export interface Session {
    *  Used by `botmux send` to address the card to the actual caller in oncall
    *  groups (where the caller is often not the session owner). */
   lastCallerOpenId?: string;
+  /** Relay-safety latch: replies in this session must not mention the relay bot. */
+  suppressRelayMentions?: boolean;
+  /** Lark app id of the relay bot whose mentions are suppressed. */
+  suppressRelayMentionAppId?: string;
   /** Persisted streaming-card state — allows the existing card to be PATCHed
    *  (rather than a fresh POST) after daemon restart. */
   streamCardId?: string;

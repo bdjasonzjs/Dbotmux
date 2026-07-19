@@ -282,6 +282,7 @@ describe('renderSenderTag', () => {
     const out = renderSenderTag({ openId: 'ou_xyz', type: 'user' });
     expect(out).toBe('<sender type="user" open_id="ou_xyz" />');
     expect(out).not.toContain('name=');
+    expect(out).not.toContain('email=');
   });
 
   it('includes name attribute when present', () => {
@@ -289,6 +290,16 @@ describe('renderSenderTag', () => {
     expect(out).toContain('type="user"');
     expect(out).toContain('open_id="ou_a"');
     expect(out).toContain('name="张三"');
+  });
+
+  it('includes email after name when present', () => {
+    const out = renderSenderTag({
+      openId: 'ou_email',
+      type: 'user',
+      name: 'Alice',
+      email: 'alice@example.com',
+    });
+    expect(out).toBe('<sender type="user" open_id="ou_email" name="Alice" email="alice@example.com" />');
   });
 
   it('preserves bot type for foreign botmux peers', () => {
@@ -302,11 +313,13 @@ describe('renderSenderTag', () => {
       openId: 'ou_"weird"',
       type: 'user',
       name: '<Alice & "Bob"\'s pal>',
+      email: 'alice&bob@example.com',
     });
     // Each special char must round-trip via entity references so the attribute
     // string stays well-formed for downstream prompt parsers.
     expect(out).toContain('name="&lt;Alice &amp; &quot;Bob&quot;&apos;s pal&gt;"');
     expect(out).toContain('open_id="ou_&quot;weird&quot;"');
+    expect(out).toContain('email="alice&amp;bob@example.com"');
     // And the tag's outer quotes are not eaten by inner ones.
     expect(out.startsWith('<sender ')).toBe(true);
     expect(out.endsWith(' />')).toBe(true);
