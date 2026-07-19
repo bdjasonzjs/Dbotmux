@@ -25,6 +25,7 @@ import { join } from 'node:path';
 import { groupByChat, type TillyMessage } from './tilly-scout.js';
 import { findActiveSessionsByChatId } from './session-store.js';
 import { logger } from '../utils/logger.js';
+import { runCocoText } from './coco-cli.js';
 import { loadOwnerProfile, renderOwnerProfileBlock, buildDynamicContext, buildMemoryTodayBlock, type OwnerProfile } from './owner-profile.js';
 // 2026-05-29: coco --resume 实测坏掉 (resume 返回 "I received this ID: <id>"
 // 而非分析结果, 每隔一轮失败), 已移除。「记忆」改纯靠 MEMORY_TODAY prompt
@@ -499,71 +500,29 @@ export async function analyzeMessages(
   // 内部 LLM，token 是免费的。之前走 codex 烧的是松松个人 ChatGPT 订阅
   // 的 quota，必须切。
   //
-  // coco 接口：`coco --print --output-format json --disallowed-tool ... PROMPT`
-  // stdout 输出 JSON 对象，`data.message.content` 是 LLM 文本响应。
-  // 禁所有 agentic 工具防 coco 想跑 shell/edit；--query-timeout 控制单次
-  // LLM 调用时长。
+  // coco 接口见 coco-cli.ts（唯一入口）：`coco exec --output-last-message <file> ... PROMPT`，
+  // 最终回复直接落文件，不依赖 stdout 格式。禁所有 agentic 工具防 coco 想跑 shell/edit；
+  // 超时由 runCocoText 的 SIGKILL 计时器控制。
   const tmp = mkdtempSync(join(tmpdir(), 'tilly-llm-'));
   const schemaFp = join(tmp, 'schema.json');
   writeFileSync(schemaFp, JSON.stringify(JSON_SCHEMA), 'utf-8');   // 留档便于排错
 
   const cli = opts.cliPath ?? opts.codexPath ?? 'coco';
   const timeoutMs = opts.timeoutMs ?? 600_000;
-  const args = [
-    '--print',
-    '--output-format', 'json',
-    '--query-timeout', `${Math.floor(timeoutMs / 1000)}s`,
-    // 禁所有可能让 coco 想 agentic 跑工具的能力 — 我们只要纯 LLM 文本
-    // 响应，不需要它读/写/运行任何东西。安全 + 速度都更稳。
-    '--disallowed-tool', 'Bash,Edit,Replace,Read,Write,Search,WebFetch',
-  ];
 
   // 2026-05-29: 不再 --resume (实测坏掉, 见顶部注释)。每 tick fresh session,
   // 「记忆」靠 prompt 里的 MEMORY_TODAY 注入。
-  args.push(prompt);
-
-  let stdout = '';
-  try {
-    const { spawn } = await import('node:child_process');
-    await new Promise<void>((resolve, reject) => {
-      const child = spawn(cli, args, { stdio: ['ignore', 'pipe', 'ignore'] });
-      child.stdout!.on('data', (chunk: Buffer) => { stdout += chunk.toString('utf-8'); });
-      const timer = setTimeout(() => {
-        child.kill('SIGKILL');
-        reject(new Error(`coco exec timeout after ${timeoutMs}ms`));
-      }, timeoutMs);
-      child.on('error', err => { clearTimeout(timer); reject(err); });
-      child.on('exit', (code, sig) => {
-        clearTimeout(timer);
-        if (code === 0) resolve();
-        else reject(new Error(`coco exec exited code=${code} sig=${sig} stdout-bytes=${stdout.length}`));
-      });
-    });
-  } catch (err: any) {
-    logger.warn(`[tilly-llm-analyzer] coco exec failed: ${err?.message ?? err}`);
+  // CLI 契约（参数 + 取回最终回复的方式）统一收在 coco-cli.ts——见那里的事故记录：
+  // 旧的 `--print --output-format json` 在 coco 0.200.x 被移除，曾让本函数连同其它
+  // 五条链路一起静默失效。
+  const llmText = await runCocoText({ prompt, timeoutMs, logPrefix: 'tilly-llm-analyzer', cli });
+  if (llmText == null) {
     rmSync(tmp, { recursive: true, force: true });
-    return emptyDigest(false, [], String(err?.message ?? err));
+    return emptyDigest(false, [], 'coco exec failed (见 daemon 日志 [tilly-llm-analyzer])');
   }
-
-  if (!stdout.trim()) {
+  if (!llmText.trim()) {
     rmSync(tmp, { recursive: true, force: true });
-    return emptyDigest(false, [], 'coco produced empty stdout');
-  }
-
-  // coco stdout = {session_id, agent_states, message: {role, content, ...}, stats}
-  // We want message.content which is the LLM's text response (should be JSON).
-  let cocoEnvelope: any;
-  try {
-    cocoEnvelope = JSON.parse(stdout);
-  } catch (err: any) {
-    logger.warn(`[tilly-llm-analyzer] failed to parse coco envelope: ${err?.message ?? err}; stdout[:200]=${stdout.slice(0, 200)}`);
-    rmSync(tmp, { recursive: true, force: true });
-    return emptyDigest(false, [], `coco envelope parse failed: ${err?.message ?? err}`);
-  }
-  const llmText = cocoEnvelope?.message?.content;
-  if (typeof llmText !== 'string' || !llmText.trim()) {
-    rmSync(tmp, { recursive: true, force: true });
-    return emptyDigest(false, [], 'coco envelope has no message.content');
+    return emptyDigest(false, [], 'coco produced empty output');
   }
 
   // 妹妹 review blocker (2026-05-28): session_id 保存时机移到 parse 成功后.

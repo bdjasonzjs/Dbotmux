@@ -6,8 +6,8 @@
  * （一期退场）wakeClaude 已移除：命中改写 watch-inbox incident，由投递层按 targetChatId 发，
  *   不再 @克劳德主话题；杜绝旧 report+wakeClaude 双通道。
  */
-import { spawn } from 'node:child_process';
 import { logger } from '../utils/logger.js';
+import { runCocoText, extractJsonObject } from './coco-cli.js';
 import { listChatMessages } from '../im/lark/client.js';
 import { resolveBotIdent } from '../core/main-bot-playbook.js';
 import type { MonitorExecutors, JudgeResult } from './group-monitor.js';
@@ -49,43 +49,23 @@ ${rendered}
 
 只输出 JSON, 不要解释。`;
 
+const LOG_PREFIX = 'group-monitor-exec';
+
 async function cocoJudge(prompt: string): Promise<JudgeResult | null> {
-  const args = [
-    '--print', '--output-format', 'json',
-    '--query-timeout', `${Math.floor(JUDGE_TIMEOUT_MS / 1000)}s`,
-    '--disallowed-tool', 'Bash,Edit,Replace,Read,Write,Search,WebFetch',
-    prompt,
-  ];
-  let stdout = '';
-  try {
-    await new Promise<void>((resolve, reject) => {
-      const child = spawn('coco', args, { stdio: ['ignore', 'pipe', 'ignore'] });
-      child.stdout!.on('data', (c: Buffer) => { stdout += c.toString('utf-8'); });
-      const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('coco judge timeout')); }, JUDGE_TIMEOUT_MS);
-      child.on('error', e => { clearTimeout(timer); reject(e); });
-      child.on('exit', code => { clearTimeout(timer); code === 0 ? resolve() : reject(new Error(`coco exit ${code}`)); });
-    });
-  } catch (err: any) {
-    logger.warn(`[group-monitor-exec] coco judge exec failed: ${err?.message ?? err}`);
+  // CLI 契约统一收在 coco-cli.ts（见那里的事故记录）——这里只管 schema。
+  const raw = await runCocoText({ prompt, timeoutMs: JUDGE_TIMEOUT_MS, logPrefix: LOG_PREFIX });
+  if (raw == null) return null;
+  const parsed = extractJsonObject<{ report?: unknown; summary?: unknown; evidence?: unknown }>(raw, LOG_PREFIX);
+  if (!parsed) return null;
+  if (typeof parsed.report !== 'boolean') {
+    logger.warn(`[${LOG_PREFIX}] coco judge bad report field: ${String(parsed.report).slice(0, 40)}`);
     return null;
   }
-  try {
-    const env = JSON.parse(stdout);
-    const txt = env?.message?.content;
-    if (typeof txt !== 'string') return null;
-    const m = txt.match(/\{[\s\S]*\}/);
-    if (!m) return null;
-    const parsed = JSON.parse(m[0]);
-    if (typeof parsed?.report !== 'boolean') return null;
-    return {
-      report: parsed.report,
-      summary: String(parsed?.summary ?? '').slice(0, 300),
-      evidence: String(parsed?.evidence ?? '').slice(0, 800),
-    };
-  } catch (err: any) {
-    logger.warn(`[group-monitor-exec] coco judge parse failed: ${err?.message ?? err}`);
-    return null;
-  }
+  return {
+    report: parsed.report,
+    summary: String(parsed.summary ?? '').slice(0, 300),
+    evidence: String(parsed.evidence ?? '').slice(0, 800),
+  };
 }
 
 export function makeMonitorExecutors(): MonitorExecutors {

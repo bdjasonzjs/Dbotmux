@@ -6,12 +6,8 @@
  *   complete = !hasMore (是否读到群尾)。绝不把 newest-first 不连续的一批伪装成可提交。
  * judge: coco 按 goal+历史判 signal，失败返 null → observer skip 不推进 cursor。
  */
-import { spawn } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
-import { readFileSync, unlinkSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { logger } from '../utils/logger.js';
+import { runCocoText, extractJsonObject } from './coco-cli.js';
 import {
   listMessagesAsc,
   getMessageDetail,
@@ -102,82 +98,19 @@ ${ctx.newMessages}
 
 只输出 JSON, 不要解释。`;
 
-/** judge 禁用的工具集。coco 的 `--disallowed-tool` 一次只收一个工具名（"can be
- *  specified multiple times"），所以必须逐个重复传，不能像旧代码那样传逗号串。 */
-const JUDGE_DISALLOWED_TOOLS = ['Bash', 'Edit', 'Replace', 'Read', 'Write', 'Search', 'WebFetch'];
-
-/**
- * 构造 coco judge 的命令行参数。抽成纯函数是为了可单测——**这里传错一个 flag，
- * 整个子任务 observer 会静默瘫痪**（见下方注释里的真实事故）。
- *
- * ⚠️ 事故记录（2026-07-15 ~ 07-19，31k+ 次失败、45 个任务受影响）：
- * 旧实现用的是顶层 `--print --output-format json` + `--query-timeout <s>`。coco
- * (traecli) 升到 0.200.x 后：
- *   - `--output-format=json` 被移除 → 直接报 "not supported yet" 并非零退出；
- *   - `exec` 子命令不认 `--query-timeout` → exit 2。
- * 于是 `cocoJudge` 每次都走 catch 返回 null，observer 每 tick 都 skip、cursor 永不
- * 推进 → **所有子群的自动唤醒/催办全线静默失效**（reviewer 发完评审不会唤回执行者、
- * 卡住的子群不会上报），且症状只在 daemon 日志里，聊天侧完全无感。
- *
- * 现在改走 `exec` 子命令 + `--output-last-message <file>`：最终回复直接落文件，
- * 不依赖任何 stdout 包装格式，比解析 JSONL 事件流更不容易被上游 CLI 改动打穿。
- * 超时不再交给 CLI，由调用侧的 SIGKILL 计时器兜底（本来就有）。
- */
-export function buildCocoJudgeArgs(prompt: string, outFile: string): string[] {
-  return [
-    'exec',
-    '--skip-git-repo-check',   // observer 的 cwd 不保证在 git 仓库里
-    '--ephemeral',             // 判断是一次性的，别给 coco 攒会话文件
-    '--output-last-message', outFile,
-    ...JUDGE_DISALLOWED_TOOLS.flatMap(t => ['--disallowed-tool', t]),
-    prompt,
-  ];
-}
+const LOG_PREFIX = 'subtask-observer-exec';
 
 async function cocoJudge(prompt: string): Promise<JudgeResult | null> {
-  const outFile = join(
-    tmpdir(),
-    `bmx-coco-judge-${process.pid}-${Date.now()}-${randomBytes(4).toString('hex')}.txt`,
-  );
-  const args = buildCocoJudgeArgs(prompt, outFile);
-  try {
-    await new Promise<void>((resolve, reject) => {
-      const child = spawn('coco', args, { stdio: ['ignore', 'ignore', 'ignore'] });
-      const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('coco judge timeout')); }, JUDGE_TIMEOUT_MS);
-      child.on('error', e => { clearTimeout(timer); reject(e); });
-      child.on('exit', code => { clearTimeout(timer); code === 0 ? resolve() : reject(new Error(`coco exit ${code}`)); });
-    });
-  } catch (err: any) {
-    logger.warn(`[subtask-observer-exec] coco judge exec failed: ${err?.message ?? err}`);
-    try { unlinkSync(outFile); } catch { /* 可能压根没生成 */ }
-    return null; // observer 会 skip、不推进 cursor
-  }
-  let raw = '';
-  try {
-    raw = readFileSync(outFile, 'utf-8');
-  } catch (err: any) {
-    logger.warn(`[subtask-observer-exec] coco judge output missing: ${err?.message ?? err}`);
-    return null;
-  } finally {
-    try { unlinkSync(outFile); } catch { /* 已被清理 */ }
-  }
-  try {
-    // 只认最终回复里的 JSON 对象；模型偶尔会包一层解释文字，正则兜住。
-    const m = raw.match(/\{[\s\S]*\}/);
-    if (!m) {
-      logger.warn(`[subtask-observer-exec] coco judge no JSON in output (${raw.length} chars)`);
-      return null;
-    }
-    const parsed = JSON.parse(m[0]);
-    if (!['normal', 'need_help', 'done'].includes(parsed?.signal)) {
-      logger.warn(`[subtask-observer-exec] coco judge bad signal: ${clean(parsed?.signal, 40)}`);
-      return null;
-    }
-    return { signal: parsed.signal, summary: String(parsed?.summary ?? '').slice(0, 300) };
-  } catch (err: any) {
-    logger.warn(`[subtask-observer-exec] coco judge parse failed: ${err?.message ?? err}`);
+  // CLI 契约统一收在 coco-cli.ts（见那里的事故记录）——这里只管 schema。
+  const raw = await runCocoText({ prompt, timeoutMs: JUDGE_TIMEOUT_MS, logPrefix: LOG_PREFIX });
+  if (raw == null) return null; // observer 会 skip、不推进 cursor
+  const parsed = extractJsonObject<{ signal?: string; summary?: unknown }>(raw, LOG_PREFIX);
+  if (!parsed) return null;
+  if (!['normal', 'need_help', 'done'].includes(parsed.signal as string)) {
+    logger.warn(`[${LOG_PREFIX}] coco judge bad signal: ${clean(parsed.signal, 40)}`);
     return null;
   }
+  return { signal: parsed.signal as JudgeResult['signal'], summary: String(parsed.summary ?? '').slice(0, 300) };
 }
 
 /** observer 缇蕾 bot 读不到「自己不在的外部群」(lark 230002 等) 时，复用 owner user 授权
