@@ -1,4 +1,5 @@
 import type { CliUsageLimitState } from './utils/cli-usage-limit.js';
+import type { PendingInputMetadata } from './services/codex-input-batch.js';
 
 /** Runtime status the worker derives from screen content. */
 export type ScreenStatus = 'working' | 'idle' | 'analyzing' | 'limited';
@@ -34,6 +35,10 @@ export interface Session {
    *  Used by `botmux send` to address the card to the actual caller in oncall
    *  groups (where the caller is often not the session owner). */
   lastCallerOpenId?: string;
+  /** Batch turns deliberately have no implicit single recipient. While true,
+   *  botmux send/fallback cards only mention recipients explicitly supplied
+   *  in reply text. Cleared when the next ordinary single input starts. */
+  suppressImplicitAddressing?: boolean;
   /** Persisted streaming-card state — allows the existing card to be PATCHed
    *  (rather than a fresh POST) after daemon restart. */
   streamCardId?: string;
@@ -168,7 +173,7 @@ export type TermActionKey =
 /** Messages sent from Daemon to Worker */
 export type DaemonToWorker =
   | { type: 'init'; sessionId: string; chatId: string; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; backendType: 'pty' | 'tmux'; prompt: string; resume?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; claudeConfigDir?: string; modelOverrides?: { model?: string; reasoningEffort?: string }; adoptMode?: boolean; adoptTmuxTarget?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean }
-  | { type: 'message'; content: string }
+  | { type: 'message'; content: string; metadata?: PendingInputMetadata }
   | { type: 'raw_input'; content: string }
   | { type: 'close' }
   | { type: 'restart' }
@@ -184,6 +189,17 @@ export type WorkerToDaemon =
   | { type: 'cli_session_id'; cliSessionId: string }
   | { type: 'claude_exit'; code: number | null; signal: string | null }
   | { type: 'prompt_ready' }
+  | { type: 'input_queued'; pendingCount: number }
+  | {
+      type: 'input_started';
+      ids: string[];
+      title?: string;
+      pendingCount: number;
+      callers: string[];
+      originalContent: string;
+      cliInput: string;
+      batch?: { batchId: string; count: number; path: string };
+    }
   | { type: 'screen_update'; content: string; status: ScreenStatus; usageLimit?: CliUsageLimitState }
   | { type: 'error'; message: string }
   | { type: 'tui_prompt'; description: string; options: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>; multiSelect?: boolean }
@@ -203,5 +219,7 @@ export type WorkerToDaemon =
       // which mixes presentation with payload).
       kind?: 'bridge' | 'local-turn' | 'local-turn-headless';
       userText?: string;
+      /** Batch fallback replies must never infer a single footer recipient. */
+      suppressImplicitAddressing?: boolean;
     }
   | { type: 'adopt_preamble'; userText: string; assistantText: string };

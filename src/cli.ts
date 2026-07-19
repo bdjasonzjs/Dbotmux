@@ -2415,6 +2415,7 @@ function argValues(args: string[], ...flags: string[]): string[] {
 // daemon's bridge fallback path can produce identical cards. cmdSend
 // keeps using `buildCardBodyElements` and `hasMarkdown` from there.
 import { buildCardBodyElements, hasMarkdown } from './im/lark/md-card.js';
+import { buildFooterAddressing } from './services/reply-addressing.js';
 
 /**
  * Decide who the reply card should @ in its footer.
@@ -2423,16 +2424,6 @@ import { buildCardBodyElements, hasMarkdown } from './im/lark/md-card.js';
  * Oncall chats: `发送给: @<last caller>` (falls back to owner if unknown) —
  *   permission is governed by allowedUsers, so there's no per-chat list to cc.
  */
-function buildFooterAddressing(
-  s: { ownerOpenId?: string; lastCallerOpenId?: string },
-  oncall: { workingDir: string } | undefined,
-): { sendTo: string | undefined; cc: string[] } {
-  const owner = s.ownerOpenId;
-  const caller = s.lastCallerOpenId ?? owner;
-  if (!oncall) return { sendTo: owner, cc: [] };
-  return { sendTo: caller, cc: [] };
-}
-
 async function cmdSend(rest: string[]): Promise<void> {
   // Safety gate: a CLI agent running inside a workflow subagent (Slice F)
   // must not chat-post directly — chat-facing side effects are reserved

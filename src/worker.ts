@@ -12,7 +12,7 @@
  *   6. On 'close', kills CLI and exits
  *   7. On 'restart', kills CLI and re-spawns with --resume
  */
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { mkdirSync, writeFileSync, unlinkSync, existsSync, statSync, readdirSync, readlinkSync, readFileSync, watch as fsWatch, createWriteStream, type FSWatcher, type WriteStream } from 'node:fs';
 import { join } from 'node:path';
 import { drainTranscript, joinAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, type TranscriptEvent } from './services/claude-transcript.js';
@@ -31,6 +31,20 @@ import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, 
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
 import { baselineJsonlCursor } from './services/jsonl-cursor.js';
 import { scheduleSubmitFailureRechecks, SUBMIT_RECHECK_DELAYS_MS, SUBMIT_RECHECK_TOTAL_MS } from './services/submit-failure-recheck.js';
+import {
+  CODEX_BATCH_RETAINED_MAX_BYTES,
+  CODEX_BATCH_RETAINED_MAX_FILES,
+  boundCodexBatchDescriptors,
+  deleteCodexBatchFile,
+  describeCodexBatch,
+  hasBatchReceipt,
+  makePendingInput,
+  pruneRetainedCodexBatchFiles,
+  tryPrepareCodexBatch,
+  type CodexBatchDescriptor,
+  type PendingInput,
+  type PendingInputMetadata,
+} from './services/codex-input-batch.js';
 import { dirname } from 'node:path';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -65,7 +79,6 @@ import { uploadImageBuffer } from './utils/lark-upload.js';
 import { config } from './config.js';
 import * as sessionStore from './services/session-store.js';
 import * as pty from 'node-pty';
-import { createHash } from 'node:crypto';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -93,7 +106,29 @@ function cliName(): string { return CLI_DISPLAY_NAMES[lastInitConfig?.cliId ?? '
 let isPromptReady = false;
 /** Mutex for async flushPending — prevents concurrent flush loops. */
 let isFlushing = false;
-const pendingMessages: string[] = [];
+const pendingMessages: PendingInput[] = [];
+/** Inflight entries are bounded descriptors only; raw message bodies live in
+ *  the private immutable file and are never duplicated in worker memory. */
+const inflightCodexBatches = new Map<string, CodexBatchDescriptor>();
+let retainedUnconfirmedCodexBatches: CodexBatchDescriptor[] = [];
+
+function retainUnconfirmedCodexBatch(batch: CodexBatchDescriptor): { count: number; bytes: number; evicted: string[] } {
+  const bounded = boundCodexBatchDescriptors([...retainedUnconfirmedCodexBatches, batch]);
+  retainedUnconfirmedCodexBatches = bounded.retained;
+  const evicted: string[] = [];
+  for (const oldest of bounded.evicted) {
+    if (deleteCodexBatchFile(oldest.path)) evicted.push(oldest.path);
+  }
+  const disk = pruneRetainedCodexBatchFiles(sessionId);
+  const removed = new Set([...evicted, ...disk.deletedPaths]);
+  retainedUnconfirmedCodexBatches = retainedUnconfirmedCodexBatches.filter(item => !removed.has(item.path));
+  const bytes = retainedUnconfirmedCodexBatches.reduce((total, item) => total + item.sizeBytes, 0);
+  return {
+    count: retainedUnconfirmedCodexBatches.length,
+    bytes,
+    evicted: [...removed],
+  };
+}
 
 type RuntimeScreenStatus = Exclude<ScreenStatus, 'limited'>;
 
@@ -1322,6 +1357,10 @@ function structuredBridgeIsCodex(): boolean {
   return lastInitConfig?.cliId === 'codex';
 }
 
+function codexInputBatchEnabled(): boolean {
+  return !/^(0|false|off)$/i.test(process.env.BOTMUX_CODEX_INPUT_BATCH?.trim() ?? '1');
+}
+
 function structuredBridgeIngestPath(path: string, offset: number) {
   return structuredBridgeIsCodex()
     ? drainCodexRollout(path, offset)
@@ -1529,6 +1568,32 @@ function emitReadyCodexTurns(): void {
   for (let i = 0; i < ready.length; i++) {
     const turn = ready[i];
     if (!turn.finalText) continue;
+    const batch = inflightCodexBatches.get(turn.turnId);
+    if (batch) {
+      if (hasBatchReceipt(turn.finalText, batch.batchId, batch.count)) {
+        inflightCodexBatches.delete(turn.turnId);
+        const deleted = deleteCodexBatchFile(batch.path);
+        const disk = pruneRetainedCodexBatchFiles(sessionId);
+        log(`Codex batch receipt confirmed (batch_id=${batch.batchId}, ${batch.count}/${batch.count}, file_deleted=${deleted}, retained_files=${disk.retainedCount})`);
+        if (!deleted) {
+          send({
+            type: 'user_notify',
+            message: `⚠️ Codex 批次已确认，但私有批文件清理失败：batch_id=${batch.batchId}，路径 ${batch.path}。保留策略仍会限制后续文件数量。`,
+          });
+        }
+      } else {
+        // The turn ended without a normative success receipt. Move the small
+        // descriptor out of inflight, retain the private file under bounded
+        // count/byte caps, and never auto-resend the payload.
+        inflightCodexBatches.delete(turn.turnId);
+        const retained = retainUnconfirmedCodexBatch(batch);
+        log(`Codex batch receipt missing (batch_id=${batch.batchId}, expected ${batch.count}/${batch.count}, file retained at ${batch.path}, retained=${retained.count}/${CODEX_BATCH_RETAINED_MAX_FILES}, bytes=${retained.bytes}/${CODEX_BATCH_RETAINED_MAX_BYTES}, evicted=${retained.evicted.length})`);
+        send({
+          type: 'user_notify',
+          message: `⚠️ Codex 批次未完成规范回执：batch_id=${batch.batchId}，期望末行 BOTMUX_BATCH_RECEIPT … processed=${batch.count}/${batch.count} status=ok。该批不计为已消费，不会自动重发；私有文件按每会话最多 ${CODEX_BATCH_RETAINED_MAX_FILES} 份 / ${Math.round(CODEX_BATCH_RETAINED_MAX_BYTES / 1024 / 1024)} MiB 有界保留：${batch.path}`,
+        });
+      }
+    }
     codexBridgeCompletedTurnIds.add(turn.turnId);
     if (codexBridgeCompletedTurnIds.size > 200) {
       const oldest = codexBridgeCompletedTurnIds.values().next().value;
@@ -1556,7 +1621,13 @@ function emitReadyCodexTurns(): void {
       });
       continue;
     }
-    send({ type: 'final_output', content: turn.finalText, lastUuid: turn.turnId, turnId: turn.turnId });
+    send({
+      type: 'final_output',
+      content: turn.finalText,
+      lastUuid: turn.turnId,
+      turnId: turn.turnId,
+      suppressImplicitAddressing: !!batch,
+    });
   }
 }
 
@@ -1574,6 +1645,8 @@ function stopCodexBridge(): void {
   codexBridgePendingTail = '';
   codexBridgeBaselineDone = false;
   codexBridgeQueue.clearPending();
+  inflightCodexBatches.clear();
+  retainedUnconfirmedCodexBatches = [];
   codexBridgeCompletedTurnIds.clear();
   codexBridgeQueue.setLocalTurns(false);
   codexBridgePendingSessionId = undefined;
@@ -2308,8 +2381,29 @@ async function flushPending(): Promise<void> {
 
   try {
     while (pendingMessages.length > 0 && backend && cliAdapter) {
-      const msg = pendingMessages.shift()!;
+      // Codex-only backlog collapse. Snapshot creation consumes nothing on
+      // failure; in that case the following shift is the exact legacy FIFO
+      // path (one ordinary input for this idle cycle).
+      const batch = structuredBridgeIsCodex() && codexInputBatchEnabled()
+        ? tryPrepareCodexBatch(sessionId, pendingMessages, {
+            onError: error => log(`Codex batch snapshot failed; preserving queue and falling back to one-item FIFO: ${(error as Error)?.message ?? String(error)}`),
+          })
+        : null;
+      const pendingInput = batch ? null : pendingMessages.shift()!;
+      const msg = batch?.stub ?? pendingInput!.content;
       const turnSeq = usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
+      renderer?.markNewTurn();
+      const metadata = pendingInput?.metadata;
+      send({
+        type: 'input_started',
+        ids: batch?.ids ?? (metadata ? [metadata.messageId] : []),
+        title: batch?.title ?? metadata?.title,
+        pendingCount: pendingMessages.length,
+        callers: batch?.callers ?? (metadata?.sender.openId ? [metadata.sender.openId] : []),
+        originalContent: batch ? `batch_id=${batch.batchId} N=${batch.count}` : (metadata?.originalContent ?? msg),
+        cliInput: msg,
+        batch: batch ? { batchId: batch.batchId, count: batch.count, path: batch.path } : undefined,
+      });
       // Bridge fallback: mark immediately before writeInput. Doing it here
       // (instead of at enqueue time) means markTimeMs anchors to the
       // moment the message actually starts hitting the PTY — so any
@@ -2330,6 +2424,7 @@ async function flushPending(): Promise<void> {
         // after still fingerprint-matches this turn.
         codexBridgeMarkTimeMs = Date.now();
         codexBridgeTurnId = codexBridgeMarkPendingTurn(msg, codexBridgeMarkTimeMs);
+        if (batch && codexBridgeTurnId) inflightCodexBatches.set(codexBridgeTurnId, describeCodexBatch(batch));
       }
       log(`Writing to PTY (flush): "${msg.substring(0, 80)}"`);
       // Defense in depth: TmuxPipeBackend's send methods no longer throw on a
@@ -2365,6 +2460,9 @@ async function flushPending(): Promise<void> {
       // nulled backend) the user already got a "CLI exited" notice; don't also
       // nag that the submit wasn't confirmed.
       if (result && result.submitted === false && backend) {
+        if (batch) {
+          log(`Codex batch submit is inflight_unconfirmed (batch_id=${batch.batchId}, N=${batch.count}, file retained; no automatic resend)`);
+        }
         scheduleSubmitFailureNotify(
           msg,
           result.recheck,
@@ -2391,9 +2489,10 @@ async function flushPending(): Promise<void> {
   }
 }
 
-function sendToPty(content: string): void {
+function sendToPty(content: string, metadata?: PendingInputMetadata): void {
   if (!backend || !cliAdapter) return;
-  pendingMessages.push(content);
+  pendingMessages.push(makePendingInput(content, metadata));
+  send({ type: 'input_queued', pendingCount: pendingMessages.length });
   // User-override semantics: a fresh Lark message while a TUI prompt is "active"
   // takes precedence over the AI-detected prompt. The screen analyzer can be
   // wrong (false positive on a question that has no rendered options) and a
@@ -3329,7 +3428,7 @@ process.on('message', async (raw: unknown) => {
         // Bridge mark is deferred to flushPending — see flushPending
         // comment for why marking at enqueue is wrong.
         if (msg.prompt && !cliAdapter?.passesInitialPromptViaArgs) {
-          pendingMessages.push(msg.prompt);
+          pendingMessages.push(makePendingInput(msg.prompt));
         }
 
         send({ type: 'ready', port, token: writeToken });
@@ -3341,13 +3440,23 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'message': {
-      // Mark new turn baseline so the streaming card only shows this turn's content
-      renderer?.markNewTurn();
-      const turnSeq = usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
       // Cancel any active tmux copy-mode scroll so user input reaches the CLI.
       if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
       const content = msg.content;
       if (lastInitConfig?.adoptMode) {
+        // Adopt writes immediately rather than entering pendingMessages, so
+        // this point is its real input-start boundary.
+        renderer?.markNewTurn();
+        const turnSeq = usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
+        send({
+          type: 'input_started',
+          ids: msg.metadata ? [msg.metadata.messageId] : [],
+          title: msg.metadata?.title,
+          pendingCount: pendingMessages.length,
+          callers: msg.metadata?.sender.openId ? [msg.metadata.sender.openId] : [],
+          originalContent: msg.metadata?.originalContent ?? content,
+          cliInput: content,
+        });
         // Bridge mode: capture transcript baseline BEFORE writing to the pane,
         // so any assistant uuids appended after this point are attributed to
         // *this* Lark turn (not local user activity in the pane). Mark may
@@ -3427,7 +3536,7 @@ process.on('message', async (raw: unknown) => {
         // arrival. Marking now would race with a still-running previous
         // turn whose `botmux send` could sneak its sentAtMs past this
         // turn's markTimeMs and falsely suppress its fallback.
-        sendToPty(content);
+        sendToPty(content, msg.metadata);
       }
       break;
     }

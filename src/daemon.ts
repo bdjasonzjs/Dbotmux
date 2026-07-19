@@ -88,6 +88,7 @@ import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, writeBotInfoF
 import { learnFromMentions, resolveSender, flushIdentityCacheSync } from './im/lark/identity-cache.js';
 import { renderSenderTag } from './core/session-manager.js';
 import { markSessionActivity } from './core/session-activity.js';
+import { applyInputStartedMetadata } from './core/input-started-metadata.js';
 import { WorkflowEventWatcher, handleWorkflowFanoutEvent } from './workflows/fanout.js';
 import type { WorkflowRuntimeContext, WorkerSpawnFn } from './workflows/runtime.js';
 import { runLoop } from './workflows/loop.js';
@@ -2484,16 +2485,10 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     sessionReply(anchor, tr('daemon.download_failed_need_login', undefined, localeForBot(effectiveAppId)), 'text', effectiveAppId);
   }
 
-  // Update last message time + last caller (used by `botmux send` to address
-  // reply cards to whoever triggered this turn — matters in oncall groups
-  // where the caller is often not the session owner).
+  // Arrival updates activity only. Caller/title/last-input belong to the turn
+  // that is actually running and are switched by worker input_started.
   if (ds) {
     markSessionActivity(ds);
-    const callerOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
-    if (callerOpenId && ds.session.lastCallerOpenId !== callerOpenId) {
-      ds.session.lastCallerOpenId = callerOpenId;
-      sessionStore.updateSession(ds.session);
-    }
   }
 
   // If waiting for repo selection, buffer the message and remind user
@@ -2678,6 +2673,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     // out-of-band.
     const isBridge = !!ds.adoptedFrom;
     const selfBot = getBot(ds.larkAppId);
+    const inputSender = await getThreadSender();
     const msgContent = isBridge
       ? buildBridgeInputContent(promptContent, {
           attachments,
@@ -2690,14 +2686,28 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
           isAdoptMode: false,
           cliId: dsBotCfgForMsg.cliId,
           cliPathOverride: dsBotCfgForMsg.cliPathOverride,
-          sender: await getThreadSender(),
+          sender: inputSender,
           chatId: ds.session.chatId,
           larkAppId: ds.larkAppId,
           selfMentionedThisTurn: isBotMentioned(ds.larkAppId, data?.message ?? {}, data?.sender?.sender_id?.open_id),
         });
-    beginNewTurn(ds, parsed.content);
-    rememberLastCliInput(ds, promptContent, msgContent);
-    ds.worker.send({ type: 'message', content: msgContent } as DaemonToWorker);
+    const callerOpenId = inputSender?.openId || parsed.senderId || data?.sender?.sender_id?.open_id || '';
+    ds.worker.send({
+      type: 'message',
+      content: msgContent,
+      metadata: {
+        kind: 'ordinary',
+        messageId: parsed.messageId,
+        createTime: parsed.createTime,
+        sender: {
+          openId: callerOpenId,
+          type: inputSender?.type ?? (parsed.senderType === 'user' ? 'user' : 'bot'),
+          name: inputSender?.name,
+        },
+        title: parsed.content.substring(0, 50),
+        originalContent: parsed.content,
+      },
+    } as DaemonToWorker);
   } else {
     // Worker not running — re-fork with resume. This is a NEW turn, so drop
     // any restored streaming-card reference; worker_ready will POST a fresh
@@ -2795,6 +2805,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     sessionReply,
     getSessionWorkingDir,
     getActiveCount,
+    inputStarted(ds, msg) {
+      const applied = applyInputStartedMetadata(ds, msg);
+      if (applied.title) beginNewTurn(ds, applied.title);
+      if (applied.remember) rememberLastCliInput(ds, applied.remember.userPrompt, applied.remember.cliInput);
+      sessionStore.updateSession(ds.session);
+    },
     closeSession(ds: DaemonSession) {
       // Route through the dashboard-aware helper so session.exited / session.update
       // events fire for withdrawn-message / crash / adopt-exit teardown paths too,

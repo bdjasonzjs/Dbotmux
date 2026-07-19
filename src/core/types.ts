@@ -83,6 +83,8 @@ export interface DaemonSession {
   usageLimitRetryTimer?: NodeJS.Timeout;
   lastUserPrompt?: string;
   lastCliInput?: string;
+  /** Number of worker-side inputs waiting behind the active turn. */
+  pendingInputCount?: number;
   currentTurnTitle?: string;      // title for the current turn's streaming card
   cardPatchInFlight?: boolean;    // true while a card PATCH is in-flight
   pendingCardJson?: string;       // queued card JSON — flushed when in-flight PATCH completes (latest wins)
