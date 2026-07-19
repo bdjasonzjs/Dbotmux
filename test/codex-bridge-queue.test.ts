@@ -11,6 +11,23 @@ function asstEv(text: string, uuid?: string, ts = 0): CodexBridgeEvent {
 }
 
 describe('CodexBridgeQueue', () => {
+  it('drops an aborted collecting turn and does not let it block the next completed turn', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('t1', 'first prompt', 100);
+    q.mark('t2', 'second prompt', 100);
+
+    q.ingest([
+      { uuid: 'u-abort-1', timestampMs: 110, kind: 'user', text: 'first prompt' },
+      { uuid: 'abort-1', timestampMs: 120, kind: 'turn_aborted', text: 'interrupted' },
+      { uuid: 'u-after-abort', timestampMs: 130, kind: 'user', text: 'second prompt' },
+      { uuid: 'a-after-abort', timestampMs: 140, kind: 'assistant_final', text: 'second answer' },
+    ]);
+
+    expect(q.drainAbortedTurns()).toEqual([{ turnId: 't1', reason: 'interrupted' }]);
+    expect(q.drainEmittable().map(turn => turn.turnId)).toEqual(['t2']);
+    expect(q.size()).toBe(0);
+  });
+
   it('marked turn whose user fingerprint matches becomes started; assistant_final closes it; drainEmittable yields finalText', () => {
     const q = new CodexBridgeQueue();
     q.mark('t1', 'hello model please', 100);

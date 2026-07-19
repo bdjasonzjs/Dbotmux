@@ -147,6 +147,14 @@ function handleCodexBatchLifecycleEvent(event: CodexBatchLifecycleEvent): void {
 }
 
 function handleCodexOrdinaryTurnRetentionEvent(event: CodexOrdinaryTurnRetentionEvent): void {
+  if (event.cause === 'turn_aborted') {
+    log(`Codex ordinary turn aborted (turnId=${event.turnId}, state=${event.state}, reason=${event.reason ?? 'unknown'}, no_resend=true)`);
+    send({
+      type: 'user_notify',
+      message: `⚠️ Codex 单条消息已中断（原因 ${event.reason ?? 'unknown'}），未产生最终回复。归因记录已清理且未自动重发；后续排队消息会继续处理。`,
+    });
+    return;
+  }
   const limit = event.cause === 'ttl' ? '寿命上限' : '数量上限';
   log(`Codex ordinary failed mark evicted (turnId=${event.turnId}, cause=${event.cause}, state=${event.state}, reason=${event.reason ?? 'unknown'}, no_resend=true)`);
   send({
@@ -445,7 +453,7 @@ function maybeEmitAdoptPreamble(events: TranscriptEvent[]): void {
  *  对齐 maybeEmitAdoptPreamble；区别只在事件取出方式（codex/coco 是结构化
  *  event，不需要走 claude 那套 jsonl turn assembly）。 */
 function maybeEmitCodexAdoptPreamble(
-  history: readonly { kind: 'user' | 'assistant_final'; text: string }[],
+  history: readonly { kind: 'user' | 'assistant_final' | 'turn_aborted'; text: string }[],
 ): void {
   if (!lastInitConfig?.adoptMode) return;
   if (lastInitConfig?.adoptRestoredFromMetadata) return;
@@ -1410,9 +1418,9 @@ function codexBridgeStartTimer(): void {
   // the next emit chance would be at the next idle — i.e. the user has
   // to send another message before the previous turn's fallback shows
   // up. Emitting here when isPromptReady=true closes that window.
-  // Codex's queue only releases turns on `assistant_final` (the model's
-  // declared end-of-turn), so a tick-driven emit can't accidentally
-  // publish a half-streamed response.
+  // Codex's queue only emits turns on `assistant_final`; `turn_aborted`
+  // releases a blocker without emitting content. A tick-driven emit still
+  // cannot publish a half-streamed response.
   codexBridgeTimer = setInterval(() => {
     try {
       if (!codexBridgeRolloutPath) {
@@ -1488,7 +1496,7 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'fre
     const cutoff = (codexAdoptStartMs ?? Date.now()) - 5_000;
     const { history, live } = splitCodexEventsByCutoff(result.events, cutoff);
     codexBridgeQueue.absorb(history);
-    codexBridgeQueue.ingest(live);
+    codexBridgeApplyEvents(live);
     codexBridgeOffset = result.newOffset;
     codexBridgePendingTail = result.pendingTail;
     codexBridgeBaselineDone = true;
@@ -1552,15 +1560,22 @@ function codexBridgeIngest(): void {
   const result = structuredBridgeIngestPath(codexBridgeRolloutPath, codexBridgeOffset);
   codexBridgeOffset = result.newOffset;
   codexBridgePendingTail = result.pendingTail;
-  codexBridgeQueue.ingest(result.events);
+  codexBridgeApplyEvents(result.events);
   // Transcript-driven idle: an `assistant_final` event is the CLI declaring
   // end-of-turn, far more reliable than the screen-pattern heuristic
   // (CoCo's status bar varies by --yolo flag, version, theme; codex has
   // its own moving targets). Pushing idle here lets the bridge emit
   // immediately instead of waiting for readyPattern + quiescence to
   // converge. Idempotent — IdleDetector.fireIdle no-ops while already idle.
-  if (result.events.some(e => e.kind === 'assistant_final')) {
+  if (result.events.some(e => e.kind === 'assistant_final' || e.kind === 'turn_aborted')) {
     idleDetector?.fireIdle();
+  }
+}
+
+function codexBridgeApplyEvents(events: Parameters<CodexBridgeQueue['ingest']>[0]): void {
+  codexBridgeQueue.ingest(events);
+  for (const aborted of codexBridgeQueue.drainAbortedTurns()) {
+    codexBatchTurns.markTranscriptAborted(aborted.turnId, aborted.reason);
   }
 }
 

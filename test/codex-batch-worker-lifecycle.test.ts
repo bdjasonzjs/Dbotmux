@@ -103,6 +103,35 @@ describe('Codex worker batch lifecycle', () => {
     expect(queue.drainEmittable().map(turn => turn.turnId)).toEqual(['healthy-next']);
   });
 
+  it('retains an aborted batch as unconfirmed without auto-resend or file deletion', () => {
+    const events: CodexBatchLifecycleEvent[] = [];
+    const queue = new CodexBridgeQueue();
+    const coordinator = new CodexBatchTurnCoordinator(queue, {
+      removeFile: path => { try { unlinkSync(path); return true; } catch { return false; } },
+      pruneFiles: () => ({ retainedCount: 0, retainedBytes: 0, deletedPaths: [] }),
+      onEvent: event => events.push(event),
+    });
+    const batch = descriptor(1);
+    queue.mark('aborted-batch', 'aborted batch stub', 100);
+    coordinator.track('aborted-batch', batch);
+    queue.ingest([
+      { uuid: 'u-aborted-batch', timestampMs: 110, kind: 'user', text: 'aborted batch stub' },
+      { uuid: 'abort-batch', timestampMs: 120, kind: 'turn_aborted', text: 'interrupted' },
+    ]);
+    for (const aborted of queue.drainAbortedTurns()) {
+      coordinator.markTranscriptAborted(aborted.turnId, aborted.reason);
+    }
+
+    expect(queue.size()).toBe(0);
+    expect(coordinator.get('aborted-batch')).toEqual(
+      expect.objectContaining({ state: 'unconfirmed', reason: 'turn_aborted:interrupted' }),
+    );
+    expect(statSync(batch.path).isFile()).toBe(true);
+    expect(events).toContainEqual(
+      expect.objectContaining({ type: 'unconfirmed', record: expect.objectContaining({ turnId: 'aborted-batch' }) }),
+    );
+  });
+
   it('bounds consecutive submitted:false batches with no final, retains no bodies, and warns', () => {
     const events: CodexBatchLifecycleEvent[] = [];
     const lifecycle = new CodexBatchLifecycle({

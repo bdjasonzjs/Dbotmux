@@ -26,6 +26,8 @@
  *         emit ordering reflects when the event landed.
  *       * 'assistant_final' event → the currently-collecting turn closes
  *         with finalText set; eligible for emit on the next drain.
+ *       * 'turn_aborted' event → the currently-collecting turn is removed
+ *         without emit and exposed to the lifecycle coordinator.
  *   - drainEmittable() — parked/unstarted holes do not block ready turns;
  *     ready output is ordered by authoritative transcript start time.
  */
@@ -58,10 +60,16 @@ export interface CodexPendingTurn {
   userText?: string;
 }
 
+export interface CodexAbortedTurn {
+  turnId: string;
+  reason: string;
+}
+
 export class CodexBridgeQueue {
   private seen = new Set<string>();
   private queue: CodexPendingTurn[] = [];
   private collecting: CodexPendingTurn | null = null;
+  private abortedTurns: CodexAbortedTurn[] = [];
   private localTurnsEnabled = false;
   /** Lower bound (ms) for synthesising local turns — protects against a
    *  fresh-empty attach replaying historical iTerm conversation as
@@ -125,6 +133,7 @@ export class CodexBridgeQueue {
   clearPending(): CodexPendingTurn[] {
     const dropped = this.queue.splice(0);
     if (this.collecting && dropped.includes(this.collecting)) this.collecting = null;
+    this.abortedTurns = [];
     return dropped;
   }
 
@@ -177,8 +186,22 @@ export class CodexBridgeQueue {
           this.collecting.finalText = ev.text;
           this.collecting = null;
         }
+      } else if (ev.kind === 'turn_aborted') {
+        if (this.collecting) {
+          const aborted = this.collecting;
+          this.drop(aborted.turnId);
+          this.abortedTurns.push({ turnId: aborted.turnId, reason: ev.text || 'turn_aborted' });
+        }
       }
     }
+  }
+
+  /** Consume transcript-backed abort terminals after attribution has already
+   * removed them from the active queue. The worker forwards these to the
+   * lifecycle coordinator so batch files stay retained and ordinary failure
+   * records receive a visible, bounded terminal transition. */
+  drainAbortedTurns(): CodexAbortedTurn[] {
+    return this.abortedTurns.splice(0);
   }
 
   /** Pop ready turns without letting parked/unstarted holes block them. */

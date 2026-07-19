@@ -15,9 +15,9 @@ export interface CodexOrdinaryParkedTurnRecord {
 
 export interface CodexOrdinaryTurnRetentionEvent {
   type: 'ordinary_evicted';
-  cause: 'count_cap' | 'ttl';
+  cause: 'count_cap' | 'ttl' | 'turn_aborted';
   turnId: string;
-  state: CodexOrdinaryParkedTurnRecord['state'];
+  state: CodexOrdinaryParkedTurnRecord['state'] | 'inflight';
   reason?: string;
 }
 
@@ -72,7 +72,7 @@ export class CodexBatchTurnCoordinator {
       this.lifecycle.markRechecking(turnId, reason);
       return;
     }
-    if (!parked) return;
+    if (!parked && !this.queue.hasStarted(turnId)) return;
     this.upsertOrdinary(turnId, 'rechecking', reason);
   }
 
@@ -83,7 +83,7 @@ export class CodexBatchTurnCoordinator {
       this.lifecycle.markSubmitUnconfirmed(turnId, reason);
       return;
     }
-    if (!parked) return;
+    if (!parked && !this.queue.hasStarted(turnId)) return;
     this.upsertOrdinary(turnId, 'unconfirmed', reason);
   }
 
@@ -93,23 +93,40 @@ export class CodexBatchTurnCoordinator {
     this.ordinaryParked.delete(turnId);
   }
 
+  /** A real Codex turn_aborted event is authoritative terminal evidence.
+   * The queue has already removed the started/no-final turn. Batch payloads
+   * remain unconfirmed and bounded on disk; ordinary attribution retention
+   * is closed with a visible no-resend event. */
+  markTranscriptAborted(turnId: string, reason = 'turn_aborted'): void {
+    if (this.lifecycle.get(turnId)) {
+      this.lifecycle.markSubmitUnconfirmed(turnId, `turn_aborted:${reason}`);
+      return;
+    }
+    const record = this.ordinaryParked.get(turnId);
+    this.ordinaryParked.delete(turnId);
+    this.onOrdinaryEvent?.({
+      type: 'ordinary_evicted',
+      cause: 'turn_aborted',
+      turnId,
+      state: record?.state ?? 'inflight',
+      reason,
+    });
+  }
+
   /** A response-side signal suppressed the submit warning. If the rollout
    * never started this ordinary turn, discard its now-unneeded fingerprint;
    * otherwise preserve the collecting turn until assistant_final arrives. */
   resolveSuppressed(turnId: string): void {
     if (this.lifecycle.get(turnId)) return;
+    if (this.queue.hasStarted(turnId)) return;
     this.ordinaryParked.delete(turnId);
-    if (!this.queue.hasStarted(turnId)) this.queue.drop(turnId);
+    this.queue.drop(turnId);
   }
 
   /** Called by the worker's existing 1s Codex bridge ticker. This gives
    * ordinary failed marks a hard lifetime even when no later input arrives. */
   pruneOrdinaryTurnMarks(nowMs = this.now()): void {
     for (const record of [...this.ordinaryParked.values()]) {
-      if (this.queue.hasStarted(record.turnId)) {
-        this.ordinaryParked.delete(record.turnId);
-        continue;
-      }
       if (nowMs - record.createdAtMs <= this.ordinaryParkedTtlMs) continue;
       this.evictOrdinary(record, 'ttl');
     }
