@@ -193,6 +193,34 @@ export function buildOutputDisciplineBlock(): string {
  * 因为 MCP 工具不是 skill，多轮对话后 bot 会丢失「可以向主 bot 求助」「自己/别人的角色」等信息。
  * getByChatId corrupt 会抛 StoreCorruptError → try/catch 兜住，**注入失败绝不阻塞 spawn / 发消息**。
  */
+type SeatRole = 'main' | 'collab' | 'observer';
+
+/** 解析本 bot 在某子任务里的席位（供 block 全文 + tldr 共用，避免两处 drift）。 */
+function resolveSelfSeat(task: NonNullable<ReturnType<typeof subtaskStore.getByChatId>>, larkAppId: string): { selfOpenId: string | null; seat: SeatRole | undefined } {
+  try {
+    const b = getBot(larkAppId);
+    const selfOpenId = b.botOpenId ?? null;
+    const seat = task.bots.find(bot => bot.openId === selfOpenId)?.role as SeatRole | undefined;
+    return { selfOpenId, seat };
+  } catch { return { selfOpenId: null, seat: undefined }; }
+}
+
+/** subtask_member_routing 的一行精华：**按席位分流**（蔻黛克斯 review blocker 2——原来把执行者
+ *  专属动作 `subtask-request-review` 塞给了 reviewer/observer，与「reviewer 只 review 不驱动」冲突）。
+ *  gate 与 buildSubtaskMemberBlock 完全一致（同 getByChatId + 终态守卫），保证「块渲染 ⇔ 精华出现」。 */
+function subtaskMemberTldr(ctx: BuildCtx): string {
+  if (!ctx.chatId || !ctx.larkAppId) return '';
+  let task: ReturnType<typeof subtaskStore.getByChatId>;
+  try { task = subtaskStore.getByChatId(ctx.chatId); } catch { return ''; }
+  if (!task || task.status === 'finished' || task.status === 'stopped') return '';
+  const { seat } = resolveSelfSeat(task, ctx.larkAppId);
+  const esc = '卡住/岔路用 `subtask-askforhelp` 逐级上报父群，严禁直接 @ / 惊动 owner';
+  if (seat === 'main') return `你是本子群执行者(main)：驱动任务、产出先 \`subtask-request-review\` 唤 reviewer；${esc}。`;
+  if (seat === 'collab') return `你是本子群 reviewer：只 review/challenge、不驱动任务、不抢实现；${esc}。`;
+  if (seat === 'observer') return `你是本子群观测者：只盯群/触发唤醒、不参与执行；${esc}。`;
+  return `你在子任务子群干活：按本群【你的角色】推进；${esc}。`;
+}
+
 export function buildSubtaskMemberBlock(chatId: string | undefined, larkAppId: string | undefined): string {
   if (!chatId || !larkAppId) return '';
   let task: ReturnType<typeof subtaskStore.getByChatId>;
@@ -208,14 +236,9 @@ export function buildSubtaskMemberBlock(chatId: string | undefined, larkAppId: s
     collab: 'Reviewer —— 只 review/challenge：**不驱动任务、不产主交付物、不直接实现**。只在执行者已有方案/代码/明确请求 review 时再 review，发现问题挑出来交执行者改，别自己上手抢执行。',
     observer: '观测/盯群、触发唤醒（不参与执行）',
   };
-  let selfOpenId: string | null = null;
+  const { selfOpenId, seat: selfSeat } = resolveSelfSeat(task, larkAppId);
   let selfRole = '(未识别角色，按子任务目标干活)';
-  try {
-    const b = getBot(larkAppId);
-    selfOpenId = b.botOpenId ?? null;
-    const selfSeat = task.bots.find(bot => bot.openId === selfOpenId)?.role;
-    if (selfSeat) selfRole = ROLE_BY_SEAT[selfSeat] ?? selfRole;
-  } catch { /* xref 缺失 → 用兜底 */ }
+  if (selfSeat) selfRole = ROLE_BY_SEAT[selfSeat] ?? selfRole;
 
   const others = task.bots
     .filter(b => b.openId !== selfOpenId)
@@ -328,8 +351,8 @@ registerContextProvider({
   inlineRounds: 'all',
   applies: () => true, // 真实 gate（active 子任务命中）在 render 内，返 '' 即不注入
   render: ctx => buildSubtaskMemberBlock(ctx.chatId, ctx.larkAppId),
-  // 稳定核心指令（具体角色/目标是动态的，留在文件里，这里只放不变的行为兜底）。
-  tldr: () => '你在子任务子群干活：按本群【你的角色】推进，产出先 `subtask-request-review`；卡住/岔路用 `subtask-askforhelp` 逐级上报父群，严禁直接 @ / 惊动 owner。',
+  // 按席位分流的一行精华（main/collab/observer 各不同，见 subtaskMemberTldr）。
+  tldr: subtaskMemberTldr,
 });
 
 registerContextProvider({

@@ -171,8 +171,8 @@ export async function getAvailableBots(
  */
 const SENDER_ROLE_HINT: Record<NonNullable<ResolvedSender['role']>, string> = {
   owner: 'owner=项目主人本人，其指令/写操作按最高权威对待',
-  'teammate-bot': 'teammate-bot=协作机器人，不是真人',
-  external: 'external=非 owner 的其他人，写操作需谨慎',
+  bot: 'bot=机器人（只表示不是真人；是否可信队友需另行判断）',
+  external: 'external=已确证的非 owner 真人，写操作需谨慎',
 };
 
 export function renderSenderTag(sender?: ResolvedSender): string {

@@ -393,21 +393,48 @@ describe('tldr：behavioral 块的一行精华每轮进 stub（file 模式）', 
     };
   }
 
-  it('子群成员/输出纪律的一行精华出现在 stub、完整块进文件', () => {
+  function seatTask(selfRole: 'main' | 'collab' | 'observer'): any {
+    return {
+      taskId: 'st_tldr', chatId: CHAT, status: 'active', goal: '目标', acceptance: null,
+      bots: [{ name: '克劳德', openId: 'ou_self', role: selfRole }], // mock getBot().botOpenId='ou_self'
+    };
+  }
+
+  it('执行者(main)：一行精华含 request-review；完整块进文件', () => {
     setContextDelivery(CHAT, 'file');
-    subtaskState.task = activeTask();
+    subtaskState.task = seatTask('main');
     const prompt = buildNewTopicPrompt('hi', SID, 'claude-code',
       undefined, undefined, undefined, undefined, undefined, undefined, undefined,
       { openId: 'ou_sender', type: 'user', name: '张三' }, CHAT, APP);
 
     expect(stubVersion(prompt)).not.toBeNull();
-    // stub 里有一行精华（跟随 render 的 gate：块真渲染才收）
     expect(prompt).toContain('本群本轮要点');
-    expect(prompt).toContain('按本群【你的角色】推进');       // subtask_member_routing.tldr
-    expect(prompt).toContain('说做分离：一回合');            // output_discipline.tldr
-    // 完整块仍进文件、不在消息体
+    expect(prompt).toContain('执行者(main)');
+    expect(prompt).toContain('subtask-request-review');   // 执行者才有
+    expect(prompt).toContain('说做分离：一回合');           // output_discipline.tldr
     expect(prompt).not.toContain('<subtask_member_routing>');
     expect(readFileSync(contextFilePath(CHAT, APP), 'utf-8')).toContain('<subtask_member_routing>');
+  });
+
+  it('⚠️blocker2：reviewer(collab) 的精华不含 request-review、且写明只 review 不驱动', () => {
+    setContextDelivery(CHAT, 'file');
+    subtaskState.task = seatTask('collab');
+    const prompt = buildNewTopicPrompt('hi', SID, 'claude-code',
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      { openId: 'ou_sender', type: 'user', name: '张三' }, CHAT, APP);
+    expect(prompt).toContain('reviewer');
+    expect(prompt).toContain('不驱动任务');
+    expect(prompt).not.toContain('subtask-request-review'); // reviewer 不该被塞执行者动作
+  });
+
+  it('observer 的精华：只盯群不执行、无 request-review', () => {
+    setContextDelivery(CHAT, 'file');
+    subtaskState.task = seatTask('observer');
+    const prompt = buildNewTopicPrompt('hi', SID, 'claude-code',
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      { openId: 'ou_sender', type: 'user', name: '张三' }, CHAT, APP);
+    expect(prompt).toContain('观测者');
+    expect(prompt).not.toContain('subtask-request-review');
   });
 
   it('块不渲染（无 active 子任务）→ 该块不贡献精华', () => {
@@ -418,7 +445,7 @@ describe('tldr：behavioral 块的一行精华每轮进 stub（file 模式）', 
       undefined, undefined, undefined, undefined, undefined, undefined, undefined,
       { openId: 'ou_sender', type: 'user', name: '张三' }, CHAT, APP);
     // 没有子任务 → 无 subtask 精华；但 output_discipline 仍在 → 仍有要点块
-    expect(prompt).not.toContain('按本群【你的角色】推进');
+    expect(prompt).not.toContain('执行者(main)');
     expect(prompt).toContain('说做分离：一回合');
   });
 });
@@ -430,8 +457,8 @@ describe('renderSenderTag：role 属性 + 一行含义', () => {
     expect(tag).toContain('role="owner"');
     expect(tag).toContain('项目主人本人');
   });
-  it('teammate-bot / external 各自的含义注释', () => {
-    expect(renderSenderTag({ openId: 'ou_b', type: 'bot', role: 'teammate-bot' })).toContain('协作机器人');
+  it('bot / external 各自的含义注释', () => {
+    expect(renderSenderTag({ openId: 'ou_b', type: 'bot', role: 'bot' })).toContain('机器人');
     expect(renderSenderTag({ openId: 'ou_e', type: 'user', role: 'external' })).toContain('非 owner');
   });
   it('无 role（历史行为）→ 不加 role 属性、不加注释', () => {

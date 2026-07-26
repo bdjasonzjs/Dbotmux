@@ -272,13 +272,37 @@ export interface ResolvedSender {
   email?: string;
   /**
    * 本条发言人相对本 bot 的身份分类（file 模式下每轮兜底：即使不读身份文件，也一眼知道
-   * 跟自己说话的是不是项目主人 / 队友 bot / 外人 —— 决定能否听其写操作、用什么口吻）。
-   *  - 'owner'        ：open_id === 本 app 视角的 owner（项目主人本人）
-   *  - 'teammate-bot' ：发言人是一个 bot（协作机器人）
-   *  - 'external'     ：其他真人（非 owner）
-   * open_id 是 app-scoped，故 owner 判定用 getOwnerOpenId(larkAppId) 同 app 视角比对。
+   * 跟自己说话的是不是项目主人 / bot / 外人 —— 决定能否听其写操作、用什么口吻）。
+   *  - 'owner'    ：可**确证**是项目主人（open_id === 本 app 视角已知 owner）
+   *  - 'bot'      ：发言人是一个 bot（只证明是机器人，不代表可信队友）
+   *  - 'external' ：可**确证**的其他真人（已知 owner 且 ≠ 发言人）
+   *  - undefined  ：owner 无法确证时**不猜**（绝不把未知者误标成 external / owner）
+   * open_id 是 app-scoped，故 owner 判定必须同 app 视角比对（见 classifySenderRole）。
    */
-  role?: 'owner' | 'teammate-bot' | 'external';
+  role?: 'owner' | 'bot' | 'external';
+}
+
+/**
+ * 发言人身份分类（纯函数，便于全边界测试）。核心不变式：**owner 不可确证时返回 undefined，
+ * 绝不据此断言 external**（蔻黛克斯 review blocker 1：owner 未配置时不能把所有真人误标 external，
+ * 尤其邹劲松会被误判）。
+ *  - `appOwnerOpenId`     ：`getOwnerOpenId(larkAppId)` —— 本 app 视角的权威 owner（可能未配置=undefined）
+ *  - `profileOwnerOpenId` ：owner-profile 里的 owner open_id —— **仅用于正向确认 owner**，
+ *    绝不用它断言 external（它是单一 app 视角、app-scoped，跨 app「不相等」不代表不是 owner）。
+ */
+export function classifySenderRole(args: {
+  senderType: 'user' | 'bot';
+  senderOpenId: string;
+  appOwnerOpenId?: string;
+  profileOwnerOpenId?: string;
+}): ResolvedSender['role'] {
+  if (args.senderType === 'bot') return 'bot';
+  const { senderOpenId, appOwnerOpenId, profileOwnerOpenId } = args;
+  // 本 app 有权威 owner 配置 → 可做完整三分（相等=owner，不等=可确证的 external）。
+  if (appOwnerOpenId) return senderOpenId === appOwnerOpenId ? 'owner' : 'external';
+  // 无 app 级配置 → 只用 owner-profile 做 owner 的**正向**确认；确认不了就 unknown（不猜）。
+  if (profileOwnerOpenId && senderOpenId === profileOwnerOpenId) return 'owner';
+  return undefined;
 }
 
 /**
@@ -318,11 +342,33 @@ export async function resolveSender(
     name = name ?? resolved?.name;
     email = resolved?.email;
   }
-  // 身份分类（app-scoped：owner 用同 app 视角比对）。getOwnerOpenId 失败不阻塞发消息。
+  // 身份分类（app-scoped owner + owner-profile 正向兜底）。任何失败都不阻塞发消息。
   let role: ResolvedSender['role'];
   try {
-    if (type === 'bot') role = 'teammate-bot';
-    else role = getOwnerOpenId(larkAppId) === openId ? 'owner' : 'external';
+    let appOwner: string | undefined;
+    try { appOwner = getOwnerOpenId(larkAppId); } catch { appOwner = undefined; }
+    role = classifySenderRole({
+      senderType: type,
+      senderOpenId: openId,
+      appOwnerOpenId: appOwner,
+      profileOwnerOpenId: ownerProfileOpenId(),
+    });
   } catch { role = undefined; }
   return { openId, type, name, email, role };
+}
+
+/** owner-profile.json 里 owner.open_id 的**轻量、memoized** 读取（避免每条消息文件 IO，
+ *  也避开 import owner-profile 模块引入 digest-store 等重依赖）。owner 半年才改一次，
+ *  变更后 daemon 重启即刷新。仅用于 classifySenderRole 的 owner **正向**确认。 */
+let ownerProfileIdCache: string | null | undefined;
+export function __resetOwnerProfileIdCacheForTesting(): void { ownerProfileIdCache = undefined; }
+function ownerProfileOpenId(): string | undefined {
+  if (ownerProfileIdCache === undefined) {
+    try {
+      const fp = join(config.session.dataDir, 'owner-profile.json');
+      const id = existsSync(fp) ? JSON.parse(readFileSync(fp, 'utf-8'))?.owner?.open_id : undefined;
+      ownerProfileIdCache = typeof id === 'string' && id.startsWith('ou_') ? id : null;
+    } catch { ownerProfileIdCache = null; }
+  }
+  return ownerProfileIdCache ?? undefined;
 }
