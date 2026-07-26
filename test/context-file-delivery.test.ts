@@ -470,11 +470,11 @@ describe('renderSenderTag：role 属性 + 一行含义', () => {
   it('带 role=owner → 输出 role 属性 + owner 含义注释', () => {
     const tag = renderSenderTag({ openId: 'ou_o', type: 'user', name: '邹劲松', role: 'owner' });
     expect(tag).toContain('role="owner"');
-    expect(tag).toContain('项目主人本人');
+    expect(tag).toContain('本会话的发起人');
   });
   it('bot / external 各自的含义注释', () => {
     expect(renderSenderTag({ openId: 'ou_b', type: 'bot', role: 'bot' })).toContain('机器人');
-    expect(renderSenderTag({ openId: 'ou_e', type: 'user', role: 'external' })).toContain('非 owner');
+    expect(renderSenderTag({ openId: 'ou_e', type: 'user', role: 'external' })).toContain('非发起人');
   });
   it('无 role（历史行为）→ 不加 role 属性、不加注释', () => {
     const tag = renderSenderTag({ openId: 'ou_x', type: 'user', name: '张三' });

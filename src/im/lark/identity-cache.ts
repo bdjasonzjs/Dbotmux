@@ -283,22 +283,21 @@ export interface ResolvedSender {
 }
 
 /**
- * 发言人身份分类（纯函数，便于全边界测试）。两条核心不变式（蔻黛克斯 R1/R2 blocker）：
- *  ① owner 源必须**与当前 app 绑定且已确证**——绝不用 allowlist 首项当 owner（email 解析会打乱
- *     顺序，把普通授权用户误当 owner，是授权级误判）；也绝不用无 scope 的 open_id 做跨 app 比对。
- *  ② owner 不可确证时返回 undefined，**绝不**据此把真人断言成 external。
- *
- * `scopedOwnerOpenId`：**已证明适用于当前 larkAppId** 的 owner open_id（调用方保证 app_id 匹配才传入）；
- *  无法为当前 app 确证 owner 时不传（=undefined）→ 该 app 下不产出 owner/external 标（只 unknown）。
+ * 发言人身份分类（纯函数，便于全边界测试）。**per-chat 模型**（2026-07-26 邹劲松指出：角色是每个
+ * 聊天各自的事、不该只有全局）：owner 判定用**本会话的 ownerOpenId**（= 这个聊天的发起人/主人）。
+ *  - 该值由 daemon 从**本聊天的消息事件**里取，天然是该聊天所在 app 视角、app-scoped 一致——
+ *    因此在 Claude/Codex/Coco 任一 bot 下都能正确认出 owner，**无需任何全局多 app 映射**。
+ * 不变式：owner 不可知（chatOwnerOpenId 缺）→ undefined，绝不据此把真人误标 external。
  */
 export function classifySenderRole(args: {
   senderType: 'user' | 'bot';
   senderOpenId: string;
-  scopedOwnerOpenId?: string;
+  /** 本会话 ownerOpenId（发起人/主人）；缺失（无会话/未知）→ 不产出 owner/external，只 undefined。 */
+  chatOwnerOpenId?: string;
 }): ResolvedSender['role'] {
   if (args.senderType === 'bot') return 'bot';
-  if (!args.scopedOwnerOpenId) return undefined; // 当前 app 无已确证 owner → 不猜
-  return args.senderOpenId === args.scopedOwnerOpenId ? 'owner' : 'external';
+  if (!args.chatOwnerOpenId) return undefined; // 本会话 owner 未知 → 不猜
+  return args.senderOpenId === args.chatOwnerOpenId ? 'owner' : 'external';
 }
 
 /**
@@ -316,6 +315,9 @@ export async function resolveSender(
   openId: string | undefined,
   senderType: string | undefined,
   hint?: { name?: string; type?: 'user' | 'bot' },
+  /** 本会话 ownerOpenId（发起人）——per-chat owner 判定，见 classifySenderRole。调用方从
+   *  DaemonSession.ownerOpenId 传入（它取自本聊天事件、天然同 app 视角）。 */
+  chatOwnerOpenId?: string,
 ): Promise<ResolvedSender | undefined> {
   if (!openId) return undefined;
 
@@ -338,37 +340,11 @@ export async function resolveSender(
     name = name ?? resolved?.name;
     email = resolved?.email;
   }
-  // 身份分类：owner 只用 **app-scope 已确证** 的来源（owner-profile 的 open_id 且 app_id 匹配）。
+  // 身份分类（per-chat）：owner = 本会话发起人（chatOwnerOpenId，取自本聊天 app 视角）。
   // 任何失败都不阻塞发消息。
   let role: ResolvedSender['role'];
   try {
-    role = classifySenderRole({
-      senderType: type,
-      senderOpenId: openId,
-      scopedOwnerOpenId: scopedOwnerOpenId(larkAppId),
-    });
+    role = classifySenderRole({ senderType: type, senderOpenId: openId, chatOwnerOpenId });
   } catch { role = undefined; }
   return { openId, type, name, email, role };
-}
-
-/** owner-profile.json 的**轻量、memoized** 读取（避免每消息文件 IO，也避开 import owner-profile
- *  模块引入 digest-store 等重依赖）。owner 半年才改一次，变更后 daemon 重启即刷新。
- *  仅当 profile 记录的 **app_id === 当前 larkAppId** 时才返回其 owner open_id（scope 匹配才确证，
- *  杜绝跨 app open_id 误判——蔻黛克斯 R2 P1-B）。缺 app_id / open_id → undefined（不确证）。 */
-let ownerProfileCache: { openId: string; appId: string } | null | undefined;
-export function __resetOwnerProfileIdCacheForTesting(): void { ownerProfileCache = undefined; }
-function scopedOwnerOpenId(larkAppId: string): string | undefined {
-  if (ownerProfileCache === undefined) {
-    ownerProfileCache = null;
-    try {
-      const fp = join(config.session.dataDir, 'owner-profile.json');
-      if (existsSync(fp)) {
-        const o = JSON.parse(readFileSync(fp, 'utf-8'))?.owner;
-        if (typeof o?.open_id === 'string' && o.open_id.startsWith('ou_') && typeof o?.app_id === 'string' && o.app_id) {
-          ownerProfileCache = { openId: o.open_id, appId: o.app_id };
-        }
-      }
-    } catch { ownerProfileCache = null; }
-  }
-  return ownerProfileCache && ownerProfileCache.appId === larkAppId ? ownerProfileCache.openId : undefined;
 }

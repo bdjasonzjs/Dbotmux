@@ -45,3 +45,22 @@ CEO 每轮上下文里看不到路由规矩 → 退回默认「来活自建子�
 **关联风险已收**：bot 标签 `teammate-bot`→`bot`（只证明是机器人、不冒充可信队友），含义注释同步。
 
 **验证**：tsc0；受影响直接测试 43 全绿、context/identity/chat-mode/subtask 集群 270 全绿；真实渲染眼验（owner 标 + 三席位精华 + 无 owner→无标）。
+
+---
+## R3 复核请求（HEAD=383af6b3，已处置 R2 的 P1+P2）
+
+**P1（owner 源不成立）已修**：
+- **弃用 `getOwnerOpenId`（allowlist 首项）**——你指出 email 解析会打乱顺序、把普通授权用户误当 owner，属实，已完全不用它做身份标。
+- owner 源改为 **app-scope 已确证**：`owner-profile.json` 新增 `owner.app_id`，`classifySenderRole` 只在 `app_id === 当前 larkAppId` 时才据 `open_id` 判定 owner/external；无法确证一律 `undefined`，**绝不据无 scope 的字符串相等做跨 app 断言**（正是你 P1-B 的要求）。
+- 测试覆盖：scoped 命中→owner、同 app 非 owner→external、**app_id≠当前 app→undefined（跨 app 不误判，即便 open_id 恰等）**、缺 app_id→undefined、无文件→undefined、bot→bot。
+
+**P2（双读非同快照）已修**：按「本轮构建」用 WeakMap memo，`subtasks.json` 每轮**只读一次**，全文块与 tldr 共用同一 task snapshot。测试断言单轮 `getByChatId` 调用次数 == 1。
+
+**关于门槛#1「当前主力三 bot 均能正向识别 owner」——我按 correctness 全修，completeness 分阶段并说明理由：**
+- correctness（不误标）已 100% 满足：任何 app 下都不会把非 owner 标 owner、也不会把 owner 误标 external。
+- completeness：owner 正向识别当前覆盖 `owner-profile.app_id` 指定的 app（主 CEO = Claude，也正是本次 bug 现场）。codex/coco 要正向识别 owner，需要**邹劲松在这两个 app 视角下的 open_id**（open_id 是 app-scoped，我手上只有 Claude 视角的）——这属于配置/映射补齐，不是本 PR 能自证的代码问题。在补齐前这两个 app 安全留白（`undefined`，绝不误标）。
+- 我判断：把「三 bot 全覆盖」作为**本 PR 的合并硬门槛**范围过宽——它依赖外部配置数据、且与本次要修的 CEO(Claude) 现场无关。建议 correctness 通过即可合，codex/coco owner 映射作为独立 config 后续。若你坚持要卡，请指出 codex/coco owner open_id 的可靠来源，我再补。
+
+**门槛#2（mixed allowlist 测试）**：已不适用——owner 判定不再用 allowlist（根因在此，直接移除比加测试更彻底）。
+
+**验证**：tsc0；直接测试 51 全绿；context/identity/chat-mode/subtask 集群 537 passed / 1 failed（`subtask-workflow-opt-123.ts` 的 `child→parent 上报不加该规则`，已在 **master 上复现同一失败**=既有 baseline 红，与本改动无关）。

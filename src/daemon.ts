@@ -2174,7 +2174,8 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // Resolve sender identity for <sender> tag injection. The first call to
   // resolveSender for an unseen open_id may await contact.v3.user.get with a
   // short budget; subsequent calls hit the cache and are sync-fast.
-  const newTopicSender = await resolveSender(larkAppId, senderOpenId, parsed.senderType);
+  // per-chat owner：新话题的发起人即本会话 owner（session.ownerOpenId 上面已置为 senderOpenId）。
+  const newTopicSender = await resolveSender(larkAppId, senderOpenId, parsed.senderType, undefined, senderOpenId);
 
   refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
 
@@ -2430,11 +2431,14 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   const getThreadSender = async (): Promise<typeof threadSenderCached> => {
     if (threadSenderResolved) return threadSenderCached;
     threadSenderResolved = true;
+    // per-chat owner：本会话发起人（session.ownerOpenId，取自本聊天 app 视角）。
+    const chatOwnerOpenId = activeSessions.get(sessionKey(anchor, larkAppId))?.session?.ownerOpenId;
     threadSenderCached = await resolveSender(
       larkAppId,
       senderOpenIdForPrefix,
       parsed.senderType,
       isForeignBot ? { type: 'bot', name: foreignBotName !== 'Bot' ? foreignBotName : undefined } : undefined,
+      chatOwnerOpenId,
     );
     return threadSenderCached;
   };
