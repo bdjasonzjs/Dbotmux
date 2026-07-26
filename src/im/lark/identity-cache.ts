@@ -301,6 +301,18 @@ export function classifySenderRole(args: {
 }
 
 /**
+ * 解析一条回复所属会话的 owner open_id（喂给 classifySenderRole 的 chatOwnerOpenId）。
+ * 修复蔻黛克斯 R4 blocker：`handleThreadReply` 的 **auto-create 首轮**在 `activeSessions.set`
+ * 之前就解析 sender，此时 activeSessions 还没有这个会话 → `activeSessionOwnerOpenId` 为空。
+ * 但 auto-create 恰恰把新会话的 `ownerOpenId` 置为**当前发言人**（daemon: `session.ownerOpenId = senderOId`），
+ * 所以「已注册会话 owner 缺失时回退到当前发言人」与 auto-create 即将写入的 owner **恒等**，
+ * 首轮即可正确认出 owner；正常 follow-up（会话已注册）仍用既有 owner（可与发言人不同）。
+ */
+export function chatOwnerForReply(activeSessionOwnerOpenId: string | undefined, senderOpenId: string | undefined): string | undefined {
+  return activeSessionOwnerOpenId ?? senderOpenId;
+}
+
+/**
  * Resolve sender identity for prompt injection.
  *
  * Inputs are taken directly from the Lark event (`sender_id.open_id`,

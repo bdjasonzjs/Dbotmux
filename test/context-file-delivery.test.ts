@@ -481,4 +481,13 @@ describe('renderSenderTag：role 属性 + 一行含义', () => {
     expect(tag).not.toContain('role=');
     expect(tag).not.toContain('<!--');
   });
+
+  it('首轮 prompt（buildNewTopicPrompt，auto-create 也走它）携带 sender role=owner', () => {
+    // auto-create 首轮把 role=owner 的 sender 传给 buildNewTopicPrompt（见 daemon autoCreateSender）
+    const prompt = buildNewTopicPrompt('hi', SID, 'claude-code',
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      { openId: 'ou_creator', type: 'user', name: '邹劲松', role: 'owner' }, 'oc_ac', APP);
+    expect(prompt).toContain('role="owner"');
+    expect(prompt).toContain('本会话的发起人');
+  });
 });

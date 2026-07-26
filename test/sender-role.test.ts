@@ -85,3 +85,32 @@ describe('resolveSender 集成 role（owner 源 = 传入的本会话 ownerOpenId
     expect(contactGet).not.toHaveBeenCalled();
   });
 });
+
+// 蔻黛克斯 R4 blocker：auto-create 首轮在 activeSessions.set 之前解析 sender，
+// activeSessionOwner 拿不到 → 必须回退到当前发言人（= auto-create 即将写入的 owner）。
+describe('chatOwnerForReply（auto-create 首轮 owner 回退）', () => {
+  it('已注册会话 owner 存在 → 用它（正常 follow-up，可与发言人不同）', async () => {
+    const { chatOwnerForReply } = await freshIdentity();
+    expect(chatOwnerForReply('ou_owner', 'ou_guest')).toBe('ou_owner');
+  });
+  it('会话未注册（auto-create 首轮）→ 回退到当前发言人', async () => {
+    const { chatOwnerForReply } = await freshIdentity();
+    expect(chatOwnerForReply(undefined, 'ou_creator')).toBe('ou_creator');
+  });
+
+  it('端到端：auto-create 首轮（无 activeSession）→ 发言人被认出 owner', async () => {
+    const identity = await freshIdentity();
+    contactGet.mockResolvedValue({ code: 0, data: { user: { name: '邹劲松', email: 'z@x.com' } } });
+    const owner = identity.chatOwnerForReply(undefined, 'ou_creator'); // 无会话 → 回退发言人
+    const sender = await identity.resolveSender('cli_app', 'ou_creator', 'user', undefined, owner);
+    expect(sender?.role).toBe('owner');
+  });
+
+  it('端到端：follow-up 中非发起人发言 → external（用既有会话 owner）', async () => {
+    const identity = await freshIdentity();
+    contactGet.mockResolvedValue({ code: 0, data: { user: { name: '路人', email: 'p@x.com' } } });
+    const owner = identity.chatOwnerForReply('ou_creator', 'ou_guest'); // 会话已注册 → 用既有 owner
+    const sender = await identity.resolveSender('cli_app', 'ou_guest', 'user', undefined, owner);
+    expect(sender?.role).toBe('external');
+  });
+});

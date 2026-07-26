@@ -85,7 +85,7 @@ import {
 import { EventLog as WorkflowEventLog } from './workflows/events/append.js';
 import { replay as replayWorkflow } from './workflows/events/replay.js';
 import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, writeBotInfoFile, canOperate, isKnownPeerBot, checkRequiredScopes, type RoutingContext } from './im/lark/event-dispatcher.js';
-import { learnFromMentions, resolveSender, flushIdentityCacheSync } from './im/lark/identity-cache.js';
+import { learnFromMentions, resolveSender, chatOwnerForReply, flushIdentityCacheSync } from './im/lark/identity-cache.js';
 import { renderSenderTag } from './core/session-manager.js';
 import { markSessionActivity } from './core/session-activity.js';
 import { applyInputStartedMetadata } from './core/input-started-metadata.js';
@@ -2432,7 +2432,12 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     if (threadSenderResolved) return threadSenderCached;
     threadSenderResolved = true;
     // per-chat owner：本会话发起人（session.ownerOpenId，取自本聊天 app 视角）。
-    const chatOwnerOpenId = activeSessions.get(sessionKey(anchor, larkAppId))?.session?.ownerOpenId;
+    // auto-create 首轮此时 activeSessions 尚未 set（见 chatOwnerForReply 注释）→ 回退到当前发言人，
+    // 与 auto-create 即将写入的 ownerOpenId(=senderOId) 恒等，首轮即可认出 owner。
+    const chatOwnerOpenId = chatOwnerForReply(
+      activeSessions.get(sessionKey(anchor, larkAppId))?.session?.ownerOpenId,
+      senderOpenIdForPrefix,
+    );
     threadSenderCached = await resolveSender(
       larkAppId,
       senderOpenIdForPrefix,

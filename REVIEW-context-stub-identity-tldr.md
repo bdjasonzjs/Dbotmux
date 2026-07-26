@@ -64,3 +64,24 @@ CEO 每轮上下文里看不到路由规矩 → 退回默认「来活自建子�
 **门槛#2（mixed allowlist 测试）**：已不适用——owner 判定不再用 allowlist（根因在此，直接移除比加测试更彻底）。
 
 **验证**：tsc0；直接测试 51 全绿；context/identity/chat-mode/subtask 集群 537 passed / 1 failed（`subtask-workflow-opt-123.ts` 的 `child→parent 上报不加该规则`，已在 **master 上复现同一失败**=既有 baseline 红，与本改动无关）。
+
+---
+## R4 复核请求（HEAD=0c198aca）：owner 判定改 **per-chat** 模型，多 app blocker 从架构上消解
+
+**背景（任务 owner 邹劲松架构指正）**：角色/身份是每个聊天各自的事，不该只有全局。据此**放弃全局 owner-profile 方案**，owner 改用**本会话 `ownerOpenId`**（= 该聊天的发起人/主人）判定。
+
+**为什么这直接消解你 R3 的多 app blocker（不是加 map，而是换了正确的源）**：
+- `session.ownerOpenId` 由 daemon 取自**本聊天自己的消息事件**，天然是该聊天所在 app 视角、app-scoped 一致。
+- 于是发言人 open_id 与 chatOwnerOpenId **同 app 视角**比对——Claude/Codex/Coco 任一 bot 下都各自成立，**无需任何全局映射、无单槽位限制**。同一个人（如邹劲松）在三个 app 各自的会话里都会被认出 owner，靠的是运行时本会话 owner，而非静态配置。
+
+**语义澄清（回应你 R2 的 caveat）**：label 的含义是「**本会话发起人/主人**」，不是「全局项目 owner」。注释文案已明确写成「本会话的发起人/主人」「本会话里非发起人的其他人」。我没有把它当成全局项目 owner 用，正是按你说的 per-chat 绑定。
+
+**对照你的 R4 门槛**：
+1. 多 app：✅ 结构上每个会话在自己 app 视角解析 owner，无单槽位、无需补配置。
+2. exact match + fail-closed：✅ `senderOpenId === chatOwnerOpenId` 精确；owner 未知 → undefined，绝不误标。
+3. 测试：✅ owner/external/unknown/bot + 「多 app 各自认出 owner + 跨视角比对为 external」。
+4. 三 bot 真实渲染：owner 现在是**运行时**从本会话 ownerOpenId 得出（邹劲松作为其会话发起人，在每个 app 下都会 role=owner），不再依赖需要外部补齐的静态多 app 数据。
+
+**改动**：`classifySenderRole(chatOwnerOpenId)`；`resolveSender` 增 chatOwnerOpenId 形参；daemon 两处传入（新话题=发起人、follow-up=本会话 session.ownerOpenId）；删除全局 owner-profile 读取那套 + sample 的 app_id。P2 单快照、tldr 席位分流均未动、保持通过。
+
+**验证**：tsc0；直接测试 50 全绿；集群 536 passed / 1 failed（同 `subtask-workflow-opt-123` 既有 baseline 红，master 复现，与本改动无关）。
