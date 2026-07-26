@@ -39,10 +39,13 @@ vi.mock('../src/core/worker-pool.js', () => ({
   forkWorker: vi.fn(), killStalePids: vi.fn(), getCurrentCliVersion: vi.fn(() => '1.0.0'),
 }));
 
-// 子任务 store：可变 holder，测「finished → 块消失 → version 变化」
-const subtaskState = vi.hoisted(() => ({ task: null as any }));
+// 子任务 store：可变 holder，测「finished → 块消失 → version 变化」；calls 计数用于 P2 单快照验证。
+const subtaskState = vi.hoisted(() => ({ task: null as any, calls: 0 }));
 vi.mock('../src/services/subtask-store.js', () => ({
-  getByChatId: (chatId: string) => (subtaskState.task && subtaskState.task.chatId === chatId ? subtaskState.task : null),
+  getByChatId: (chatId: string) => {
+    subtaskState.calls++;
+    return subtaskState.task && subtaskState.task.chatId === chatId ? subtaskState.task : null;
+  },
 }));
 
 import { mkdirSync, writeFileSync, existsSync, rmSync, readFileSync } from 'node:fs';
@@ -82,6 +85,7 @@ beforeAll(() => {
 beforeEach(() => {
   __resetContextFileCacheForTesting();
   subtaskState.task = null;
+  subtaskState.calls = 0;
   rmrf(CTX_ROOT);
   rmrf(`${DATA}/context-delivery`);
   rmrf(`${DATA}/chat-contexts`);
@@ -447,6 +451,17 @@ describe('tldr：behavioral 块的一行精华每轮进 stub（file 模式）', 
     // 没有子任务 → 无 subtask 精华；但 output_discipline 仍在 → 仍有要点块
     expect(prompt).not.toContain('执行者(main)');
     expect(prompt).toContain('说做分离：一回合');
+  });
+
+  it('⚠️P2：全文块与 tldr 单轮共用同一 task 快照（getByChatId 每轮只读一次，杜绝双读串味）', () => {
+    setContextDelivery(CHAT, 'file');
+    subtaskState.task = seatTask('main');
+    subtaskState.calls = 0;
+    buildNewTopicPrompt('hi', SID, 'claude-code',
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      { openId: 'ou_sender', type: 'user', name: '张三' }, CHAT, APP);
+    // 全文 render + tldr 两处都要 task，但本轮只允许读一次 store（WeakMap 单快照）
+    expect(subtaskState.calls).toBe(1);
   });
 });
 

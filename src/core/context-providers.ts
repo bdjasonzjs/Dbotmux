@@ -194,6 +194,24 @@ export function buildOutputDisciplineBlock(): string {
  * getByChatId corrupt 会抛 StoreCorruptError → try/catch 兜住，**注入失败绝不阻塞 spawn / 发消息**。
  */
 type SeatRole = 'main' | 'collab' | 'observer';
+type SubtaskSnapshot = ReturnType<typeof subtaskStore.getByChatId>;
+
+/** 单快照（蔻黛克斯 R2 P2）：subtasks.json 是**跨进程文件**、每次 getByChatId 都重读，
+ *  全文块与 tldr 若各读一次，两次同步读之间可能被别的进程 atomic-rename → 席位在单轮内串味
+ *  （文件写 reviewer、stub 写执行者）。故按「本轮构建」memo 一次读取，全文与 tldr 共用同一 task。
+ *  ctx 每轮构建都是新对象（WeakMap 天然按轮隔离，无跨轮陈旧）。 */
+const subtaskSnapshotByBuild = new WeakMap<BuildCtx, { task: SubtaskSnapshot }>();
+function getSubtaskForBuild(ctx: BuildCtx): SubtaskSnapshot {
+  const hit = subtaskSnapshotByBuild.get(ctx);
+  if (hit) return hit.task;
+  let task: SubtaskSnapshot = null;
+  if (ctx.chatId) {
+    try { task = subtaskStore.getByChatId(ctx.chatId); }
+    catch (err) { logger.warn(`[context-providers] subtask lookup failed for ${ctx.chatId}: ${err}`); task = null; }
+  }
+  subtaskSnapshotByBuild.set(ctx, { task });
+  return task;
+}
 
 /** 解析本 bot 在某子任务里的席位（供 block 全文 + tldr 共用，避免两处 drift）。 */
 function resolveSelfSeat(task: NonNullable<ReturnType<typeof subtaskStore.getByChatId>>, larkAppId: string): { selfOpenId: string | null; seat: SeatRole | undefined } {
@@ -210,8 +228,7 @@ function resolveSelfSeat(task: NonNullable<ReturnType<typeof subtaskStore.getByC
  *  gate 与 buildSubtaskMemberBlock 完全一致（同 getByChatId + 终态守卫），保证「块渲染 ⇔ 精华出现」。 */
 function subtaskMemberTldr(ctx: BuildCtx): string {
   if (!ctx.chatId || !ctx.larkAppId) return '';
-  let task: ReturnType<typeof subtaskStore.getByChatId>;
-  try { task = subtaskStore.getByChatId(ctx.chatId); } catch { return ''; }
+  const task = getSubtaskForBuild(ctx); // 与全文块同一快照（P2）
   if (!task || task.status === 'finished' || task.status === 'stopped') return '';
   const { seat } = resolveSelfSeat(task, ctx.larkAppId);
   const esc = '卡住/岔路用 `subtask-askforhelp` 逐级上报父群，严禁直接 @ / 惊动 owner';
@@ -221,11 +238,15 @@ function subtaskMemberTldr(ctx: BuildCtx): string {
   return `你在子任务子群干活：按本群【你的角色】推进；${esc}。`;
 }
 
-export function buildSubtaskMemberBlock(chatId: string | undefined, larkAppId: string | undefined): string {
+export function buildSubtaskMemberBlock(chatId: string | undefined, larkAppId: string | undefined, taskArg?: SubtaskSnapshot): string {
   if (!chatId || !larkAppId) return '';
-  let task: ReturnType<typeof subtaskStore.getByChatId>;
-  try { task = subtaskStore.getByChatId(chatId); }
-  catch (err) { logger.warn(`[context-providers] subtask member lookup failed for ${chatId}: ${err}`); return ''; }
+  // taskArg 传入（含 null）= 用本轮共享快照（与 tldr 同一 task，避免双读串味）；未传 = 自行读取（兼容旧调用/测试）。
+  let task: SubtaskSnapshot;
+  if (taskArg !== undefined) task = taskArg;
+  else {
+    try { task = subtaskStore.getByChatId(chatId); }
+    catch (err) { logger.warn(`[context-providers] subtask member lookup failed for ${chatId}: ${err}`); return ''; }
+  }
   if (!task) return '';
   if (task.status === 'finished' || task.status === 'stopped') return ''; // 终态不再注入
 
@@ -350,8 +371,8 @@ registerContextProvider({
   delivery: 'file',
   inlineRounds: 'all',
   applies: () => true, // 真实 gate（active 子任务命中）在 render 内，返 '' 即不注入
-  render: ctx => buildSubtaskMemberBlock(ctx.chatId, ctx.larkAppId),
-  // 按席位分流的一行精华（main/collab/observer 各不同，见 subtaskMemberTldr）。
+  render: ctx => buildSubtaskMemberBlock(ctx.chatId, ctx.larkAppId, getSubtaskForBuild(ctx)),
+  // 按席位分流的一行精华（main/collab/observer 各不同，见 subtaskMemberTldr）；与全文同一快照。
   tldr: subtaskMemberTldr,
 });
 

@@ -4,6 +4,9 @@
   "owner": {
     "name": "YOUR_NAME（中文名 / 英文名 / 昵称都行）",
     "open_id": "ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "_open_id_note": "open_id 是 app-scoped（同一人在不同 app 下 open_id 不同）。此处填 owner 在 app_id 所指那个 app 视角下的 open_id。",
+    "app_id": "cli_xxxxxxxxxxxxxxxx",
+    "_app_id_note": "上面 open_id 属于哪个 bot app（如主 CEO bot 的 larkAppId）。<sender role> 仅在消息所属 app === 此 app_id 时才据 open_id 判定 owner，避免跨 app 误判。缺此字段则不产出 owner 标。",
     "responsibilities": {
       "business": "你的业务职责一句话（如：豆包 computer use 开发）",
       "technical": "你的技术职责一句话（如：团队 AI 工作流优化）"

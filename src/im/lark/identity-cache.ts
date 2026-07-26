@@ -20,7 +20,7 @@
  */
 import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
-import { getBotClient, getOwnerOpenId } from '../../bot-registry.js';
+import { getBotClient } from '../../bot-registry.js';
 import { config } from '../../config.js';
 import { logger } from '../../utils/logger.js';
 
@@ -283,26 +283,22 @@ export interface ResolvedSender {
 }
 
 /**
- * 发言人身份分类（纯函数，便于全边界测试）。核心不变式：**owner 不可确证时返回 undefined，
- * 绝不据此断言 external**（蔻黛克斯 review blocker 1：owner 未配置时不能把所有真人误标 external，
- * 尤其邹劲松会被误判）。
- *  - `appOwnerOpenId`     ：`getOwnerOpenId(larkAppId)` —— 本 app 视角的权威 owner（可能未配置=undefined）
- *  - `profileOwnerOpenId` ：owner-profile 里的 owner open_id —— **仅用于正向确认 owner**，
- *    绝不用它断言 external（它是单一 app 视角、app-scoped，跨 app「不相等」不代表不是 owner）。
+ * 发言人身份分类（纯函数，便于全边界测试）。两条核心不变式（蔻黛克斯 R1/R2 blocker）：
+ *  ① owner 源必须**与当前 app 绑定且已确证**——绝不用 allowlist 首项当 owner（email 解析会打乱
+ *     顺序，把普通授权用户误当 owner，是授权级误判）；也绝不用无 scope 的 open_id 做跨 app 比对。
+ *  ② owner 不可确证时返回 undefined，**绝不**据此把真人断言成 external。
+ *
+ * `scopedOwnerOpenId`：**已证明适用于当前 larkAppId** 的 owner open_id（调用方保证 app_id 匹配才传入）；
+ *  无法为当前 app 确证 owner 时不传（=undefined）→ 该 app 下不产出 owner/external 标（只 unknown）。
  */
 export function classifySenderRole(args: {
   senderType: 'user' | 'bot';
   senderOpenId: string;
-  appOwnerOpenId?: string;
-  profileOwnerOpenId?: string;
+  scopedOwnerOpenId?: string;
 }): ResolvedSender['role'] {
   if (args.senderType === 'bot') return 'bot';
-  const { senderOpenId, appOwnerOpenId, profileOwnerOpenId } = args;
-  // 本 app 有权威 owner 配置 → 可做完整三分（相等=owner，不等=可确证的 external）。
-  if (appOwnerOpenId) return senderOpenId === appOwnerOpenId ? 'owner' : 'external';
-  // 无 app 级配置 → 只用 owner-profile 做 owner 的**正向**确认；确认不了就 unknown（不猜）。
-  if (profileOwnerOpenId && senderOpenId === profileOwnerOpenId) return 'owner';
-  return undefined;
+  if (!args.scopedOwnerOpenId) return undefined; // 当前 app 无已确证 owner → 不猜
+  return args.senderOpenId === args.scopedOwnerOpenId ? 'owner' : 'external';
 }
 
 /**
@@ -342,33 +338,37 @@ export async function resolveSender(
     name = name ?? resolved?.name;
     email = resolved?.email;
   }
-  // 身份分类（app-scoped owner + owner-profile 正向兜底）。任何失败都不阻塞发消息。
+  // 身份分类：owner 只用 **app-scope 已确证** 的来源（owner-profile 的 open_id 且 app_id 匹配）。
+  // 任何失败都不阻塞发消息。
   let role: ResolvedSender['role'];
   try {
-    let appOwner: string | undefined;
-    try { appOwner = getOwnerOpenId(larkAppId); } catch { appOwner = undefined; }
     role = classifySenderRole({
       senderType: type,
       senderOpenId: openId,
-      appOwnerOpenId: appOwner,
-      profileOwnerOpenId: ownerProfileOpenId(),
+      scopedOwnerOpenId: scopedOwnerOpenId(larkAppId),
     });
   } catch { role = undefined; }
   return { openId, type, name, email, role };
 }
 
-/** owner-profile.json 里 owner.open_id 的**轻量、memoized** 读取（避免每条消息文件 IO，
- *  也避开 import owner-profile 模块引入 digest-store 等重依赖）。owner 半年才改一次，
- *  变更后 daemon 重启即刷新。仅用于 classifySenderRole 的 owner **正向**确认。 */
-let ownerProfileIdCache: string | null | undefined;
-export function __resetOwnerProfileIdCacheForTesting(): void { ownerProfileIdCache = undefined; }
-function ownerProfileOpenId(): string | undefined {
-  if (ownerProfileIdCache === undefined) {
+/** owner-profile.json 的**轻量、memoized** 读取（避免每消息文件 IO，也避开 import owner-profile
+ *  模块引入 digest-store 等重依赖）。owner 半年才改一次，变更后 daemon 重启即刷新。
+ *  仅当 profile 记录的 **app_id === 当前 larkAppId** 时才返回其 owner open_id（scope 匹配才确证，
+ *  杜绝跨 app open_id 误判——蔻黛克斯 R2 P1-B）。缺 app_id / open_id → undefined（不确证）。 */
+let ownerProfileCache: { openId: string; appId: string } | null | undefined;
+export function __resetOwnerProfileIdCacheForTesting(): void { ownerProfileCache = undefined; }
+function scopedOwnerOpenId(larkAppId: string): string | undefined {
+  if (ownerProfileCache === undefined) {
+    ownerProfileCache = null;
     try {
       const fp = join(config.session.dataDir, 'owner-profile.json');
-      const id = existsSync(fp) ? JSON.parse(readFileSync(fp, 'utf-8'))?.owner?.open_id : undefined;
-      ownerProfileIdCache = typeof id === 'string' && id.startsWith('ou_') ? id : null;
-    } catch { ownerProfileIdCache = null; }
+      if (existsSync(fp)) {
+        const o = JSON.parse(readFileSync(fp, 'utf-8'))?.owner;
+        if (typeof o?.open_id === 'string' && o.open_id.startsWith('ou_') && typeof o?.app_id === 'string' && o.app_id) {
+          ownerProfileCache = { openId: o.open_id, appId: o.app_id };
+        }
+      }
+    } catch { ownerProfileCache = null; }
   }
-  return ownerProfileIdCache ?? undefined;
+  return ownerProfileCache && ownerProfileCache.appId === larkAppId ? ownerProfileCache.openId : undefined;
 }
