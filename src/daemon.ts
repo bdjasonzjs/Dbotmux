@@ -2431,13 +2431,14 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   const getThreadSender = async (): Promise<typeof threadSenderCached> => {
     if (threadSenderResolved) return threadSenderCached;
     threadSenderResolved = true;
-    // per-chat owner：本会话发起人（session.ownerOpenId，取自本聊天 app 视角）。
-    // auto-create 首轮此时 activeSessions 尚未 set（见 chatOwnerForReply 注释）→ 回退到当前发言人，
-    // 与 auto-create 即将写入的 ownerOpenId(=senderOId) 恒等，首轮即可认出 owner。
-    const chatOwnerOpenId = chatOwnerForReply(
-      activeSessions.get(sessionKey(anchor, larkAppId))?.session?.ownerOpenId,
-      senderOpenIdForPrefix,
-    );
+    // per-chat owner：三态严格区分（见 chatOwnerForReply）。传入「会话是否已注册」以区分
+    // auto-create 首轮（无会话→当前发言人）与「有会话但 owner 缺失」（旧数据→fail-closed undefined，不猜）。
+    const ownerDs = activeSessions.get(sessionKey(anchor, larkAppId));
+    const chatOwnerOpenId = chatOwnerForReply({
+      sessionExists: !!ownerDs,
+      sessionOwnerOpenId: ownerDs?.session?.ownerOpenId,
+      senderOpenId: senderOpenIdForPrefix,
+    });
     threadSenderCached = await resolveSender(
       larkAppId,
       senderOpenIdForPrefix,

@@ -301,15 +301,18 @@ export function classifySenderRole(args: {
 }
 
 /**
- * 解析一条回复所属会话的 owner open_id（喂给 classifySenderRole 的 chatOwnerOpenId）。
- * 修复蔻黛克斯 R4 blocker：`handleThreadReply` 的 **auto-create 首轮**在 `activeSessions.set`
- * 之前就解析 sender，此时 activeSessions 还没有这个会话 → `activeSessionOwnerOpenId` 为空。
- * 但 auto-create 恰恰把新会话的 `ownerOpenId` 置为**当前发言人**（daemon: `session.ownerOpenId = senderOId`），
- * 所以「已注册会话 owner 缺失时回退到当前发言人」与 auto-create 即将写入的 owner **恒等**，
- * 首轮即可正确认出 owner；正常 follow-up（会话已注册）仍用既有 owner（可与发言人不同）。
+ * 解析一条回复所属会话的 owner open_id（喂给 classifySenderRole 的 chatOwnerOpenId）。三态严格区分
+ * （蔻黛克斯 R4→R5 blocker）：
+ *  - **无 active session**（auto-create 首轮，`activeSessions` 尚未 set）：owner = 当前发言人——
+ *    因为 auto-create 恰把新会话 `ownerOpenId` 置为当前发言人（daemon: `session.ownerOpenId = senderOId`），二者恒等。
+ *  - **有 session 且 owner 已知**：用既有 owner（正常 follow-up，可与发言人不同）。
+ *  - **有 session 但 owner 缺失**（旧数据/恢复态，实测存在 22 个）：**fail-closed 返回 undefined，绝不回退发言人**
+ *    （否则会把任意发言人误标 owner，抬高信任级别）。
+ * 只用 owner 值无法区分后两类，故必须显式传入 `sessionExists`。
  */
-export function chatOwnerForReply(activeSessionOwnerOpenId: string | undefined, senderOpenId: string | undefined): string | undefined {
-  return activeSessionOwnerOpenId ?? senderOpenId;
+export function chatOwnerForReply(args: { sessionExists: boolean; sessionOwnerOpenId?: string; senderOpenId?: string }): string | undefined {
+  if (args.sessionExists) return args.sessionOwnerOpenId; // 有会话：用既有 owner；缺失→undefined（不猜）
+  return args.senderOpenId; // 无会话（auto-create 首轮）：当前发言人即将成为 owner
 }
 
 /**

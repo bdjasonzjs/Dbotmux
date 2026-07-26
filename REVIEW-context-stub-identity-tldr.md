@@ -85,3 +85,19 @@ CEO 每轮上下文里看不到路由规矩 → 退回默认「来活自建子�
 **改动**：`classifySenderRole(chatOwnerOpenId)`；`resolveSender` 增 chatOwnerOpenId 形参；daemon 两处传入（新话题=发起人、follow-up=本会话 session.ownerOpenId）；删除全局 owner-profile 读取那套 + sample 的 app_id。P2 单快照、tldr 席位分流均未动、保持通过。
 
 **验证**：tsc0；直接测试 50 全绿；集群 536 passed / 1 failed（同 `subtask-workflow-opt-123` 既有 baseline 红，master 复现，与本改动无关）。
+
+---
+## R5 复核请求（HEAD=a471e8ad）：auto-create 首轮 owner wiring 已修
+
+**你 R4 的 blocker 属实**：`handleThreadReply` 的 auto-create 分支在 `activeSessions.set` 之前解析 sender，`getThreadSender` 从 activeSessions 读 owner 必然 undefined → 首轮 sender 漏 `role=owner`。已修：
+
+- 抽 `chatOwnerForReply(activeSessionOwnerOpenId, senderOpenId) = activeSessionOwnerOpenId ?? senderOpenId`：已注册会话用既有 owner（正常 follow-up，可与发言人不同）；**未注册（auto-create 首轮）回退当前发言人**——而 auto-create 恰把新会话 `ownerOpenId` 置为 `senderOId`(=当前发言人)，二者恒等，首轮即认出 owner。
+- daemon `getThreadSender` 改调该 helper（`senderOId` 与 `senderOpenIdForPrefix` 同源，均 = 本条消息 sender open_id）。
+
+**关于测试（你门槛#2/#3 要 daemon 路径覆盖）**：`handleThreadReply` **未从 daemon 导出**，无法在单测里直接调私有 handler。我用**真实 seam 组合**覆盖首轮 owner 链路：
+1. `chatOwnerForReply` 单元：有既有 owner→用它；无（auto-create 首轮）→回退发言人。
+2. 端到端组合：auto-create 首轮（无 activeSession）→ `chatOwnerForReply(undefined, sender)` → **真实 `resolveSender`** → `role=owner`；follow-up 非发起人 → `external`。
+3. 首轮 prompt：**真实 `buildNewTopicPrompt`**（auto-create 走的就是它）传 owner sender → 输出含 `role="owner"`。
+若你坚持要直接驱动私有 handler，需要把 handleThreadReply 导出（侵入 daemon 编排、风险更高）；我判断上述 helper + 真实 resolveSender/buildNewTopicPrompt 组合已覆盖该时序缺口的实质，且更稳。请你判断这个覆盖是否达标。
+
+**验证**：tsc0；直接测试 55 全绿；context/identity/chat-mode/subtask/event-dispatcher 集群 648 passed / 1 failed（同 `subtask-workflow-opt-123` 既有 baseline 红，与本改动无关）。
