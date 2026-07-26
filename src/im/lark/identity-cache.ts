@@ -270,6 +270,49 @@ export interface ResolvedSender {
   type: 'user' | 'bot';
   name?: string;
   email?: string;
+  /**
+   * 本条发言人相对本 bot 的身份分类（file 模式下每轮兜底：即使不读身份文件，也一眼知道
+   * 跟自己说话的是不是项目主人 / bot / 外人 —— 决定能否听其写操作、用什么口吻）。
+   *  - 'owner'    ：可**确证**是项目主人（open_id === 本 app 视角已知 owner）
+   *  - 'bot'      ：发言人是一个 bot（只证明是机器人，不代表可信队友）
+   *  - 'external' ：可**确证**的其他真人（已知 owner 且 ≠ 发言人）
+   *  - undefined  ：owner 无法确证时**不猜**（绝不把未知者误标成 external / owner）
+   * open_id 是 app-scoped，故 owner 判定必须同 app 视角比对（见 classifySenderRole）。
+   */
+  role?: 'owner' | 'bot' | 'external';
+}
+
+/**
+ * 发言人身份分类（纯函数，便于全边界测试）。**per-chat 模型**（2026-07-26 邹劲松指出：角色是每个
+ * 聊天各自的事、不该只有全局）：owner 判定用**本会话的 ownerOpenId**（= 这个聊天的发起人/主人）。
+ *  - 该值由 daemon 从**本聊天的消息事件**里取，天然是该聊天所在 app 视角、app-scoped 一致——
+ *    因此在 Claude/Codex/Coco 任一 bot 下都能正确认出 owner，**无需任何全局多 app 映射**。
+ * 不变式：owner 不可知（chatOwnerOpenId 缺）→ undefined，绝不据此把真人误标 external。
+ */
+export function classifySenderRole(args: {
+  senderType: 'user' | 'bot';
+  senderOpenId: string;
+  /** 本会话 ownerOpenId（发起人/主人）；缺失（无会话/未知）→ 不产出 owner/external，只 undefined。 */
+  chatOwnerOpenId?: string;
+}): ResolvedSender['role'] {
+  if (args.senderType === 'bot') return 'bot';
+  if (!args.chatOwnerOpenId) return undefined; // 本会话 owner 未知 → 不猜
+  return args.senderOpenId === args.chatOwnerOpenId ? 'owner' : 'external';
+}
+
+/**
+ * 解析一条回复所属会话的 owner open_id（喂给 classifySenderRole 的 chatOwnerOpenId）。三态严格区分
+ * （蔻黛克斯 R4→R5 blocker）：
+ *  - **无 active session**（auto-create 首轮，`activeSessions` 尚未 set）：owner = 当前发言人——
+ *    因为 auto-create 恰把新会话 `ownerOpenId` 置为当前发言人（daemon: `session.ownerOpenId = senderOId`），二者恒等。
+ *  - **有 session 且 owner 已知**：用既有 owner（正常 follow-up，可与发言人不同）。
+ *  - **有 session 但 owner 缺失**（旧数据/恢复态，实测存在 22 个）：**fail-closed 返回 undefined，绝不回退发言人**
+ *    （否则会把任意发言人误标 owner，抬高信任级别）。
+ * 只用 owner 值无法区分后两类，故必须显式传入 `sessionExists`。
+ */
+export function chatOwnerForReply(args: { sessionExists: boolean; sessionOwnerOpenId?: string; senderOpenId?: string }): string | undefined {
+  if (args.sessionExists) return args.sessionOwnerOpenId; // 有会话：用既有 owner；缺失→undefined（不猜）
+  return args.senderOpenId; // 无会话（auto-create 首轮）：当前发言人即将成为 owner
 }
 
 /**
@@ -287,6 +330,9 @@ export async function resolveSender(
   openId: string | undefined,
   senderType: string | undefined,
   hint?: { name?: string; type?: 'user' | 'bot' },
+  /** 本会话 ownerOpenId（发起人）——per-chat owner 判定，见 classifySenderRole。调用方从
+   *  DaemonSession.ownerOpenId 传入（它取自本聊天事件、天然同 app 视角）。 */
+  chatOwnerOpenId?: string,
 ): Promise<ResolvedSender | undefined> {
   if (!openId) return undefined;
 
@@ -309,5 +355,11 @@ export async function resolveSender(
     name = name ?? resolved?.name;
     email = resolved?.email;
   }
-  return { openId, type, name, email };
+  // 身份分类（per-chat）：owner = 本会话发起人（chatOwnerOpenId，取自本聊天 app 视角）。
+  // 任何失败都不阻塞发消息。
+  let role: ResolvedSender['role'];
+  try {
+    role = classifySenderRole({ senderType: type, senderOpenId: openId, chatOwnerOpenId });
+  } catch { role = undefined; }
+  return { openId, type, name, email, role };
 }

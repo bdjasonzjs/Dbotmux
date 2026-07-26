@@ -39,14 +39,17 @@ vi.mock('../src/core/worker-pool.js', () => ({
   forkWorker: vi.fn(), killStalePids: vi.fn(), getCurrentCliVersion: vi.fn(() => '1.0.0'),
 }));
 
-// 子任务 store：可变 holder，测「finished → 块消失 → version 变化」
-const subtaskState = vi.hoisted(() => ({ task: null as any }));
+// 子任务 store：可变 holder，测「finished → 块消失 → version 变化」；calls 计数用于 P2 单快照验证。
+const subtaskState = vi.hoisted(() => ({ task: null as any, calls: 0 }));
 vi.mock('../src/services/subtask-store.js', () => ({
-  getByChatId: (chatId: string) => (subtaskState.task && subtaskState.task.chatId === chatId ? subtaskState.task : null),
+  getByChatId: (chatId: string) => {
+    subtaskState.calls++;
+    return subtaskState.task && subtaskState.task.chatId === chatId ? subtaskState.task : null;
+  },
 }));
 
 import { mkdirSync, writeFileSync, existsSync, rmSync, readFileSync } from 'node:fs';
-import { buildNewTopicPrompt, buildFollowUpContent } from '../src/core/session-manager.js';
+import { buildNewTopicPrompt, buildFollowUpContent, renderSenderTag } from '../src/core/session-manager.js';
 import { buildContextBlocks, buildOutputDisciplineBlock, renderContextRefStub } from '../src/core/context-providers.js';
 import {
   getContextDelivery, getContextDeliveryWithSource, setContextDelivery, setGlobalContextDelivery, clearContextDelivery,
@@ -82,6 +85,7 @@ beforeAll(() => {
 beforeEach(() => {
   __resetContextFileCacheForTesting();
   subtaskState.task = null;
+  subtaskState.calls = 0;
   rmrf(CTX_ROOT);
   rmrf(`${DATA}/context-delivery`);
   rmrf(`${DATA}/chat-contexts`);
@@ -367,5 +371,123 @@ describe('renderContextRefStub', () => {
     expect(stub).toContain('必须先 Read 该文件');
     expect(stub).toContain('红线速记');
     expect(stub).toContain('未经显式授权不 commit/push/deploy');
+  });
+
+  it('传入 tldrs → 每条一行精华（• 前缀）+ 要点小标题；空列表不加要点块', () => {
+    const withTldr = renderContextRefStub('/f.md', 'ab12cd34', ['先判归口交经理群', '说做分离']);
+    expect(withTldr).toContain('本群本轮要点');
+    expect(withTldr).toContain('• 先判归口交经理群');
+    expect(withTldr).toContain('• 说做分离');
+
+    const noTldr = renderContextRefStub('/f.md', 'ab12cd34', []);
+    expect(noTldr).not.toContain('本群本轮要点');
+    // 空白/纯空格项被过滤
+    const blanks = renderContextRefStub('/f.md', 'ab12cd34', ['   ', '']);
+    expect(blanks).not.toContain('本群本轮要点');
+  });
+});
+
+// ─── 一行精华 tldr：file 模式下从 provider 流进 stub ─────────────────────────────
+describe('tldr：behavioral 块的一行精华每轮进 stub（file 模式）', () => {
+  const CHAT = 'oc_tldr';
+  function activeTask(status = 'active'): any {
+    return {
+      taskId: 'st_tldr', chatId: CHAT, status, goal: '目标', acceptance: null,
+      bots: [{ name: '克劳德', openId: 'ou_self', role: 'main' }],
+    };
+  }
+
+  function seatTask(selfRole: 'main' | 'collab' | 'observer'): any {
+    return {
+      taskId: 'st_tldr', chatId: CHAT, status: 'active', goal: '目标', acceptance: null,
+      bots: [{ name: '克劳德', openId: 'ou_self', role: selfRole }], // mock getBot().botOpenId='ou_self'
+    };
+  }
+
+  it('执行者(main)：一行精华含 request-review；完整块进文件', () => {
+    setContextDelivery(CHAT, 'file');
+    subtaskState.task = seatTask('main');
+    const prompt = buildNewTopicPrompt('hi', SID, 'claude-code',
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      { openId: 'ou_sender', type: 'user', name: '张三' }, CHAT, APP);
+
+    expect(stubVersion(prompt)).not.toBeNull();
+    expect(prompt).toContain('本群本轮要点');
+    expect(prompt).toContain('执行者(main)');
+    expect(prompt).toContain('subtask-request-review');   // 执行者才有
+    expect(prompt).toContain('说做分离：一回合');           // output_discipline.tldr
+    expect(prompt).not.toContain('<subtask_member_routing>');
+    expect(readFileSync(contextFilePath(CHAT, APP), 'utf-8')).toContain('<subtask_member_routing>');
+  });
+
+  it('⚠️blocker2：reviewer(collab) 的精华不含 request-review、且写明只 review 不驱动', () => {
+    setContextDelivery(CHAT, 'file');
+    subtaskState.task = seatTask('collab');
+    const prompt = buildNewTopicPrompt('hi', SID, 'claude-code',
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      { openId: 'ou_sender', type: 'user', name: '张三' }, CHAT, APP);
+    expect(prompt).toContain('reviewer');
+    expect(prompt).toContain('不驱动任务');
+    expect(prompt).not.toContain('subtask-request-review'); // reviewer 不该被塞执行者动作
+  });
+
+  it('observer 的精华：只盯群不执行、无 request-review', () => {
+    setContextDelivery(CHAT, 'file');
+    subtaskState.task = seatTask('observer');
+    const prompt = buildNewTopicPrompt('hi', SID, 'claude-code',
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      { openId: 'ou_sender', type: 'user', name: '张三' }, CHAT, APP);
+    expect(prompt).toContain('观测者');
+    expect(prompt).not.toContain('subtask-request-review');
+  });
+
+  it('块不渲染（无 active 子任务）→ 该块不贡献精华', () => {
+    setContextDelivery(CHAT, 'file');
+    subtaskState.task = null;
+    writeChatContextFixture(CHAT, '普通群');
+    const prompt = buildNewTopicPrompt('hi', SID, 'claude-code',
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      { openId: 'ou_sender', type: 'user', name: '张三' }, CHAT, APP);
+    // 没有子任务 → 无 subtask 精华；但 output_discipline 仍在 → 仍有要点块
+    expect(prompt).not.toContain('执行者(main)');
+    expect(prompt).toContain('说做分离：一回合');
+  });
+
+  it('⚠️P2：全文块与 tldr 单轮共用同一 task 快照（getByChatId 每轮只读一次，杜绝双读串味）', () => {
+    setContextDelivery(CHAT, 'file');
+    subtaskState.task = seatTask('main');
+    subtaskState.calls = 0;
+    buildNewTopicPrompt('hi', SID, 'claude-code',
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      { openId: 'ou_sender', type: 'user', name: '张三' }, CHAT, APP);
+    // 全文 render + tldr 两处都要 task，但本轮只允许读一次 store（WeakMap 单快照）
+    expect(subtaskState.calls).toBe(1);
+  });
+});
+
+// ─── <sender> 身份分类渲染 ───────────────────────────────────────────────────
+describe('renderSenderTag：role 属性 + 一行含义', () => {
+  it('带 role=owner → 输出 role 属性 + owner 含义注释', () => {
+    const tag = renderSenderTag({ openId: 'ou_o', type: 'user', name: '邹劲松', role: 'owner' });
+    expect(tag).toContain('role="owner"');
+    expect(tag).toContain('本会话的发起人');
+  });
+  it('bot / external 各自的含义注释', () => {
+    expect(renderSenderTag({ openId: 'ou_b', type: 'bot', role: 'bot' })).toContain('机器人');
+    expect(renderSenderTag({ openId: 'ou_e', type: 'user', role: 'external' })).toContain('非发起人');
+  });
+  it('无 role（历史行为）→ 不加 role 属性、不加注释', () => {
+    const tag = renderSenderTag({ openId: 'ou_x', type: 'user', name: '张三' });
+    expect(tag).not.toContain('role=');
+    expect(tag).not.toContain('<!--');
+  });
+
+  it('首轮 prompt（buildNewTopicPrompt，auto-create 也走它）携带 sender role=owner', () => {
+    // auto-create 首轮把 role=owner 的 sender 传给 buildNewTopicPrompt（见 daemon autoCreateSender）
+    const prompt = buildNewTopicPrompt('hi', SID, 'claude-code',
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      { openId: 'ou_creator', type: 'user', name: '邹劲松', role: 'owner' }, 'oc_ac', APP);
+    expect(prompt).toContain('role="owner"');
+    expect(prompt).toContain('本会话的发起人');
   });
 });

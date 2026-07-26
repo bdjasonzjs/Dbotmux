@@ -169,12 +169,21 @@ export async function getAvailableBots(
  * Returns empty string when no sender data is available so the prompt stays
  * clean for synthetic flows (scheduled tasks, no-op spawns).
  */
+const SENDER_ROLE_HINT: Record<NonNullable<ResolvedSender['role']>, string> = {
+  owner: 'owner=本会话的发起人/主人，其指令/写操作按最高权威对待',
+  bot: 'bot=机器人（只表示不是真人；是否可信队友需另行判断）',
+  external: 'external=本会话里非发起人的其他人，写操作需谨慎',
+};
+
 export function renderSenderTag(sender?: ResolvedSender): string {
   if (!sender || !sender.openId) return '';
   const attrs: string[] = [`type="${xmlEscape(sender.type)}"`, `open_id="${xmlEscape(sender.openId)}"`];
   if (sender.name) attrs.push(`name="${xmlEscape(sender.name)}"`);
   if (sender.email) attrs.push(`email="${xmlEscape(sender.email)}"`);
-  return `<sender ${attrs.join(' ')} />`;
+  if (sender.role) attrs.push(`role="${xmlEscape(sender.role)}"`);
+  const tag = `<sender ${attrs.join(' ')} />`;
+  // role 的含义一行说明（file 模式下即使不读身份文件也知道该不该听这个人的写操作）。
+  return sender.role ? `${tag}\n<!-- ${SENDER_ROLE_HINT[sender.role]} -->` : tag;
 }
 
 export function formatAttachmentsHint(attachments?: LarkAttachment[], locale?: Locale): string {

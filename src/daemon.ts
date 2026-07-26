@@ -85,7 +85,7 @@ import {
 import { EventLog as WorkflowEventLog } from './workflows/events/append.js';
 import { replay as replayWorkflow } from './workflows/events/replay.js';
 import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, writeBotInfoFile, canOperate, isKnownPeerBot, checkRequiredScopes, type RoutingContext } from './im/lark/event-dispatcher.js';
-import { learnFromMentions, resolveSender, flushIdentityCacheSync } from './im/lark/identity-cache.js';
+import { learnFromMentions, resolveSender, chatOwnerForReply, flushIdentityCacheSync } from './im/lark/identity-cache.js';
 import { renderSenderTag } from './core/session-manager.js';
 import { markSessionActivity } from './core/session-activity.js';
 import { applyInputStartedMetadata } from './core/input-started-metadata.js';
@@ -2174,7 +2174,8 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // Resolve sender identity for <sender> tag injection. The first call to
   // resolveSender for an unseen open_id may await contact.v3.user.get with a
   // short budget; subsequent calls hit the cache and are sync-fast.
-  const newTopicSender = await resolveSender(larkAppId, senderOpenId, parsed.senderType);
+  // per-chat owner：新话题的发起人即本会话 owner（session.ownerOpenId 上面已置为 senderOpenId）。
+  const newTopicSender = await resolveSender(larkAppId, senderOpenId, parsed.senderType, undefined, senderOpenId);
 
   refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
 
@@ -2430,11 +2431,20 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   const getThreadSender = async (): Promise<typeof threadSenderCached> => {
     if (threadSenderResolved) return threadSenderCached;
     threadSenderResolved = true;
+    // per-chat owner：三态严格区分（见 chatOwnerForReply）。传入「会话是否已注册」以区分
+    // auto-create 首轮（无会话→当前发言人）与「有会话但 owner 缺失」（旧数据→fail-closed undefined，不猜）。
+    const ownerDs = activeSessions.get(sessionKey(anchor, larkAppId));
+    const chatOwnerOpenId = chatOwnerForReply({
+      sessionExists: !!ownerDs,
+      sessionOwnerOpenId: ownerDs?.session?.ownerOpenId,
+      senderOpenId: senderOpenIdForPrefix,
+    });
     threadSenderCached = await resolveSender(
       larkAppId,
       senderOpenIdForPrefix,
       parsed.senderType,
       isForeignBot ? { type: 'bot', name: foreignBotName !== 'Bot' ? foreignBotName : undefined } : undefined,
+      chatOwnerOpenId,
     );
     return threadSenderCached;
   };
