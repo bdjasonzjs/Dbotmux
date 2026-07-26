@@ -20,7 +20,7 @@
  */
 import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
-import { getBotClient } from '../../bot-registry.js';
+import { getBotClient, getOwnerOpenId } from '../../bot-registry.js';
 import { config } from '../../config.js';
 import { logger } from '../../utils/logger.js';
 
@@ -270,6 +270,15 @@ export interface ResolvedSender {
   type: 'user' | 'bot';
   name?: string;
   email?: string;
+  /**
+   * 本条发言人相对本 bot 的身份分类（file 模式下每轮兜底：即使不读身份文件，也一眼知道
+   * 跟自己说话的是不是项目主人 / 队友 bot / 外人 —— 决定能否听其写操作、用什么口吻）。
+   *  - 'owner'        ：open_id === 本 app 视角的 owner（项目主人本人）
+   *  - 'teammate-bot' ：发言人是一个 bot（协作机器人）
+   *  - 'external'     ：其他真人（非 owner）
+   * open_id 是 app-scoped，故 owner 判定用 getOwnerOpenId(larkAppId) 同 app 视角比对。
+   */
+  role?: 'owner' | 'teammate-bot' | 'external';
 }
 
 /**
@@ -309,5 +318,11 @@ export async function resolveSender(
     name = name ?? resolved?.name;
     email = resolved?.email;
   }
-  return { openId, type, name, email };
+  // 身份分类（app-scoped：owner 用同 app 视角比对）。getOwnerOpenId 失败不阻塞发消息。
+  let role: ResolvedSender['role'];
+  try {
+    if (type === 'bot') role = 'teammate-bot';
+    else role = getOwnerOpenId(larkAppId) === openId ? 'owner' : 'external';
+  } catch { role = undefined; }
+  return { openId, type, name, email, role };
 }

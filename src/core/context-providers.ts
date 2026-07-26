@@ -74,6 +74,15 @@ export interface ContextProvider {
   applies(ctx: BuildCtx): boolean;
   /** 渲染块全文。不适用时返回 ''。 */
   render(ctx: BuildCtx): string;
+  /**
+   * file 模式「一行精华」（可选）：完整块进文件、消息里只留 stub 时，这一行**每轮**
+   * 仍拼进 stub，做行为兜底——即使 bot 偷懒不读文件，最核心的方向性指令也在眼前，
+   * 不至于犯方向性错误（如 CEO 忘了「先判归口交经理群」）。
+   * 只在本块本轮真会渲染（render 非空）时才带上（跟随 render 的 gate，天然按群/角色收敛）。
+   * ⚠️ 只写**稳定不变的一句核心指令**，别复述动态内容——避免与文件正文 drift。
+   * 不声明 = 该块不进 stub 精华（仍靠「去读文件」兜底）。inline 模式下本字段完全不参与。
+   */
+  tldr?(ctx: BuildCtx): string;
 }
 
 const registry: ContextProvider[] = [];
@@ -308,6 +317,8 @@ registerContextProvider({
   inlineRounds: 'all',
   applies: () => true, // 真实 gate（mainTopic + 是否 CEO bot）在 render 内，返 '' 即不注入
   render: ctx => buildMainBotPromptBlock(ctx.chatId, ctx.larkAppId),
+  // 稳定核心指令：CEO 忘了这条就会永远自己建群不判归口（2026-07-26 回归的病根）。
+  tldr: () => '你是 CEO：复杂/多轮任务先判归口（`botmux subtask-managers` 看有没有对口经理群），有对口经理就交给经理（`subtask-supplement --target-role main`）、CEO 不自建；只一句话能答的即时问题才自己答。',
 });
 
 registerContextProvider({
@@ -317,6 +328,8 @@ registerContextProvider({
   inlineRounds: 'all',
   applies: () => true, // 真实 gate（active 子任务命中）在 render 内，返 '' 即不注入
   render: ctx => buildSubtaskMemberBlock(ctx.chatId, ctx.larkAppId),
+  // 稳定核心指令（具体角色/目标是动态的，留在文件里，这里只放不变的行为兜底）。
+  tldr: () => '你在子任务子群干活：按本群【你的角色】推进，产出先 `subtask-request-review`；卡住/岔路用 `subtask-askforhelp` 逐级上报父群，严禁直接 @ / 惊动 owner。',
 });
 
 registerContextProvider({
@@ -327,6 +340,7 @@ registerContextProvider({
   // 2026-06-10 chat 模式 gate：闲聊群（mode=chat）不注入工作纪律块。缺省 work → 照旧注入。
   applies: ctx => getChatMode(ctx.chatId) !== 'chat',
   render: () => buildOutputDisciplineBlock(),
+  tldr: () => '说做分离：一回合要么只 botmux send 说话、要么只执行工具调用，别混在一回合；给 owner 的话一次一件、简短。',
 });
 
 // ─── 装配器 ──────────────────────────────────────────────────────────────────
@@ -363,12 +377,18 @@ function resolveDeliveryMode(ctx: BuildCtx): 'inline' | 'file' {
 
 /** 消息侧 stub（设计 §3.3）：替代原半静态大块。红线速记必须保留 inline —— 文件引用
  *  依赖模型自觉去读，安全最关键的几条（输出纪律核心 + escalation 铁律 + 授权边界）
- *  以一行浓缩兜底，即使 bot 偷懒不读文件也不至于犯大错。 */
-export function renderContextRefStub(path: string, version: string): string {
+ *  以一行浓缩兜底，即使 bot 偷懒不读文件也不至于犯大错。
+ *
+ *  `tldrs`：各 file provider 本轮贡献的「一行精华」（见 ContextProvider.tldr）。让 CEO/经理/
+ *  子群成员即使不读文件，本群该记的方向性指令（如「先判归口交经理群」）也每轮在眼前。
+ *  只放几行、总长受控，不会把 stub 撑大到卡消息。 */
+export function renderContextRefStub(path: string, version: string, tldrs: string[] = []): string {
+  const essence = tldrs.filter(s => s && s.trim()).map(s => `• ${s.trim()}`);
+  const essenceBlock = essence.length ? `\n本群本轮要点（完整见文件）：\n${essence.join('\n')}` : '';
   return `<context_ref path="${xmlEscape(path)}" version="${xmlEscape(version)}">
 本群的角色 / 纪律 / 协作规范 / 任务背景在上述文件里。
 - version 与你上次读过的不一致（或你还没读过）→ 必须先 Read 该文件再继续干活。
-- 一致 → 不必重读。
+- 一致 → 不必重读。${essenceBlock}
 红线速记：说做分离（一回合要么只 botmux send 说话、要么只执行工具调用）；子群决策/卡点逐级上报父群、严禁直接惊动 owner；未经显式授权不 commit/push/deploy。
 </context_ref>`;
 }
@@ -397,13 +417,25 @@ export function buildContextBlocks(ctx: BuildCtx): string[] {
   if (resolveDeliveryMode(ctx) === 'inline') return inlineAll();
 
   const sections: Array<{ id: string; text: string }> = [];
+  const tldrs: string[] = [];
   const inlineParts: string[] = [];
   for (const p of registry) {
     if (!p.applies(ctx)) continue;
     if (p.delivery === 'file') {
       // file 运载不受 inlineRounds 限制：半静态内容每轮都参与渲染/hash（见 provider 注释）
       const text = safeRender(p, ctx);
-      if (text) sections.push({ id: p.id, text });
+      if (text) {
+        sections.push({ id: p.id, text });
+        // 一行精华跟随 render 的 gate：仅当本块本轮真渲染出内容才收（天然按群/角色收敛）。
+        if (p.tldr) {
+          try {
+            const line = p.tldr(ctx);
+            if (line && line.trim()) tldrs.push(line.trim());
+          } catch (err) {
+            logger.warn(`[context-providers] tldr(${p.id}) failed: ${err}`);
+          }
+        }
+      }
     } else {
       if (p.inlineRounds === 'new_topic' && ctx.round !== 'new_topic') continue;
       const text = safeRender(p, ctx);
@@ -420,5 +452,5 @@ export function buildContextBlocks(ctx: BuildCtx): string[] {
   // stub 固定放在本组块的首位、inline 型 provider 输出跟在其后——当前四个内置 provider
   // 全是 file 型，inlineParts 恒空。未来注册 inline 型 provider 时注意：这里不保持
   // 它与 file 型块之间的注册顺序交错（组内顺序 = stub 先、inline 后），若顺序敏感需重看。
-  return [renderContextRefStub(mat.path, mat.version), ...inlineParts];
+  return [renderContextRefStub(mat.path, mat.version, tldrs), ...inlineParts];
 }

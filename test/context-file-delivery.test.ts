@@ -46,7 +46,7 @@ vi.mock('../src/services/subtask-store.js', () => ({
 }));
 
 import { mkdirSync, writeFileSync, existsSync, rmSync, readFileSync } from 'node:fs';
-import { buildNewTopicPrompt, buildFollowUpContent } from '../src/core/session-manager.js';
+import { buildNewTopicPrompt, buildFollowUpContent, renderSenderTag } from '../src/core/session-manager.js';
 import { buildContextBlocks, buildOutputDisciplineBlock, renderContextRefStub } from '../src/core/context-providers.js';
 import {
   getContextDelivery, getContextDeliveryWithSource, setContextDelivery, setGlobalContextDelivery, clearContextDelivery,
@@ -367,5 +367,76 @@ describe('renderContextRefStub', () => {
     expect(stub).toContain('必须先 Read 该文件');
     expect(stub).toContain('红线速记');
     expect(stub).toContain('未经显式授权不 commit/push/deploy');
+  });
+
+  it('传入 tldrs → 每条一行精华（• 前缀）+ 要点小标题；空列表不加要点块', () => {
+    const withTldr = renderContextRefStub('/f.md', 'ab12cd34', ['先判归口交经理群', '说做分离']);
+    expect(withTldr).toContain('本群本轮要点');
+    expect(withTldr).toContain('• 先判归口交经理群');
+    expect(withTldr).toContain('• 说做分离');
+
+    const noTldr = renderContextRefStub('/f.md', 'ab12cd34', []);
+    expect(noTldr).not.toContain('本群本轮要点');
+    // 空白/纯空格项被过滤
+    const blanks = renderContextRefStub('/f.md', 'ab12cd34', ['   ', '']);
+    expect(blanks).not.toContain('本群本轮要点');
+  });
+});
+
+// ─── 一行精华 tldr：file 模式下从 provider 流进 stub ─────────────────────────────
+describe('tldr：behavioral 块的一行精华每轮进 stub（file 模式）', () => {
+  const CHAT = 'oc_tldr';
+  function activeTask(status = 'active'): any {
+    return {
+      taskId: 'st_tldr', chatId: CHAT, status, goal: '目标', acceptance: null,
+      bots: [{ name: '克劳德', openId: 'ou_self', role: 'main' }],
+    };
+  }
+
+  it('子群成员/输出纪律的一行精华出现在 stub、完整块进文件', () => {
+    setContextDelivery(CHAT, 'file');
+    subtaskState.task = activeTask();
+    const prompt = buildNewTopicPrompt('hi', SID, 'claude-code',
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      { openId: 'ou_sender', type: 'user', name: '张三' }, CHAT, APP);
+
+    expect(stubVersion(prompt)).not.toBeNull();
+    // stub 里有一行精华（跟随 render 的 gate：块真渲染才收）
+    expect(prompt).toContain('本群本轮要点');
+    expect(prompt).toContain('按本群【你的角色】推进');       // subtask_member_routing.tldr
+    expect(prompt).toContain('说做分离：一回合');            // output_discipline.tldr
+    // 完整块仍进文件、不在消息体
+    expect(prompt).not.toContain('<subtask_member_routing>');
+    expect(readFileSync(contextFilePath(CHAT, APP), 'utf-8')).toContain('<subtask_member_routing>');
+  });
+
+  it('块不渲染（无 active 子任务）→ 该块不贡献精华', () => {
+    setContextDelivery(CHAT, 'file');
+    subtaskState.task = null;
+    writeChatContextFixture(CHAT, '普通群');
+    const prompt = buildNewTopicPrompt('hi', SID, 'claude-code',
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      { openId: 'ou_sender', type: 'user', name: '张三' }, CHAT, APP);
+    // 没有子任务 → 无 subtask 精华；但 output_discipline 仍在 → 仍有要点块
+    expect(prompt).not.toContain('按本群【你的角色】推进');
+    expect(prompt).toContain('说做分离：一回合');
+  });
+});
+
+// ─── <sender> 身份分类渲染 ───────────────────────────────────────────────────
+describe('renderSenderTag：role 属性 + 一行含义', () => {
+  it('带 role=owner → 输出 role 属性 + owner 含义注释', () => {
+    const tag = renderSenderTag({ openId: 'ou_o', type: 'user', name: '邹劲松', role: 'owner' });
+    expect(tag).toContain('role="owner"');
+    expect(tag).toContain('项目主人本人');
+  });
+  it('teammate-bot / external 各自的含义注释', () => {
+    expect(renderSenderTag({ openId: 'ou_b', type: 'bot', role: 'teammate-bot' })).toContain('协作机器人');
+    expect(renderSenderTag({ openId: 'ou_e', type: 'user', role: 'external' })).toContain('非 owner');
+  });
+  it('无 role（历史行为）→ 不加 role 属性、不加注释', () => {
+    const tag = renderSenderTag({ openId: 'ou_x', type: 'user', name: '张三' });
+    expect(tag).not.toContain('role=');
+    expect(tag).not.toContain('<!--');
   });
 });
