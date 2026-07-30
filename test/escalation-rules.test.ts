@@ -128,21 +128,21 @@ describe('escalation-rules', () => {
     });
   });
 
-  describe('R5 (stuck keywords in summary)', () => {
-    it('fires when summary contains "卡住"', () => {
+  // R5（stuck-keyword 探针）已于 2026-06-04 按松松指令 DISABLED（纯关键词匹配 error/blocked/
+  // stuck/卡住… 高误报、无信号，checkR5 恒 return null，见 escalation-rules.ts）。以下断言 R5
+  // 即使命中 stuck keyword 也不再触发。要恢复 R5：删掉 checkR5 的 early-return，并把这几条改回
+  // toBeTruthy + keyword 断言。
+  describe('R5 (stuck keywords in summary) — DISABLED 2026-06-04', () => {
+    it('does NOT fire even when summary contains "卡住"（R5 已禁用）', () => {
       const node = mkNode({ chatId: 'oc_stuck', summary: 'sp19 cherry-pick 卡住 conflict 解不开' });
       const out = runEscalationRules({ nodes: [node], inbox: { pending: [], processed: [] }, now: NOW });
-      const r5 = out.find(e => e.ruleId === 'R5');
-      expect(r5).toBeTruthy();
-      expect((r5!.payload as any).keyword).toBe('卡住');
+      expect(out.find(e => e.ruleId === 'R5')).toBeUndefined();
     });
 
-    it('fires on English keyword "blocked"', () => {
+    it('does NOT fire even on English keyword "blocked"（R5 已禁用）', () => {
       const node = mkNode({ chatId: 'oc_block', summary: 'CI is blocked by a leaky env' });
       const out = runEscalationRules({ nodes: [node], inbox: { pending: [], processed: [] }, now: NOW });
-      const r5 = out.find(e => e.ruleId === 'R5');
-      expect(r5).toBeTruthy();
-      expect((r5!.payload as any).keyword).toBe('blocked');
+      expect(out.find(e => e.ruleId === 'R5')).toBeUndefined();
     });
 
     it('does NOT fire when summary is clean', () => {
@@ -266,22 +266,26 @@ describe('escalation-rules', () => {
   });
 
   describe('evaluateRawConditions (P2-rev1 #1) — skips dedup/cooldown', () => {
-    it('returns R5:chatId for nodes with stuck keyword in summary, regardless of inbox state', () => {
-      const node = mkNode({ chatId: 'oc_stuck', summary: 'CI build is blocked' });
+    it('surfaces a raw condition even when an existing pending entry would suppress it in runEscalationRules', () => {
+      // 原用 R5 演示「raw 跳过 dedup/cooldown」这一性质；R5 已于 2026-06-04 禁用，改用仍启用的
+      // 持久态规则 R3（idle group）演示同一性质。
+      const node = mkNode({
+        chatId: 'oc_r3dup', originType: 'bot_spawned',
+        metrics: { lastMessageAt: new Date(NOW - 2 * 60 * 60 * 1000).toISOString(), messages24h: 0, hasUnansweredPing: false },
+      });
       const inbox = {
-        // Existing pending R5:oc_stuck — runEscalationRules would suppress
-        // a new entry, but evaluateRawConditions doesn't care.
+        // 已有 pending R3:oc_r3dup —— runEscalationRules 会去重压制新条目，evaluateRawConditions 不管。
         pending: [{
           id: 'existing', type: 'escalation' as const, enqueuedAt: 'x', status: 'pending' as const, resolvedBy: null, resolution: null,
-          escalation: { ruleId: 'R5' as const, triggeredAt: 'x', chatId: 'oc_stuck', context: 'old', payload: {} },
+          escalation: { ruleId: 'R3' as const, triggeredAt: 'x', chatId: 'oc_r3dup', context: 'old', payload: {} },
         }],
         processed: [],
       };
       const raw = evaluateRawConditions({ nodes: [node], inbox, now: NOW });
-      expect(raw.has('R5:oc_stuck')).toBe(true);
-      // runEscalationRules WOULD return empty (suppressed)
+      expect(raw.has('R3:oc_r3dup')).toBe(true);
+      // runEscalationRules WOULD return empty (suppressed as duplicate)
       const newOut = runEscalationRules({ nodes: [node], inbox, now: NOW });
-      expect(newOut.find(e => e.ruleId === 'R5' && e.chatId === 'oc_stuck')).toBeUndefined();
+      expect(newOut.find(e => e.ruleId === 'R3' && e.chatId === 'oc_r3dup')).toBeUndefined();
     });
     it('returns R3:chatId for fresh bot_spawned chat with no activity', () => {
       const node = mkNode({

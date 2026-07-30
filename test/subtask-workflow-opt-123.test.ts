@@ -5,7 +5,7 @@
  * Run: pnpm vitest run test/subtask-workflow-opt-123.test.ts
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -53,7 +53,15 @@ function mkCmd(over?: Partial<OutboxCommand>): OutboxCommand {
   };
 }
 
-beforeEach(() => { tempDir = mkdtempSync(join(tmpdir(), 'opt123-')); __resetForTesting(); });
+beforeEach(() => {
+  tempDir = mkdtempSync(join(tmpdir(), 'opt123-'));
+  // childToParentSummon → resolveParentOrchestrator → resolveBotIdent('claude') 需要 bots-info.json
+  // （原测试漏 seed，导致 child→parent 用例长期红：bots-info.json not found）。seed 一个最小 canonical claude 条目。
+  writeFileSync(join(tempDir, 'bots-info.json'), JSON.stringify([
+    { larkAppId: 'cli_test_claude', botName: '克劳德', cliId: 'claude-code', botOpenId: 'ou_claude' },
+  ]));
+  __resetForTesting();
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 describe('#1 role-aware parentToChildSummon', () => {
