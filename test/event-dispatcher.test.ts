@@ -329,11 +329,10 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
-  it('ignores cross-bot @mention in chat-scope from an unknown bot', async () => {
-    // Foreign bot @mentions us at top level (no rootId) in a 普通群, but the
-    // sender is NOT in our peer cross-ref (random Lark bot, not a botmux peer).
-    // Drop it — otherwise random bots could spawn chat-scope sessions in any
-    // chat they share with us.
+  it('routes cross-bot @mention in chat-scope from an unknown bot (owner decision 2026-08-06)', async () => {
+    // Foreign bot @mentions us at top level (no rootId) in a 普通群, sender NOT
+    // in our peer cross-ref（外部机器的 botmux / 任意三方 bot）。2026-08-06 owner
+    // 拍板移除白名单闸：真 @ 一律路由。
     mockGetChatMode.mockResolvedValueOnce('group');
     // No cross-ref entries → unknown peer
     mockReadFileSync.mockReturnValue('{}');
@@ -349,7 +348,11 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
 
     await capturedHandlers['im.message.receive_v1'](event);
 
-    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-001',
+      larkAppId: MY_APP_ID,
+    }));
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
@@ -408,11 +411,11 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
-  it('still enforces chat-scope known-peer gate when sender_type="bot" + unknown peer', async () => {
-    // sender_type='bot' 不应该绕开 isKnownPeerBot gate。Lark 随机第三方 bot
-    // 给我们发卡片 @mention，sender_type 即使是 'bot'，cross-ref 里没有 →
-    // 应该跟 'app' 走 unknown-peer 分支一样被 drop，不能 fall through 到
-    // user-message 路径开 chat-scope session。
+  it('routes chat-scope @mention from unknown foreign bot (owner decision 2026-08-06: no whitelist)', async () => {
+    // 2026-08-06 owner 拍板：任何 bot 真 @ 本 bot 都必须响应。原 isKnownPeerBot
+    // cross-ref 白名单闸导致外部机器的 botmux（如 W2）@ 我们时在非 oncall 普通群
+    // 被零日志静默丢弃。此用例锁定新行为：cross-ref 为空（unknown peer）+ 非
+    // oncall + 无会话，也要正常路由到 handleThreadReply。
     mockGetChatMode.mockResolvedValueOnce('group');
     mockReadFileSync.mockReturnValue('{}');  // empty cross-ref → unknown peer
     const event = makeBotMessageEvent({
@@ -428,7 +431,11 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
 
     await capturedHandlers['im.message.receive_v1'](event);
 
-    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-001',
+      larkAppId: MY_APP_ID,
+    }));
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 

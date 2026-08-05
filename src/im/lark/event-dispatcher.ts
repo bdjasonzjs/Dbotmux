@@ -986,30 +986,25 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
               .catch(err => logger.error(`Error handling message event: ${err}`));
             return;
           }
-          // Foreign bot: only route on @mention of us.
-          if (!isBotMentioned(larkAppId, message, undefined)) return;
-          const ctx = await decideRouting(larkAppId, message);
-          // Chat-scope foreign-bot @mention without an existing session: gate to
-          // vetted botmux peers (registered in our bot-openids cross-ref). This
-          // keeps random Lark bots from silently spawning chat-scope sessions
-          // in 普通群/p2p, while letting Bot A → Bot B handoffs in 普通群 work
-          // (handleThreadReply auto-create + chat-scope inheritance below).
-          //
-          // 注意 isKnownPeerBot 查的是 cross-ref（bot-openids-<appId>.json），它只
-          // 收录 bots-info.json 里有名字的 bot，即本机 daemon 自己配置的 bot
-          // （getAllBots）。"别人的 bot" 永远进不了这个 cross-ref，所以 isKnownPeerBot
-          // 对外部 bot 恒为 false——这跟 /introduce 是两套独立存储：/introduce 写的是
-          // observed-bots-store，只负责让发送方"发现并能 @ 到"对方，过不了这道接收闸。
-          //
-          // Oncall 群是显式部署的协作工作区，canTalk 已对任何成员（含真人）放行；这里
-          // 对 bot 同等放行，跳过 cross-ref vetting。否则 oncall 群里外部 bot 互相 @
-          // 会被静默丢弃、只有真人能拉起会话，与 oncall「全员可对话」语义不符。
-          if (ctx.scope === 'chat' && !isChatOncallBoundForAnyBot(chatId)) {
-            const ownsSession = handlers.isSessionOwner?.(ctx.anchor, larkAppId) ?? false;
-            if (!ownsSession && !isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId)) {
-              return;
+          // Foreign bot: only route on @mention of us. Drop 也要留痕——被 @ 了
+          // 却不响应曾经是零日志静默丢弃，排查只能靠猜（2026-08-06 W2 事件）。
+          if (!isBotMentioned(larkAppId, message, undefined)) {
+            if ((message.mentions?.length ?? 0) > 0) {
+              logger.info(
+                `[${larkAppId}] foreign-bot message has mentions but none is us — not routing ` +
+                `(msg=${shortId(messageId)} chat=${shortId(chatId)} sender=${redactedId(senderOpenId)} ` +
+                `mentions=${message.mentions.length})`,
+              );
             }
+            return;
           }
+          const ctx = await decideRouting(larkAppId, message);
+          // 2026-08-06 owner 拍板：任何 bot @ 本 bot 都必须响应。原先这里有一道
+          // isKnownPeerBot cross-ref 白名单闸（外部机器的 bot 恒 false → chat-scope
+          // 下非 oncall 群被静默丢弃），W2（另一台机器的 botmux）@ 我们即命中此闸、
+          // 零日志丢消息。按 owner 指令移除该闸：真 @ 一律路由。
+          // 注意 directAck（clone integrity probe 回执）的信任判定不在此列，仍按
+          // oncall/known-peer 收紧——那是写 store 的安全面，不是"要不要理人"。
           // Clone integrity direct-@ probe. A bot-sent probe is trusted only
           // from an oncall-bound chat or a receiver-side known peer; an existing
           // session alone must not let unknown bots write direct acks or route
