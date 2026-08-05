@@ -546,6 +546,57 @@ export function forceDestroySessionRuntime(ds: DaemonSession): void {
   } catch { /* no tmux session */ }
 }
 
+/**
+ * 2026-08-05 (病二根治·会话复用前探活): 判断 activeSessions 里一条会话记录
+ * 背后的 worker / CLI 进程是否还活着。
+ *
+ * 背景（investigate 报告实证）：daemon 消息路由只看 activeSessions 里有没有
+ * 记录 `ds`——有就一律把新消息 Reply 到既有会话，**从不校验背后进程死没死**。
+ * 真实故障：daemon 重启"恢复"了一条会话记录，但它的 worker/pid 已随重启没了
+ * → 记录变"聋"，之后每次投递都写进黑洞（卡片进群没人接，实测连投 3 次白等
+ * 近 1 小时）。复用前用本函数探活，判死则驱逐 + 重建。
+ *
+ * 两条判据各挡不同的坑，缺一不可（owner 特别要求写清、防后人误删其一）：
+ *
+ *  ① 有 worker 句柄时，**句柄是权威**：alive ⇔ 没被我们 kill 过 (`!killed`)
+ *     且进程未退出 (`exitCode===null && signalCode===null`，含它自己崩的)。
+ *     这条**同时天然挡住 PID 复用**：老会话死后 OS 可能把它的 pid 分配给一个
+ *     毫不相干的新进程；只要还有 worker 句柄，就以句柄为准、根本不去查那个 pid，
+ *     也就不会把"pid 被复用"误判成"会话还活着"。（这正是 owner 说的
+ *     "`ds.worker && !ds.worker.killed` 已经能挡住 PID 复用"——有句柄就不走 pid。）
+ *
+ *  ② 无 worker 句柄时（adopt / bridge / daemon 重启恢复的会话，底层 CLI 在 pid
+ *     上独立跑、句柄为 null）才退回探 pid 存在性，且**必须按 errno 分支**：
+ *       - 不抛     → 进程存在 → 活
+ *       - EPERM    → 进程**存在**、只是无权发信号 → **活**（owner 强调：EPERM
+ *                    判活不判死，否则会误杀正在干活、只是不属本用户的会话）
+ *       - ESRCH/其它 → 进程不存在 → 死
+ *     `process.kill(pid, 0)` 的 signal 0 不真发信号，只做存在性+权限探测。
+ *
+ * 语义：只有"句柄证明已死"或"无句柄且 pid 确实不存在"才判死。任一迹象显示还
+ * 活着就保守判活——宁可漏杀一个真死会话（下轮投递再探一次），也绝不误杀一个
+ * 在干活的会话。**本函数只判"进程还在不在"，不判"进程是否还响应"**——
+ * hung-but-alive（进程活着但卡死不吭声）按 owner 明确要求不在本次范围
+ * （区分 hung 与 busy 不可靠、会误杀忙碌会话）。
+ */
+export function isSessionLive(ds: DaemonSession): boolean {
+  const w = ds.worker;
+  if (w) {
+    // ① 有句柄：句柄权威，不看 pid（天然免疫 PID 复用）
+    return !w.killed && w.exitCode === null && w.signalCode === null;
+  }
+  // ② 无句柄：退回探 pid 存在性（errno 分支）
+  const pid = ds.session.pid;
+  if (!pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;                                  // 存在 = 活
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === 'EPERM') return true;  // 存在但无权 = 活
+    return false;                                 // ESRCH 等 = 死
+  }
+}
+
 function armWorkerKillBackstop(w: ChildProcess, label: string): void {
   const sigterm = setTimeout(() => {
     if (w.exitCode === null && w.signalCode === null) {

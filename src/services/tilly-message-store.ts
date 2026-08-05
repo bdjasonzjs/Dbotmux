@@ -113,6 +113,49 @@ export function setLastFetchEnd(end: Date): void {
   write(store);
 }
 
+/** 2026-08-05 (病一根治): 本轮扫描窗口。`clamped=true` 表示 rawStart 早于
+ *  硬上界地板、被钳到 now-maxWindowMs（高水位冻结或长时间停摆的信号）。 */
+export interface TillyWindow {
+  start: Date;
+  end: Date;
+  clamped: boolean;
+}
+
+/** 病一根治·纯函数（冻结螺旋的回归就构造在这里，可单测）：
+ *  计算扫描窗口 [start, end]。start = max(高水位-overlap 或首轮 now-interval,
+ *  now-maxWindowMs)。硬上界保证：**无论高水位是否冻结，窗口宽度永远 ≤
+ *  maxWindowMs**，lark-cli --page-all 翻页量有界、fetch 不会无限变慢陷入
+ *  60s 超时的死亡螺旋。 */
+export function computeTillyWindow(
+  lastEnd: Date | null,
+  end: Date,
+  opts: { maxWindowMs: number; overlapMs: number; intervalMs: number },
+): TillyWindow {
+  const rawStart = lastEnd
+    ? lastEnd.getTime() - opts.overlapMs
+    : end.getTime() - opts.intervalMs;
+  const floor = end.getTime() - opts.maxWindowMs;
+  const clamped = rawStart < floor;
+  return { start: new Date(Math.max(rawStart, floor)), end, clamped };
+}
+
+/** 病一根治·纯函数（可单测）：cap-hit 时高水位应推进到的值 =
+ *  max(原高水位, now-maxWindowMs)。
+ *   - 正常量（原高水位 ≥ 地板）：取原值 → 维持"下轮重拉同窗口补扫剩余"语义，
+ *     窗口内未扫消息靠 filterUnscanned 去重后继续分析、不丢。
+ *   - 已冻结（原高水位 < 地板）：跳到地板 now-maxWindowMs → 解冻。超地板的最老
+ *     未扫消息本就已被 computeTillyWindow 钳出窗口，这里推进不额外丢东西。
+ *  **绝不返回比地板更早的值** → 高水位再也不会冻结在远古。 */
+export function nextWatermarkOnCapHit(
+  lastEnd: Date | null,
+  end: Date,
+  maxWindowMs: number,
+): Date {
+  const floor = end.getTime() - maxWindowMs;
+  const prev = lastEnd ? lastEnd.getTime() : floor;
+  return new Date(Math.max(prev, floor));
+}
+
 /** Stats: count, oldest/newest entry (lark messageId is sortable). */
 export function stats(): { count: number; oldest: string | null; newest: string | null; updatedAt: string } {
   const store = read();

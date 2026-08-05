@@ -45,6 +45,7 @@ import {
   CARD_POSTING_SENTINEL,
   parkStreamCard,
   closeSession as closeSessionHelper,
+  isSessionLive,
 } from './core/worker-pool.js';
 import { ipcRoute, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer } from './core/dashboard-ipc-server.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
@@ -120,6 +121,9 @@ import { AttemptResumeManager } from './workflows/attempt-resume.js';
 // ─── State ───────────────────────────────────────────────────────────────────
 
 const activeSessions = new Map<string, DaemonSession>();
+// 2026-08-05 (病二根治·可观测): 聋会话被探活判死并驱逐的累计次数。留痕让
+// "投递曾写进已死会话（现已自动重建）"可 grep / 可统计——病二自愈但要可追溯。
+let deafSessionEvictions = 0;
 const workflowEventWatchers = new Map<string, WorkflowEventWatcher>();
 /**
  * Per-run state for active workflow loops.
@@ -2521,6 +2525,22 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
 
   let ds = activeSessions.get(sessionKey(anchor, larkAppId));
 
+  // 2026-08-05 (病二根治): 复用既有会话前先探活。原代码只要 activeSessions 里
+  // 有记录就一律把消息 Reply 进去、从不校验背后 worker/CLI 进程死没死——进程
+  // 没了（如 daemon 重启恢复了记录但 worker/pid 已死）时消息全写进黑洞，卡片
+  // 进群没人接（实测连投 3 次白等近 1 小时）。判死则驱逐 + 清记录，落到下面的
+  // `!ds` 分支 auto-create 一个新 worker，聋会话在下一次投递即自愈。isSessionLive
+  // 只认"进程确实没了"这种确定信号（EPERM 判活、worker 句柄挡 PID 复用），
+  // 不会误杀正在干活的会话。放在最前面，确保任何 ds 用法都不碰死会话。
+  if (ds && !isSessionLive(ds)) {
+    deafSessionEvictions++;
+    logger.warn(`[${larkAppId}] chat/thread-scope 会话 ${ds.session.sessionId.slice(0, 8)} @ ${anchor} 已死（worker/pid 均不在）— 驱逐 + 重建，不再把投递写进聋会话 (病二自愈 #${deafSessionEvictions})`);
+    try { void closeSessionHelper(ds.session.sessionId).catch(() => { /* idempotent */ }); }
+    catch { /* best-effort */ }
+    activeSessions.delete(sessionKey(anchor, larkAppId));
+    ds = undefined;
+  }
+
   if (ds && applyNoMentionReplySentinelToDaemonSession(ds, relaySignal)) {
     sessionStore.updateSession(ds.session);
   }
@@ -3178,6 +3198,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // daily digest → publish to mainTopic 1 card per day (updated in
     // place). Independent of the R1-R5 escalation pipeline above.
     const TILLY_TICK_INTERVAL_MS = 15 * 60 * 1000;
+    // 2026-08-05 (病一根治): 扫描窗口硬上界。高水位只在"成功且未 cap-hit"时
+    // 推进 → 一旦持续 cap-hit（消息量长期高于 100/轮分析上限）高水位就永久冻结，
+    // 窗口 [冻结点, now] 一天天变宽，lark-cli --page-all 翻页量无界增长直到越过
+    // 60s 超时，每轮抛错 = 死亡螺旋（实测 2026-07-15 冻结、连挂 19 天）。加 6h
+    // 硬上界：算 start 时钳到 max(高水位-overlap, now-6h)，无论高水位是否冻结，
+    // 窗口宽度永远 ≤ 6h、fetch 耗时有界。代价（owner 已批准）：持续暴雨、积压
+    // > 6h 且 100/轮追不上时，超过 6h 的最老未扫消息会被跳过——scout 定位是盯
+    // 最近的重要事、cap 本就注定扫不全，用"有界滞后"换"无限冻结"划算。
+    const TILLY_MAX_WINDOW_MS = 6 * 60 * 60 * 1000;
     // P3-rev1 #6 (妹妹): in-flight guard — if previous tick is still
     // running (codex slow / lark stuck), skip this tick instead of
     // overlapping. Cron is 15min; codex+fetch typically < 2min, so
@@ -3188,6 +3217,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // publish alert 到主话题；成功一次清零 + dismiss alert。
     let tillyConsecutiveFails = 0;
     const TILLY_ALERT_THRESHOLD = 3;
+    // 2026-08-05 (共性根治·静默失败告警): scout 健康独立健康线。记录上次"有实质
+    // 进展"的时刻（fetch 成功——含无新消息、或高水位推进）。若超阈值没有任何成功
+    // tick → 主动发**会冒泡的文本告警** @CEO 到主话题（不靠更新那张 Lark 不上浮
+    // 的卡）。独立于 consecutiveFails：后者是内存计数、重启清零、且只数硬失败；
+    // 健康线直接盯"多久没成功过"，连"cap-hit 假成功但水位不动"这类静默退化也兜住。
+    const TILLY_STALENESS_ALERT_MS = 45 * 60 * 1000;  // ≈ 3 个 tick 没成功
+    let lastTillyProgressAt = Date.now();
     const tillyHandle = setInterval(async () => {
       if (tillyTickInFlight) {
         logger.info('[tilly/scout] previous tick still in flight — skipping this interval');
@@ -3206,7 +3242,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         // pushHighPriorityToScoutInbox 写 scout-inbox + notifyClaudeAboutInboxItems
         // 绑 inbox insert 结果通知。
         const { publishTillyAlert, dismissTillyAlert, pushHighPriorityToScoutInbox, notifyClaudeAboutInboxItems } = await import('./services/tilly-publisher.js');
-        const { markScanned, getLastFetchEnd, setLastFetchEnd } = await import('./services/tilly-message-store.js');
+        const { markScanned, getLastFetchEnd, setLastFetchEnd, computeTillyWindow, nextWatermarkOnCapHit } = await import('./services/tilly-message-store.js');
         const { resolveBotIdent } = await import('./core/main-bot-playbook.js');
         // 2026-05-25 (松松实拍): 之前用 claudeApp 发卡 → 群里 sender 显示
         // 克劳德，缇蕾 bot identity 一次都没用过。从 P3 commit #5 起就
@@ -3224,10 +3260,18 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         const HIGH_WATER_OVERLAP_MS = 5 * 60 * 1000;
         const end = new Date();
         const lastEnd = getLastFetchEnd();
-        const start = lastEnd
-          ? new Date(lastEnd.getTime() - HIGH_WATER_OVERLAP_MS)
-          : new Date(end.getTime() - TILLY_TICK_INTERVAL_MS);
+        // 病一根治：窗口硬上界（钳逻辑抽到 computeTillyWindow 纯函数，可单测）。
+        // start = max(高水位-overlap, now-6h) —— 即使高水位冻结在远古，窗口也永
+        // 不超过 6h、fetch 不会无界变慢陷入超时螺旋。
+        const { start, clamped } = computeTillyWindow(lastEnd, end, {
+          maxWindowMs: TILLY_MAX_WINDOW_MS,
+          overlapMs: HIGH_WATER_OVERLAP_MS,
+          intervalMs: TILLY_TICK_INTERVAL_MS,
+        });
         const windowMin = Math.round((end.getTime() - start.getTime()) / 60000);
+        if (clamped) {
+          logger.warn(`[tilly/scout] window clamped to ${TILLY_MAX_WINDOW_MS / 3600000}h ceiling (高水位可能已冻结/长时间停摆，超窗口的最老未扫消息将被跳过)`);
+        }
         // 一期（给任意群挂 observer + 扫读静音）：扫读静音名单从统一群级配置取
         // （fail-closed：含主话题 Flumy 小分队，配置损坏也保守静音），传进 fetch 做
         // per-chat 排除——被静音群的消息根本不进 fresh，也就不进 analyzeMessages /
@@ -3242,6 +3286,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           logger.info(`[tilly/scout] tick — no new messages (window ${windowMin}min, high-water=${lastEnd ? 'on' : 'first-run'})`);
           // fetch 成功且无新消息 → 推进高水位 (这段时间确认没漏)
           setLastFetchEnd(end);
+          lastTillyProgressAt = Date.now();  // fetch 成功 = scout 健康，健康线复位
           // 2026-05-25 妹妹 non-blocker 2: 没新消息 = fetch 成功 = scout 健康。
           // 这里清 counter + dismiss alert（如果在）— 否则 alert 会"挂着等
           // 一条新消息才关掉"，跟"恢复后自动 close" 直觉不符。LLM 路径没
@@ -3326,8 +3371,16 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         if (!capHit) {
           setLastFetchEnd(end);
         } else {
-          logger.warn(`[tilly/scout] cap hit (${digest.analyzedMessageIds.length} analyzed < ${fresh.length} fresh) — 不推进高水位, 下轮重拉补扫剩余`);
+          // 病一根治：cap-hit 也要让高水位"至少推进到窗口地板 (now-6h)"，绝不再
+          // 冻结（nextWatermarkOnCapHit 纯函数，可单测）。原"cap-hit 完全不推进"
+          // 是死亡螺旋的根：持续 cap-hit → 高水位永远停在冻结点。现在推进到
+          // max(原高水位, now-6h)——正常量维持"下轮重拉同窗口补扫剩余"语义(窗口内
+          // 未扫的靠 filterUnscanned 去重后继续分析、不丢)；已冻结时跳到地板解冻
+          // (超地板的最老未扫本就已被 computeTillyWindow 钳出窗口，不额外丢)。
+          setLastFetchEnd(nextWatermarkOnCapHit(lastEnd, end, TILLY_MAX_WINDOW_MS));
+          logger.warn(`[tilly/scout] cap hit (${digest.analyzedMessageIds.length} analyzed < ${fresh.length} fresh) — 高水位推进到 max(原值, now-6h) 防冻结, 下轮重拉补扫窗口内剩余`);
         }
+        lastTillyProgressAt = Date.now();  // 走到这里 = fetch+analyze 成功，健康线复位
         const ms = Date.now() - tickStartTime;
         logger.info(`[tilly/scout] tick done in ${ms}ms: ${fresh.length} fresh / ${toMark.length} analyzed → +${digest.todos.length}t/${digest.progress.length}p/${digest.blockers.length}b/${digest.noteworthy.length}n (today total: ${cumulative.todos.length}/${cumulative.progress.length}/${cumulative.blockers.length}/${cumulative.noteworthy.length}) · scout-inbox +${newlyInserted.length}`);
       } catch (err) {
@@ -3353,6 +3406,31 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             } catch (alertErr) {
               logger.error(`[tilly/scout] publishTillyAlert itself failed: ${alertErr}`);
             }
+          }
+        }
+        // 2026-08-05 (共性根治·静默失败告警): 独立健康线 + **会冒泡的**告警。
+        // publishTillyAlert 只更新那张 Lark 不上浮的卡（owner 看不见 = 连挂 19 天
+        // 没被发现的真因）。这里判"多久没成功过"，达阈值就发一条 fresh 文本 @CEO
+        // 到主话题——文本消息会在 timeline 冒泡、owner 能看见。触发二选一：连续
+        // 失败达阈值，或健康线超时（含"cap-hit 假成功但水位不动"这类 consecutiveFails
+        // 兜不住的静默退化）。ping 内部 30min 节流，不会每轮刷屏。
+        const stalenessMs = Date.now() - lastTillyProgressAt;
+        const stale = stalenessMs > TILLY_STALENESS_ALERT_MS;
+        if ((tickFailed && tillyConsecutiveFails >= TILLY_ALERT_THRESHOLD) || stale) {
+          try {
+            const { publishTillyHealthPing } = await import('./services/tilly-publisher.js');
+            const { resolveBotIdent } = await import('./core/main-bot-playbook.js');
+            const staleMin = Math.round(stalenessMs / 60000);
+            const reason = tickFailed
+              ? `连续 ${tillyConsecutiveFails} 次 tick 失败（最近成功距今 ${staleMin}min）`
+              : `已 ${staleMin}min 没有成功 tick（fetch/analyze 持续无进展）`;
+            await publishTillyHealthPing({
+              larkAppId: resolveBotIdent('tilly').larkAppId,
+              claudeOpenId: resolveBotIdent('claude').openId,
+              reason,
+            });
+          } catch (pingErr) {
+            logger.error(`[tilly/scout] health ping itself failed: ${pingErr}`);
           }
         }
       }

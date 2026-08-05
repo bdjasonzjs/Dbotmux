@@ -251,6 +251,57 @@ export async function publishTillyAlert(
   return { rootCardMessageId: msgId, inserted };
 }
 
+/** 2026-08-05 (共性根治·静默失败告警): scout 停摆时发一条**会在 timeline
+ *  冒泡**的 fresh 文本告警到主话题 @CEO bot。
+ *
+ *  为什么不复用 publishTillyAlert：那个走 root-inbox-card-renderer 更新
+ *  一张 dedup 固定的卡，Lark 对"更新已有卡"**不上浮**（松松实拍确认，见
+ *  renderTillyCardContent 注释），owner 在 timeline 最新位置看不到 → 缇蕾
+ *  连挂 19 天 / consecutiveFails=28 都没被任何人发现。fresh 文本消息才会
+ *  在 timeline 冒泡出来。两者并存：卡留作 dashboard 记录，文本负责"主动
+ *  冒出来让人看见"。
+ *
+ *  @CEO bot（claudeOpenId，用 resolveBotIdent 解析、与既有 notify 同一条
+ *  被验证可用的发送路径）而非 @owner：owner open_id 是 app-scoped，coco
+ *  daemon 用 tilly 身份发时 @owner 需要 owner 的 coco-app open_id，易踩
+ *  cross-app 坑；@CEO bot 既能推送通知、CEO 也会把健康告警转达 owner，且
+ *  文本本身已在主话题冒泡。
+ *
+ *  节流 30min（module-level，同 daemon 进程）——停摆期每 15min 一个 tick
+ *  都会触发，节流防刷屏；owner 看见一条就够。 */
+const HEALTH_PING_THROTTLE_MS = 30 * 60 * 1000;
+let lastHealthPingAt = 0;
+
+export async function publishTillyHealthPing(
+  opts: PublishTillyOpts & { claudeOpenId: string; reason: string },
+): Promise<boolean> {
+  const now = Date.now();
+  if (now - lastHealthPingAt < HEALTH_PING_THROTTLE_MS) {
+    logger.info(`[tilly-publisher] health ping throttled (last sent ${Math.floor((now - lastHealthPingAt) / 1000)}s ago, throttle=${HEALTH_PING_THROTTLE_MS / 1000}s)`);
+    return false;
+  }
+  const mainTopic = getMainTopicChatId();
+  if (!mainTopic) {
+    logger.warn('[tilly-publisher] health ping: mainTopic 未配置，无法冒泡告警');
+    return false;
+  }
+  const text = `<at user_id="${opts.claudeOpenId}"></at> ⚠️ 缇蕾扫读健康告警：${opts.reason}。scout（coco daemon）已停摆，请查 [tilly/scout] 日志并转达 owner。`;
+  try {
+    const msgId = await sendMessage(opts.larkAppId, mainTopic, text, 'text');
+    lastHealthPingAt = now;
+    logger.warn(`[tilly-publisher] health ping sent (msg=${msgId}) to mainTopic ${mainTopic} — reason: ${opts.reason}`);
+    return true;
+  } catch (err) {
+    logger.error(`[tilly-publisher] health ping send failed: ${err}`);
+    return false;
+  }
+}
+
+/** Test helper: 重置 health ping 节流状态。 */
+export function __resetHealthPingThrottleForTesting(): void {
+  lastHealthPingAt = 0;
+}
+
 /** P0-2: tilly tick 成功一次后 close alert 卡（如果存在），让健康卡显
  *  示「已恢复」状态。idempotent — 卡不存在/已关闭都 no-op。
  *

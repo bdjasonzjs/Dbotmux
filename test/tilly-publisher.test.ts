@@ -224,3 +224,52 @@ describe('Phase A v2 commit 2: publishTillyDigest 退化', () => {
     expect(store.readInbox().pending).toHaveLength(0);
   });
 });
+
+describe('共性告警 · publishTillyHealthPing (2026-08-05 静默失败冒泡)', () => {
+  it('发一条 fresh 文本 @CEO 到主话题 (会在 timeline 冒泡)', async () => {
+    fakeMainTopic = 'oc_main';
+    const { publisher } = await freshImports();
+    const ok = await publisher.publishTillyHealthPing({
+      larkAppId: 'cli_tilly', claudeOpenId: 'ou_claude', reason: '已 47min 没有成功 tick',
+    });
+    expect(ok).toBe(true);
+    expect(sendMessageSpy).toHaveBeenCalledTimes(1);
+    const [appId, chat, text, kind] = sendMessageSpy.mock.calls[0];
+    expect(appId).toBe('cli_tilly');
+    expect(chat).toBe('oc_main');
+    expect(kind).toBe('text');            // fresh 文本(会冒泡), 不是更新卡
+    expect(text).toContain('ou_claude');  // @CEO
+    expect(text).toContain('已 47min 没有成功 tick');
+  });
+
+  it('30min 内节流: 第二次不发', async () => {
+    fakeMainTopic = 'oc_main';
+    const { publisher } = await freshImports();
+    expect(await publisher.publishTillyHealthPing({ larkAppId: 'a', claudeOpenId: 'ou_c', reason: 'r1' })).toBe(true);
+    expect(await publisher.publishTillyHealthPing({ larkAppId: 'a', claudeOpenId: 'ou_c', reason: 'r2' })).toBe(false);
+    expect(sendMessageSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('节流重置后可再发', async () => {
+    fakeMainTopic = 'oc_main';
+    const { publisher } = await freshImports();
+    expect(await publisher.publishTillyHealthPing({ larkAppId: 'a', claudeOpenId: 'ou_c', reason: 'r1' })).toBe(true);
+    publisher.__resetHealthPingThrottleForTesting();
+    expect(await publisher.publishTillyHealthPing({ larkAppId: 'a', claudeOpenId: 'ou_c', reason: 'r2' })).toBe(true);
+    expect(sendMessageSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('主话题未配置 → 不发、返回 false', async () => {
+    fakeMainTopic = undefined;
+    const { publisher } = await freshImports();
+    expect(await publisher.publishTillyHealthPing({ larkAppId: 'a', claudeOpenId: 'ou_c', reason: 'r' })).toBe(false);
+    expect(sendMessageSpy).not.toHaveBeenCalled();
+  });
+
+  it('send 抛错 → 吞掉返回 false (告警失败不能拖垮 tick)', async () => {
+    fakeMainTopic = 'oc_main';
+    sendMessageSpy.mockRejectedValueOnce(new Error('lark down'));
+    const { publisher } = await freshImports();
+    expect(await publisher.publishTillyHealthPing({ larkAppId: 'a', claudeOpenId: 'ou_c', reason: 'r' })).toBe(false);
+  });
+});
