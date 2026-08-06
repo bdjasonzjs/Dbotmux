@@ -190,10 +190,12 @@ export async function fetchRecentMessages(opts: FetchOpts): Promise<TillyMessage
   ];
   let stdout: string;
   try {
-    // P3-rev1 #6: 60s timeout so a stuck lark-cli can't pile up tick
-    // overlaps (cron is 15min; 60s gives lots of room for normal calls
-    // including pagination, but kills truly hung subprocess).
-    const r = await execFileAsync(cli, args, { maxBuffer: 50 * 1024 * 1024, timeout: 60_000 });
+    // P3-rev1 #6 / 2026-08-06 重新校准: exec 超时。cron 15min 一轮 + tillyTickInFlight
+    // in-flight guard 已防重叠，所以抬高超时对 tick 堆叠零风险。
+    // 60s → 180s：60s 太紧——实测 50min 窗口就要 ~40s、2h 窗口中午高峰 80s，群量一天
+    // 涨近 4 倍，60s 下窗口稍大即炸。180s(3min) 给翻页/高峰足够头寸，配 45min 窗口上界
+    // 双保险（窗口限住正常量、超时兜住峰值），不再"防护栏设在车翻下去之后"。
+    const r = await execFileAsync(cli, args, { maxBuffer: 50 * 1024 * 1024, timeout: 180_000 });
     stdout = r.stdout;
   } catch (err: any) {
     throw new Error(`[tilly-scout] lark-cli exec failed: ${err?.message ?? err}`);

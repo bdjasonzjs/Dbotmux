@@ -3198,15 +3198,20 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // daily digest → publish to mainTopic 1 card per day (updated in
     // place). Independent of the R1-R5 escalation pipeline above.
     const TILLY_TICK_INTERVAL_MS = 15 * 60 * 1000;
-    // 2026-08-05 (病一根治): 扫描窗口硬上界。高水位只在"成功且未 cap-hit"时
-    // 推进 → 一旦持续 cap-hit（消息量长期高于 100/轮分析上限）高水位就永久冻结，
-    // 窗口 [冻结点, now] 一天天变宽，lark-cli --page-all 翻页量无界增长直到越过
-    // 60s 超时，每轮抛错 = 死亡螺旋（实测 2026-07-15 冻结、连挂 19 天）。加 6h
-    // 硬上界：算 start 时钳到 max(高水位-overlap, now-6h)，无论高水位是否冻结，
-    // 窗口宽度永远 ≤ 6h、fetch 耗时有界。代价（owner 已批准）：持续暴雨、积压
-    // > 6h 且 100/轮追不上时，超过 6h 的最老未扫消息会被跳过——scout 定位是盯
-    // 最近的重要事、cap 本就注定扫不全，用"有界滞后"换"无限冻结"划算。
-    const TILLY_MAX_WINDOW_MS = 6 * 60 * 60 * 1000;
+    // 2026-08-05 (病一根治) / 2026-08-06 (重新校准): 扫描窗口硬上界。高水位只在
+    // "成功且未 cap-hit"时推进 → 一旦持续 cap-hit（消息量长期高于 100/轮分析上限）
+    // 高水位就冻结，窗口 [高水位, now] 每轮 +15min 单调变宽，lark-cli --page-all
+    // 翻页量增长直到越过 exec 超时预算，每轮抛错 = 死亡螺旋。硬上界：算 start 时
+    // 钳到 max(高水位-overlap, now-MAX_WINDOW)，无论高水位是否冻结，窗口宽度永远
+    // ≤ MAX_WINDOW、fetch 耗时有界。
+    // ⚠️ 值必须按真实群量校准、别拍脑袋：08-05 初设 6h **太大**——实测 6h 窗口
+    // messages-search 要 >90s，60s 超时下每轮必炸、防护栏形同虚设。08-06 手动分窗
+    // 口计时（同账号真实数据）：30min=5s / 50min≈40s / 2h(凌晨)=21s→(中午同量)=80s，
+    // 群量一天内涨了近 4 倍。故收到 45min（正常 tick 窗口本就 ~20min，上界只在停摆
+    // 追赶时生效；45min 配下面抬到 180s 的 exec 超时，余量足、也能容纳群量继续涨）。
+    // 代价：停摆超 45min 时只补最近 45min、更早的丢——scout 盯最近、cap 本就扫不全，
+    // 用"有界滞后"换"无限冻结"划算。
+    const TILLY_MAX_WINDOW_MS = 45 * 60 * 1000;
     // P3-rev1 #6 (妹妹): in-flight guard — if previous tick is still
     // running (codex slow / lark stuck), skip this tick instead of
     // overlapping. Cron is 15min; codex+fetch typically < 2min, so
@@ -3270,7 +3275,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         });
         const windowMin = Math.round((end.getTime() - start.getTime()) / 60000);
         if (clamped) {
-          logger.warn(`[tilly/scout] window clamped to ${TILLY_MAX_WINDOW_MS / 3600000}h ceiling (高水位可能已冻结/长时间停摆，超窗口的最老未扫消息将被跳过)`);
+          logger.warn(`[tilly/scout] window clamped to ${Math.round(TILLY_MAX_WINDOW_MS / 60000)}min ceiling (高水位可能已冻结/长时间停摆，超窗口的最老未扫消息将被跳过)`);
         }
         // 一期（给任意群挂 observer + 扫读静音）：扫读静音名单从统一群级配置取
         // （fail-closed：含主话题 Flumy 小分队，配置损坏也保守静音），传进 fetch 做
