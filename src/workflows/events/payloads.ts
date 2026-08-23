@@ -44,6 +44,12 @@ export const ErrorCodeEnum = z.enum([
   //    found).  Always manual class.
   'InputUnrecoverable',
   'CorruptLog',
+  'LoopMaxIterationsExceeded',
+  // Non-terminator failure inside a loop body (subagent crash /
+  // hostExecutor error / non-terminator humanGate reject = fail-run).
+  // Carried on `loopFinished` when resolution='body-failed'.  Loop v0.2
+  // Step 3 review Medium — see /tmp/wf-loop-v02.md §10.8.
+  'LoopBodyFailed',
 ]);
 export type ErrorCode = z.infer<typeof ErrorCodeEnum>;
 
@@ -101,6 +107,20 @@ export const BotSnapshotSchema = z.object({
   cliId: z.string().optional(),
   displayName: z.string().optional(),
   workingDir: z.string().optional(),
+  cliPathOverride: z.string().optional(),
+  sandbox: z.boolean().optional(),
+  // New three-tier fs-policy lists (deny-by-default). Frozen alongside the
+  // legacy fields so a historical run's sandbox policy matches what a normal
+  // session would build — omitting it would silently drop the readWrite tier +
+  // any user-declared deny when a workflow worker rehydrates the snapshot.
+  sandboxPaths: z.object({
+    readWrite: z.array(z.string()).optional(),
+    readOnly: z.array(z.string()).optional(),
+    deny: z.array(z.string()).optional(),
+  }).optional(),
+  sandboxHidePaths: z.array(z.string()).optional(),
+  sandboxReadonlyPaths: z.array(z.string()).optional(),
+  sandboxNetwork: z.boolean().optional(),
 });
 export type BotSnapshot = z.infer<typeof BotSnapshotSchema>;
 
@@ -179,6 +199,51 @@ export const ActivityTimedOutPayload = z.object({
   runningMs: z.number().int().nonnegative(),
   reason: z.literal('LeaseExpired'),
   errorClass: z.literal('retryable'),
+});
+
+// ─── Group 1b — Loop lifecycle (4) ─────────────────────────────────────────
+
+export const LoopStartedPayload = z.object({
+  loopId: z.string(),
+  maxIterations: z.number().int().positive(),
+});
+
+export const LoopIterationStartedPayload = z.object({
+  loopId: z.string(),
+  iteration: z.number().int().positive(),
+  prevResolution: z.enum(['initial', 'rejected']),
+});
+
+export const LoopIterationFinishedPayload = z.object({
+  loopId: z.string(),
+  iteration: z.number().int().positive(),
+  resolution: z.enum(['approved', 'rejected']),
+  decisionActivityId: z.string(),
+  waitResolvedEventId: z.string(),
+  by: z.string(),
+  comment: z.string().optional(),
+  timedOut: z.boolean().optional(),
+});
+
+export const LoopFinishedPayload = z.object({
+  loopId: z.string(),
+  finalIteration: z.number().int().positive(),
+  // - approved: terminator decision approved (success)
+  // - max-iterations-exceeded: ran out of iterations on rejection
+  // - body-failed: non-terminator body node failed (subagent crash /
+  //   hostExecutor error / non-terminator humanGate reject = fail-run)
+  // - cancelled: user-initiated cancel reached the loop
+  // - timeout: terminator humanGate deadline expired
+  resolution: z.enum([
+    'approved',
+    'max-iterations-exceeded',
+    'body-failed',
+    'cancelled',
+    'timeout',
+  ]),
+  outputRef: OutputRefSchema.optional(),
+  errorCode: ErrorCodeEnum.optional(),
+  errorClass: ErrorClassEnum.optional(),
 });
 
 // ─── Group 2 — Scheduling (5) ───────────────────────────────────────────────

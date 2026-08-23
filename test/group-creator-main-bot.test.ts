@@ -10,15 +10,23 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 const createChatMock = vi.fn();
 const transferChatOwnerMock = vi.fn();
 const getChatOwnerMock = vi.fn();
+const getChatShareLinkMock = vi.fn();
+const addBotToChatMock = vi.fn();
+const addUsersToChatByUnionIdMock = vi.fn();
 vi.mock('../src/services/groups-store.js', () => ({
   createChat: createChatMock,
   transferChatOwner: transferChatOwnerMock,
   getChatOwner: getChatOwnerMock,
+  getChatShareLink: getChatShareLinkMock,
+  addBotToChat: addBotToChatMock,
+  addUsersToChatByUnionId: addUsersToChatByUnionIdMock,
 }));
 
 const sendMessageMock = vi.fn();
 vi.mock('../src/im/lark/client.js', () => ({
   sendMessage: sendMessageMock,
+  listChatBotMembers: vi.fn(async () => []),
+  resolveAllowedUsersWithMap: vi.fn(async () => ({ resolved: [], map: new Map() })),
 }));
 
 const bindOncallMock = vi.fn();
@@ -44,6 +52,9 @@ beforeEach(() => {
   createChatMock.mockReset();
   transferChatOwnerMock.mockReset();
   getChatOwnerMock.mockReset();
+  getChatShareLinkMock.mockReset();
+  addBotToChatMock.mockReset();
+  addUsersToChatByUnionIdMock.mockReset();
   sendMessageMock.mockReset();
   bindOncallMock.mockReset();
   dispatchChatCreatedMock.mockReset();
@@ -55,6 +66,10 @@ beforeEach(() => {
     invalidBotIds: [],
     invalidUserIds: [],
   });
+  getChatShareLinkMock.mockResolvedValue({ ok: true, shareLink: 'https://example.test/share' });
+  addBotToChatMock.mockImplementation(async (_appId: string, _chatId: string, ids: string[]) =>
+    ids.map(id => ({ id, ok: true as const })));
+  addUsersToChatByUnionIdMock.mockResolvedValue({ invalidUserIds: [] });
 });
 
 describe('createGroupWithBots — P0/4 main-bot dispatch', () => {

@@ -6,9 +6,12 @@ import { join } from 'node:path';
 const contactGet = vi.hoisted(() => vi.fn());
 
 vi.mock('../src/bot-registry.js', () => ({
-  getBotClient: vi.fn(() => ({
-    contact: { v3: { user: { get: contactGet } } },
-  })),
+  getBotClient: vi.fn(() => ({})),
+}));
+
+vi.mock('../src/im/lark/client.js', () => ({
+  larkGet: (...args: unknown[]) => contactGet(...args),
+  getMessageDetail: vi.fn(),
 }));
 
 let dataDir: string | undefined;
@@ -41,6 +44,7 @@ describe('identity-cache sender email', () => {
       type: 'user',
       name: 'Alice',
       email: 'alice@example.com',
+      role: undefined,
     });
 
     identity.recordIdentity('app_email_test', {
@@ -77,6 +81,7 @@ describe('identity-cache sender email', () => {
       type: 'user',
       name: 'Cached Alice',
       email: 'cached-alice@example.com',
+      role: undefined,
     });
     identity.flushIdentityCacheSync();
   });

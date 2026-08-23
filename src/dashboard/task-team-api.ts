@@ -2,7 +2,7 @@
 // 只读 batch1 config/instance store；在 daemon 进程内运行。挂载点见 src/dashboard.ts（additive）。
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { jsonRes } from './workflow-api.js';
+import { jsonRes } from './http.js';
 import { readTaskTeamConfig } from '../services/taskteam-config-store.js';
 import { readTaskTeams } from '../services/taskteam-store.js';
 import type { TaskTeamConfigFile, TaskTeamInstance } from '../services/taskteam-schema.js';

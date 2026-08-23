@@ -73,6 +73,9 @@ vi.mock('../src/config.js', () => ({
 }));
 
 vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
   closeSession: vi.fn(),
   updateSession: vi.fn(),
   createSession: vi.fn(),
@@ -90,6 +93,7 @@ vi.mock('../src/core/worker-pool.js', async (importOriginal) => {
 
 vi.mock('../src/core/session-manager.js', () => ({
   getSessionWorkingDir: vi.fn(() => '/tmp'),
+  ensureSessionWhiteboard: vi.fn(),
   buildNewTopicPrompt: vi.fn(() => 'mock-prompt'),
   getAvailableBots: vi.fn(() => []),
   // card-handler's toggle path calls persistStreamCardState after flipping
@@ -312,12 +316,15 @@ describe('Streaming card toggle_stream', () => {
       expect(patchCalls, 'only one PATCH sent').toHaveLength(1);
       expect(parseDisplayMode(ds.pendingCardJson!), 'latest queued should be screenshot').toBe('screenshot');
 
-      // Resolve first → only ONE queued PATCH flushes (the latest)
+      // Resolve first. The latest queued state is byte-identical to the
+      // successful in-flight PATCH for the same card, so it is an adjacent
+      // duplicate and does not need another Lark call.
       patchCalls[0].resolve();
       await flush();
 
-      expect(patchCalls).toHaveLength(2);
-      expect(parseDisplayMode(patchCalls[1].cardJson), 'flushed PATCH should be the latest state').toBe('screenshot');
+      expect(patchCalls).toHaveLength(1);
+      expect(ds.pendingCardJson).toBeUndefined();
+      expect(ds.cardPatchInFlight).toBe(false);
     });
   });
 });

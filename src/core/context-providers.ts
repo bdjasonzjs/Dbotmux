@@ -382,7 +382,9 @@ registerContextProvider({
   delivery: 'file',
   inlineRounds: 'all',
   // 2026-06-10 chat 模式 gate：闲聊群（mode=chat）不注入工作纪律块。缺省 work → 照旧注入。
-  applies: ctx => getChatMode(ctx.chatId) !== 'chat',
+  // Mira is a botmux-unaware runner: injecting instructions that require
+  // `botmux send` would violate its no-routing prompt contract.
+  applies: ctx => ctx.cliId !== 'mira' && getChatMode(ctx.chatId) !== 'chat',
   render: () => buildOutputDisciplineBlock(),
   tldr: () => '说做分离：一回合要么只 botmux send 说话、要么只执行工具调用，别混在一回合；给 owner 的话一次一件、简短。',
 });

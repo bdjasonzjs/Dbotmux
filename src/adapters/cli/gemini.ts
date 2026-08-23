@@ -2,20 +2,26 @@ import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 
-function delay(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
+import { delay } from '../../utils/timing.js';
 
 export function createGeminiAdapter(pathOverride?: string): CliAdapter {
-  const bin = resolveCommand(pathOverride ?? 'gemini');
+  // resolvedBin is lazy: setup constructs adapters only to read static
+  // modelChoices and must not shell out (see resolveCommand); the binary path
+  // is a spawn-time concern.
+  const rawBin = pathOverride ?? 'gemini';
+  let cachedBin: string | undefined;
   return {
     id: 'gemini',
-    resolvedBin: bin,
+    authPaths: ['~/.gemini/oauth_creds.json'],
+    get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ initialPrompt }) {
+    buildArgs({ initialPrompt, model, disableCliBypass }) {
       // Gemini CLI manages sessions internally (--resume takes "latest" or
       // an index/UUID, not our daemon session IDs).  We always start fresh.
-      const args = ['--yolo'];
+      const args = disableCliBypass ? [] : ['--yolo'];
+      if (model && model.trim()) {
+        args.push('--model', model.trim());
+      }
       // Use -i (prompt-interactive) for the initial prompt.  Gemini's Ink TUI
       // has a startup phase where the TextInput component isn't mounted yet
       // (auth, model loading, extensions).  Writing to stdin during this phase
@@ -46,6 +52,7 @@ export function createGeminiAdapter(pathOverride?: string): CliAdapter {
     systemHints: BOTMUX_SHELL_HINTS,
     altScreen: true,                // Ink renders in alternate screen buffer by default
     skillsDir: '~/.gemini/skills',
+    modelChoices: ['gemini-2.5-pro', 'gemini-2.5-flash'],
   };
 }
 

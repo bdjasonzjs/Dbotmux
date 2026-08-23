@@ -84,6 +84,14 @@ vi.mock('../src/services/main-bot-digest-store.js', () => ({
   enqueueEscalation: vi.fn(),
 }));
 
+// The production dispatcher persists message-id claims before scheduling the
+// ACK-safe work. This suite deliberately reuses one fixture id across cases,
+// so keep dedupe out of the behavior under test.
+vi.mock('../src/services/seen-message-store.js', () => ({
+  claimMessageOnce: vi.fn(() => true),
+  _resetCacheForTest: vi.fn(),
+}));
+
 // Capture handlers from EventDispatcher.register()
 let capturedHandlers: Record<string, Function> = {};
 vi.mock('@larksuiteoapi/node-sdk', () => {
@@ -140,7 +148,7 @@ describe('auto-unarchive sender_type gate (P5 regression)', () => {
     mockIsArchived.mockReturnValue(true);
     mockUnarchive.mockClear();
     setupBot();
-    startLarkEventDispatcher({
+    startLarkEventDispatcher(MY_APP_ID, 'secret', {
       handleCardAction: async () => undefined,
       handleNewTopic: async () => {},
       handleThreadReply: async () => {},
@@ -161,7 +169,10 @@ describe('auto-unarchive sender_type gate (P5 regression)', () => {
 
   it('DOES unarchive when sender_type is "user" (human message)', async () => {
     await dispatch(makeEvent({ senderType: 'user', senderOpenId: 'ou_human_jason' }));
-    expect(mockUnarchive).toHaveBeenCalledWith(TARGET_CHAT);
+    // The current dispatcher ACKs first and runs the message body through its
+    // serialized ingress queue, so the registered handler may return before
+    // the bookkeeping callback has completed.
+    await vi.waitFor(() => expect(mockUnarchive).toHaveBeenCalledWith(TARGET_CHAT));
   });
 
   it('does not call unarchive when the chat is already active (isArchived → false)', async () => {

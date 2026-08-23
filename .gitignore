@@ -1,12 +1,17 @@
-node_modules/
+node_modules
 .pnpm-store/
 dist/
+packages/workflow-core/dist/
+packages/workflow-core/.packs/
 data/
 log/
+.DS_Store
+.idea/
 *.tsbuildinfo
 .env
 .npmrc
 docs/superpowers/
+docs/specs/
 storageState.json
 midscene_run/
 .codex
@@ -15,3 +20,36 @@ midscene_run/
 diagrams/
 
 REVIEW-context-stub-identity-tldr.md
+.cjadk/
+.trae/
+# magic / 妙笔发布 token 与 app 映射（含密钥，绝不提交）
+.magic-token
+.magic-apps.json
+docs-site/.magic-token
+
+# HD2D office runtime binaries — downloaded on demand from GitHub Release
+# (hd2d-assets-*), never committed. See src/dashboard/hd2d-assets.ts
+src/dashboard/web/game/index.wasm
+src/dashboard/web/game/index.pck
+
+# Playwright MCP verification artifacts
+.playwright-mcp/
+dashboard-substitute*.png
+
+# Desktop packaging staging/generated raster assets
+build/desktop-node/
+build/desktop-runtime/
+build/icon.png
+src/desktop/assets/*.png
+
+# 内网独立仓 / 网关配置：各自有独立 git 仓，含内网部署信息，
+# 绝不并入这个公开仓。防 `git add .` 误提交。
+# 必须用 `/` 锚定到仓库根：不锚定的 `platform/` 会连 `src/platform/`（隧道绑定、
+# 设备注册这些正经源码）一起吃掉——已跟踪的文件不受影响，但**新增**文件会被
+# 静默忽略，`git add` 只报一行提示，很容易漏提交。
+/platform/
+/mcp-gateway/
+.gdpa
+
+# OMO 计划产物（.omo/ 计划、草稿、证据），绝不提交
+.omo/

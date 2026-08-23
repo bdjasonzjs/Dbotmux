@@ -14,6 +14,7 @@ import { describe, it, expect, afterEach, beforeEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';
 import * as pty from 'node-pty';
 import { IdleDetector } from '../src/utils/idle-detector.js';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
@@ -25,6 +26,10 @@ const OPENCODE_BIN = 'opencode';
 const PTY_COLS = 300;
 const PTY_ROWS = 50;
 const TEST_PROMPT = 'just say the word PONG and nothing else';
+const OPENCODE_AVAILABLE = !spawnSync(OPENCODE_BIN, ['--version'], {
+  stdio: 'ignore',
+  timeout: 5_000,
+}).error;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -51,7 +56,7 @@ function simpleStrip(data: string): string {
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
-describe('OpenCode first input submission', () => {
+describe.skipIf(!OPENCODE_AVAILABLE)('OpenCode first input submission', () => {
   let proc: pty.IPty | null = null;
   let tmpDir: string | null = null;
 
@@ -259,22 +264,36 @@ describe('OpenCode first input submission', () => {
       console.log('>>> No useful session to continue — --continue is unreliable for restart');
     }
 
-    // The fix: buildArgs should NOT include --continue on resume
+    // The fix: buildArgs must NEVER include --continue on resume. Use a
+    // UUID-shaped botmux session id so the opencode.db text lookup can't
+    // accidentally match unrelated rows on the test machine.
     const adapter = createOpenCodeAdapter();
-    const resumeArgs = adapter.buildArgs({ sessionId: 'test', resume: true });
+    const resumeArgs = adapter.buildArgs({ sessionId: 'f0e1d2c3-0000-4000-8000-badbadbadbad', resume: true });
     expect(resumeArgs).not.toContain('--continue');
-    expect(resumeArgs, 'resume should produce empty args (start fresh)').toEqual([]);
+    expect(resumeArgs, 'resume without a discoverable session should produce empty args (start fresh)').toEqual([]);
   }, 15_000);
 
-  it('adapter: resume starts fresh (no --continue)', () => {
+  it('adapter: resume uses --session when the native id is known, else starts fresh', () => {
     const adapter = createOpenCodeAdapter();
-    // resume: true should NOT add --continue — always start fresh
-    expect(adapter.buildArgs({ sessionId: 'test', resume: true })).toEqual([]);
-    // resume with prompt should only have --prompt
-    const args = adapter.buildArgs({ sessionId: 'test', resume: true, initialPrompt: 'hello' });
+    const nowhereSession = 'f0e1d2c3-0000-4000-8000-badbadbadbad';
+    // resume with a persisted OpenCode session id → precise --session resume
+    expect(adapter.buildArgs({ sessionId: nowhereSession, resume: true, resumeSessionId: 'ses_0123abcDEF' }))
+      .toEqual(['--session', 'ses_0123abcDEF']);
+    // a non-OpenCode-shaped id (e.g. another CLI's UUID after a CLI switch) is rejected
+    const foreignId = adapter.buildArgs({ sessionId: nowhereSession, resume: true, resumeSessionId: '01234567-89ab-cdef-0123-456789abcdef' });
+    expect(foreignId).not.toContain('--session');
+    // resume: true with no discoverable session → fresh, never --continue
+    expect(adapter.buildArgs({ sessionId: nowhereSession, resume: true })).toEqual([]);
+    // fresh-degraded resume with prompt keeps --prompt delivery
+    const args = adapter.buildArgs({ sessionId: nowhereSession, resume: true, initialPrompt: 'hello' });
     expect(args).not.toContain('--continue');
     expect(args).toContain('--prompt');
     expect(args).toContain('hello');
+  });
+
+  it('adapter: initialPromptArgsIgnoredOnResume is set (opencode drops --prompt with -s)', () => {
+    const adapter = createOpenCodeAdapter();
+    expect(adapter.initialPromptArgsIgnoredOnResume).toBe(true);
   });
 
   it('adapter: altScreen is true (Bubble Tea)', () => {

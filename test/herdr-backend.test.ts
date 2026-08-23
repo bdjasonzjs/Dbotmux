@@ -1,0 +1,1236 @@
+/**
+ * Unit tests for HerdrBackend.
+ *
+ * Covers:
+ *   - Backend "connection" surface: isAvailable / hasSession / ensureServer
+ *     boot polling (no busy-spin; respects an already-running session).
+ *   - spawn() in three flavours: fresh agent start, existing-agent reuse, and
+ *     external-target adopt — verifies the right `herdr agent {start,get}` /
+ *     pane-id wiring runs in each case.
+ *   - Message writing: write / sendText / sendSpecialKeys hit `pane
+ *     send-text` and `pane send-keys` with the resolved pane target.
+ *   - Data + exit callbacks: poll() emits the prefix-delta on changed
+ *     `pane read` output, and emits exit once the agent vanishes from
+ *     `agent list`.
+ *
+ * Run:  pnpm vitest run test/herdr-backend.test.ts
+ */
+import { EventEmitter } from 'node:events';
+import { existsSync } from 'node:fs';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+
+vi.mock('node:child_process', () => ({
+  execFileSync: vi.fn(),
+  spawn: vi.fn(),
+}));
+
+vi.mock('node-pty', () => ({
+  spawn: vi.fn(),
+}));
+
+import { execFileSync, spawn } from 'node:child_process';
+import * as pty from 'node-pty';
+import { HerdrBackend } from '../src/adapters/backend/herdr-backend.js';
+
+const mockedExecFileSync = vi.mocked(execFileSync);
+const mockedSpawn = vi.mocked(spawn);
+const mockedPtySpawn = vi.mocked(pty.spawn);
+
+// ─── Helpers ───────────────────────────────────────────────────────────────
+
+class FakeChild extends EventEmitter {
+  killed = false;
+  unref = vi.fn();
+  kill = vi.fn(() => { this.killed = true; return true; });
+}
+
+function makeFakeChild(): FakeChild { return new FakeChild(); }
+
+class FakePty {
+  readonly resize = vi.fn();
+  readonly kill = vi.fn();
+  private dataCb: ((data: string) => void) | null = null;
+  private exitCb: ((event: { exitCode: number; signal?: number }) => void) | null = null;
+
+  readonly onData = vi.fn((cb: (data: string) => void) => {
+    this.dataCb = cb;
+    return { dispose: vi.fn() };
+  });
+
+  readonly onExit = vi.fn((cb: (event: { exitCode: number; signal?: number }) => void) => {
+    this.exitCb = cb;
+    return { dispose: vi.fn() };
+  });
+
+  emitData(data: string): void { this.dataCb?.(data); }
+  emitExit(exitCode = 0, signal?: number): void { this.exitCb?.({ exitCode, signal }); }
+}
+
+function makeFakePty(): FakePty { return new FakePty(); }
+
+function findCall(predicate: (args: string[]) => boolean): string[] | undefined {
+  for (const call of mockedExecFileSync.mock.calls) {
+    const args = (call[1] as string[]) ?? [];
+    if (predicate(args)) return args;
+  }
+  return undefined;
+}
+
+function findCallOpts(predicate: (args: string[]) => boolean): any | undefined {
+  for (const call of mockedExecFileSync.mock.calls) {
+    const args = (call[1] as string[]) ?? [];
+    if (predicate(args)) return call[2];
+  }
+  return undefined;
+}
+
+function herdrCall(...needles: string[]): string[] | undefined {
+  return findCall(args => needles.every(n => args.includes(n)));
+}
+
+/**
+ * Route mocked herdr CLI invocations to canned payloads. Anything not matched
+ * returns "" (sleep, version probes, fire-and-forget writes).
+ */
+function setHerdrResponses(handlers: Array<{ match: (args: string[]) => boolean; reply: () => string }>) {
+  mockedExecFileSync.mockImplementation(((cmd: any, args: any) => {
+    if (cmd !== 'herdr') return '' as any;
+    const argv = args as string[];
+    for (const h of handlers) {
+      if (h.match(argv)) return h.reply() as any;
+    }
+    return '' as any;
+  }) as any);
+}
+
+const SESSION = 'bmx-deadbeef';
+const EXISTING_SESSION_REPLY = JSON.stringify({ sessions: [{ name: SESSION, running: true }] });
+const EMPTY_SESSIONS_REPLY = JSON.stringify({ sessions: [] });
+const AGENT_GET_REPLY = (paneId: string) => JSON.stringify({ result: { agent: { name: 'botmux', pane_id: paneId } } });
+const AGENT_LIST_REPLY = (paneId: string) => JSON.stringify({ result: { agents: [{ name: 'botmux', pane_id: paneId }] } });
+const PANE_READ_REPLY = (text: string) => JSON.stringify({ result: { read: { text } } });
+const WORKSPACE_CREATED_REPLY = (workspaceId: string, paneId: string) => JSON.stringify({
+  result: {
+    workspace: { workspace_id: workspaceId },
+    root_pane: { pane_id: paneId },
+  },
+});
+
+beforeEach(() => {
+  mockedExecFileSync.mockReset();
+  mockedSpawn.mockReset();
+  mockedPtySpawn.mockReset();
+  // Default: every spawn (including the bg `wait agent-status` watcher) gets
+  // a fake child whose lifecycle the test fully controls.
+  mockedSpawn.mockImplementation((() => makeFakeChild()) as any);
+  mockedPtySpawn.mockImplementation((() => makeFakePty()) as any);
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+// ─── Backend connection surface ────────────────────────────────────────────
+
+describe('HerdrBackend connection surface', () => {
+  it('isAvailable() returns true when `herdr --version` succeeds', () => {
+    mockedExecFileSync.mockImplementation((() => 'herdr 1.0\n') as any);
+    expect(HerdrBackend.isAvailable()).toBe(true);
+    const versionCall = mockedExecFileSync.mock.calls.find(c => (c[1] as string[]).includes('--version'));
+    expect(versionCall).toBeDefined();
+  });
+
+  it('isAvailable() returns false when herdr binary is missing', () => {
+    mockedExecFileSync.mockImplementation((() => { throw new Error('ENOENT'); }) as any);
+    expect(HerdrBackend.isAvailable()).toBe(false);
+  });
+
+  it('uses one machine-wide Herdr host for Botmux-launched agents', () => {
+    expect(HerdrBackend.managedSessionName()).toBe('botmux');
+  });
+
+  it('hasSession() parses `session list --json` and matches running sessions', () => {
+    setHerdrResponses([{
+      match: a => a[0] === 'session' && a[1] === 'list',
+      reply: () => JSON.stringify({ sessions: [{ name: SESSION, running: true }, { name: 'other', running: false }] }),
+    }]);
+    expect(HerdrBackend.hasSession(SESSION)).toBe(true);
+    expect(HerdrBackend.hasSession('other')).toBe(false);
+    expect(HerdrBackend.hasSession('missing')).toBe(false);
+  });
+
+  // ── Tri-state probe (exists | missing | unknown) ────────────────────────────
+  // The restore-time zombie-close decision MUST NOT collapse "list command
+  // failed/timed out" into "session is gone" — a transient probe failure would
+  // otherwise permanently close a still-alive session. probeSession() keeps the
+  // two apart; hasSession() stays the conservative boolean wrapper.
+  it('probeSession() reports "exists" for a running session and "missing" for an absent one', () => {
+    setHerdrResponses([{
+      match: a => a[0] === 'session' && a[1] === 'list',
+      reply: () => JSON.stringify({ sessions: [{ name: SESSION, running: true }] }),
+    }]);
+    expect(HerdrBackend.probeSession(SESSION)).toBe('exists');
+    expect(HerdrBackend.probeSession('bmx-absent')).toBe('missing');
+  });
+
+  it('probeSession() reports "missing" for a present-but-not-running row (a genuine zombie)', () => {
+    setHerdrResponses([{
+      match: a => a[0] === 'session' && a[1] === 'list',
+      reply: () => JSON.stringify({ sessions: [{ name: SESSION, running: false }] }),
+    }]);
+    expect(HerdrBackend.probeSession(SESSION)).toBe('missing');
+  });
+
+  it('probeSession() reports "unknown" when `session list` fails/times out — NOT "missing"', () => {
+    mockedExecFileSync.mockImplementation((() => { throw new Error('ETIMEDOUT'); }) as any);
+    expect(HerdrBackend.probeSession(SESSION)).toBe('unknown');
+    // hasSession() must stay conservative (false) on unknown so existing
+    // boolean callers are unaffected by the new tri-state.
+    expect(HerdrBackend.hasSession(SESSION)).toBe(false);
+  });
+
+  it('probeAgent() distinguishes a live managed agent, a missing agent, and a failed probe', () => {
+    setHerdrResponses([{
+      match: a => a.includes('agent') && a.includes('list'),
+      reply: () => JSON.stringify({ result: { agents: [
+        { name: 'botmux-live', pane_id: '1-1' },
+        { name: 'botmux-exited', pane_id: '1-2', running: false },
+      ] } }),
+    }]);
+
+    expect(HerdrBackend.probeAgent('work', 'botmux-live')).toBe('exists');
+    expect(HerdrBackend.probeAgent('work', 'botmux-exited')).toBe('missing');
+    expect(HerdrBackend.probeAgent('work', 'botmux-absent')).toBe('missing');
+
+    mockedExecFileSync.mockImplementation((() => { throw new Error('ETIMEDOUT'); }) as any);
+    expect(HerdrBackend.probeAgent('work', 'botmux-live')).toBe('unknown');
+  });
+
+  it('killAgent() closes only the managed pane in a shared session', () => {
+    setHerdrResponses([{
+      match: a => a.includes('agent') && a.includes('list'),
+      reply: () => JSON.stringify({ result: { agents: [
+        { name: 'botmux-deadbeef', pane_id: '4-2' },
+      ] } }),
+    }]);
+
+    HerdrBackend.killAgent('work', 'botmux-deadbeef');
+
+    expect(herdrCall('--session', 'work', 'pane', 'close', '4-2')).toBeDefined();
+    expect(herdrCall('session', 'stop', 'work')).toBeUndefined();
+    expect(herdrCall('session', 'delete', 'work')).toBeUndefined();
+  });
+
+  it('killAgents() lists a shared host once and closes only selected live panes', () => {
+    setHerdrResponses([{
+      match: a => a.includes('agent') && a.includes('list'),
+      reply: () => JSON.stringify({ result: { agents: [
+        { name: 'botmux-one', pane_id: '4-1' },
+        { name: 'botmux-two', pane_id: '4-2' },
+        { name: 'botmux-exited', pane_id: '4-4', running: false },
+        { name: 'user-sibling', pane_id: '4-3' },
+      ] } }),
+    }]);
+
+    HerdrBackend.killAgents(
+      'work',
+      new Set(['botmux-one', 'botmux-two', 'botmux-exited', 'already-gone']),
+    );
+
+    const listCalls = mockedExecFileSync.mock.calls.filter(call => {
+      const args = (call[1] as string[]) ?? [];
+      return args.includes('agent') && args.includes('list');
+    });
+    expect(listCalls).toHaveLength(1);
+    expect(herdrCall('--session', 'work', 'pane', 'close', '4-1')).toBeDefined();
+    expect(herdrCall('--session', 'work', 'pane', 'close', '4-2')).toBeDefined();
+    expect(herdrCall('--session', 'work', 'pane', 'close', '4-3')).toBeUndefined();
+    expect(herdrCall('--session', 'work', 'pane', 'close', '4-4')).toBeUndefined();
+    expect(herdrCall('session', 'stop', 'work')).toBeUndefined();
+    expect(herdrCall('session', 'delete', 'work')).toBeUndefined();
+  });
+
+  it('ensureServer skips boot poll when session already exists (no spawn, no sleep)', () => {
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('1-1') },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('') },
+    ]);
+    // Session already exists ⇒ this is the reattach path (resolves paneId via
+    // `agent get`, no `agent start`).
+    const be = new HerdrBackend(SESSION, { isReattach: true });
+    be.spawn('claude', [], { cwd: '/tmp', cols: 80, rows: 24, env: {} });
+    // Only the bg status watcher should be spawned. No `herdr ... server`, no
+    // sleep child_process call.
+    const headlessSpawns = mockedSpawn.mock.calls.filter(c => (c[1] as string[]).includes('server'));
+    expect(headlessSpawns).toHaveLength(0);
+    const sleepCalls = mockedExecFileSync.mock.calls.filter(c => c[0] === 'sleep');
+    expect(sleepCalls).toHaveLength(0);
+    be.kill();
+  });
+
+  it('ensureServer spawns `herdr server` then polls until hasSession returns true', () => {
+    // First three session-list probes report empty, fourth reports running.
+    let listCount = 0;
+    setHerdrResponses([
+      {
+        match: a => a[0] === 'session' && a[1] === 'list',
+        reply: () => {
+          listCount++;
+          return listCount >= 4 ? EXISTING_SESSION_REPLY : EMPTY_SESSIONS_REPLY;
+        },
+      },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => '' },
+      {
+        match: a => a.includes('agent') && a.includes('start'),
+        reply: () => JSON.stringify({ result: { agent: { name: 'botmux', pane_id: '1-1' } } }),
+      },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('') },
+    ]);
+    // No pre-existing session ⇒ fresh start: boots `herdr server`, then
+    // `agent start`s the CLI.
+    const be = new HerdrBackend(SESSION, { createSession: true });
+    be.spawn('claude', [], { cwd: '/tmp', cols: 80, rows: 24, env: {} });
+    const serverSpawn = mockedSpawn.mock.calls.find(c => (c[1] as string[]).includes('server'));
+    expect(serverSpawn).toBeDefined();
+    // At least one `sleep` invocation between session-list probes — proves we
+    // are not busy-spinning.
+    const sleepCalls = mockedExecFileSync.mock.calls.filter(c => c[0] === 'sleep');
+    expect(sleepCalls.length).toBeGreaterThanOrEqual(1);
+    be.kill();
+  });
+});
+
+// ─── spawn(): fresh / existing / external ──────────────────────────────────
+
+describe('HerdrBackend.spawn', () => {
+  it('Herdr 0.7.5: creates a workspace and starts the real Pi coding agent in its root pane', () => {
+    setHerdrResponses([
+      { match: a => a.includes('--version'), reply: () => 'herdr 0.7.5\n' },
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('workspace') && a.includes('create'), reply: () => WORKSPACE_CREATED_REPLY('w_pi', 'w_pi-1') },
+      { match: a => a.includes('agent') && a.includes('start'), reply: () => AGENT_GET_REPLY('w_pi-1') },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('hello') },
+    ]);
+    const be = new HerdrBackend(SESSION);
+    be.spawn('/Users/test/.local/bin/node/bin/pi', ['--session-id', 'sid-1', 'line one\nline two'], {
+      cwd: '/work',
+      cols: 120,
+      rows: 30,
+      env: { PATH: '/usr/bin:/bin', BOTMUX_SESSION_ID: 'sid-1' },
+    });
+
+    const workspaceCall = herdrCall('workspace', 'create', '--cwd', '/work', '--label', 'botmux', '--no-focus');
+    expect(workspaceCall).toBeDefined();
+    const pathArg = workspaceCall!.find(arg => arg.startsWith('PATH='));
+    expect(pathArg).toMatch(/^PATH=.*botmux-herdr-launch-/);
+    expect(pathArg).toContain('/Users/test/.local/bin/node/bin:/usr/bin:/bin');
+    const launcherDir = pathArg!.slice('PATH='.length).split(':')[0]!;
+    expect(workspaceCall).toContain('BOTMUX_SESSION_ID=sid-1');
+
+    const startCall = herdrCall(
+      'agent', 'start', 'botmux',
+      '--kind', 'pi',
+      '--pane', 'w_pi-1',
+      '--timeout', '30000',
+    );
+    expect(startCall).toBeDefined();
+    expect(startCall).not.toContain('--cwd');
+    // Exact CLI args (including the multiline initial prompt) live in the
+    // short-lived launcher script. Herdr receives no control-character args.
+    expect(startCall).not.toContain('--session-id');
+    expect(startCall).not.toContain('line one\nline two');
+    expect(existsSync(launcherDir)).toBe(false);
+    be.kill();
+  });
+
+  it('Herdr 0.7.5: forwards safe Pi session and prompt-file args when the managed integration bypasses PATH', () => {
+    setHerdrResponses([
+      { match: a => a.includes('--version'), reply: () => 'herdr 0.7.5\n' },
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('workspace') && a.includes('create'), reply: () => WORKSPACE_CREATED_REPLY('w_pi', 'w_pi-1') },
+      { match: a => a.includes('agent') && a.includes('start'), reply: () => AGENT_GET_REPLY('w_pi-1') },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('hello') },
+    ]);
+    const be = new HerdrBackend(SESSION);
+    be.spawn('/Users/test/.local/bin/node/bin/pi', ['--session-id', 'sid-1', '@/tmp/initial.prompt.md'], {
+      cwd: '/work', cols: 120, rows: 30, env: { PATH: '/usr/bin:/bin' },
+    });
+
+    expect(herdrCall(
+      'agent', 'start', 'botmux',
+      '--kind', 'pi',
+      '--pane', 'w_pi-1',
+      '--timeout', '30000',
+      '--', '--session-id', 'sid-1', '@/tmp/initial.prompt.md',
+    )).toBeDefined();
+    be.kill();
+  });
+
+  it('Herdr 0.7.5: retries while a new workspace shell is not yet available', () => {
+    let startAttempts = 0;
+    mockedExecFileSync.mockImplementation(((cmd: any, args: any) => {
+      if (cmd !== 'herdr') return '' as any;
+      const argv = args as string[];
+      if (argv.includes('--version')) return 'herdr 0.7.5\n' as any;
+      if (argv[0] === 'session' && argv[1] === 'list') return EXISTING_SESSION_REPLY as any;
+      if (argv.includes('workspace') && argv.includes('create')) return WORKSPACE_CREATED_REPLY('w_race', 'w_race-1') as any;
+      if (argv.includes('agent') && argv.includes('start')) {
+        startAttempts++;
+        if (startAttempts < 3) {
+          const err: any = new Error('exit 1');
+          err.stdout = JSON.stringify({ error: { code: 'agent_pane_busy', message: 'agent target pane is not an available shell' } });
+          err.stderr = '';
+          throw err;
+        }
+        return AGENT_GET_REPLY('w_race-1') as any;
+      }
+      if (argv.includes('read')) return PANE_READ_REPLY('hello') as any;
+      return '' as any;
+    }) as any);
+
+    const be = new HerdrBackend(SESSION);
+    be.spawn('pi', [], { cwd: '/work', cols: 120, rows: 30, env: {} });
+
+    expect(startAttempts).toBe(3);
+    expect(herdrCall('workspace', 'close', 'w_race')).toBeUndefined();
+    be.kill();
+  });
+
+  it('Herdr 0.7.5: rejects unsupported launch wrappers before creating a workspace', () => {
+    setHerdrResponses([
+      { match: a => a.includes('--version'), reply: () => 'herdr 0.7.5\n' },
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+    ]);
+    const be = new HerdrBackend(SESSION);
+
+    expect(() => be.spawn('/usr/local/bin/custom-pi-wrapper', [], {
+      cwd: '/work', cols: 120, rows: 30, env: {},
+    })).toThrow(/cannot launch executable "custom-pi-wrapper".*tmux backend/);
+    expect(herdrCall('workspace', 'create')).toBeUndefined();
+    be.kill();
+  });
+
+  it('Herdr 0.7.5: closes the new workspace and surfaces upstream diagnostics when agent startup fails', () => {
+    mockedExecFileSync.mockImplementation(((cmd: any, args: any) => {
+      if (cmd !== 'herdr') return '' as any;
+      const argv = args as string[];
+      if (argv.includes('--version')) return 'herdr 0.7.5\n' as any;
+      if (argv[0] === 'session' && argv[1] === 'list') return EXISTING_SESSION_REPLY as any;
+      if (argv.includes('workspace') && argv.includes('create')) return WORKSPACE_CREATED_REPLY('w_failed', 'w_failed-1') as any;
+      if (argv.includes('agent') && argv.includes('start')) {
+        const err: any = new Error('exit 1');
+        err.stdout = JSON.stringify({ error: { code: 'agent_start_failed', message: 'pi exited before interactive' } });
+        err.stderr = '';
+        throw err;
+      }
+      return '' as any;
+    }) as any);
+    const be = new HerdrBackend(SESSION);
+
+    expect(() => be.spawn('pi', [], {
+      cwd: '/work', cols: 120, rows: 30, env: {},
+    })).toThrow(/agent_start_failed.*pi exited before interactive/);
+    expect(herdrCall('workspace', 'close', 'w_failed')).toBeDefined();
+    be.kill();
+  });
+
+  it('fresh session: calls `agent start botmux --cwd <cwd> -- bin args...` and records pane_id', () => {
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => '' },
+      {
+        match: a => a.includes('agent') && a.includes('start'),
+        reply: () => JSON.stringify({ result: { agent: { name: 'botmux', pane_id: '2-3' } } }),
+      },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('hello') },
+    ]);
+    const be = new HerdrBackend(SESSION);
+    be.spawn('claude', ['--resume', 'abc'], { cwd: '/work', cols: 120, rows: 30, env: {} });
+
+    const startCall = herdrCall('agent', 'start', 'botmux', '--cwd', '/work', '--', 'claude', '--resume', 'abc');
+    expect(startCall).toBeDefined();
+    expect(startCall).toContain('--session');
+    expect(startCall![startCall!.indexOf('--session') + 1]).toBe(SESSION);
+    be.kill();
+  });
+
+  it('per-bot injectEnv is threaded into the herdr server + agent-start env (so the forked CLI inherits it)', () => {
+    // Fresh start so ensureServer actually boots a `herdr server`: first
+    // session-list probe empty (→ boot), subsequent probes running (→ ready).
+    let listCount = 0;
+    setHerdrResponses([
+      {
+        match: a => a[0] === 'session' && a[1] === 'list',
+        reply: () => { listCount++; return listCount >= 2 ? EXISTING_SESSION_REPLY : EMPTY_SESSIONS_REPLY; },
+      },
+      { match: a => a.includes('agent') && a.includes('start'), reply: () => AGENT_GET_REPLY('1-1') },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('') },
+    ]);
+    const be = new HerdrBackend(SESSION, { createSession: true });
+    be.spawn('claude', [], {
+      cwd: '/work', cols: 80, rows: 24,
+      env: { BOTMUX_SESSION_ID: 'sess_x' },
+      injectEnv: { ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic', ANTHROPIC_AUTH_TOKEN: 'glm-key' },
+    });
+
+    // The daemon forks the CLI, so the SERVER spawn env is what the CLI inherits.
+    const serverSpawn = mockedSpawn.mock.calls.find(c => (c[1] as string[]).includes('server'));
+    expect(serverSpawn).toBeDefined();
+    expect(serverSpawn![2].env.ANTHROPIC_BASE_URL).toBe('https://api.z.ai/api/anthropic');
+    expect(serverSpawn![2].env.ANTHROPIC_AUTH_TOKEN).toBe('glm-key');
+    expect(serverSpawn![2].env.BOTMUX_SESSION_ID).toBe('sess_x'); // base env preserved
+    // agent-start call carries it too (defense in depth).
+    const startOpts = findCallOpts(a => a.includes('agent') && a.includes('start'));
+    expect(startOpts?.env?.ANTHROPIC_AUTH_TOKEN).toBe('glm-key');
+    be.kill();
+  });
+
+  it('keeps the machine-wide shared server credential-neutral while passing env to its agent', () => {
+    let listCount = 0;
+    setHerdrResponses([
+      {
+        match: a => a[0] === 'session' && a[1] === 'list',
+        reply: () => {
+          listCount++;
+          return listCount >= 2
+            ? JSON.stringify({ sessions: [{ name: 'botmux', running: true }] })
+            : EMPTY_SESSIONS_REPLY;
+        },
+      },
+      { match: a => a.includes('agent') && a.includes('start'), reply: () => AGENT_GET_REPLY('1-1') },
+      { match: a => a.includes('read'), reply: () => PANE_READ_REPLY('') },
+    ]);
+    const be = new HerdrBackend('botmux', {
+      createSession: true,
+      agentName: 'botmux-topic1',
+      ownsSession: false,
+      ownsAgent: true,
+    });
+    be.spawn('claude', [], {
+      cwd: '/work', cols: 80, rows: 24,
+      env: { BOTMUX_SESSION_ID: 'topic1' },
+      injectEnv: { ANTHROPIC_AUTH_TOKEN: 'bot-secret' },
+    });
+
+    const serverSpawn = mockedSpawn.mock.calls.find(c => (c[1] as string[]).includes('server'));
+    expect(serverSpawn?.[2].env.BOTMUX_SESSION_ID).toBeUndefined();
+    expect(serverSpawn?.[2].env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+    const startOpts = findCallOpts(a => a.includes('agent') && a.includes('start'));
+    expect(startOpts?.env?.BOTMUX_SESSION_ID).toBe('topic1');
+    expect(startOpts?.env?.ANTHROPIC_AUTH_TOKEN).toBe('bot-secret');
+    be.kill();
+  });
+
+  it('per-bot GitHub tokens still flow through injectEnv to the CLI start env', () => {
+    let listCount = 0;
+    setHerdrResponses([
+      {
+        match: a => a[0] === 'session' && a[1] === 'list',
+        reply: () => { listCount++; return listCount >= 2 ? EXISTING_SESSION_REPLY : EMPTY_SESSIONS_REPLY; },
+      },
+      { match: a => a.includes('agent') && a.includes('start'), reply: () => AGENT_GET_REPLY('1-1') },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('') },
+    ]);
+    const be = new HerdrBackend(SESSION, { createSession: true });
+    be.spawn('claude', [], {
+      cwd: '/work', cols: 80, rows: 24,
+      env: { BOTMUX_SESSION_ID: 'sess_x' },
+      injectEnv: { GITHUB_TOKEN: 'ghp_explicit_bot' },
+    });
+
+    const serverSpawn = mockedSpawn.mock.calls.find(c => (c[1] as string[]).includes('server'));
+    expect(serverSpawn?.[2].env.GITHUB_TOKEN).toBe('ghp_explicit_bot');
+    const startOpts = findCallOpts(a => a.includes('agent') && a.includes('start'));
+    expect(startOpts?.env?.GITHUB_TOKEN).toBe('ghp_explicit_bot');
+    be.kill();
+  });
+
+  it('without injectEnv the server env carries only the base env (no provider keys)', () => {
+    let listCount = 0;
+    setHerdrResponses([
+      {
+        match: a => a[0] === 'session' && a[1] === 'list',
+        reply: () => { listCount++; return listCount >= 2 ? EXISTING_SESSION_REPLY : EMPTY_SESSIONS_REPLY; },
+      },
+      { match: a => a.includes('agent') && a.includes('start'), reply: () => AGENT_GET_REPLY('1-1') },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('') },
+    ]);
+    const be = new HerdrBackend(SESSION, { createSession: true });
+    be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: { BOTMUX_SESSION_ID: 'sess_x' } });
+    const serverSpawn = mockedSpawn.mock.calls.find(c => (c[1] as string[]).includes('server'));
+    expect(serverSpawn![2].env.BOTMUX_SESSION_ID).toBe('sess_x');
+    expect(serverSpawn![2].env.ANTHROPIC_BASE_URL).toBeUndefined();
+    be.kill();
+  });
+
+  it('reattach reuses an existing agent without re-running `agent start`', () => {
+    // Reuse is gated on isReattach: only a genuine daemon-restart reattach to a
+    // still-alive session adopts the existing `botmux` row. A fresh spawn (incl.
+    // the /restart respawn) always `agent start`s — see the restart test below.
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('9-9') },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('') },
+    ]);
+    const be = new HerdrBackend(SESSION, { isReattach: true });
+    be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+    expect(herdrCall('agent', 'start', 'botmux')).toBeUndefined();
+    expect(be.isReattach).toBe(true);
+    be.kill();
+  });
+
+  it('REFUSES to silently fresh-start when a predicted reattach has no reusable agent (freeze the decision)', () => {
+    // Generational-race symmetric case: the worker predicted reattach and SKIPPED
+    // the cold-path setup (PENDING proof + credential-only wrapper, both gated on
+    // !willReattachPersistent). If the `botmux` agent vanished between that probe
+    // and spawn, silently `agent start`ing would launch an UNWRAPPED (no credential
+    // boundary) CLI on an enrolled host and inherit the stale committed marker. So
+    // the backend must FREEZE the reattach decision and throw (mirrors ZmxBackend),
+    // never internally turn it fresh — the worker's next launch re-plans cold.
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => JSON.stringify({ result: {} }) },
+      { match: a => a.includes('agent') && a.includes('start'), reply: () => AGENT_GET_REPLY('fresh-2') },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('') },
+    ]);
+    const be = new HerdrBackend(SESSION, { isReattach: true });
+    expect(() => be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} }))
+      .toThrow(/disappeared before reattach|refusing to silently start/);
+    // Must NOT have started a fresh agent — the throw precedes any `agent start`,
+    // so no unwrapped generation was ever launched. (isReattach stays false because
+    // we never completed a reattach; the point is that we ALSO never fresh-started,
+    // which the missing `agent start` call proves.)
+    expect(herdrCall('agent', 'start', 'botmux')).toBeUndefined();
+    be.kill();
+  });
+
+  it('fresh spawn does NOT reuse a residual agent row — always `agent start`s (restart fix)', () => {
+    // Regression for the /restart no-op: after destroySession, herdr can
+    // resurrect a dead `botmux` row. A non-reattach spawn must ignore it and
+    // start the new CLI, or the resume:true respawn silently runs nothing.
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('9-9') },
+      {
+        match: a => a.includes('agent') && a.includes('start'),
+        reply: () => JSON.stringify({ result: { agent: { name: 'botmux', pane_id: 'fresh-1' } } }),
+      },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('') },
+    ]);
+    const be = new HerdrBackend(SESSION, { createSession: true });
+    be.spawn('claude', ['--resume', 'x'], { cwd: '/work', cols: 80, rows: 24, env: {} });
+    expect(herdrCall('agent', 'start', 'botmux')).toBeDefined();
+    be.kill();
+  });
+
+  it('external target adopt: uses externalTarget paneId, never spawns server or agent', () => {
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('adopted screen') },
+    ]);
+    const be = new HerdrBackend(SESSION, {
+      externalTarget: { sessionName: SESSION, target: '1-1', paneId: '1-1' },
+    });
+    be.spawn('', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+
+    expect(herdrCall('agent', 'start', 'botmux')).toBeUndefined();
+    expect(be.captureCurrentScreen()).toBe('adopted screen');
+    const serverSpawn = mockedSpawn.mock.calls.find(c => (c[1] as string[]).includes('server'));
+    expect(serverSpawn).toBeUndefined();
+    be.kill();
+  });
+
+  it('external target adopt accepts Herdr 0.7.5 raw ANSI read output', () => {
+    const rawScreen = '\u001b[1mPi output\u001b[0m\n> ';
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('read') && a.includes('agent'), reply: () => rawScreen },
+    ]);
+    const be = new HerdrBackend(SESSION, {
+      externalTarget: { sessionName: SESSION, target: 'w3:p1', paneId: 'w3:p1' },
+    });
+    be.spawn('', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+
+    expect(be.captureCurrentScreen()).toBe(rawScreen);
+    be.kill();
+  });
+
+  it('external target adopt throws when the herdr session is not running', () => {
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EMPTY_SESSIONS_REPLY },
+    ]);
+    const be = new HerdrBackend(SESSION, {
+      externalTarget: { sessionName: SESSION, target: '1-1', paneId: '1-1' },
+    });
+    expect(() => be.spawn('', [], { cwd: '/work', cols: 80, rows: 24, env: {} }))
+      .toThrow(/is not running/);
+  });
+});
+
+// ─── Session ownership on destroySession ─────────────────────────────────────
+
+describe('HerdrBackend.destroySession ownership', () => {
+  it('managed session: stops the herdr session (botmux owns it)', () => {
+    setHerdrResponses([]);
+    const be = new HerdrBackend(SESSION);
+    be.destroySession();
+    expect(herdrCall('session', 'stop', SESSION)).toBeDefined();
+  });
+
+  it('adopted external target: detaches only, never stops the user\'s session', () => {
+    setHerdrResponses([]);
+    const be = new HerdrBackend(SESSION, {
+      externalTarget: { sessionName: SESSION, target: '1-1', paneId: '1-1' },
+    });
+    be.destroySession();
+    // The external herdr session belongs to the user — destroySession must not
+    // issue `session stop` (mirrors TmuxPipeBackend's ownsSession guard).
+    expect(herdrCall('session', 'stop')).toBeUndefined();
+  });
+});
+
+// ─── Managed web-terminal direct attach ────────────────────────────────────
+
+describe('HerdrBackend web terminal sizing', () => {
+  function spawnManagedBackend(): HerdrBackend {
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('pane-web') },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('') },
+    ]);
+    const be = new HerdrBackend(SESSION, { isReattach: true });
+    be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: { PATH: '/usr/bin' } });
+    return be;
+  }
+
+  it('uses the first resized viewer as owner and pins later viewers to its grid', () => {
+    const attach = makeFakePty();
+    mockedPtySpawn.mockReturnValue(attach as any);
+    const be = spawnManagedBackend();
+    const desktop = {};
+    const mobile = {};
+    const relayed: string[] = [];
+    be.onData(data => relayed.push(data));
+
+    expect(be.acquireWebTerminal(desktop)).toBeNull();
+    expect(be.resizeWebTerminal(desktop, 150, 42)).toEqual({ cols: 150, rows: 42 });
+    expect(mockedPtySpawn).toHaveBeenCalledTimes(1);
+    expect(mockedPtySpawn).toHaveBeenCalledWith(
+      'herdr',
+      ['--session', SESSION, 'agent', 'attach', 'pane-web'],
+      expect.objectContaining({ name: 'xterm-256color', cols: 150, rows: 42 }),
+    );
+    expect(mockedPtySpawn.mock.calls[0]![1]).not.toContain('--takeover');
+    expect(attach.onData).toHaveBeenCalledOnce();
+    attach.emitData('ignored attach frame');
+    expect(relayed).toEqual([]);
+
+    expect(be.acquireWebTerminal(mobile)).toEqual({ cols: 150, rows: 42 });
+    expect(be.resizeWebTerminal(mobile, 48, 30)).toBeNull();
+    expect(attach.resize).not.toHaveBeenCalled();
+    expect(be.isWebTerminalOwner(desktop)).toBe(true);
+    expect(be.isWebTerminalOwner(mobile)).toBe(false);
+
+    expect(be.resizeWebTerminal(desktop, 160, 45)).toEqual({ cols: 160, rows: 45 });
+    expect(attach.resize).toHaveBeenCalledWith(160, 45);
+    be.kill();
+  });
+
+  it('promotes without applying a stale follower size and releases the last viewer', () => {
+    const attach = makeFakePty();
+    const reopenedAttach = makeFakePty();
+    mockedPtySpawn.mockReturnValueOnce(attach as any).mockReturnValueOnce(reopenedAttach as any);
+    const be = spawnManagedBackend();
+    const desktop = {};
+    const mobile = {};
+
+    be.acquireWebTerminal(desktop);
+    be.resizeWebTerminal(desktop, 150, 42);
+    be.acquireWebTerminal(mobile);
+    be.resizeWebTerminal(mobile, 48, 30);
+    attach.resize.mockClear();
+
+    expect(be.releaseWebTerminal(desktop)).toBe(mobile);
+    expect(attach.resize).not.toHaveBeenCalled();
+    expect(be.isWebTerminalOwner(mobile)).toBe(true);
+    expect(be.resizeWebTerminal(mobile, 52, 32)).toEqual({ cols: 52, rows: 32 });
+    expect(attach.resize).toHaveBeenCalledWith(52, 32);
+
+    expect(be.releaseWebTerminal(mobile)).toBeNull();
+    expect(attach.kill).toHaveBeenCalledOnce();
+
+    const reopened = {};
+    expect(be.acquireWebTerminal(reopened)).toBeNull();
+    expect(be.resizeWebTerminal(reopened, 90, 28)).toEqual({ cols: 90, rows: 28 });
+    expect(mockedPtySpawn).toHaveBeenCalledTimes(2);
+    expect(mockedPtySpawn.mock.calls[1]![2]).toEqual(expect.objectContaining({ cols: 90, rows: 28 }));
+    be.kill();
+    expect(attach.kill).toHaveBeenCalledOnce();
+    expect(reopenedAttach.kill).toHaveBeenCalledOnce();
+  });
+
+  it('tracks the real cursor from the managed web attach stream', async () => {
+    const attach = makeFakePty();
+    mockedPtySpawn.mockReturnValue(attach as any);
+    const be = spawnManagedBackend();
+    const viewer = {};
+    const cursors: Array<{ col: number; row: number }> = [];
+    be.onWebTerminalCursor(cursor => cursors.push(cursor));
+
+    be.acquireWebTerminal(viewer);
+    be.resizeWebTerminal(viewer, 80, 24);
+    attach.emitData('\x1b[5;7H');
+    attach.emitData('\x1b[8;9H');
+
+    await vi.waitFor(() => expect(cursors).toEqual([{ col: 8, row: 7 }]));
+    expect(be.getWebTerminalCursor()).toEqual({ col: 8, row: 7 });
+    be.kill();
+  });
+
+  it('cleans an exited attach and retries on the owner next resize', () => {
+    const first = makeFakePty();
+    const second = makeFakePty();
+    mockedPtySpawn.mockReturnValueOnce(first as any).mockReturnValueOnce(second as any);
+    const be = spawnManagedBackend();
+    const viewer = {};
+
+    be.acquireWebTerminal(viewer);
+    be.resizeWebTerminal(viewer, 120, 36);
+    first.emitExit(1);
+    expect(be.resizeWebTerminal(viewer, 130, 38)).toEqual({ cols: 130, rows: 38 });
+    expect(mockedPtySpawn).toHaveBeenCalledTimes(2);
+    expect(mockedPtySpawn.mock.calls[1]![2]).toEqual(expect.objectContaining({ cols: 130, rows: 38 }));
+
+    be.kill();
+    expect(second.kill).toHaveBeenCalledOnce();
+  });
+
+  it('never direct-attaches an external adopted target', () => {
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('') },
+    ]);
+    const be = new HerdrBackend(SESSION, {
+      externalTarget: { sessionName: SESSION, target: 'external-pane', paneId: 'external-pane' },
+    });
+    be.spawn('', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+    const viewer = {};
+
+    expect(be.acquireWebTerminal(viewer)).toBeNull();
+    expect(be.resizeWebTerminal(viewer, 150, 42)).toBeNull();
+    expect(be.releaseWebTerminal(viewer)).toBeNull();
+    expect(mockedPtySpawn).not.toHaveBeenCalled();
+    be.kill();
+  });
+});
+
+// ─── Env propagation ───────────────────────────────────────────────────────
+
+describe('HerdrBackend env propagation', () => {
+  // Regression: worker.ts hands us a redacted+injected env (BOTMUX_* added,
+  // bare LARK_APP_SECRET deleted). If we don't thread that env through the
+  // herdr daemon spawn AND the agent-start call, the CLI inside herdr sees
+  // raw process.env: missing BOTMUX_* (botmux send/ask exits 2) AND leaks
+  // LARK_APP_SECRET. Both are blocking bugs from PR #81 review.
+  const cliEnv = {
+    BOTMUX_SESSION_ID: 'sess-1',
+    BOTMUX_CHAT_ID: 'chat-1',
+    BOTMUX_LARK_APP_ID: 'app-1',
+    BOTMUX_ROOT_MESSAGE_ID: 'msg-1',
+    PATH: '/usr/bin',
+    // Intentionally NOT including LARK_APP_SECRET — redactChildEnv would
+    // have already dropped it before reaching the backend.
+  };
+
+  it('fresh server boot: spawns `herdr server` with the worker-supplied env', () => {
+    let listCount = 0;
+    setHerdrResponses([
+      {
+        match: a => a[0] === 'session' && a[1] === 'list',
+        reply: () => { listCount++; return listCount >= 2 ? EXISTING_SESSION_REPLY : EMPTY_SESSIONS_REPLY; },
+      },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => '' },
+      {
+        match: a => a.includes('agent') && a.includes('start'),
+        reply: () => JSON.stringify({ result: { agent: { name: 'botmux', pane_id: '2-3' } } }),
+      },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('') },
+    ]);
+
+    const be = new HerdrBackend(SESSION);
+    be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: cliEnv });
+
+    const serverSpawn = mockedSpawn.mock.calls.find(c => (c[1] as string[]).includes('server'));
+    expect(serverSpawn).toBeDefined();
+    const serverOpts = serverSpawn![2] as { env?: Record<string, string> };
+    expect(serverOpts.env).toBeDefined();
+    expect(serverOpts.env!.BOTMUX_SESSION_ID).toBe('sess-1');
+    expect(serverOpts.env!.BOTMUX_LARK_APP_ID).toBe('app-1');
+    // Ensure we didn't accidentally pass through the test runner's env
+    // (which would re-introduce whatever the parent shell exported).
+    expect('LARK_APP_SECRET' in serverOpts.env!).toBe(false);
+    be.kill();
+  });
+
+  it('agent start: passes the worker-supplied env to execFileSync', () => {
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => '' },
+      {
+        match: a => a.includes('agent') && a.includes('start'),
+        reply: () => JSON.stringify({ result: { agent: { name: 'botmux', pane_id: '2-3' } } }),
+      },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('') },
+    ]);
+
+    const be = new HerdrBackend(SESSION);
+    be.spawn('claude', ['--resume', 'abc'], { cwd: '/work', cols: 80, rows: 24, env: cliEnv });
+
+    const opts = findCallOpts(a => a.includes('agent') && a.includes('start'));
+    expect(opts).toBeDefined();
+    expect(opts!.env).toBeDefined();
+    expect(opts!.env.BOTMUX_SESSION_ID).toBe('sess-1');
+    expect(opts!.env.BOTMUX_CHAT_ID).toBe('chat-1');
+    be.kill();
+  });
+
+  it('external target adopt: skips env injection (user owns the running CLI)', () => {
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('') },
+    ]);
+    const be = new HerdrBackend(SESSION, {
+      externalTarget: { sessionName: SESSION, target: '1-1', paneId: '1-1' },
+    });
+    be.spawn('', [], { cwd: '/work', cols: 80, rows: 24, env: cliEnv });
+    // Adopt path doesn't run `herdr server` or `agent start`, so there's
+    // no env to assert — just verify no agent-start was issued.
+    expect(herdrCall('agent', 'start', 'botmux')).toBeUndefined();
+    be.kill();
+  });
+});
+
+// ─── Message writing ───────────────────────────────────────────────────────
+
+describe('HerdrBackend message writing', () => {
+  function spawnBackend(paneId = '1-1'): HerdrBackend {
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY(paneId) },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('') },
+    ]);
+    // isReattach so the mocked `agent get` row resolves paneId without needing
+    // an `agent start` reply (reuse is now gated on the reattach path).
+    const be = new HerdrBackend(SESSION, { isReattach: true });
+    be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+    mockedExecFileSync.mockClear();
+    // re-install the response handlers since mockClear wipes them
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('') },
+      { match: a => a.includes('agent') && a.includes('list'), reply: () => AGENT_LIST_REPLY(paneId) },
+    ]);
+    return be;
+  }
+
+  it('write() / sendText() invoke `pane send-text` on the resolved pane id', () => {
+    const be = spawnBackend('5-5');
+    be.sendText('飞书消息');
+
+    const call = herdrCall('pane', 'send-text', '5-5', '飞书消息');
+    expect(call).toBeDefined();
+    expect(call!.slice(0, 2)).toEqual(['--session', SESSION]);
+    be.kill();
+  });
+
+  it('sendSpecialKeys() invokes `pane send-keys` with each key', () => {
+    const be = spawnBackend('5-5');
+    be.sendSpecialKeys('Enter', 'C-c');
+
+    const call = herdrCall('pane', 'send-keys', '5-5', 'Enter', 'C-c');
+    expect(call).toBeDefined();
+    be.kill();
+  });
+
+  it('reports a rejected pane command instead of claiming raw input acceptance', () => {
+    const be = spawnBackend('5-5');
+    mockedExecFileSync.mockImplementation(() => {
+      throw new Error('pane disappeared');
+    });
+    expect(be.sendText('/goal x')).toBe(false);
+    expect(be.sendSpecialKeys('Enter')).toBe(false);
+    expect(be.pasteText('/goal x')).toBe(false);
+    be.kill();
+  });
+
+  it('write() is a no-op after kill()', () => {
+    const be = spawnBackend('5-5');
+    be.kill();
+    mockedExecFileSync.mockClear();
+    expect(be.sendText('after-exit')).toBe(false);
+    const call = herdrCall('pane', 'send-text');
+    expect(call).toBeUndefined();
+  });
+});
+
+// ─── Callbacks: onData delta + onExit ──────────────────────────────────────
+
+describe('HerdrBackend callbacks', () => {
+  it('onAgentStatus reports an already-settled agent registered after spawn', async () => {
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      {
+        match: a => a.includes('agent') && a.includes('get'),
+        reply: () => JSON.stringify({ result: { agent: { name: 'botmux', pane_id: '1-1', agent_status: 'idle' } } }),
+      },
+      { match: a => a.includes('agent') && a.includes('list'), reply: () => AGENT_LIST_REPLY('1-1') },
+      { match: a => a.includes('read'), reply: () => PANE_READ_REPLY('') },
+    ]);
+
+    const be = new HerdrBackend(SESSION, { isReattach: true });
+    be.spawn('pi', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+    const statuses: string[] = [];
+    be.onAgentStatus(status => statuses.push(status));
+    await Promise.resolve();
+
+    expect(statuses).toEqual(['idle']);
+    be.kill();
+  });
+
+  it('onData fires with the prefix-delta when pane recent output grows', () => {
+    let paneText = 'hello';
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('1-1') },
+      { match: a => a.includes('agent') && a.includes('list'), reply: () => AGENT_LIST_REPLY('1-1') },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY(paneText) },
+    ]);
+
+    vi.useFakeTimers();
+    // Use an isReattach backend so the baseline is captured at spawn
+    // (lastText = current pane content) — that mirrors the worker.ts
+    // reattach contract, where the initial screen is seeded separately and
+    // the data stream emits only deltas.
+    const be = new HerdrBackend(SESSION, { isReattach: true });
+    const seen: string[] = [];
+    const snapshots: string[] = [];
+    be.onData(d => seen.push(d));
+    be.onSnapshot(frame => snapshots.push(frame));
+    be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+
+    // Reattach captures the current screen as baseline → no immediate emit.
+    expect(seen).toEqual([]);
+
+    paneText = 'hello world';
+    vi.advanceTimersByTime(600); // > POLL_INTERVAL_MS (500ms)
+    expect(seen).toEqual([' world']);
+    expect(snapshots).toEqual(['hello world']);
+
+    paneText = 'hello world!';
+    vi.advanceTimersByTime(600);
+    expect(seen).toEqual([' world', '!']);
+    expect(snapshots).toEqual(['hello world', 'hello world!']);
+
+    be.kill();
+  });
+
+  it('onData fresh-spawn baseline: lastText starts empty so listeners see initial output', () => {
+    // Counterpart to the reattach test: a fresh spawn keeps lastText='' so
+    // listeners attached *before* spawn don't miss output the agent emitted
+    // between agent-start and the first poll tick (the herdr-backend's
+    // missing-initial-output bug we hit in the e2e run).
+    let paneText = '';
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => '' },
+      {
+        match: a => a.includes('agent') && a.includes('start'),
+        reply: () => JSON.stringify({ result: { agent: { name: 'botmux', pane_id: '1-1' } } }),
+      },
+      { match: a => a.includes('agent') && a.includes('list'), reply: () => AGENT_LIST_REPLY('1-1') },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY(paneText) },
+    ]);
+
+    vi.useFakeTimers();
+    const be = new HerdrBackend(SESSION);
+    const seen: string[] = [];
+    be.onData(d => seen.push(d));
+    be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+
+    paneText = 'HELLO_HERDR\n';
+    vi.advanceTimersByTime(600);
+    expect(seen.join('')).toBe('HELLO_HERDR\n');
+
+    be.kill();
+  });
+
+  it('onExit fires when the agent disappears from `agent list`', () => {
+    let agentAlive = true;
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('1-1') },
+      {
+        match: a => a.includes('agent') && a.includes('list'),
+        reply: () => agentAlive
+          ? AGENT_LIST_REPLY('1-1')
+          : JSON.stringify({ result: { agents: [] } }),
+      },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('') },
+    ]);
+
+    vi.useFakeTimers();
+    const be = new HerdrBackend(SESSION, { isReattach: true });
+    const exits: Array<[number | null, string | null]> = [];
+    be.onExit((code, signal) => exits.push([code, signal]));
+    be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+
+    agentAlive = false;
+    vi.advanceTimersByTime(600);
+    expect(exits).toEqual([[0, null]]);
+  });
+
+  it('onExit fires when the agent stays in list with running:false (v0.6.6 tombstone)', () => {
+    // herdr v0.6.6+ does NOT drop exited agents from `agent list` — they
+    // stick around with running:false / status:"exited". Without this
+    // detection the worker never sees the CLI exit → claude_exit never
+    // fires → session hangs (the bug deepcoldy reported in PR #81).
+    let agentRunning = true;
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('1-1') },
+      {
+        match: a => a.includes('agent') && a.includes('list'),
+        reply: () => agentRunning
+          ? AGENT_LIST_REPLY('1-1')
+          : JSON.stringify({ result: { agents: [{ name: 'botmux', pane_id: '1-1', running: false, status: 'exited', exit_code: 7 }] } }),
+      },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('') },
+    ]);
+
+    vi.useFakeTimers();
+    const be = new HerdrBackend(SESSION, { isReattach: true });
+    const exits: Array<[number | null, string | null]> = [];
+    be.onExit((code, signal) => exits.push([code, signal]));
+    be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+
+    agentRunning = false;
+    vi.advanceTimersByTime(600);
+    // exit_code surfaces from the tombstone row so callers can distinguish
+    // clean exits from crashes (mirrors the PTY backend's exit code path).
+    expect(exits).toEqual([[7, null]]);
+  });
+
+  it('status watcher: excludes the current status when re-arming, preventing level-triggered success storms', () => {
+    // Capture every fake `wait agent-status` child + its --status arg so the
+    // test can drive a specific watcher's exit and verify the cohort
+    // behaviour (first-to-fire reads, the rest get SIGTERM'd).
+    const waitChildren: Array<{ status: string; child: FakeChild }> = [];
+    mockedSpawn.mockImplementation(((_cmd: any, args: any) => {
+      const child = makeFakeChild();
+      const argv = args as string[];
+      if (argv.includes('wait') && argv.includes('agent-status')) {
+        const statusIdx = argv.indexOf('--status');
+        waitChildren.push({ status: argv[statusIdx + 1]!, child });
+      }
+      return child;
+    }) as any);
+
+    let paneText = 'baseline';
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('1-1') },
+      { match: a => a.includes('agent') && a.includes('list'), reply: () => AGENT_LIST_REPLY('1-1') },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY(paneText) },
+    ]);
+
+    // Reattach so the baseline is captured at spawn — keeps the assertion
+    // focused on "watcher exit triggers delta", not on the initial screen.
+    const be = new HerdrBackend(SESSION, { isReattach: true });
+    const seen: string[] = [];
+    be.onData(d => seen.push(d));
+    be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+
+    // The initial cohort also watches `working`: after a settled state fires,
+    // observing the next working transition is what makes that settled state
+    // eligible again for the following turn.
+    const cohort = waitChildren.slice();
+    expect(cohort.map(w => w.status).sort()).toEqual(['blocked', 'done', 'idle', 'working']);
+
+    // Simulate the agent transitioning to `done` mid-turn — that watcher wins.
+    paneText = 'baseline result';
+    const doneWatcher = cohort.find(w => w.status === 'done')!;
+    doneWatcher.child.emit('exit', 0, null);
+
+    // The win triggered a read+emit.
+    expect(seen).toEqual([' result']);
+
+    // The losing siblings got killed and a fresh cohort got armed. Crucially,
+    // `done` is excluded while it remains the current status: Herdr's wait is
+    // level-triggered, so immediately watching `done` again would return code
+    // 0 in ~20ms forever and saturate the API socket.
+    for (const w of cohort) {
+      if (w !== doneWatcher) expect(w.child.killed).toBe(true);
+    }
+    const nextCohort = waitChildren.slice(cohort.length);
+    expect(nextCohort.map(w => w.status).sort()).toEqual(['blocked', 'idle', 'working']);
+
+    // Once the agent starts the next turn, `working` becomes current and
+    // `done` is armed again for that turn's completion.
+    nextCohort.find(w => w.status === 'working')!.child.emit('exit', 0, null);
+    const thirdCohort = waitChildren.slice(cohort.length + nextCohort.length);
+    expect(thirdCohort.map(w => w.status).sort()).toEqual(['blocked', 'done', 'idle']);
+
+    be.kill();
+    // kill() tears down the live cohort.
+    for (const w of thirdCohort) expect(w.child.killed).toBe(true);
+  });
+
+  it('status watcher: instant non-zero exit on a vanished agent emits onExit and does NOT re-arm (storm guard)', () => {
+    // Regression for the re-arm storm: on herdr v0.6.6 a `herdr wait
+    // agent-status` against a dead pane returns code 1 IMMEDIATELY. The old
+    // code re-armed synchronously on any non-0 code → a tight spawn loop that
+    // starved the poll timer and the session hung. The fix: an instant
+    // non-zero return triggers a liveness check; a vanished agent (empty
+    // `agent list`) emits onExit instead of re-arming.
+    const waitChildren: Array<{ status: string; child: FakeChild }> = [];
+    mockedSpawn.mockImplementation(((_cmd: any, args: any) => {
+      const child = makeFakeChild();
+      const argv = args as string[];
+      if (argv.includes('wait') && argv.includes('agent-status')) {
+        const statusIdx = argv.indexOf('--status');
+        waitChildren.push({ status: argv[statusIdx + 1]!, child });
+      }
+      return child;
+    }) as any);
+
+    // Agent present at spawn, then GONE (empty list) once it has exited.
+    let agentGone = false;
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('1-1') },
+      { match: a => a.includes('agent') && a.includes('list'), reply: () => agentGone ? JSON.stringify({ result: { agents: [] } }) : AGENT_LIST_REPLY('1-1') },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('x') },
+    ]);
+
+    const be = new HerdrBackend(SESSION, { isReattach: true });
+    const exits: Array<[number | null, string | null]> = [];
+    be.onExit((code, signal) => exits.push([code, signal]));
+    be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+
+    const cohort = waitChildren.slice();
+    expect(cohort.length).toBe(4);
+
+    // The agent has now exited; the next `wait` returns code 1 instantly.
+    agentGone = true;
+    cohort.find(w => w.status === 'done')!.child.emit('exit', 1, null);
+
+    // onExit fired (storm guard saw the empty agent list)...
+    expect(exits.length).toBe(1);
+    // ...and NO fresh cohort was armed synchronously (the bug spun new ones).
+    const nextCohort = waitChildren.slice(cohort.length);
+    expect(nextCohort.length).toBe(0);
+
+    be.kill();
+  });
+});

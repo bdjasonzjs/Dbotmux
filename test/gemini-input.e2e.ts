@@ -15,6 +15,7 @@ import { describe, it, expect, afterEach, beforeEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';
 import * as pty from 'node-pty';
 import { IdleDetector } from '../src/utils/idle-detector.js';
 import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
@@ -25,6 +26,10 @@ const GEMINI_BIN = 'gemini';
 const PTY_COLS = 300;
 const PTY_ROWS = 50;
 const TEST_PROMPT = 'just say the word PONG and nothing else';
+const GEMINI_AVAILABLE = !spawnSync(GEMINI_BIN, ['--version'], {
+  stdio: 'ignore',
+  timeout: 5_000,
+}).error;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -51,7 +56,7 @@ function simpleStrip(data: string): string {
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
-describe('Gemini first input submission', () => {
+describe.skipIf(!GEMINI_AVAILABLE)('Gemini first input submission', () => {
   let proc: pty.IPty | null = null;
   let tmpDir: string | null = null;
 

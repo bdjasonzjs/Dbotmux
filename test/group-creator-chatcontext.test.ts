@@ -21,16 +21,25 @@ const mockCreateChat = vi.fn(async () => ({
 }));
 const mockTransferChatOwner = vi.fn(async () => ({ ok: true as const }));
 const mockGetChatOwner = vi.fn(async () => 'ou_someone');
+const mockGetChatShareLink = vi.fn(async () => ({ ok: true as const, shareLink: 'https://example.test/share' }));
+const mockAddBotToChat = vi.fn(async (_appId: string, _chatId: string, ids: string[]) =>
+  ids.map(id => ({ id, ok: true as const })));
+const mockAddUsersToChatByUnionId = vi.fn(async () => ({ invalidUserIds: [] as string[] }));
 
 vi.mock('../src/services/groups-store.js', () => ({
   createChat: (...args: any[]) => mockCreateChat(...args),
   transferChatOwner: (...args: any[]) => mockTransferChatOwner(...args),
   getChatOwner: (...args: any[]) => mockGetChatOwner(...args),
+  getChatShareLink: (...args: any[]) => mockGetChatShareLink(...args),
+  addBotToChat: (...args: any[]) => mockAddBotToChat(...args),
+  addUsersToChatByUnionId: (...args: any[]) => mockAddUsersToChatByUnionId(...args),
 }));
 
 const mockSendMessage = vi.fn(async () => 'om_notify');
 vi.mock('../src/im/lark/client.js', () => ({
   sendMessage: (...args: any[]) => mockSendMessage(...args),
+  listChatBotMembers: vi.fn(async () => []),
+  resolveAllowedUsersWithMap: vi.fn(async () => ({ resolved: [], map: new Map() })),
 }));
 
 const mockBindOncall = vi.fn();

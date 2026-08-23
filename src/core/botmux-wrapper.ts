@@ -1,0 +1,81 @@
+/**
+ * Helpers for the `~/.botmux/bin` wrapper that lets CLI sessions call
+ * `botmux send` / `botmux schedule` without a global npm install.
+ *
+ * Split out from worker-pool / attempt-resume / daemon so the
+ * platform-sensitive bits (PATH delimiter, Windows `.cmd` wrapper) live in one
+ * pure, unit-tested place instead of being duplicated as inline string concat.
+ */
+import { delimiter, join } from 'node:path';
+import { homedir } from 'node:os';
+
+/**
+ * SINGLE SOURCE OF TRUTH for the `botmux` wrapper bin dir (codex P1). The daemon
+ * WRITES the wrapper here and every consumer (worker-pool fork PATH, worker.ts
+ * child-env prepends, tmux pane scripts) must PREPEND the SAME dir — otherwise a
+ * core-only service that writes its wrapper to a dedicated dir but leaves the
+ * consumers pointing at the shared `~/.botmux/bin` would resolve `botmux` to a
+ * same-HOME fleet's wrapper (shared:dedicated:… PATH → shared wins).
+ *
+ *  - core-only (BOTMUX_CORE_ONLY=1): a DEDICATED `<SESSION_DATA_DIR>/bin`, so a
+ *    same-HOME fleet's `~/.botmux/bin` is never consulted or clobbered.
+ *  - normal fleet: the shared `~/.botmux/bin` (unchanged).
+ *
+ * Env-driven (not config) so it resolves identically in the daemon, a forked
+ * worker, and a value baked into a tmux pane script — all of which see the same
+ * BOTMUX_CORE_ONLY / SESSION_DATA_DIR. Falls back to ~/.botmux/bin if a core-only
+ * process somehow lacks SESSION_DATA_DIR (defensive; the entrypoint always sets it).
+ */
+export function resolveBotmuxWrapperBinDir(env: NodeJS.ProcessEnv = process.env): string {
+  if (env.BOTMUX_CORE_ONLY === '1' && env.SESSION_DATA_DIR) {
+    return join(env.SESSION_DATA_DIR, 'bin');
+  }
+  return join(env.HOME ?? env.USERPROFILE ?? homedir(), '.botmux', 'bin');
+}
+
+/**
+ * Prepend the wrapper bin dir to a PATH string using the platform-correct
+ * separator (':' on POSIX, ';' on Windows). Hardcoding ':' silently breaks the
+ * inherited PATH on Windows, so route every PATH prepend through here.
+ */
+export function prependBotmuxBin(
+  binDir: string,
+  currentPath: string | undefined,
+  delim: string = delimiter,
+): string {
+  return `${binDir}${delim}${currentPath ?? ''}`;
+}
+
+export interface BotmuxWrapperFile {
+  /** Filename within ~/.botmux/bin. */
+  name: string;
+  content: string;
+  /** chmod mode (ignored on Windows). */
+  mode: number;
+}
+
+/**
+ * The wrapper files to materialize in ~/.botmux/bin. Always a POSIX `sh`
+ * wrapper (used by macOS/Linux and Git Bash/WSL); on Windows additionally a
+ * `botmux.cmd` so native shells (cmd.exe / PowerShell) resolve `botmux` —
+ * without it `botmux send` from a Windows-native CLI session fails. The `.cmd`
+ * pins the daemon's current Node binary so it never depends on a PATH-resolved
+ * `node`. Both wrappers point at THIS daemon's dist/cli.js.
+ */
+export function botmuxWrapperFiles(
+  cliScript: string,
+  nodePath: string,
+  platform: NodeJS.Platform = process.platform,
+): BotmuxWrapperFile[] {
+  const files: BotmuxWrapperFile[] = [
+    { name: 'botmux', content: `#!/bin/sh\nexec node "${cliScript}" "$@"\n`, mode: 0o755 },
+  ];
+  if (platform === 'win32') {
+    files.push({
+      name: 'botmux.cmd',
+      content: `@echo off\r\n"${nodePath}" "${cliScript}" %*\r\n`,
+      mode: 0o755,
+    });
+  }
+  return files;
+}

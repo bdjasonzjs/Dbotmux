@@ -1,0 +1,18 @@
+{
+  "hook_event_name": "question.asked",
+  "session_id": "ses_abc123",
+  "question_id": "que_001",
+  "tool_input": {
+    "questions": [
+      {
+        "question": "选择部署策略？",
+        "header": "部署配置",
+        "options": [
+          { "label": "蓝绿部署", "description": "零停机" },
+          { "label": "滚动更新", "description": "逐步切流" }
+        ],
+        "multiple": false
+      }
+    ]
+  }
+}

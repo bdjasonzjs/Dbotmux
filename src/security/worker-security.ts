@@ -1,48 +1,76 @@
-import { existsSync, mkdirSync, writeFileSync, chmodSync } from 'node:fs';
+import {
+  accessSync,
+  chmodSync,
+  constants,
+  mkdtempSync,
+  mkdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { homedir } from 'node:os';
-import { delimiter, join } from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { delimiter, join, resolve } from 'node:path';
 import { logger } from '../utils/logger.js';
 
-const DEFAULT_NO_PROXY = [
+const PUBLIC_DEFAULT_NO_PROXY = [
   'localhost',
   '127.0.0.1',
   '::1',
   '*.feishu.cn',
   '*.larksuite.com',
   'open.feishu.cn',
-  'code.byted.org',
-  'bits.bytedance.net',
-  'luban-source',
-  '*.byted.org',
-  '*.bytedance.net',
 ].join(',');
 
-const DEFAULT_EGRESS_ALLOW_HOSTS = [
+const PUBLIC_DEFAULT_EGRESS_ALLOW_HOSTS = [
   'feishu.cn',
   'larksuite.com',
   'open.feishu.cn',
-  'code.byted.org',
-  'bits.bytedance.net',
-  'luban-source',
-  'byted.org',
-  'bytedance.net',
 ].join(',');
 
 const GUARDED_BINS = ['bash', 'sh', 'zsh', 'curl', 'wget', 'python', 'python3', 'node'] as const;
 
 export function commandGuardDir(env: NodeJS.ProcessEnv = process.env): string {
-  return env.BOTMUX_COMMAND_GUARD_DIR?.trim() || join(homedir(), '.botmux', 'security-bin');
+  // A relative override is interpreted once, at the daemon boundary. Workers
+  // and terminal backends run from session-specific cwd values, so carrying a
+  // relative prefix into their PATH would make the guard point somewhere else
+  // and silently fall through to the real command.
+  return resolve(env.BOTMUX_COMMAND_GUARD_DIR?.trim() || join(homedir(), '.botmux', 'security-bin'));
 }
 
 export function commandGuardEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return env.BOTMUX_COMMAND_GUARD !== '0';
 }
 
+function configuredNoProxy(env: NodeJS.ProcessEnv): string {
+  return env.BOTMUX_EGRESS_NO_PROXY?.trim()
+    || env.NO_PROXY?.trim()
+    || env.no_proxy?.trim()
+    || PUBLIC_DEFAULT_NO_PROXY;
+}
+
+/**
+ * Keep deployment-specific hostnames runtime-only. Existing installations
+ * already carry their direct-connect inventory in NO_PROXY; deriving the guard
+ * allowlist from that value preserves those routes without committing private
+ * infrastructure names to the public tree. BOTMUX_EGRESS_ALLOW_HOSTS remains
+ * the explicit override when the two inventories intentionally differ.
+ */
+function configuredEgressAllowHosts(env: NodeJS.ProcessEnv): string {
+  const explicit = env.BOTMUX_EGRESS_ALLOW_HOSTS?.trim();
+  if (explicit) return explicit;
+  const derived = configuredNoProxy(env)
+    .split(',')
+    .map(value => value.trim().replace(/^\*?\./, ''))
+    .filter(Boolean)
+    .join(',');
+  return derived || PUBLIC_DEFAULT_EGRESS_ALLOW_HOSTS;
+}
+
 export function resolveEgressProxyEnv(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
   const proxy = env.BOTMUX_EGRESS_PROXY?.trim();
-  const noProxy = env.BOTMUX_EGRESS_NO_PROXY?.trim() || DEFAULT_NO_PROXY;
-  const allowHosts = env.BOTMUX_EGRESS_ALLOW_HOSTS?.trim() || DEFAULT_EGRESS_ALLOW_HOSTS;
+  const noProxy = configuredNoProxy(env);
+  const allowHosts = configuredEgressAllowHosts(env);
   if (!proxy) {
     // 默认（未显式配置受限代理）：**保留 worker 继承的代理 env**（本机通常是 http://127.0.0.1:7890），
     // 不覆盖、不清空。硬约束：所有 bot（尤其 claude→Anthropic / codex→OpenAI）必须走该代理，否则本机
@@ -72,6 +100,10 @@ export function resolveWorkerSecurityEnv(env: NodeJS.ProcessEnv = process.env): 
     ...resolveEgressProxyEnv(env),
   };
   if (commandGuardEnabled(env)) {
+    // The command guard needs the same runtime-only deployment inventory even
+    // when no restricted proxy is configured and inherited proxy vars are left
+    // untouched by resolveEgressProxyEnv().
+    out.BOTMUX_EGRESS_ALLOW_HOSTS = configuredEgressAllowHosts(env);
     out.BOTMUX_PATH_PREFIX = commandGuardDir(env);
     out.BOTMUX_COMMAND_GUARD = '1';
   }
@@ -79,18 +111,26 @@ export function resolveWorkerSecurityEnv(env: NodeJS.ProcessEnv = process.env): 
 }
 
 function findRealBinary(bin: string, guardDir: string, env: NodeJS.ProcessEnv = process.env): string | null {
-  const path = (env.PATH ?? '').split(delimiter).filter(p => p && p !== guardDir).join(delimiter);
-  try {
-    const out = execFileSync('bash', ['-lc', `command -v ${bin}`], {
-      encoding: 'utf-8',
-      env: { ...env, PATH: path },
-      stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: 2000,
-    }).trim();
-    return out && out !== join(guardDir, bin) ? out : null;
-  } catch {
-    return null;
+  const normalizedGuardDir = resolve(guardDir);
+  for (const pathEntry of (env.PATH ?? '').split(delimiter)) {
+    // POSIX treats an empty PATH component as the current directory. Resolve it
+    // explicitly so a command reachable through `:/bin` cannot bypass the shim.
+    // Resolve every PATH entry against the daemon lookup cwd before probing.
+    // The absolute candidate is embedded into REAL_BIN, so changing to a
+    // worker/session cwd cannot rebind it to another executable.
+    const searchDir = resolve(pathEntry || process.cwd());
+    if (searchDir === normalizedGuardDir) continue;
+    const candidate = join(searchDir, bin);
+    try {
+      if (!statSync(candidate).isFile()) continue;
+      accessSync(candidate, constants.X_OK);
+      return candidate;
+    } catch {
+      // Missing/non-executable candidates are not guard materialization failures:
+      // there is no command at this PATH position for the shim to intercept.
+    }
   }
+  return null;
 }
 
 function shimContent(bin: string, realBin: string): string {
@@ -144,7 +184,7 @@ if [ "$BIN_NAME" = "curl" ] || [ "$BIN_NAME" = "wget" ]; then
     exit 126
   fi
   allowed=0
-  allow_hosts="\${BOTMUX_EGRESS_ALLOW_HOSTS:-${DEFAULT_EGRESS_ALLOW_HOSTS}}"
+  allow_hosts="\${BOTMUX_EGRESS_ALLOW_HOSTS:-${PUBLIC_DEFAULT_EGRESS_ALLOW_HOSTS}}"
   old_ifs="$IFS"
   IFS=,
   for suffix in $allow_hosts; do
@@ -182,26 +222,62 @@ exec "$REAL_BIN" "$@"
 `;
 }
 
+function unavailableShimContent(bin: string): string {
+  return `#!/bin/sh
+echo "botmux command guard: ${bin} is unavailable in the daemon worker PATH" >&2
+exit 127
+`;
+}
+
 export function ensureCommandGuardShims(env: NodeJS.ProcessEnv = process.env): string | null {
   if (!commandGuardEnabled(env)) return null;
   const dir = commandGuardDir(env);
   try {
+    // The generated shims are POSIX /bin/sh programs. Native Windows must never
+    // silently advertise BOTMUX_COMMAND_GUARD=1 while executing past them.
+    if (process.platform === 'win32') {
+      throw new Error('native Windows command-guard shims are not supported');
+    }
     mkdirSync(dir, { recursive: true });
-    for (const bin of GUARDED_BINS) {
-      const real = findRealBinary(bin, dir, env);
-      if (!real) continue;
-      const fp = join(dir, bin);
-      const content = shimContent(bin, real);
-      if (!existsSync(fp)) {
-        writeFileSync(fp, content, { mode: 0o755 });
-      } else {
-        writeFileSync(fp, content, 'utf-8');
-        chmodSync(fp, 0o755);
+    const stagingDir = mkdtempSync(join(dir, '.staging-'));
+    try {
+      // Stage every declared interception target first. A command that is not
+      // currently reachable still gets an explicit blocking shim, so a later
+      // interactive-shell PATH expansion cannot bypass the launch-time guard.
+      for (const bin of GUARDED_BINS) {
+        const real = findRealBinary(bin, dir, env);
+        const staged = join(stagingDir, bin);
+        writeFileSync(staged, real ? shimContent(bin, real) : unavailableShimContent(bin), {
+          mode: 0o755,
+        });
+        chmodSync(staged, 0o755);
+        accessSync(staged, constants.X_OK);
       }
+
+      // rename(2) prevents an interrupted write from truncating an existing
+      // live shim. If any publication fails, the caller throws and no worker is
+      // forked; files already published in this loop are individually complete.
+      for (const bin of GUARDED_BINS) {
+        renameSync(join(stagingDir, bin), join(dir, bin));
+      }
+    } finally {
+      rmSync(stagingDir, { recursive: true, force: true });
+    }
+    for (const bin of GUARDED_BINS) {
+      const shim = join(dir, bin);
+      if (!statSync(shim).isFile()) {
+        throw new Error(`guard target is not a file after materialization: ${bin}`);
+      }
+      accessSync(shim, constants.X_OK);
     }
     return dir;
   } catch (err) {
-    logger.warn(`[worker-security] failed to prepare command guard shims: ${err}`);
-    return null;
+    const reason = err instanceof Error ? err.message : String(err);
+    const failure = new Error(
+      `command guard is enabled but its shims could not be fully materialized; refusing worker start: ${reason}`,
+      { cause: err },
+    );
+    logger.error(`[worker-security] ${failure.message}`);
+    throw failure;
   }
 }

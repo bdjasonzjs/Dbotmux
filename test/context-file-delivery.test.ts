@@ -18,7 +18,14 @@ import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest';
 
 // ─── Mocks（照 prompt-builder / chat-mode-injection 的配方） ─────────────────
 
-vi.mock('node:child_process', () => ({ execSync: vi.fn(() => ''), execFileSync: vi.fn(() => '') }));
+vi.mock('node:child_process', () => ({
+  execSync: vi.fn(() => ''),
+  execFileSync: vi.fn(() => ''),
+  execFile: vi.fn((...args: unknown[]) => {
+    const callback = args.at(-1);
+    if (typeof callback === 'function') callback(null, '', '');
+  }),
+}));
 vi.mock('node:fs', async () => { const memfs = await import('memfs'); return memfs.fs; });
 vi.mock('../src/config.js', () => ({
   config: {

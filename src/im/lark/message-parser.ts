@@ -1,6 +1,10 @@
 import type { LarkMessage, LarkMention } from '../../types.js';
 import { getMessageDetail } from './client.js';
 import { logger } from '../../utils/logger.js';
+import {
+  REPLY_CARD_FOOTER_ELEMENT_ID,
+} from './reply-card-footer-signature.js';
+import { hasBotmuxCallbackMarker } from './callback-button-marker.js';
 
 // Event data structure from WSClient im.message.receive_v1
 // sender is at data top-level, NOT inside data.message
@@ -8,6 +12,7 @@ interface RawEventData {
   sender: {
     sender_id: {
       open_id?: string;
+      app_id?: string;
       user_id?: string;
       union_id?: string;
     };
@@ -17,6 +22,7 @@ interface RawEventData {
   message: {
     message_id: string;
     root_id?: string;
+    thread_id?: string;
     parent_id?: string;
     message_type: string; // NOT msg_type
     content: string;
@@ -26,10 +32,250 @@ interface RawEventData {
     mentions?: Array<{
       key: string;       // e.g. "@_user_1"
       name: string;      // display name
-      id?: { open_id?: string; user_id?: string; union_id?: string };
+      // Two shapes exist in the wild. The WS event (im.message.receive_v1)
+      // delivers an OBJECT: { open_id, union_id, user_id }. The REST API
+      // (im.message.get / list) delivers a bare STRING ("ou_xxx") plus a
+      // sibling `id_type`. Always read the open_id via mentionOpenId() so both
+      // forms are handled — see its doc-comment for why this matters.
+      id?: { open_id?: string; user_id?: string; union_id?: string; app_id?: string } | string;
+      id_type?: string;  // present only in the REST string form, e.g. "open_id" / "app_id"
       tenant_key?: string;
     }>;
   };
+}
+
+/**
+ * Extract a mention's open_id, tolerating BOTH Lark shapes for `mention.id`:
+ *
+ *   - WebSocket event (im.message.receive_v1): `id` is an OBJECT
+ *       { open_id, union_id, user_id }            ← what botmux has always seen
+ *   - Message REST API (im.message.get / list):  `id` is a bare STRING "ou_xxx"
+ *       with a sibling `id_type` ("open_id" | "union_id" | "user_id")
+ *
+ * The two diverged in production: the API already ships the flat-string form
+ * while the event still ships the object form. If Lark ever converges the event
+ * onto the string form, every `m.id.open_id` read across botmux would silently
+ * become `undefined` and @-detection (isBotMentioned) would fail closed with no
+ * log. Reading through this helper keeps every caller robust regardless of
+ * which shape arrives.
+ *
+ * For the string form we return the value only when it actually IS an open_id
+ * (id_type === 'open_id', or absent — mentions are open_id-keyed by default). A
+ * string carrying a non-open_id id_type (union_id / user_id, which Lark may
+ * return when the app lacks the open_id scope) yields `undefined` rather than
+ * being mis-compared against a botOpenId.
+ */
+export function mentionOpenId(m: { id?: { open_id?: string; app_id?: string } | string | null; id_type?: string } | null | undefined): string | undefined {
+  const id = m?.id;
+  if (id == null) return undefined;
+  if (typeof id === 'object') return id.open_id || undefined;
+  if (typeof id === 'string') {
+    if (m?.id_type && m.id_type !== 'open_id') return undefined;
+    return id || undefined;
+  }
+  return undefined;
+}
+
+export interface MentionIdentity {
+  key?: string;
+  name?: string;
+  openId?: string;
+  userId?: string;
+  unionId?: string;
+  appId?: string;
+  idType?: string;
+}
+
+/** Extract all stable ids Lark provides for @mentions, across WS and REST shapes. */
+export function mentionIdentity(m: {
+  key?: string;
+  name?: string;
+  id?: { open_id?: string; user_id?: string; union_id?: string; app_id?: string } | string | null;
+  id_type?: string;
+} | null | undefined): MentionIdentity {
+  const id = m?.id;
+  const out: MentionIdentity = {
+    key: m?.key,
+    name: m?.name,
+    idType: m?.id_type,
+  };
+  if (id && typeof id === 'object') {
+    out.openId = id.open_id || undefined;
+    out.userId = id.user_id || undefined;
+    out.unionId = id.union_id || undefined;
+    out.appId = id.app_id || undefined;
+    return out;
+  }
+  if (typeof id === 'string' && id) {
+    if (!m?.id_type || m.id_type === 'open_id') out.openId = id;
+    else if (m.id_type === 'user_id') out.userId = id;
+    else if (m.id_type === 'union_id') out.unionId = id;
+    else if (m.id_type === 'app_id') out.appId = id;
+  }
+  return out;
+}
+
+/** id_type across both shapes Lark uses (snake_case REST, camelCase legacy). */
+export function mentionIdType(m: any): string | undefined {
+  if (!m || typeof m !== 'object') return undefined;
+  if (typeof m.id_type === 'string') return m.id_type;
+  if (typeof m.idType === 'string') return m.idType;
+  return undefined;
+}
+
+/**
+ * Extract a bot mention's app_id across ALL shapes Lark has been observed to
+ * use. app_id-form bot mentions must never flow through mentionOpenId() (which
+ * is persisted/used as an open_id), so they are matched separately:
+ *   1. top-level camelCase `m.appId`
+ *   2. top-level snake_case `m.app_id`
+ *   3. string `m.id` with id_type === 'app_id' (REST bare-string OR legacy)
+ *   4. object `m.id.app_id`
+ * Keep this exhaustive: the realtime @-gate (isBotMentioned) depends on it, so
+ * dropping a shape silently un-@'s a bot in that shape.
+ */
+export function mentionAppId(m: any): string | undefined {
+  if (!m || typeof m !== 'object') return undefined;
+  if (typeof m.appId === 'string') return m.appId;
+  if (typeof m.app_id === 'string') return m.app_id;
+  const idType = mentionIdType(m);
+  if (idType === 'app_id' && typeof m.id === 'string') return m.id;
+  if (m.id && typeof m.id === 'object' && typeof m.id.app_id === 'string') return m.id.app_id;
+  return undefined;
+}
+
+/**
+ * Extract @-mentions carried by a post (rich-text) message's inline `at` nodes,
+ * as routing-only `LarkMention`s for the --mention-back participant window.
+ *
+ * WHY separate from parseEventMessage().mentions: a post's `message.mentions[]`
+ * is frequently empty — the real @s live as inline `{ tag: 'at', user_id,
+ * user_name }` nodes in the content (the realtime @-gate isBotMentioned already
+ * scans these). Folding them into the general `parsed.mentions` would ripple
+ * into prompt rendering / stripLeadingMentions / mention hints, so this stays a
+ * dedicated lane consumed ONLY by buildTurnParticipants.
+ *
+ * A post `at`'s `user_id` is an `ou_` open_id (in-group) or a `cli_` app_id
+ * (out-of-group bot). We classify into openId vs appId; `all` and any other
+ * shape are surfaced WITHOUT an executable id so the participant core marks the
+ * window incomplete rather than inventing a candidate. Deliberately NO position
+ * filtering (unlike mention-targets' command parsing) — every counterpart in the
+ * turn counts, including a leading @ of the answering bot (excluded later by
+ * self open_id/app_id). Returns [] on non-post shapes / parse errors.
+ */
+export function extractPostAtParticipants(message: { content?: string } | null | undefined): LarkMention[] {
+  const out: LarkMention[] = [];
+  let content: any;
+  try { content = JSON.parse(message?.content ?? '{}'); } catch { return out; }
+  const inner = content?.zh_cn ?? content?.en_us ?? content;
+  if (!Array.isArray(inner?.content)) return out;
+  let seq = 0;
+  for (const para of inner.content) {
+    if (!Array.isArray(para)) continue;
+    for (const node of para) {
+      if (node?.tag === 'at') {
+        const uid: string | undefined = typeof node.user_id === 'string' ? node.user_id : undefined;
+        const name: string | undefined = typeof node.user_name === 'string' ? node.user_name : undefined;
+        const isOpenId = !!uid && uid.startsWith('ou_');
+        const isAppId = !!uid && uid.startsWith('cli_');
+        out.push({
+          key: `@_post_at_${seq}`,
+          name: name ?? uid ?? '',
+          ...(isOpenId ? { openId: uid } : {}),
+          ...(isAppId ? { appId: uid } : {}),
+          idType: isAppId ? 'app_id' : 'open_id',
+        });
+      }
+      seq++;
+    }
+  }
+  return out;
+}
+
+/**
+ * truth for the @-gate across every consumer (realtime routing's isBotMentioned,
+ * the 30s poll backfill, and the dashboard preview/run-preview collector) so the
+ * "explicit @ hands off to normal routing, not the listener" rule can never
+ * diverge between legs. Matches by open_id OR by app_id (via mentionAppId, which
+ * covers every observed app_id shape), and also scans post-content inline `at`
+ * tags (post messages may not populate `mentions`).
+ */
+export function messageMentionsBot(
+  message: { mentions?: any[]; content?: string; body?: { content?: string } } | null | undefined,
+  larkAppId: string | undefined,
+  botOpenId: string | undefined,
+): boolean {
+  if (!botOpenId && !larkAppId) return false;
+  const mentions: any[] = message?.mentions ?? [];
+  for (const m of mentions) {
+    if (botOpenId && mentionOpenId(m) === botOpenId) return true;
+    if (larkAppId && mentionAppId(m) === larkAppId) return true;
+  }
+  // Post-content inline `at` tags (bot-sent post messages may omit `mentions`).
+  // Realtime events carry the body in `content`; the REST message-list API
+  // (poll + dashboard preview/run-preview) carries it in `body.content` — read
+  // both so the @-gate is identical across all three legs.
+  if (botOpenId) {
+    const rawContent = message?.content ?? message?.body?.content;
+    try {
+      const content = JSON.parse(rawContent ?? '{}');
+      const inner = content.zh_cn ?? content.en_us ?? content;
+      if (Array.isArray(inner?.content)) {
+        for (const paragraph of inner.content) {
+          if (!Array.isArray(paragraph)) continue;
+          for (const node of paragraph) {
+            if (node?.tag === 'at' && node.user_id === botOpenId) return true;
+          }
+        }
+      }
+    } catch { /* ignore parse errors */ }
+  }
+  return false;
+}
+
+export function extractMentionIdentities(message: {
+  mentions?: Array<{
+    key?: string;
+    name?: string;
+    id?: { open_id?: string; user_id?: string; union_id?: string; app_id?: string } | string | null;
+    id_type?: string;
+  }>;
+  content?: string;
+} | null | undefined): MentionIdentity[] {
+  const out = (message?.mentions ?? []).map(mentionIdentity);
+  try {
+    const content = JSON.parse(message?.content ?? '{}');
+    const inner = content.zh_cn ?? content.en_us ?? content;
+    if (Array.isArray(inner?.content)) {
+      for (const paragraph of inner.content) {
+        if (!Array.isArray(paragraph)) continue;
+        for (const node of paragraph) {
+          if (node?.tag !== 'at') continue;
+          // In post/rich-text content Lark carries the mentionee's OPEN_ID in the
+          // at-node's `user_id` field (cf. isBotMentioned, which compares
+          // node.user_id against botOpenId), NOT a tenant user_id. Map it to
+          // openId only — mislabeling it as userId would both miss a userId-only
+          // target and pollute the userId leg with an open_id value.
+          out.push({
+            name: node.user_name,
+            openId: node.user_id,
+          });
+        }
+      }
+    }
+  } catch { /* ignore non-JSON content */ }
+  return out;
+}
+
+export function mentionUnionId(m: { id?: { union_id?: string } | string | null; id_type?: string } | null | undefined): string | undefined {
+  const id = m?.id;
+  if (id == null) return undefined;
+  if (typeof id === 'object') return id.union_id || undefined;
+  if (typeof id === 'string') {
+    if (m?.id_type !== 'union_id') return undefined;
+    return id || undefined;
+  }
+  return undefined;
 }
 
 /**
@@ -246,7 +492,10 @@ export function extractResources(msgType: string, rawContent: string, numberer?:
   return [];
 }
 
-export function parseEventMessage(data: RawEventData): { parsed: LarkMessage; resources: MessageResource[] } {
+export function parseEventMessage(
+  data: RawEventData,
+  numberer: ImgNumberer = createImgNumberer(),
+): { parsed: LarkMessage; resources: MessageResource[] } {
   const { sender, message } = data;
 
   // Trace non-text messages at debug only (DEBUG=1 gated). The raw card/post
@@ -261,7 +510,6 @@ export function parseEventMessage(data: RawEventData): { parsed: LarkMessage; re
   // Share numberer so in-body [图片 N] placeholders use the same numbers as
   // the attachment list. Resources first → numbers assigned; text second →
   // reuses them.
-  const numberer = createImgNumberer();
   const resources = extractResources(message.message_type, message.content, numberer);
 
   // Extract structured mentions
@@ -270,15 +518,21 @@ export function parseEventMessage(data: RawEventData): { parsed: LarkMessage; re
       ? message.mentions.map(m => ({
           key: m.key,
           name: m.name,
-          openId: m.id?.open_id,
+          openId: mentionOpenId(m),
+          userId: mentionIdentity(m).userId,
+          unionId: mentionUnionId(m),
+          appId: mentionIdentity(m).appId,
+          idType: m.id_type,
         }))
       : undefined;
 
   const parsed: LarkMessage = {
     messageId: message.message_id,
     rootId: message.root_id ?? '',
+    threadId: message.thread_id || undefined,
     parentId: message.parent_id || undefined,
     senderId: sender.sender_id?.open_id ?? '',
+    senderUnionId: sender.sender_id?.union_id,
     senderType: sender.sender_type,
     msgType: message.message_type,
     content: extractTextContent(message.message_type, message.content, message.mentions, numberer),
@@ -291,11 +545,18 @@ export function parseEventMessage(data: RawEventData): { parsed: LarkMessage; re
 export function parseApiMessage(msg: any, numberer?: ImgNumberer): LarkMessage {
   const msgType = msg.msg_type ?? 'text';
   const rawContent = msg.body?.content ?? '';
+  // sender_name is only present when the fetch opted in via with_sender_name=true
+  // (all client.ts message read paths do). Covers bot senders too — the one case
+  // local rosters can't resolve for third-party bots.
+  const senderName = typeof msg.sender?.sender_name === 'string' && msg.sender.sender_name.trim()
+    ? msg.sender.sender_name.trim()
+    : undefined;
   return {
     messageId: msg.message_id ?? '',
     rootId: msg.root_id ?? msg.thread_id ?? '',
     senderId: msg.sender?.id ?? '',
     senderType: msg.sender?.sender_type ?? 'unknown',
+    ...(senderName ? { senderName } : {}),
     msgType,
     content: extractTextContent(msgType, normalizeApiMessageContent(msgType, rawContent), undefined, numberer),
     createTime: msg.create_time ?? '',
@@ -381,6 +642,51 @@ function resolveMentions(text: string, mentions?: RawEventData['message']['menti
   return result.trim();
 }
 
+function normalizeFenceLanguage(lang: unknown): string {
+  return typeof lang === 'string' ? lang.trim().replace(/\s+/g, '_') : '';
+}
+
+function renderPostCodeBlock(node: any): string {
+  const raw = typeof node.text === 'string'
+    ? node.text
+    : typeof node.content === 'string'
+      ? node.content
+      : typeof node.code === 'string'
+        ? node.code
+        : '';
+  const code = raw.replace(/\n+$/, '');
+  const lang = normalizeFenceLanguage(node.language ?? node.lang);
+  const longestFence = Math.max(2, ...[...code.matchAll(/`+/g)].map(m => m[0].length));
+  const fence = '`'.repeat(longestFence + 1);
+  return `\n${fence}${lang}\n${code}\n${fence}\n`;
+}
+
+function renderPostNode(node: any, numberer?: ImgNumberer): string {
+  if (node.tag === 'text') return node.text ?? '';
+  if (node.tag === 'a') return node.text ?? node.href ?? '';
+  if (node.tag === 'at') return `@${node.user_name ?? 'unknown'}`;
+  if (node.tag === 'code_block') return renderPostCodeBlock(node);
+  if (node.tag === 'img' || node.tag === 'media') {
+    const key = node.image_key ?? node.file_key;
+    if (key && numberer) return `[图片 ${numberer.assign(`image:${key}`).num}]`;
+    return '[图片]';
+  }
+  if (node.tag === 'file') {
+    const key = node.file_key;
+    const name = node.file_name ?? '';
+    if (key && numberer) {
+      const n = numberer.assign(`file:${key}`).num;
+      return name ? `[文件 ${n}: ${name}]` : `[文件 ${n}]`;
+    }
+    return name ? `[文件: ${name}]` : '[文件]';
+  }
+  return '';
+}
+
+function joinPostNodeText(parts: string[]): string {
+  return parts.join('').replace(/\n{3,}/g, '\n\n').trim();
+}
+
 function extractTextContent(msgType: string, rawContent: string, mentions?: RawEventData['message']['mentions'], numberer?: ImgNumberer): string {
   try {
     if (msgType === 'text') {
@@ -393,32 +699,7 @@ function extractTextContent(msgType: string, rawContent: string, mentions?: RawE
       const body = content
         .map((paragraph: any[]) => {
           const nodes = Array.isArray(paragraph) ? paragraph : [paragraph];
-          return nodes
-            .map((node: any) => {
-              if (node.tag === 'text') return node.text ?? '';
-              if (node.tag === 'a') return node.text ?? node.href ?? '';
-              if (node.tag === 'at') return `@${node.user_name ?? 'unknown'}`;
-              // Render img/media tags as a placeholder. Without this fallback,
-              // a post message with images surfaces as text-only — which lets
-              // a reader (e.g. another bot scanning thread history) believe
-              // no image was attached and prompt the sender to retry.
-              if (node.tag === 'img' || node.tag === 'media') {
-                const key = node.image_key ?? node.file_key;
-                if (key && numberer) return `[图片 ${numberer.assign(`image:${key}`).num}]`;
-                return '[图片]';
-              }
-              if (node.tag === 'file') {
-                const key = node.file_key;
-                const name = node.file_name ?? '';
-                if (key && numberer) {
-                  const n = numberer.assign(`file:${key}`).num;
-                  return name ? `[文件 ${n}: ${name}]` : `[文件 ${n}]`;
-                }
-                return name ? `[文件: ${name}]` : '[文件]';
-              }
-              return '';
-            })
-            .join('');
+          return joinPostNodeText(nodes.map((node: any) => renderPostNode(node, numberer)));
         })
         .filter(Boolean)
         .join('\n');
@@ -456,6 +737,126 @@ function extractTextContent(msgType: string, rawContent: string, mentions?: RawE
 }
 
 /**
+ * botmux-generated reply-card footer signature. New cards carry both a visible
+ * versioned link marker and an exact element id. The canonical repository URL
+ * is NOT a signature: it is valid body content. For pre-signature cards we
+ * recognize only the exact old default-brand + recipient chrome shape; a
+ * default-brand-only old card is intentionally preserved because it is
+ * indistinguishable from an ordinary repository link.
+ */
+const LEGACY_DEFAULT_FOOTER_URL = 'https://github.com/deepcoldy/botmux';
+const FOOTER_MARKER_HASHES = new Set(['#reply-card-footer', '#reply-card-footer-v1']);
+
+function isBotmuxFooterMarkerUrl(value: unknown): boolean {
+  if (typeof value !== 'string') return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:'
+      && url.hostname === 'github.com'
+      && url.port === ''
+      && url.username === ''
+      && url.password === ''
+      && url.search === ''
+      && decodeURIComponent(url.pathname) === '/deepcoldy/botmux'
+      && FOOTER_MARKER_HASHES.has(url.hash);
+  } catch {
+    return false;
+  }
+}
+
+function isBotmuxFooterMarkerText(value: unknown): boolean {
+  return value === '·' || value === '\u200B';
+}
+
+function isBotmuxFooterMarkerAnchor(href: unknown, text: unknown): boolean {
+  return isBotmuxFooterMarkerText(text) && isBotmuxFooterMarkerUrl(href);
+}
+
+function greyFontInner(line: string): string | null {
+  const font = /^\s*<font\b([^>]*)>([\s\S]*?)<\/font>\s*$/i.exec(line);
+  if (!font || !/\bcolor\s*=\s*(?:"grey"|'grey'|grey)(?:\s|$)/i.test(font[1])) return null;
+  return font[2];
+}
+
+function hasExactMarkerMarkdown(value: string): boolean {
+  // Match only the protocol's reserved anchor texts. A generic Markdown-link
+  // regex can start at an unmatched `[` inside a custom brand and swallow the
+  // later marker before it gets a chance to match.
+  for (const match of value.matchAll(/\[(·|\u200B)\]\(([^)\s]+)\)/gu)) {
+    if (isBotmuxFooterMarkerAnchor(match[2], match[1])) return true;
+  }
+  return false;
+}
+
+function isSignedFormatBFooterLine(line: string): boolean {
+  const inner = greyFontInner(line);
+  return inner !== null && hasExactMarkerMarkdown(inner);
+}
+
+/** Strict compatibility recognizer for Format A cards emitted before the
+ * versioned marker existed. Recipient chrome is required; without it, the old
+ * default-brand-only footer is indistinguishable from a real repository link. */
+function isMeaningfulFormatANode(node: unknown): boolean {
+  if (!node || typeof node !== 'object') return false;
+  const value = node as any;
+  if (value.tag === 'text') return typeof value.text === 'string' && value.text.trim().length > 0;
+  return true;
+}
+
+function isLegacyFormatAFooterParagraph(paragraph: unknown[]): boolean {
+  const nodes = paragraph.filter(isMeaningfulFormatANode) as any[];
+  const first = nodes[0];
+  if (
+    first?.tag !== 'a'
+    || first.href !== LEGACY_DEFAULT_FOOTER_URL
+    || typeof first.text !== 'string'
+    || first.text.trim().toLowerCase() !== 'botmux'
+  ) {
+    return false;
+  }
+
+  let label = '';
+  let sawAt = false;
+  for (const node of nodes.slice(1)) {
+    if (node.tag === 'at') {
+      sawAt = true;
+      continue;
+    }
+    if (node.tag !== 'text' || typeof node.text !== 'string') return false;
+    if (sawAt && node.text.trim() !== '') return false;
+    label += node.text;
+  }
+  return sawAt && /^\s*·\s*(?:发送给：|Sent to:)\s*$/i.test(label);
+}
+
+/** Strict compatibility recognizer for an old original-format footer line.
+ * Grey styling plus exact default brand, locale label, and one or more native
+ * mentions are all required; styling or the canonical URL alone proves
+ * nothing. */
+function isLegacyFormatBFooterLine(line: string): boolean {
+  const inner = greyFontInner(line);
+  if (inner === null) return false;
+  return /^\s*\[botmux\]\(https:\/\/github\.com\/deepcoldy\/botmux\)\s*·\s*(?:发送给：|Sent to:)\s*(?:<at\s+id=(?:"[^"]+"|'[^']+'|[^\s>]+)\s*><\/at>\s*)+$/i
+    .test(inner);
+}
+
+function extractRenderedCardContent(rawContent: string): string | undefined {
+  const match = rawContent.match(/^\s*<card(?:\s+title="([^"]*)")?\s*>([\s\S]*)<\/card>\s*$/);
+  if (!match) return undefined;
+  const title = match[1]?.trim();
+  const body = match[2]
+    .split('\n')
+    .map(line => line.trimEnd())
+    .filter(line => !isSignedFormatBFooterLine(line))
+    .join('\n')
+    .trim();
+  return [
+    title ? `[卡片: ${title}]` : '',
+    body,
+  ].filter(Boolean).join('\n') || '[卡片]';
+}
+
+/**
  * Extract human-readable text from an interactive card.
  *
  * Lark API returns card content in a **simplified format** (not the original card JSON):
@@ -463,7 +864,10 @@ function extractTextContent(msgType: string, rawContent: string, mentions?: RawE
  * This is similar to post message body.  We also handle the original card JSON
  * (header/config/elements with tag objects) for locally-cached cards.
  */
-function extractCardContent(rawContent: string, numberer?: ImgNumberer): string {
+export function extractCardContent(rawContent: string, numberer?: ImgNumberer): string {
+  const rendered = extractRenderedCardContent(rawContent);
+  if (rendered !== undefined) return rendered;
+
   try {
     const card = JSON.parse(rawContent);
 
@@ -500,17 +904,45 @@ function extractCardContent(rawContent: string, numberer?: ImgNumberer): string 
 
       if (isApiFormat) {
         // Format A: [[{tag:"text",text:"..."}, {tag:"img",...}, {tag:"button",...}], ...]
-        for (const paragraph of rootElements) {
+        let lastMeaningfulParagraphIndex = -1;
+        for (let i = rootElements.length - 1; i >= 0; i--) {
+          const candidate = rootElements[i];
+          if (Array.isArray(candidate) && candidate.some(isMeaningfulFormatANode)) {
+            lastMeaningfulParagraphIndex = i;
+            break;
+          }
+        }
+        for (let paragraphIndex = 0; paragraphIndex < rootElements.length; paragraphIndex++) {
+          const paragraph = rootElements[paragraphIndex];
           if (!Array.isArray(paragraph)) continue;
+          if (
+            paragraphIndex === lastMeaningfulParagraphIndex
+            && isLegacyFormatAFooterParagraph(paragraph)
+          ) {
+            continue;
+          }
           const textNodes: string[] = [];
           const buttons: string[] = [];
+          let inSignedFooter = false;
           for (const node of paragraph) {
+            if (inSignedFooter) continue;
             if (node.tag === 'text') { if (node.text) textNodes.push(node.text); }
             else if (node.tag === 'a') {
+              if (isBotmuxFooterMarkerAnchor(node.href, node.text)) {
+                inSignedFooter = true;
+                continue;
+              }
               // Keep the href so links survive — Format A separates text/href,
               // and dropping href loses real content (规则配置/详情/Trace 链接).
+              // Bare long URLs (e.g. Argos Kibana 处理建议) come back with
+              // text === href, both cut at the same offset, and the remainder
+              // spilling into the FOLLOWING text nodes of the same paragraph.
+              // Emitting `text(href)` would double the truncated URL and
+              // corrupt the line; a single copy lets join('') below reconnect
+              // the full URL from those remainder nodes.
               const t = node.text ?? '';
-              textNodes.push(node.href && t ? `${t}(${node.href})` : (t || node.href || ''));
+              if (t && t === node.href) textNodes.push(t);
+              else textNodes.push(node.href && t ? `${t}(${node.href})` : (t || node.href || ''));
             }
             else if (node.tag === 'at') textNodes.push(`@${node.user_name ?? 'unknown'}`);
             else if (node.tag === 'img' || node.tag === 'image') {
@@ -518,8 +950,15 @@ function extractCardContent(rawContent: string, numberer?: ImgNumberer): string 
               if (k) textNodes.push(imgLabel(k));
             }
             else if (node.tag === 'button') {
+              // Same jump-URL policy as Format B: simple cards reach history
+              // via the Format A list view WITHOUT a resolve pass, so dropping
+              // the URL here would lose button links on that main path.
+              if (isBotmuxCallbackButton(node)) continue;
               const btnText = typeof node.text === 'string' ? node.text : node.text?.content;
-              if (btnText) buttons.push(`[${btnText}]`);
+              if (btnText) {
+                const url = buttonOpenUrl(node);
+                buttons.push(url ? `[${btnText}](${url})` : `[${btnText}]`);
+              }
             }
             else if (node.tag === 'input') {
               const ph = typeof node.placeholder === 'string' ? node.placeholder : node.placeholder?.content;
@@ -535,7 +974,19 @@ function extractCardContent(rawContent: string, numberer?: ImgNumberer): string 
             }
           }
           const line = textNodes.join('').trim();
-          if (line) parts.push(line);
+          if (line) {
+            if (inSignedFooter) {
+              const lastBreak = line.lastIndexOf('\n');
+              if (lastBreak >= 0) {
+                const beforeFooter = line.slice(0, lastBreak).trim();
+                if (beforeFooter) parts.push(beforeFooter);
+              }
+              // No newline before the signed marker means the whole paragraph is
+              // footer chrome (brand/usage/recipient). Keep nothing.
+            } else {
+              parts.push(line);
+            }
+          }
           if (buttons.length) parts.push(buttons.join(' '));
         }
       } else {
@@ -545,7 +996,34 @@ function extractCardContent(rawContent: string, numberer?: ImgNumberer): string 
       }
     }
 
-    return parts.join('\n') || '[卡片]';
+    // Drop the botmux footer chrome so a receiving bot's prompt isn't polluted
+    // by the grey `botmux` badge / `发送给：@owner` line. Line-level (not
+    // part-level) so a footer never takes adjacent real content with it.
+    // Stable legacy markers may occur inside a multiline element, so remove
+    // only their exact line. Marker-less footer-shaped text is deliberately
+    // preserved: an arbitrary custom brand is indistinguishable from user data.
+    let visibleParts = parts
+      .map(part => part
+        .split('\n')
+        .filter(line => !isSignedFormatBFooterLine(line))
+        .join('\n'))
+      .filter(part => !!part.trim());
+    // Marker-less legacy compatibility is intentionally tail-only. Old
+    // botmux footers were always last; applying this heuristic in the middle
+    // of a foreign card would turn a footer-shaped body note into data loss.
+    if (visibleParts.length > 0) {
+      const lastIndex = visibleParts.length - 1;
+      const lines = visibleParts[lastIndex].split('\n');
+      let lastLine = lines.length - 1;
+      while (lastLine >= 0 && !lines[lastLine].trim()) lastLine--;
+      if (lastLine >= 0 && isLegacyFormatBFooterLine(lines[lastLine])) {
+        lines.splice(lastLine, 1);
+        visibleParts[lastIndex] = lines.join('\n');
+        visibleParts = visibleParts.filter(part => !!part.trim());
+      }
+    }
+    const cleaned = visibleParts.join('\n');
+    return cleaned || '[卡片]';
   } catch {
     return '[卡片]';
   }
@@ -648,7 +1126,7 @@ export function mergeCardText(textA: string, textB: string): string {
  */
 export async function resolveMergedCardContent(
   larkAppId: string, messageId: string, numberer?: ImgNumberer,
-): Promise<{ text: string; structuredContent: string } | null> {
+): Promise<{ text: string; structuredContent: string; resources: MessageResource[] } | null> {
   const [aRes, bRes] = await Promise.all([
     getMessageDetail(larkAppId, messageId, { userCardContent: false }).catch(() => null),
     getMessageDetail(larkAppId, messageId, { userCardContent: true }).catch(() => null),
@@ -656,6 +1134,12 @@ export async function resolveMergedCardContent(
   const aContent = aRes?.items?.[0]?.body?.content;
   const bContent = bRes?.items?.[0]?.body?.content;
   if (!aContent && !bContent) return null;
+  const structuredContent = (bContent ?? aContent)!;
+  // Resources BEFORE text so the shared numberer assigns [图片 N] in attachment
+  // order and the text extraction below reuses those numbers (same ordering
+  // contract as parseEventMessage / buildForwardedTree). Callers that don't
+  // pass a numberer are unaffected (fresh internal one, unnumbered text).
+  const resources = extractResources('interactive', structuredContent, numberer);
   const textA = aContent ? extractCardContent(normalizeApiMessageContent('interactive', aContent), numberer) : '';
   const textB = bContent ? extractCardContent(normalizeApiMessageContent('interactive', bContent), numberer) : '';
   const merged = mergeCardText(textA, textB);
@@ -663,7 +1147,7 @@ export async function resolveMergedCardContent(
   // Carry the structured card JSON (B preferred) alongside the merged text so
   // resource extraction (image_key/file_key) keeps working — extractResources
   // walks elements/body, extractCardContent short-circuits on the text key.
-  return { text: merged, structuredContent: (bContent ?? aContent)! };
+  return { text: merged, structuredContent, resources };
 }
 
 /**
@@ -684,6 +1168,96 @@ export async function resolveEventCard(data: RawEventData, larkAppId: string): P
     return;
   }
   unwrapUserDsl(data);
+}
+
+/** First non-empty string among the candidates. Deliberately NOT `??` — Lark
+ *  payloads carry empty-string placeholders (e.g. multi_url: {url: '', pc_url:
+ *  'https://…'}) which nullish coalescing would return, swallowing the valid
+ *  platform URL behind it. */
+function firstNonEmptyString(...candidates: unknown[]): string | undefined {
+  for (const c of candidates) {
+    if (typeof c === 'string' && c) return c;
+  }
+  return undefined;
+}
+
+/** botmux's own card control buttons (🔊 语音总结 / 关闭会话 / 重启 / 配置 …) are
+ *  pure callbacks back into the daemon: when another bot reads the card
+ *  (history / cross-bot relay / quote), rendering them as `[🔊 语音总结]`
+ *  pollutes the receiving prompt with affordances it can never click, so
+ *  drop them structurally — same rationale as the botmux grey-footer strip
+ *  in extractElementText.
+ *
+ *  Primary detection is the egress-stamped ownership marker
+ *  (callback-button-marker.ts). This wordlist is the LEGACY fallback for
+ *  cards sent by pre-marker builds (chat history is long-lived), covering
+ *  every action dispatched by card-handler as of the fix — it is frozen;
+ *  new botmux buttons rely on the marker, not on growing this list.
+ *  Third-party cards' buttons (Argos 确认/创建群组…) stay: they carry no
+ *  marker and their `value` never uses botmux's action vocabulary. */
+const BOTMUX_INTERNAL_CARD_ACTIONS: ReadonlySet<string> = new Set([
+  // session / reply card controls (card-handler's actionType dispatch)
+  'close', 'disconnect', 'export_text', 'get_write_link', 'open_local_cli',
+  'open_local_terminal', 'refresh_screenshot', 'restart', 'resume',
+  'retry_last_task', 'takeover', 'term_action', 'toggle_display',
+  'toggle_stream', 'tui_keys', 'tui_text_input', 'voice_summary',
+  // pendingRepo gates
+  'repo_manual_submit', 'repo_worktree_submit', 'skip_repo',
+  'worktree_toggle_mode',
+  // config / grant / relay cards
+  'config_toggle', 'config_set', 'config_quota', 'config_quota_open',
+  'config_quota_save', 'config_text_open', 'config_text_save',
+  'grant_chat', 'grant_global', 'grant_deny',
+  'relay_search', 'relay_page', 'relay_select', 'relay_confirm',
+  // host-overload alert + codex notifier cards
+  'overload_noop', 'overload_clean_stopped', 'overload_suspend_idle',
+  'codex_notifier_continue', 'codex_notifier_open_app',
+]);
+
+/** True when the button is one of botmux's own callback buttons. Primary
+ *  signal: the egress-stamped ownership marker (see
+ *  callback-button-marker.ts) — future-proof against any new botmux action
+ *  name. Legacy fallback: cards sent by pre-marker builds are still
+ *  recognized via the internal action wordlist, in EITHER of the two real
+ *  payload shapes — legacy top-level `value.action` (session/config cards)
+ *  or v2 `behaviors:[{type:'callback', value.action}]` (reply-card voice
+ *  button inside column_set). A button that somehow carries BOTH a botmux
+ *  signal AND an open_url jump target is kept, since a real link is always
+ *  worth surfacing. */
+function isBotmuxCallbackButton(el: any): boolean {
+  if (buttonOpenUrl(el)) return false;
+  if (hasBotmuxCallbackMarker(el)) return true;
+  let action: unknown = el?.value?.action;
+  if (typeof action !== 'string' && Array.isArray(el?.behaviors)) {
+    action = el.behaviors.find((b: any) => b?.type === 'callback')?.value?.action;
+  }
+  return typeof action === 'string' && BOTMUX_INTERNAL_CARD_ACTIONS.has(action);
+}
+
+/** Resolve a card button's jump target across schema generations: v1 `url` /
+ *  `multi_url`, v2 `behaviors: [{type:'open_url', default_url, pc_url, …}]`.
+ *  Returns undefined for callback-only buttons (they have no followable URL). */
+function buttonOpenUrl(el: any): string | undefined {
+  const direct = firstNonEmptyString(
+    el.url,
+    el.multi_url?.url, el.multi_url?.pc_url, el.multi_url?.android_url, el.multi_url?.ios_url,
+  );
+  if (direct) return direct;
+  if (Array.isArray(el.behaviors)) {
+    for (const b of el.behaviors) {
+      if (b?.type !== 'open_url') continue;
+      const u = firstNonEmptyString(b.default_url, b.pc_url, b.url, b.android_url, b.ios_url);
+      if (u) return u;
+    }
+  }
+  return undefined;
+}
+
+/** Fold an image's alt text into its placeholder: `[图片 2]` + alt →
+ *  `[图片 2: 报警前30分钟今(红)昨(蓝)同比]`. Consumers that pattern-match the
+ *  placeholder tolerate the suffix (they match `[图片…]` loosely). */
+function withImgAlt(label: string, alt: string): string {
+  return label.endsWith(']') ? `${label.slice(0, -1)}: ${alt}]` : `${label} (${alt})`;
 }
 
 type ResourcePusher = (resources: MessageResource[], r: MessageResource) => void;
@@ -720,6 +1294,20 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
 
   const tag = el.tag;
 
+  // The public element id alone is not ownership proof: third-party cards may
+  // collide with it. New botmux footers carry the id plus the exact reserved
+  // marker; unexpected large text stays visible rather than being stripped.
+  const elementText = el.text?.content ?? el.content;
+  if (
+    el.element_id === REPLY_CARD_FOOTER_ELEMENT_ID
+    && tag === 'markdown'
+    && (el.text_size === undefined || el.text_size === 'notation_small_v2')
+    && typeof elementText === 'string'
+    && hasExactMarkerMarkdown(elementText)
+  ) {
+    return;
+  }
+
   // div / markdown / plain_text blocks
   if (tag === 'div' || tag === 'markdown' || tag === 'plain_text') {
     const text = el.text?.content ?? el.content;
@@ -739,9 +1327,17 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
   }
 
   // button — text may be a plain_text object (v2) or a string (v1 simplified).
+  // Jump buttons carry their target as v1 `url`/`multi_url` or v2 `behaviors`
+  // open_url; keep it so the reader can actually follow the link (e.g. Argos
+  // [分析报告] → the report URL). Callback buttons have no URL and stay bare.
+  // botmux's own callback buttons (🔊 语音总结 …) are dropped entirely.
   if (tag === 'button') {
+    if (isBotmuxCallbackButton(el)) return;
     const btnText = typeof el.text === 'string' ? el.text : el.text?.content;
-    if (btnText) parts.push(`[${btnText}]`);
+    if (btnText) {
+      const url = buttonOpenUrl(el);
+      parts.push(url ? `[${btnText}](${url})` : `[${btnText}]`);
+    }
   }
 
   // input — surface the placeholder so the reader knows the field is there.
@@ -762,9 +1358,12 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
   }
 
   // image — emit a numbered placeholder matching the attachment list order.
+  // Carry the alt text when present: for chart images (Argos 同比曲线图) the
+  // alt is often the only machine-readable description of what the image shows.
   if (tag === 'img' || tag === 'image') {
     const k = el.image_key ?? el.img_key;
-    if (k) parts.push(imgLabel(k));
+    const alt = (typeof el.alt === 'string' ? el.alt : el.alt?.content)?.trim();
+    if (k) parts.push(alt ? withImgAlt(imgLabel(k), alt) : imgLabel(k));
   }
 
   // note blocks (v1 only — v2 removed the tag but we still parse v1 cards)

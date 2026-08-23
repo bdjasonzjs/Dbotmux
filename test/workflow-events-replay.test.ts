@@ -3,9 +3,9 @@ import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import {
-  EventLog,
-  type EventDraft,
-} from '../src/workflows/events/append.js';
+  FrozenV2EventLog,
+  type FrozenV2EventDraft as EventDraft,
+} from './helpers/frozen-v2-event-log.js';
 import {
   replay,
   type Snapshot,
@@ -21,11 +21,11 @@ const sampleOutputRef = {
 };
 
 let baseDir: string;
-let log: EventLog;
+let log: FrozenV2EventLog;
 
 beforeEach(() => {
   baseDir = mkdtempSync(join(tmpdir(), 'wf-replay-'));
-  log = new EventLog(RUN_ID, baseDir);
+  log = new FrozenV2EventLog(RUN_ID, baseDir);
 });
 afterEach(() => {
   rmSync(baseDir, { recursive: true, force: true });
@@ -139,6 +139,116 @@ describe('replay — Run lifecycle', () => {
     );
     expect(s.run.status).toBe('cancelled');
     expect(s.run.cancelOriginEventId).toBe(`${RUN_ID}-1`);
+  });
+});
+
+describe('replay — Loop lifecycle', () => {
+  it('projects loop iterations, audit anchors, and virtual loop output', async () => {
+    const s = await snapshotAfter(
+      runCreated,
+      {
+        runId: RUN_ID,
+        type: 'loopStarted',
+        actor: 'scheduler',
+        payload: { loopId: 'review-loop', maxIterations: 3 },
+      },
+      {
+        runId: RUN_ID,
+        type: 'loopIterationStarted',
+        actor: 'scheduler',
+        payload: { loopId: 'review-loop', iteration: 1, prevResolution: 'initial' },
+      },
+      {
+        runId: RUN_ID,
+        type: 'attemptCreated',
+        actor: 'scheduler',
+        payload: {
+          nodeId: 'implement',
+          activityId: `${RUN_ID}::loop::review-loop.1::work::implement`,
+          attemptId: 'att-1',
+          attemptNumber: 1,
+          inputRef: sampleOutputRef,
+        },
+      },
+      {
+        runId: RUN_ID,
+        type: 'loopIterationFinished',
+        actor: 'scheduler',
+        payload: {
+          loopId: 'review-loop',
+          iteration: 1,
+          resolution: 'rejected',
+          decisionActivityId: `${RUN_ID}::loop::review-loop.1::gate::reviewDecision`,
+          waitResolvedEventId: `${RUN_ID}-4`,
+          by: 'ou_reviewer',
+          comment: 'try again',
+        },
+      },
+      {
+        runId: RUN_ID,
+        type: 'loopIterationStarted',
+        actor: 'scheduler',
+        payload: { loopId: 'review-loop', iteration: 2, prevResolution: 'rejected' },
+      },
+      {
+        runId: RUN_ID,
+        type: 'loopIterationFinished',
+        actor: 'scheduler',
+        payload: {
+          loopId: 'review-loop',
+          iteration: 2,
+          resolution: 'approved',
+          decisionActivityId: `${RUN_ID}::loop::review-loop.2::gate::reviewDecision`,
+          waitResolvedEventId: `${RUN_ID}-7`,
+          by: 'ou_reviewer',
+        },
+      },
+      {
+        runId: RUN_ID,
+        type: 'loopFinished',
+        actor: 'scheduler',
+        payload: {
+          loopId: 'review-loop',
+          finalIteration: 2,
+          resolution: 'approved',
+          outputRef: sampleOutputRef,
+        },
+      },
+    );
+    const loop = s.loops.get('review-loop');
+    expect(loop).toMatchObject({
+      loopId: 'review-loop',
+      status: 'succeeded',
+      iteration: 2,
+      maxIterations: 3,
+      output: sampleOutputRef,
+    });
+    expect(loop?.iterations).toHaveLength(2);
+    expect(loop?.iterations[0]).toMatchObject({
+      iteration: 1,
+      status: 'rejected',
+      decisionBy: 'ou_reviewer',
+      decisionComment: 'try again',
+      waitResolvedEventId: `${RUN_ID}-4`,
+    });
+    expect(loop?.iterations[0]?.bodyActivityIds).toEqual([
+      `${RUN_ID}::loop::review-loop.1::work::implement`,
+    ]);
+    expect(s.outputs.get(`${RUN_ID}::work::review-loop`)).toEqual(sampleOutputRef);
+  });
+
+  it('requires max-iterations-exceeded loopFinished to carry canonical error', async () => {
+    await log.append(runCreated);
+    await expect(log.append({
+      runId: RUN_ID,
+      type: 'loopFinished',
+      actor: 'scheduler',
+      payload: {
+        loopId: 'review-loop',
+        finalIteration: 3,
+        resolution: 'max-iterations-exceeded',
+      },
+    })).rejects.toThrow(/LoopMaxIterationsExceeded/);
   });
 });
 

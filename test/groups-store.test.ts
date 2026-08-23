@@ -10,33 +10,51 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 const chatCreateStub = vi.fn();
 // chat.update mocks the owner-transfer call.
 const chatUpdateStub = vi.fn();
+// chat.link mocks the share-link fetch.
+const chatLinkStub = vi.fn();
 
 // Mock bot-registry's getBotClient — that's where groups-store imports from.
+// Read-only GETs (listChats / isInChat / getChatOwner) now go through
+// `client.request()` to avoid the empty-GET-body 411; mutating calls
+// (chat.create / chat.update / chatMembers.create) stay on generated methods.
 vi.mock('../src/bot-registry.js', () => ({
   getBotClient: vi.fn().mockImplementation(() => ({
+    request: vi.fn().mockImplementation(async ({ url }: { url: string }) => {
+      if (url.includes('/members/is_in_chat')) {
+        return { code: 0, data: { is_in_chat: true } };
+      }
+      if (/\/open-apis\/im\/v1\/chats$/.test(url)) {
+        return {
+          code: 0,
+          data: {
+            items: [
+              {
+                chat_id: 'c1',
+                name: 'one',
+                description: 'first chat',
+                chat_mode: 'group',
+                owner_id: 'ou_owner',
+                avatar: 'https://avatar.example/c1.png',
+              },
+            ],
+            has_more: false,
+          },
+        };
+      }
+      // getChatOwner: GET /open-apis/im/v1/chats/<id>
+      if (/\/open-apis\/im\/v1\/chats\/[^/]+$/.test(url)) {
+        return { code: 0, data: { owner_id: 'ou_owner', name: 'one' } };
+      }
+      throw new Error(`unexpected GET url in mock: ${url}`);
+    }),
     im: {
       v1: {
         chat: {
-          list: vi.fn().mockResolvedValue({
-            code: 0,
-            data: {
-              items: [
-                {
-                  chat_id: 'c1',
-                  name: 'one',
-                  description: 'first chat',
-                  chat_mode: 'group',
-                  owner_id: 'ou_owner',
-                },
-              ],
-              has_more: false,
-            },
-          }),
           create: chatCreateStub,
           update: chatUpdateStub,
+          link: chatLinkStub,
         },
         chatMembers: {
-          isInChat: vi.fn().mockResolvedValue({ code: 0, data: { is_in_chat: true } }),
           create: vi.fn().mockResolvedValue({
             code: 0,
             data: { invalid_id_list: ['cli_X'] },
@@ -48,9 +66,18 @@ vi.mock('../src/bot-registry.js', () => ({
 }));
 
 import { listChats, isInChat, addBotToChat, createChat, transferChatOwner, parseInvalidUserIds232043 } from '../src/services/groups-store.js';
+import {
+  listChats,
+  isInChat,
+  addBotToChat,
+  createChat,
+  transferChatOwner,
+  getChatShareLink,
+  renameChat,
+} from '../src/services/groups-store.js';
 
 describe('groups-store wrappers', () => {
-  beforeEach(() => { chatCreateStub.mockClear(); chatUpdateStub.mockClear(); });
+  beforeEach(() => { chatCreateStub.mockClear(); chatUpdateStub.mockClear(); chatLinkStub.mockReset(); });
 
   it('listChats returns ChatBrief array', async () => {
     const out = await listChats('appA');
@@ -60,10 +87,78 @@ describe('groups-store wrappers', () => {
     expect(out[0].description).toBe('first chat');
     expect(out[0].chatMode).toBe('group');
     expect(out[0].ownerId).toBe('ou_owner');
+    expect(out[0].avatar).toBe('https://avatar.example/c1.png');
   });
 
   it('isInChat returns boolean', async () => {
     expect(await isInChat('appA', 'c1')).toBe(true);
+  });
+
+  it('renameChat reads the current chat then updates its name with the same bot identity', async () => {
+    chatUpdateStub.mockResolvedValueOnce({ code: 0 });
+    const result = await renameChat('appA', 'c1', '支付排障｜待验证');
+    expect(result).toEqual({
+      ok: true,
+      oldName: 'one',
+      newName: '支付排障｜待验证',
+      changed: true,
+    });
+    expect(chatUpdateStub).toHaveBeenCalledWith({
+      path: { chat_id: 'c1' },
+      data: { name: '支付排障｜待验证' },
+    });
+  });
+
+  it('renameChat maps a missing update scope to permission_denied', async () => {
+    chatUpdateStub.mockResolvedValueOnce({ code: 99991672, msg: 'scope missing' });
+    await expect(renameChat('appA', 'c1', '新群名')).resolves.toMatchObject({
+      ok: false,
+      error: 'permission_denied',
+    });
+  });
+
+  it('renameChat returns same-name success before consulting the proactive write gate', async () => {
+    const beforeUpdate = vi.fn(() => ({
+      ok: false as const,
+      error: 'rate_limited' as const,
+      retryAfterSeconds: 600,
+    }));
+    await expect(renameChat('appA', 'c1', 'one', { beforeUpdate })).resolves.toEqual({
+      ok: true,
+      oldName: 'one',
+      newName: 'one',
+      changed: false,
+    });
+    expect(beforeUpdate).not.toHaveBeenCalled();
+    expect(chatUpdateStub).not.toHaveBeenCalled();
+  });
+
+  it('renameChat rate-limits a different-name proactive retry before the write', async () => {
+    const beforeUpdate = vi.fn(() => ({
+      ok: false as const,
+      error: 'rate_limited' as const,
+      retryAfterSeconds: 599,
+    }));
+    await expect(renameChat('appA', 'c1', 'two', { beforeUpdate })).resolves.toEqual({
+      ok: false,
+      error: 'rate_limited',
+      retryAfterSeconds: 599,
+      oldName: 'one',
+      newName: 'two',
+    });
+    expect(beforeUpdate).toHaveBeenCalledOnce();
+    expect(chatUpdateStub).not.toHaveBeenCalled();
+  });
+
+  it('renameChat preserves old/new names and the Lark code on update failure', async () => {
+    chatUpdateStub.mockResolvedValueOnce({ code: 99991672, msg: 'scope missing' });
+    await expect(renameChat('appA', 'c1', 'two')).resolves.toMatchObject({
+      ok: false,
+      error: 'permission_denied',
+      oldName: 'one',
+      newName: 'two',
+      larkCode: 99991672,
+    });
   });
 
   it('addBotToChat marks invalid_id_list as failed and rest as ok', async () => {
@@ -155,6 +250,15 @@ describe('groups-store wrappers', () => {
     expect(call.data.owner_id).toBe('ou_human');
   });
 
+  it('transferChatOwner can transfer by union_id after a cross-deployment invite', async () => {
+    chatUpdateStub.mockResolvedValueOnce({ code: 0 });
+    const r = await transferChatOwner('cli_creator', 'oc_chat', 'on_human', 'union_id');
+    expect(r).toEqual({ ok: true });
+    const call = chatUpdateStub.mock.calls[0][0];
+    expect(call.params.user_id_type).toBe('union_id');
+    expect(call.data.owner_id).toBe('on_human');
+  });
+
   it('transferChatOwner returns error on non-zero Lark response', async () => {
     chatUpdateStub.mockResolvedValueOnce({ code: 230002, msg: 'user not in chat' });
     const r = await transferChatOwner('cli_creator', 'oc_chat', 'ou_ghost');
@@ -235,5 +339,39 @@ describe('groups-store wrappers', () => {
     // 收紧后：仅有 "invalid user ids" 文案但无 232043（code 也不是）→ 不当可剔除项
     const eNo: any = new Error('invalid user ids: [ou_z]'); eNo.response = { data: { code: 999, msg: 'invalid user ids: [ou_z]' } };
     expect(parseInvalidUserIds232043(eNo)).toEqual([]);
+  });
+
+  it('getChatShareLink returns share_link and passes validity_period (default permanently)', async () => {
+    chatLinkStub.mockResolvedValueOnce({
+      code: 0,
+      data: { share_link: 'https://applink.feishu.cn/.../add_by_link?link_token=tok', is_permanent: true },
+    });
+    const r = await getChatShareLink('cli_creator', 'oc_chat');
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.shareLink).toMatch(/add_by_link/);
+    const callArgs = chatLinkStub.mock.calls[0][0];
+    expect(callArgs.path.chat_id).toBe('oc_chat');
+    expect(callArgs.data.validity_period).toBe('permanently');
+  });
+
+  it('getChatShareLink surfaces non-zero code as error (e.g. unsupported chat type)', async () => {
+    chatLinkStub.mockResolvedValueOnce({ code: 232001, msg: 'unsupported chat type' });
+    const r = await getChatShareLink('cli_creator', 'oc_p2p');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/unsupported chat type.*232001/);
+  });
+
+  it('getChatShareLink treats empty share_link as error', async () => {
+    chatLinkStub.mockResolvedValueOnce({ code: 0, data: {} });
+    const r = await getChatShareLink('cli_creator', 'oc_chat');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/empty share_link/);
+  });
+
+  it('getChatShareLink catches thrown errors', async () => {
+    chatLinkStub.mockRejectedValueOnce(new Error('network down'));
+    const r = await getChatShareLink('cli_creator', 'oc_chat');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/network down/);
   });
 });

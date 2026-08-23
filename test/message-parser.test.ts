@@ -7,7 +7,9 @@
  * Run:  pnpm vitest run test/message-parser.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { parseApiMessage, extractResources, parseEventMessage, stripLeadingMentions, createImgNumberer, cardContentHasUpgradeFallback, isPureCardUpgradeFallback, mergeCardText, wrapResolvedCardText, CARD_EMBEDDED_PLACEHOLDER } from '../src/im/lark/message-parser.js';
+import { parseApiMessage, extractResources, parseEventMessage, stripLeadingMentions, createImgNumberer, cardContentHasUpgradeFallback, isPureCardUpgradeFallback, mergeCardText, wrapResolvedCardText, mentionOpenId, messageMentionsBot, extractPostAtParticipants, CARD_EMBEDDED_PLACEHOLDER } from '../src/im/lark/message-parser.js';
+import { buildMarkdownCard, buildReplyCardFooter } from '../src/im/lark/md-card.js';
+import { stampBotmuxCallbackMarkers, hasBotmuxCallbackMarker, BOTMUX_CALLBACK_MARKER_KEY } from '../src/im/lark/callback-button-marker.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -39,6 +41,21 @@ describe('parseApiMessage metadata', () => {
       thread_id: 'omt_thread',
     });
     expect(result.rootId).toBe('omt_thread');
+  });
+
+  it('surfaces server-provided sender_name (with_sender_name=true reads)', () => {
+    const msg = makeMsg('text', { text: 'hi' });
+    msg.sender = { id: 'ou_bot', sender_type: 'app', sender_name: 'Premium(Claude)' } as any;
+    const result = parseApiMessage(msg);
+    expect(result.senderName).toBe('Premium(Claude)');
+    expect(result.senderType).toBe('app');
+  });
+
+  it('omits senderName when the server supplies none or blank', () => {
+    expect(parseApiMessage(makeMsg('text', { text: 'hi' })).senderName).toBeUndefined();
+    const blank = makeMsg('text', { text: 'hi' });
+    blank.sender = { id: 'ou_x', sender_type: 'user', sender_name: '  ' } as any;
+    expect(parseApiMessage(blank).senderName).toBeUndefined();
   });
 });
 
@@ -253,6 +270,847 @@ describe('Interactive card parsing: Format B (original card JSON)', () => {
   });
 });
 
+// ─── botmux footer chrome filtering ───────────────────────────────────────
+
+describe('Interactive card parsing: botmux footer is stripped from prompt', () => {
+  it('drops the Format B grey footer element but keeps body', () => {
+    const card = {
+      body: { elements: [
+        { tag: 'markdown', content: '正文内容' },
+        { tag: 'hr' },
+        { tag: 'markdown', text_size: 'notation_small_v2',
+          content: "<font color='grey'>[botmux](https://github.com/deepcoldy/botmux) · 发送给：<at id=ou_owner></at></font>" },
+      ] },
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('正文内容');
+    expect(result.content).not.toContain('botmux');
+    expect(result.content).not.toContain('发送给');
+  });
+
+  it('drops the Format A (API simplified) footer line', () => {
+    const card = {
+      elements: [
+        [{ tag: 'text', text: '正文内容' }],
+        [
+          { tag: 'a', text: 'botmux', href: 'https://github.com/deepcoldy/botmux' },
+          { tag: 'text', text: ' · 发送给：' },
+          { tag: 'at', user_name: 'Owner' },
+        ],
+      ],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('正文内容');
+    expect(result.content).not.toContain('botmux');
+  });
+
+  it('preserves an ambiguous legacy default-brand-only line', () => {
+    const formatA = {
+      elements: [[
+        { tag: 'a', text: 'botmux', href: 'https://github.com/deepcoldy/botmux' },
+      ]],
+    };
+    const formatB = {
+      body: { elements: [{
+        tag: 'markdown',
+        text_size: 'notation_small_v2',
+        content: "<font color='grey'>[botmux](https://github.com/deepcoldy/botmux)</font>",
+      }] },
+    };
+
+    expect(parseApiMessage(makeMsg('interactive', formatA)).content)
+      .toContain('botmux(https://github.com/deepcoldy/botmux)');
+    expect(parseApiMessage(makeMsg('interactive', formatB)).content)
+      .toContain('[botmux](https://github.com/deepcoldy/botmux)');
+  });
+
+  it('only applies marker-less legacy footer compatibility at the card tail', () => {
+    const formatA = {
+      elements: [
+        [
+          { tag: 'a', text: 'botmux', href: 'https://github.com/deepcoldy/botmux' },
+          { tag: 'text', text: ' · 发送给：' },
+          { tag: 'at', user_name: 'Owner' },
+        ],
+        [{ tag: 'text', text: '后续正文' }],
+      ],
+    };
+    const formatB = {
+      body: { elements: [
+        {
+          tag: 'markdown',
+          text_size: 'notation_small_v2',
+          content: "<font color='grey'>[botmux](https://github.com/deepcoldy/botmux) · 发送给：<at id=ou_owner></at></font>",
+        },
+        { tag: 'markdown', content: '后续正文' },
+      ] },
+    };
+
+    expect(parseApiMessage(makeMsg('interactive', formatA)).content).toContain('botmux');
+    expect(parseApiMessage(makeMsg('interactive', formatB)).content).toContain('[botmux]');
+  });
+
+  it('drops a Format A usage-only footer when the bot brand is disabled', () => {
+    const card = {
+      elements: [
+        [{ tag: 'text', text: '正文内容' }],
+        [
+          { tag: 'text', text: '上下文 159.9K/258.4K (62%)' },
+          { tag: 'text', text: ' · Token ↑3.7M ↓23.3K ' },
+          {
+            tag: 'a',
+            text: '·',
+            href: 'https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1',
+          },
+          { tag: 'text', text: ' 发送给：' },
+          { tag: 'at', user_name: 'Owner' },
+        ],
+      ],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('正文内容');
+    expect(result.content).not.toContain('上下文 159.9K');
+    expect(result.content).not.toContain('Token ↑3.7M');
+    expect(result.content).not.toContain('发送给');
+  });
+
+  it('drops a Format A token-only footer when context is missing', () => {
+    const card = {
+      elements: [
+        [{ tag: 'text', text: '正文内容' }],
+        [
+          { tag: 'text', text: 'Token ↑3.7M ↓23.3K ' },
+          {
+            tag: 'a',
+            text: '·',
+            href: 'https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1',
+          },
+          { tag: 'text', text: ' 发送给：' },
+          { tag: 'at', user_name: 'Owner' },
+        ],
+      ],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('正文内容');
+    expect(result.content).not.toContain('Token ↑3.7M');
+    expect(result.content).not.toContain('发送给');
+  });
+
+  it('drops a Format A context-only footer when cumulative tokens are missing', () => {
+    const card = {
+      elements: [
+        [{ tag: 'text', text: '正文内容' }],
+        [
+          { tag: 'text', text: '上下文 159.9K/258.4K (62%) ' },
+          {
+            tag: 'a',
+            text: '·',
+            href: 'https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1',
+          },
+          { tag: 'text', text: ' 发送给：' },
+          { tag: 'at', user_name: 'Owner' },
+        ],
+      ],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('正文内容');
+    expect(result.content).not.toContain('上下文 159.9K');
+    expect(result.content).not.toContain('发送给');
+  });
+
+  it('drops a Format A custom-brand footer through its stable hidden marker', () => {
+    const card = {
+      elements: [
+        [{ tag: 'text', text: '正文内容' }],
+        [
+          { tag: 'text', text: 'Acme · 发送给：' },
+          { tag: 'at', user_name: 'Owner' },
+          {
+            tag: 'a',
+            text: '\u200B',
+            href: 'https://github.com/deepcoldy/bot%6Dux#reply-card-footer',
+          },
+        ],
+      ],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('正文内容');
+    expect(result.content).not.toContain('Acme');
+    expect(result.content).not.toContain('发送给');
+  });
+
+  it('accepts a semantically equivalent decoded marker URL from Lark', () => {
+    const card = {
+      elements: [
+        [{ tag: 'text', text: '正文内容' }],
+        [
+          { tag: 'text', text: 'Acme ' },
+          {
+            tag: 'a',
+            text: '·',
+            href: 'https://github.com/deepcoldy/botmux#reply-card-footer-v1',
+          },
+        ],
+      ],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('正文内容');
+    expect(result.content).not.toContain('Acme');
+  });
+
+  it('preserves marker-prefix URLs and exact marker URLs with ordinary link text', () => {
+    const formatA = {
+      elements: [
+        [{
+          tag: 'a',
+          text: '·',
+          href: 'https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1-guide',
+        }],
+        [{
+          tag: 'a',
+          text: '协议文档',
+          href: 'https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1',
+        }],
+      ],
+    };
+    const formatB = {
+      body: { elements: [
+        {
+          tag: 'markdown',
+          content: "<font color='grey'>"
+            + '[·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1-guide)'
+            + '</font>',
+        },
+        {
+          tag: 'markdown',
+          content: '[协议文档](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)',
+        },
+      ] },
+    };
+
+    const textA = parseApiMessage(makeMsg('interactive', formatA)).content;
+    expect(textA).toContain('reply-card-footer-v1-guide');
+    expect(textA).toContain('协议文档');
+    const textB = parseApiMessage(makeMsg('interactive', formatB)).content;
+    expect(textB).toContain('reply-card-footer-v1-guide');
+    expect(textB).toContain('协议文档');
+  });
+
+  it('drops an English custom-brand footer through its visible separator marker', () => {
+    const card = {
+      elements: [
+        [{ tag: 'text', text: 'body' }],
+        [
+          { tag: 'text', text: 'Acme ' },
+          {
+            tag: 'a',
+            text: '·',
+            href: 'https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1',
+          },
+          {
+            tag: 'text',
+            text: ' Context 50.3K/258.4K (19%) · Tokens ↑1M ↓2K · Sent to: ',
+          },
+          { tag: 'at', user_name: 'Owner' },
+        ],
+      ],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('body');
+    expect(result.content).not.toContain('Acme');
+    expect(result.content).not.toContain('Context 50.3K');
+    expect(result.content).not.toContain('Tokens ↑1M');
+    expect(result.content).not.toContain('Sent to');
+  });
+
+  it('keeps a marker-less English usage-and-recipient paragraph as user data', () => {
+    const card = {
+      elements: [
+        [{ tag: 'text', text: 'body' }],
+        [
+          {
+            tag: 'text',
+            text: 'Context 50.3K/258.4K (19%) · Tokens ↑1M ↓2K · Sent to: ',
+          },
+          { tag: 'at', user_name: 'Owner' },
+        ],
+      ],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('body');
+    expect(result.content).toContain('Context 50.3K/258.4K (19%)');
+    expect(result.content).toContain('Tokens ↑1M ↓2K');
+    expect(result.content).toContain('Sent to: @Owner');
+  });
+
+  it('keeps a marker-less custom-brand footer-shaped paragraph as user data', () => {
+    const card = {
+      elements: [
+        [{ tag: 'text', text: 'body' }],
+        [
+          {
+            tag: 'text',
+            text: 'Acme · Context 50.3K/258.4K (19%) · Tokens ↑1M ↓2K · Sent to: ',
+          },
+          { tag: 'at', user_name: 'Owner' },
+        ],
+      ],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('Acme · Context 50.3K/258.4K (19%)');
+    expect(result.content).toContain('Tokens ↑1M ↓2K');
+    expect(result.content).toContain('Sent to: @Owner');
+  });
+
+  it('keeps ordinary prose that mentions context and tokens', () => {
+    const card = {
+      elements: [[
+        { tag: 'text', text: '上下文和 Token 是两个不同指标，请分别分析。' },
+      ]],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('上下文和 Token 是两个不同指标');
+  });
+
+  it('keeps a usage-shaped body paragraph when it is not the final paragraph', () => {
+    const card = {
+      elements: [
+        [{ tag: 'text', text: '上下文 12.3K/100K (12%) · Token ↑67.9K ↓123' }],
+        [{ tag: 'text', text: '这是正文中的观测值，不是页脚。' }],
+      ],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('上下文 12.3K/100K (12%)');
+    expect(result.content).toContain('这是正文中的观测值');
+  });
+
+  it('keeps a pure usage-shaped final body paragraph when no recipient chrome proves it is a footer', () => {
+    const card = {
+      elements: [
+        [{ tag: 'text', text: '本轮统计如下：' }],
+        [{ tag: 'text', text: '上下文 12.3K/100K (12%) · Token ↑67.9K ↓123' }],
+      ],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('本轮统计如下');
+    expect(result.content).toContain('上下文 12.3K/100K (12%)');
+  });
+
+  it('keeps a single usage-shaped body paragraph instead of reducing the card to a placeholder', () => {
+    const card = {
+      elements: [[
+        { tag: 'text', text: '上下文 12.3K/100K (12%) · Token ↑67.9K ↓123' },
+      ]],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('上下文 12.3K/100K (12%)');
+    expect(result.content).not.toBe('[卡片]');
+  });
+
+  it('keeps a sentence that merely contains the compact usage shape', () => {
+    const card = {
+      elements: [[
+        { tag: 'text', text: '请记录：上下文 12.3K/100K (12%) · Token ↑67.9K ↓123，稍后对比。' },
+      ]],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('请记录：上下文');
+    expect(result.content).toContain('稍后对比');
+  });
+
+  it('drops the live split-font signed footer appended after a command', () => {
+    const card = {
+      elements: [[
+        { tag: 'text', text: '/repo /data00/home/chenjihong.daryl/botmux/.worktree/peer-bot-repo-permission\n' },
+        { tag: 'a', text: 'botmux', href: 'https://github.com/deepcoldy/botmux' },
+        { tag: 'text', text: "<font color='grey'> </font>" },
+        { tag: 'a', text: '·', href: 'https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1' },
+        { tag: 'text', text: "<font color='grey'> 发送给：</font>" },
+        { tag: 'at', user_name: 'jihong traex' },
+      ]],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toBe('/repo /data00/home/chenjihong.daryl/botmux/.worktree/peer-bot-repo-permission');
+  });
+
+  it('keeps ordinary links that mention botmux and the marker URL without footer structure', () => {
+    const card = {
+      elements: [[
+        { tag: 'text', text: '正文提到 ' },
+        { tag: 'a', text: 'botmux', href: 'https://github.com/deepcoldy/botmux' },
+        { tag: 'text', text: ' 以及 ' },
+        { tag: 'a', text: 'footer spec', href: 'https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1' },
+        { tag: 'text', text: '，但这不是签名页脚。' },
+      ]],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('botmux(https://github.com/deepcoldy/botmux)');
+    expect(result.content).toContain('footer spec(https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)');
+    expect(result.content).toContain('不是签名页脚');
+  });
+
+  it('keeps a usage-shaped final line when it belongs to the same body paragraph', () => {
+    const card = {
+      elements: [[
+        {
+          tag: 'text',
+          text: '正文中的指标如下：\n上下文 12.3K/100K (12%) · Token ↑67.9K ↓123',
+        },
+      ]],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('正文中的指标如下');
+    expect(result.content).toContain('上下文 12.3K/100K (12%)');
+  });
+
+  it('round-trips a real buildMarkdownCard output without footer leakage', () => {
+    const raw = buildMarkdownCard('帮我看下这个 bug', 'ou_owner');
+    const result = parseApiMessage(makeMsg('interactive', JSON.parse(raw)));
+    expect(result.content).toContain('帮我看下这个 bug');
+    expect(result.content).not.toContain('botmux');
+    expect(result.content).not.toContain('发送给');
+  });
+
+  it('round-trips a footer whose custom brand contains an unmatched bracket', () => {
+    const raw = buildMarkdownCard('正文内容', 'ou_owner', 'Acme [beta');
+    const result = parseApiMessage(makeMsg('interactive', JSON.parse(raw)));
+    expect(result.content).toContain('正文内容');
+    expect(result.content).not.toContain('Acme [beta');
+    expect(result.content).not.toContain('发送给');
+  });
+
+  it('keeps body text that merely mentions botmux without the repo link', () => {
+    // The filter anchors on the canonical repo URL, so genuine prose about
+    // botmux survives — only the footer chrome is removed.
+    const card = {
+      body: { elements: [
+        { tag: 'markdown', content: 'botmux 这个项目挺好用的' },
+      ] },
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('botmux 这个项目挺好用的');
+  });
+
+  it('keeps a real canonical Botmux repository link in Format A body text', () => {
+    const card = {
+      elements: [[
+        { tag: 'text', text: '项目地址：' },
+        {
+          tag: 'a',
+          text: 'botmux',
+          href: 'https://github.com/deepcoldy/botmux',
+        },
+        { tag: 'text', text: '，请查看 README。' },
+      ]],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain(
+      '项目地址：botmux(https://github.com/deepcoldy/botmux)，请查看 README。',
+    );
+  });
+
+  it('keeps a real canonical Botmux repository link in Format B body text', () => {
+    const card = {
+      body: { elements: [{
+        tag: 'markdown',
+        content: '项目地址：[botmux](https://github.com/deepcoldy/botmux)，请查看 README。',
+      }] },
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain(
+      '项目地址：[botmux](https://github.com/deepcoldy/botmux)，请查看 README。',
+    );
+  });
+});
+
+// ─── Structural footer strip (brand-agnostic, for per-bot custom brands) ──
+
+describe('Interactive card parsing: footer stripped structurally (custom brand)', () => {
+  it('drops a schema 2.0 footer element without text_size when it carries the exact split-font marker', () => {
+    const card = {
+      schema: '2.0',
+      body: { elements: [
+        { tag: 'markdown', content: '/repo /data00/home/chenjihong.daryl/botmux/.worktree/peer-bot-repo-permission' },
+        { tag: 'hr' },
+        {
+          element_id: 'botmux_reply_footer',
+          tag: 'markdown',
+          content: '[botmux](https://github.com/deepcoldy/botmux)'
+            + "<font color='grey'> </font>"
+            + '[·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)'
+            + "<font color='grey'> 发送给：</font><at id=ou_owner></at>",
+        },
+      ] },
+    };
+
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toBe('/repo /data00/home/chenjihong.daryl/botmux/.worktree/peer-bot-repo-permission');
+  });
+
+  it.each([
+    {
+      name: 'wrong marker text',
+      footer: {
+        element_id: 'botmux_reply_footer',
+        tag: 'markdown',
+        content: '[footer spec](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)',
+      },
+      expected: 'footer spec',
+    },
+    {
+      name: 'wrong marker URL',
+      footer: {
+        element_id: 'botmux_reply_footer',
+        tag: 'markdown',
+        content: '[·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1-guide)',
+      },
+      expected: 'reply-card-footer-v1-guide',
+    },
+    {
+      name: 'unexpected text_size',
+      footer: {
+        element_id: 'botmux_reply_footer',
+        tag: 'markdown',
+        text_size: 'normal_v2',
+        content: '[·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)',
+      },
+      expected: 'reply-card-footer-v1',
+    },
+  ])('keeps a schema 2.0 element-id collision with $name', ({ footer, expected }) => {
+    const card = {
+      schema: '2.0',
+      body: { elements: [
+        { tag: 'markdown', content: '正文内容' },
+        footer,
+      ] },
+    };
+
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('正文内容');
+    expect(result.content).toContain(expected);
+  });
+
+  it('drops a footer carrying the complete Botmux structural signature', () => {
+    const footer = buildReplyCardFooter({
+      brand: 'Acme',
+      recipientOpenIds: ['ou_owner'],
+    })!;
+    const card = {
+      body: { elements: [
+        { tag: 'markdown', content: '正文内容' },
+        { tag: 'hr' },
+        footer.element,
+      ] },
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('正文内容');
+    expect(result.content).not.toContain('Acme');
+    expect(result.content).not.toContain('发送给');
+  });
+
+  it('keeps third-party body content that only collides with the public element id', () => {
+    const card = {
+      body: { elements: [{
+        tag: 'markdown',
+        element_id: 'botmux_reply_footer',
+        content: '这是第三方卡片正文',
+      }] },
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('这是第三方卡片正文');
+  });
+
+  it('drops a custom-brand grey footer carrying the stable separator marker', () => {
+    const card = {
+      body: { elements: [
+        { tag: 'markdown', content: '正文内容' },
+        { tag: 'hr' },
+        { tag: 'markdown', text_size: 'notation_small_v2',
+          content: "<font color='grey'>[Acme](https://acme.test) "
+            + '[·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1) '
+            + '发送给：<at id=ou_owner></at></font>' },
+      ] },
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('正文内容');
+    expect(result.content).not.toContain('Acme');
+    expect(result.content).not.toContain('发送给');
+  });
+
+  it('keeps a third-party grey notation element without a Botmux id or marker', () => {
+    const card = {
+      body: { elements: [
+        { tag: 'markdown', content: '正文内容' },
+        { tag: 'hr' },
+        {
+          tag: 'markdown',
+          text_size: 'notation_small_v2',
+          content: "<font color='grey'>报警来源：第三方监控系统</font>",
+        },
+      ] },
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('正文内容');
+    expect(result.content).toContain('报警来源：第三方监控系统');
+  });
+
+  it('drops the canonical footer nested beside a voice button', () => {
+    const footer = buildReplyCardFooter({
+      brand: 'Acme',
+      recipientOpenIds: ['ou_owner'],
+      locale: 'en',
+    })!;
+    const card = {
+      body: { elements: [
+        { tag: 'markdown', content: 'body' },
+        { tag: 'hr' },
+        {
+          tag: 'column_set',
+          columns: [
+            { tag: 'column', elements: [footer.element] },
+            {
+              tag: 'column',
+              elements: [{
+                tag: 'button',
+                text: { tag: 'plain_text', content: 'Voice summary' },
+              }],
+            },
+          ],
+        },
+      ] },
+    };
+
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('body');
+    expect(result.content).toContain('[Voice summary]');
+    expect(result.content).not.toContain('Acme');
+    expect(result.content).not.toContain('Sent to');
+  });
+
+  it('keeps a small-text element that is NOT a grey footer (foreign card content survives)', () => {
+    // notation_small_v2 alone is not enough — the botmux footer is always grey.
+    // A foreign card's small note without grey font must not be dropped.
+    const card = {
+      body: { elements: [
+        { tag: 'markdown', text_size: 'notation_small_v2', content: '报警时间 17:45' },
+      ] },
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('报警时间 17:45');
+  });
+});
+
+// ─── botmux internal callback buttons are stripped from flattened text ────
+
+describe('botmux internal callback buttons (🔊 语音总结 …) dropped from prompt', () => {
+  // botmux reply/session cards carry callback buttons whose only affordance is
+  // a callback into the sender bot's daemon. Flattening them as `[🔊 语音总结]`
+  // leaks unusable chrome into peer bots' prompts (history / cross-bot relay /
+  // quote) — the receiving bot can never click them. They are identified
+  // structurally by `value.action` from botmux's internal vocabulary + no
+  // jump URL; third-party and valueless buttons stay.
+  it('Format B: drops the production voice-summary button (column_set + behaviors callback), keeps the reply body', () => {
+    // Exact shape the cli.ts reply path builds: the button lives inside a
+    // column_set's auto-width column and carries its action under
+    // behaviors:[{type:'callback', value}] — NOT top-level value.
+    const card = {
+      body: { elements: [
+        { tag: 'markdown', content: '这是机器人的回复内容' },
+        { tag: 'hr' },
+        { tag: 'column_set', flex_mode: 'none', columns: [
+          { tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center',
+            elements: [{ tag: 'markdown', text_size: 'notation_small_v2', content: ' ' }] },
+          { tag: 'column', width: 'auto', vertical_align: 'center', elements: [{
+            tag: 'button',
+            text: { tag: 'plain_text', content: '🔊 语音总结' },
+            type: 'default',
+            behaviors: [{
+              type: 'callback',
+              value: { action: 'voice_summary', session_id: 's1', root_id: 'om_1', lark_app_id: 'cli_a1', chat_id: 'oc_1' },
+            }],
+          }] },
+        ] },
+      ] },
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('这是机器人的回复内容');
+    expect(result.content).not.toContain('语音总结');
+  });
+
+  it('Format B: drops session-card controls (关闭会话/重启), keeps third-party callbacks', () => {
+    const card = {
+      body: { elements: [
+        { tag: 'action', actions: [
+          { tag: 'button', text: { tag: 'plain_text', content: '❌ 关闭会话' },
+            value: { action: 'close', session_id: 's1' } },
+          { tag: 'button', text: { tag: 'plain_text', content: '🔄 重启' },
+            value: { action: 'restart', session_id: 's1' } },
+          // Third-party card button with its own callback vocabulary — kept.
+          { tag: 'button', text: { tag: 'plain_text', content: '确认' },
+            value: { action: 'ack_alarm', rule_id: 'r1' } },
+          // Button with no value at all — always kept.
+          { tag: 'button', text: { tag: 'plain_text', content: '🖥️ 打开终端' } },
+        ] },
+      ] },
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).not.toContain('关闭会话');
+    expect(result.content).not.toContain('重启');
+    expect(result.content).toContain('[确认]');
+    expect(result.content).toContain('[🖥️ 打开终端]');
+  });
+
+  it('Format B: real buildReplyCardFooter + real voice button — neither chrome leaks', () => {
+    // End-to-end sanity with the REAL builders: footer signature strip (master)
+    // and callback-button strip (this change) must jointly leave only the body.
+    const footer = buildReplyCardFooter({ recipientOpenIds: ['ou_55cda5a6c00f49eef42043a7746499b4'] })!;
+    const card = {
+      body: { elements: [
+        { tag: 'markdown', content: '修复已完成，详见上面。' },
+        { tag: 'hr' },
+        { tag: 'column_set', flex_mode: 'none', columns: [
+          { tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center',
+            elements: [footer.element] },
+          { tag: 'column', width: 'auto', vertical_align: 'center', elements: [{
+            tag: 'button',
+            text: { tag: 'plain_text', content: '🔊 语音总结' },
+            type: 'default',
+            behaviors: [{
+              type: 'callback',
+              value: { action: 'voice_summary', session_id: 's1', root_id: 'om_1', lark_app_id: 'cli_a1', chat_id: 'oc_1' },
+            }],
+          }] },
+        ] },
+      ] },
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('修复已完成，详见上面。');
+    expect(result.content).not.toContain('语音总结');
+    expect(result.content).not.toContain('发送给');
+    expect(result.content).not.toContain('botmux');
+  });
+
+  it('Format B: a jump-URL button is kept even under a botmux action name', () => {
+    // A real link always wins over the cleanup heuristic — the open_url
+    // behavior means the reader can actually follow it.
+    const card = {
+      body: { elements: [
+        { tag: 'button', text: { tag: 'plain_text', content: '分析报告' },
+          value: { action: 'voice_summary', session_id: 's1' },
+          behaviors: [{ type: 'open_url', default_url: 'https://example.com/report' }] },
+      ] },
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('[分析报告](https://example.com/report)');
+  });
+
+  it('Format A: drops the voice-summary button while keeping bare buttons', () => {
+    // Format A is the API simplified list view; nodes keep `value` when the
+    // card supplies it, so the same structural filter applies.
+    const card = {
+      title: '回复',
+      elements: [[
+        { tag: 'text', text: '回复正文' },
+        { tag: 'button', text: '🔊 语音总结',
+          value: { action: 'voice_summary', session_id: 's1' } },
+        { tag: 'button', text: 'Option A', type: 'primary' },
+      ]],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('回复正文');
+    expect(result.content).not.toContain('语音总结');
+    expect(result.content).toContain('[Option A]');
+  });
+
+  it('marker path: a stamped button is dropped even with an UNKNOWN action (future-proof)', () => {
+    // The egress stamp (`__bm_cb`) is the long-term contract: a future botmux
+    // button with an action the legacy wordlist has never heard of must still
+    // be stripped, WITHOUT anyone updating the wordlist.
+    const card = {
+      body: { elements: [
+        { tag: 'button', text: { tag: 'plain_text', content: '🆕 未来按钮' },
+          value: { action: 'some_future_action', __bm_cb: 1 } },
+      ] },
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).not.toContain('未来按钮');
+  });
+
+  it('roundtrip: every callback button in a real egress-stamped card vanishes, jump URL stays', () => {
+    // Full pipeline: stampBotmuxCallbackMarkers (what client.ts applies on
+    // send/reply/ephemeral/update) → parseApiMessage (what the peer bot sees).
+    // A custom-brand bot with a session card and a voice-reply card must leak
+    // zero callback chrome while its genuine jump button survives.
+    const sessionCard = JSON.stringify({
+      body: { elements: [
+        { tag: 'markdown', content: '会话正文' },
+        { tag: 'action', actions: [
+          { tag: 'button', text: { tag: 'plain_text', content: '❌ 关闭会话' },
+            type: 'danger', value: { action: 'close', session_id: 's1' } },
+          { tag: 'button', text: { tag: 'plain_text', content: '🆕 某未来功能' },
+            value: { action: 'totally_new_action', session_id: 's1' } },
+          { tag: 'button', text: { tag: 'plain_text', content: '📄 打开报告' },
+            behaviors: [{ type: 'open_url', default_url: 'https://example.com/report' }] },
+        ] },
+      ] },
+    });
+    const stamped = stampBotmuxCallbackMarkers(sessionCard);
+    const result = parseApiMessage(makeMsg('interactive', stamped));
+    expect(result.content).toContain('会话正文');
+    expect(result.content).not.toContain('关闭会话');
+    expect(result.content).not.toContain('某未来功能');   // unknown action — marker wins
+    expect(result.content).toContain('[📄 打开报告](https://example.com/report)');
+    // sanity: the stamp actually fired (not passing by accident)
+    expect(stamped).toContain('__bm_cb');
+  });
+});
+
+// ─── stampBotmuxCallbackMarkers: egress stamp unit behavior ───────────────
+
+describe('stampBotmuxCallbackMarkers (egress choke-point stamp)', () => {
+  it('stamps legacy top-level value and v2 behaviors callback, skips jump buttons', () => {
+    const card = JSON.stringify({
+      body: { elements: [
+        { tag: 'button', text: { tag: 'plain_text', content: 'A' }, value: { action: 'close', session_id: 's' } },
+        { tag: 'button', text: { tag: 'plain_text', content: 'B' },
+          behaviors: [{ type: 'callback', value: { action: 'voice_summary' } }] },
+        { tag: 'button', text: { tag: 'plain_text', content: 'C' }, value: { action: 'cfg' },
+          behaviors: [{ type: 'open_url', default_url: 'https://example.com' }] },
+      ] },
+    });
+    const out = JSON.parse(stampBotmuxCallbackMarkers(card));
+    const [a, b, c] = out.body.elements;
+    expect(a.value[BOTMUX_CALLBACK_MARKER_KEY]).toBe(1);
+    expect(b.behaviors[0].value[BOTMUX_CALLBACK_MARKER_KEY]).toBe(1);
+    // jump button untouched: its value must stay marker-free
+    expect(c.value[BOTMUX_CALLBACK_MARKER_KEY]).toBeUndefined();
+    expect(hasBotmuxCallbackMarker(a)).toBe(true);
+    expect(hasBotmuxCallbackMarker(b)).toBe(true);
+    expect(hasBotmuxCallbackMarker(c)).toBe(false);
+  });
+
+  it('reaches buttons nested in column_set / i18n sections', () => {
+    const card = JSON.stringify({
+      body: { elements: [{ tag: 'column_set', columns: [
+        { tag: 'column', elements: [{ tag: 'button', text: { tag: 'plain_text', content: 'X' },
+          behaviors: [{ type: 'callback', value: { action: 'voice_summary' } }] }] },
+      ] }] },
+      i18n_elements: { zh_cn: [{ tag: 'button', text: { tag: 'plain_text', content: 'Y' }, value: { action: 'close' } }] },
+    });
+    const out = JSON.parse(stampBotmuxCallbackMarkers(card));
+    const nested = out.body.elements[0].columns[0].elements[0];
+    expect(nested.behaviors[0].value[BOTMUX_CALLBACK_MARKER_KEY]).toBe(1);
+    expect(out.i18n_elements.zh_cn[0].value[BOTMUX_CALLBACK_MARKER_KEY]).toBe(1);
+  });
+
+  it('is idempotent and tolerates non-JSON input unchanged', () => {
+    const card = JSON.stringify({ body: { elements: [{ tag: 'button', text: { tag: 'plain_text', content: 'A' }, value: { action: 'close' } }] } });
+    const once = stampBotmuxCallbackMarkers(card);
+    expect(stampBotmuxCallbackMarkers(once)).toBe(once);
+    expect(stampBotmuxCallbackMarkers('not-json{')).toBe('not-json{');
+  });
+});
+
 // ─── mergeCardText: A+B union ─────────────────────────────────────────────
 
 describe('mergeCardText', () => {
@@ -395,6 +1253,64 @@ describe('isPureCardUpgradeFallback (replace gate)', () => {
 // ─── extractResources for interactive cards ───────────────────────────────
 
 describe('Post message parsing', () => {
+  it('renders post code block with fence boundaries for API and event messages', () => {
+    const post = {
+      zh_cn: {
+        content: [[
+          { tag: 'text', text: '前文' },
+          { tag: 'code_block', language: 'JSON', text: 'print hello\n' },
+          { tag: 'text', text: '后文' },
+        ]],
+      },
+    };
+    const expected = '前文\n```JSON\nprint hello\n```\n后文';
+
+    expect(parseApiMessage(makeMsg('post', post)).content).toBe(expected);
+
+    const event = {
+      sender: { sender_id: { open_id: 'ou_user' }, sender_type: 'user' },
+      message: {
+        message_id: 'om_post_code',
+        message_type: 'post',
+        content: JSON.stringify(post),
+        chat_id: 'oc_chat',
+        chat_type: 'group',
+        create_time: '1000',
+      },
+    };
+    expect(parseEventMessage(event).parsed.content).toBe(expected);
+  });
+
+  it('uses a longer fence when post code contains triple backticks', () => {
+    const post = {
+      content: [[
+        { tag: 'code_block', language: 'md', text: 'before\n```\ninside\n```\nafter\n' },
+      ]],
+    };
+
+    expect(parseApiMessage(makeMsg('post', post)).content).toBe('````md\nbefore\n```\ninside\n```\nafter\n````');
+  });
+
+  it('does not render unsupported post nodes as noisy text', () => {
+    const post = {
+      zh_cn: {
+        content: [
+          [
+            { tag: 'text', text: '普通' },
+            { tag: 'unknown_text', text: '未知文本' },
+            { tag: 'unknown_object', value: { nested: true } },
+          ],
+          [
+            { tag: 'a', text: '文档', href: 'https://example.com' },
+            { tag: 'at', user_name: 'Alice' },
+          ],
+        ],
+      },
+    };
+
+    expect(parseApiMessage(makeMsg('post', post)).content).toBe('普通\n文档@Alice');
+  });
+
   it('renders img tag in post body as [图片] placeholder when no numberer', () => {
     // Regression: previously dropped to empty string, hiding attached images
     // from `botmux thread messages` and misleading downstream readers.
@@ -624,5 +1540,205 @@ describe('parseEventMessage: parentId surfacing', () => {
   it('treats empty-string parent_id as absent', () => {
     const { parsed } = parseEventMessage(makeEvent({ parent_id: '' }));
     expect(parsed.parentId).toBeUndefined();
+  });
+});
+
+describe('parseEventMessage: shared resource numbering', () => {
+  const makeImageEvent = (messageId: string, imageKey: string) => ({
+    sender: { sender_id: { open_id: 'ou_user' }, sender_type: 'user' },
+    message: {
+      message_id: messageId,
+      message_type: 'image',
+      content: JSON.stringify({ image_key: imageKey }),
+      chat_id: 'oc_chat',
+      chat_type: 'group',
+      create_time: '1000',
+    },
+  });
+
+  it('continues numbering and deduplicates resources across paired events', () => {
+    const numberer = createImgNumberer();
+    const first = parseEventMessage(makeImageEvent('om_first', 'img_a'), numberer);
+    const second = parseEventMessage(makeImageEvent('om_second', 'img_b'), numberer);
+    const duplicate = parseEventMessage(makeImageEvent('om_third', 'img_a'), numberer);
+
+    expect(first.parsed.content).toBe('[图片 1]');
+    expect(second.parsed.content).toBe('[图片 2]');
+    expect(duplicate.parsed.content).toBe('[图片 1]');
+    expect(duplicate.resources).toEqual([]);
+  });
+});
+
+// ─── mentionOpenId: tolerate both Lark mention.id shapes ──────────────────
+//
+// WS event (im.message.receive_v1) → id is an OBJECT { open_id, ... }.
+// REST API (im.message.get / list) → id is a bare STRING "ou_xxx" + id_type.
+// The helper must read open_id from either so a Lark shape convergence can't
+// silently break @-detection.
+
+describe('mentionOpenId', () => {
+  it('reads open_id from the WS event object form', () => {
+    expect(mentionOpenId({ id: { open_id: 'ou_abc', union_id: 'on_x', user_id: '' } })).toBe('ou_abc');
+  });
+
+  it('reads the bare string form when id_type is open_id', () => {
+    expect(mentionOpenId({ id: 'ou_abc', id_type: 'open_id' })).toBe('ou_abc');
+  });
+
+  it('reads the bare string form when id_type is absent (mentions are open_id-keyed)', () => {
+    expect(mentionOpenId({ id: 'ou_abc' })).toBe('ou_abc');
+  });
+
+  it('returns undefined for a string id whose id_type is not open_id', () => {
+    // union_id/user_id strings (possible without open_id scope) must not be
+    // returned as an open_id and mis-compared against a botOpenId.
+    expect(mentionOpenId({ id: 'on_abc', id_type: 'union_id' })).toBeUndefined();
+    expect(mentionOpenId({ id: 'b199821f', id_type: 'user_id' })).toBeUndefined();
+  });
+
+  it('returns undefined for empty / missing ids', () => {
+    expect(mentionOpenId({ id: { open_id: '' } })).toBeUndefined();
+    expect(mentionOpenId({ id: '' })).toBeUndefined();
+    expect(mentionOpenId({ id: null })).toBeUndefined();
+    expect(mentionOpenId({})).toBeUndefined();
+    expect(mentionOpenId(undefined)).toBeUndefined();
+    expect(mentionOpenId(null)).toBeUndefined();
+  });
+});
+
+describe('parseEventMessage: mention identity formats', () => {
+  function makeMentionEvent(mention: any) {
+    return {
+      sender: { sender_id: { open_id: 'ou_user' }, sender_type: 'user' },
+      message: {
+        message_id: 'om_msg',
+        message_type: 'text',
+        content: JSON.stringify({ text: '@BotA hello' }),
+        chat_id: 'oc_chat',
+        chat_type: 'group',
+        create_time: '1000',
+        mentions: [mention],
+      },
+    };
+  }
+
+  it('surfaces openId from the WS event object form', () => {
+    const { parsed } = parseEventMessage(makeMentionEvent({
+      key: '@_bot',
+      name: 'BotA',
+      id: { open_id: 'ou_bot_a_open_id' },
+    }));
+    expect(parsed.mentions?.[0]).toMatchObject({
+      key: '@_bot',
+      name: 'BotA',
+      openId: 'ou_bot_a_open_id',
+    });
+  });
+
+  it('keeps string open_id mention ids as openId', () => {
+    const { parsed } = parseEventMessage(makeMentionEvent({
+      key: '@_bot',
+      name: 'BotA',
+      id: 'ou_bot_a_open_id',
+    }));
+    expect(parsed.mentions?.[0]).toMatchObject({
+      key: '@_bot',
+      name: 'BotA',
+      openId: 'ou_bot_a_open_id',
+    });
+  });
+
+  it('does not expose app_id mention ids as openId', () => {
+    const { parsed } = parseEventMessage(makeMentionEvent({
+      key: '@_bot',
+      name: 'BotA',
+      id: 'app-bot-a',
+      id_type: 'app_id',
+    }));
+    expect(parsed.mentions?.[0]).toMatchObject({
+      key: '@_bot',
+      name: 'BotA',
+      idType: 'app_id',
+    });
+    expect(parsed.mentions?.[0].openId).toBeUndefined();
+  });
+});
+
+// ─── messageMentionsBot: single-source @-gate across realtime/poll/preview ──
+// Regression guard: this replaced three ad-hoc @-detections. It MUST recognize
+// every mention shape the old realtime code did (5 app_id forms + open_id, WS
+// object + REST bare-string) and scan inline `at` tags in BOTH content (realtime
+// event) and body.content (REST message-list). Table-driven so a dropped shape
+// announces itself.
+describe('messageMentionsBot', () => {
+  const BOT_OPEN = 'ou_this_bot';
+  const BOT_APP = 'cli_this_bot';
+
+  const matchCases: Array<[string, any]> = [
+    ['WS object open_id', { mentions: [{ id: { open_id: BOT_OPEN } }] }],
+    ['REST bare-string open_id + id_type', { mentions: [{ id: BOT_OPEN, id_type: 'open_id' }] }],
+    ['REST bare-string open_id (no id_type)', { mentions: [{ id: BOT_OPEN }] }],
+    ['app_id: top-level snake_case', { mentions: [{ app_id: BOT_APP }] }],
+    ['app_id: top-level camelCase', { mentions: [{ appId: BOT_APP }] }],
+    ['app_id: id string + id_type', { mentions: [{ id: BOT_APP, id_type: 'app_id' }] }],
+    ['app_id: id string + camelCase idType', { mentions: [{ id: BOT_APP, idType: 'app_id' }] }],
+    ['app_id: id object', { mentions: [{ id: { app_id: BOT_APP } }] }],
+    ['inline at in realtime content', { content: JSON.stringify({ zh_cn: { content: [[{ tag: 'at', user_id: BOT_OPEN }]] } }) }],
+    ['inline at in REST body.content', { body: { content: JSON.stringify({ zh_cn: { content: [[{ tag: 'at', user_id: BOT_OPEN }]] } }) } }],
+  ];
+  for (const [label, message] of matchCases) {
+    it(`matches: ${label}`, () => {
+      expect(messageMentionsBot(message, BOT_APP, BOT_OPEN)).toBe(true);
+    });
+  }
+
+  const noMatchCases: Array<[string, any]> = [
+    ['a different user open_id', { mentions: [{ id: { open_id: 'ou_someone_else' } }] }],
+    ['a different bot app_id', { mentions: [{ app_id: 'cli_other_bot' }] }],
+    ['no mentions and no inline at', { content: JSON.stringify({ text: 'hello' }) }],
+    ['inline at for another user', { body: { content: JSON.stringify({ zh_cn: { content: [[{ tag: 'at', user_id: 'ou_someone_else' }]] } }) } }],
+    ['empty message', {}],
+  ];
+  for (const [label, message] of noMatchCases) {
+    it(`does not match: ${label}`, () => {
+      expect(messageMentionsBot(message, BOT_APP, BOT_OPEN)).toBe(false);
+    });
+  }
+
+  it('returns false when neither botOpenId nor larkAppId is known', () => {
+    expect(messageMentionsBot({ mentions: [{ id: { open_id: BOT_OPEN } }] }, undefined, undefined)).toBe(false);
+  });
+
+  it('matches an app_id mention even when botOpenId is not yet resolved', () => {
+    expect(messageMentionsBot({ mentions: [{ app_id: BOT_APP }] }, BOT_APP, undefined)).toBe(true);
+  });
+});
+
+describe('extractPostAtParticipants (post inline @ → routing-only participants)', () => {
+  const post = (nodes: any[]) => ({ content: JSON.stringify({ zh_cn: { title: '', content: [nodes] } }) });
+
+  it('classifies ou_ → openId, cli_ → appId, carries user_name', () => {
+    const out = extractPostAtParticipants(post([
+      { tag: 'text', text: 'hi ' },
+      { tag: 'at', user_id: 'ou_human', user_name: '张三' },
+      { tag: 'at', user_id: 'cli_bot', user_name: 'OtherBot' },
+    ]));
+    expect(out).toEqual([
+      { key: '@_post_at_1', name: '张三', openId: 'ou_human', idType: 'open_id' },
+      { key: '@_post_at_2', name: 'OtherBot', appId: 'cli_bot', idType: 'app_id' },
+    ]);
+  });
+
+  it('an `all` inline at is surfaced WITHOUT an executable id (→ core marks incomplete)', () => {
+    const out = extractPostAtParticipants(post([{ tag: 'at', user_id: 'all', user_name: '所有人' }]));
+    expect(out).toHaveLength(1);
+    expect(out[0].openId).toBeUndefined();
+    expect(out[0].appId).toBeUndefined();
+  });
+
+  it('non-post shapes / parse errors → empty', () => {
+    expect(extractPostAtParticipants({ content: '{"text":"plain"}' })).toEqual([]);
+    expect(extractPostAtParticipants({ content: 'not json' })).toEqual([]);
+    expect(extractPostAtParticipants(undefined)).toEqual([]);
   });
 });

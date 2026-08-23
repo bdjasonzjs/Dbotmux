@@ -1,0 +1,295 @@
+// test/terminal-write-auth.test.ts
+//
+// Guard for the terminal write-permission gate.
+//
+// The `X-Botmux-Role` header is only trustworthy on a request that genuinely
+// traversed the platform's authenticated reverse proxy. That proxy drops any
+// client Cookie and injects this machine's real `botmux_dashboard_token`; the
+// dashboard `/s` bridge / terminal-proxy then replay headers verbatim. A direct
+// caller (front door binds all interfaces) can forge `X-Botmux-Role: owner` but
+// cannot supply the secret dashboard token. The gate therefore honors the role
+// header only when the machine is platform-bound AND the request carries the
+// matching dashboard-token cookie; otherwise write falls back to `?token=`.
+//
+// Independently of the role, a matching private write-link `?token=` is a
+// capability in its own right: the owner explicitly issued that link, so it
+// grants write even when the platform authenticated the viewer as guest.
+import { createHmac } from 'node:crypto';
+import { describe, it, expect } from 'vitest';
+import * as terminalWriteAuth from '../src/core/terminal-write-auth.js';
+import {
+  deriveTerminalWriteToken,
+  resolveTerminalAccess,
+  resolveTerminalAccessForRequest,
+  resolveTerminalWrite,
+  resolveTerminalWriteForRequest,
+  readDashboardCookie,
+  safeTerminalTokenEqual,
+} from '../src/core/terminal-write-auth.js';
+
+const TOK = 'dash-secret-token';
+
+/** The RETIRED stable view derivation (P1-5), reproduced here so tests can
+ *  prove nothing accepts or re-mints it any more. */
+function retiredStableViewToken(secret: string, sessionId: string): string {
+  return createHmac('sha256', secret)
+    .update('botmux-terminal-view-v1\0')
+    .update(sessionId)
+    .digest('base64url');
+}
+
+describe('terminal view capability', () => {
+  it('P1-5: the stable view derivation is retired — the module no longer exports a view-token minter', () => {
+    // A stable per-session view HMAC could never be revoked (logout/expiry/
+    // worker restart all left it valid). Read capabilities are now either the
+    // worker's per-boot random token or a short-lived signed read grant; no
+    // code path may re-grow a stable derivation under this name.
+    expect((terminalWriteAuth as Record<string, unknown>).deriveTerminalViewToken).toBeUndefined();
+  });
+
+  it('compares capabilities safely and rejects empty/wrong values', () => {
+    expect(safeTerminalTokenEqual('same', 'same')).toBe(true);
+    expect(safeTerminalTokenEqual('wrong', 'same')).toBe(false);
+    expect(safeTerminalTokenEqual(null, 'same')).toBe(false);
+  });
+
+  it('grants view but never write to a matching view capability', () => {
+    expect(resolveTerminalAccess({
+      role: undefined,
+      tokenMatches: false,
+      viewTokenMatches: true,
+      platformBound: false,
+      platformProxied: false,
+    })).toEqual({ hasRead: true, hasWrite: false, platformReadonly: false });
+  });
+
+  it('denies a localhost scanner with no capability or authenticated cookie', () => {
+    expect(resolveTerminalAccess({
+      role: undefined,
+      tokenMatches: false,
+      viewTokenMatches: false,
+      platformBound: false,
+      platformProxied: false,
+    })).toEqual({ hasRead: false, hasWrite: false, platformReadonly: false });
+  });
+
+  it('grants both read and write to the independent write capability', () => {
+    expect(resolveTerminalAccess({
+      role: undefined,
+      tokenMatches: true,
+      viewTokenMatches: false,
+      platformBound: false,
+      platformProxied: false,
+    })).toEqual({ hasRead: true, hasWrite: true, platformReadonly: false });
+  });
+});
+
+describe('terminal write capability', () => {
+  it('is stable for one session, domain-bound to the session, and secret-bound', () => {
+    // Stability across derivations is what keeps an issued operate link valid
+    // after a worker restart re-derives the token.
+    const a = deriveTerminalWriteToken('host-secret', 'session-a');
+    expect(a).toBe(deriveTerminalWriteToken('host-secret', 'session-a'));
+    expect(a).not.toBe(deriveTerminalWriteToken('host-secret', 'session-b'));
+    expect(a).not.toBe(deriveTerminalWriteToken('other-secret', 'session-a'));
+  });
+
+  it('is distinct from the retired stable view token for the same session + secret (domain separation)', () => {
+    // Knowing a historical read-only view token must never yield the write
+    // token — old view links must stay read-dead, not become operate links.
+    expect(deriveTerminalWriteToken('host-secret', 'session-a'))
+      .not.toBe(retiredStableViewToken('host-secret', 'session-a'));
+  });
+});
+
+describe('resolveTerminalWrite (pure gate)', () => {
+  describe('role header ignored unless BOTH platform-bound AND platform-proxied', () => {
+    it('bound but not proxied: forged owner ignored → token fallback (no write)', () => {
+      expect(resolveTerminalWrite({ role: 'owner', tokenMatches: false, platformBound: true, platformProxied: false }))
+        .toEqual({ hasWrite: false, platformReadonly: false });
+    });
+
+    it('proxied but not bound: role ignored → token fallback (defense in depth)', () => {
+      expect(resolveTerminalWrite({ role: 'owner', tokenMatches: false, platformBound: false, platformProxied: true }))
+        .toEqual({ hasWrite: false, platformReadonly: false });
+    });
+
+    it('neither: forged owner ignored → token fallback', () => {
+      expect(resolveTerminalWrite({ role: 'owner', tokenMatches: false, platformBound: false, platformProxied: false }))
+        .toEqual({ hasWrite: false, platformReadonly: false });
+    });
+
+    it('bound but not proxied: a matching ?token= still grants write', () => {
+      expect(resolveTerminalWrite({ role: 'owner', tokenMatches: true, platformBound: true, platformProxied: false }))
+        .toEqual({ hasWrite: true, platformReadonly: false });
+    });
+  });
+
+  describe('platform-bound AND platform-proxied: trust the injected role', () => {
+    it('grants write for role owner (token irrelevant)', () => {
+      expect(resolveTerminalWrite({ role: 'owner', tokenMatches: false, platformBound: true, platformProxied: true }))
+        .toEqual({ hasWrite: true, platformReadonly: false });
+    });
+
+    it('a matching private write-link token grants write even for role guest (capability)', () => {
+      expect(resolveTerminalWrite({ role: 'guest', tokenMatches: true, platformBound: true, platformProxied: true }))
+        .toEqual({ hasWrite: true, platformReadonly: false });
+    });
+
+    it('forces read-only for a non-owner role (guest) without a token', () => {
+      expect(resolveTerminalWrite({ role: 'guest', tokenMatches: false, platformBound: true, platformProxied: true }))
+        .toEqual({ hasWrite: false, platformReadonly: true });
+    });
+
+    it('forces read-only for role teammate', () => {
+      expect(resolveTerminalWrite({ role: 'teammate', tokenMatches: false, platformBound: true, platformProxied: true }))
+        .toEqual({ hasWrite: false, platformReadonly: true });
+    });
+
+    it('no role header present → token fallback (local direct hit on a bound box)', () => {
+      expect(resolveTerminalWrite({ role: undefined, tokenMatches: true, platformBound: true, platformProxied: true }))
+        .toEqual({ hasWrite: true, platformReadonly: false });
+      expect(resolveTerminalWrite({ role: '', tokenMatches: false, platformBound: true, platformProxied: true }))
+        .toEqual({ hasWrite: false, platformReadonly: false });
+    });
+  });
+});
+
+describe('readDashboardCookie', () => {
+  it('extracts the token from a Cookie header among others', () => {
+    expect(readDashboardCookie('a=1; botmux_dashboard_token=xyz; b=2')).toBe('xyz');
+  });
+  it('joins an array Cookie header', () => {
+    expect(readDashboardCookie(['a=1', 'botmux_dashboard_token=xyz'])).toBe('xyz');
+  });
+  it('returns null when absent / empty / undefined', () => {
+    expect(readDashboardCookie('a=1; b=2')).toBeNull();
+    expect(readDashboardCookie('botmux_dashboard_token=')).toBeNull();
+    expect(readDashboardCookie(undefined)).toBeNull();
+  });
+});
+
+describe('resolveTerminalWriteForRequest', () => {
+  const bound = () => true;
+  const unbound = () => false;
+  const token = () => TOK;
+  const noToken = () => null;
+  const cookie = (v: string) => ({ cookie: `botmux_dashboard_token=${v}` });
+
+  it('honors owner when bound AND the cookie matches the active dashboard token', () => {
+    expect(resolveTerminalWriteForRequest({ 'x-botmux-role': 'owner', ...cookie(TOK) }, false, bound, token))
+      .toEqual({ hasWrite: true, platformReadonly: false });
+  });
+
+  it('ignores a forged owner when the dashboard cookie is MISSING → token fallback (the fix)', () => {
+    expect(resolveTerminalWriteForRequest({ 'x-botmux-role': 'owner' }, false, bound, token))
+      .toEqual({ hasWrite: false, platformReadonly: false });
+  });
+
+  it('ignores a forged owner when the cookie value is WRONG → token fallback (the fix)', () => {
+    expect(resolveTerminalWriteForRequest({ 'x-botmux-role': 'owner', ...cookie('attacker-guess') }, false, bound, token))
+      .toEqual({ hasWrite: false, platformReadonly: false });
+  });
+
+  it('ignores the role when the machine has no active dashboard token', () => {
+    expect(resolveTerminalWriteForRequest({ 'x-botmux-role': 'owner', ...cookie(TOK) }, false, bound, noToken))
+      .toEqual({ hasWrite: false, platformReadonly: false });
+  });
+
+  it('fails closed when the live dashboard token cannot be read during rotation', () => {
+    const unreadable = () => { throw new Error('token changed during read'); };
+    expect(() => resolveTerminalWriteForRequest(
+      { 'x-botmux-role': 'owner', ...cookie(TOK) },
+      false,
+      bound,
+      unreadable,
+    )).not.toThrow();
+    expect(resolveTerminalWriteForRequest(
+      { 'x-botmux-role': 'owner', ...cookie(TOK) },
+      false,
+      bound,
+      unreadable,
+    )).toEqual({ hasWrite: false, platformReadonly: false });
+  });
+
+  it('ignores the role when unbound even with a matching cookie', () => {
+    expect(resolveTerminalWriteForRequest({ 'x-botmux-role': 'owner', ...cookie(TOK) }, false, unbound, token))
+      .toEqual({ hasWrite: false, platformReadonly: false });
+  });
+
+  it('treats a duplicated (array) role header as absent → token fallback', () => {
+    expect(resolveTerminalWriteForRequest({ 'x-botmux-role': ['owner', 'guest'], ...cookie(TOK) }, false, bound, token))
+      .toEqual({ hasWrite: false, platformReadonly: false });
+    expect(resolveTerminalWriteForRequest({ 'x-botmux-role': ['owner', 'guest'], ...cookie(TOK) }, true, bound, token))
+      .toEqual({ hasWrite: true, platformReadonly: false });
+  });
+
+  it('falls back to token when no role header is present', () => {
+    expect(resolveTerminalWriteForRequest({ ...cookie(TOK) }, true, bound, token))
+      .toEqual({ hasWrite: true, platformReadonly: false });
+  });
+
+  // Both thunks must be evaluated per request, never snapshotted: bind/unbind and
+  // dashboard token rotation are hot-reloaded without restarting live workers.
+  it('evaluates binding + token on every call (not cached)', () => {
+    let boundNow = false;
+    let activeTok: string | null = TOK;
+    const isBound = () => boundNow;
+    const getTok = () => activeTok;
+    const req = { 'x-botmux-role': 'owner', ...cookie(TOK) };
+
+    // Unbound: forged owner ignored.
+    expect(resolveTerminalWriteForRequest(req, false, isBound, getTok))
+      .toEqual({ hasWrite: false, platformReadonly: false });
+
+    // Bound + cookie matches active token → trusted next request.
+    boundNow = true;
+    expect(resolveTerminalWriteForRequest(req, false, isBound, getTok))
+      .toEqual({ hasWrite: true, platformReadonly: false });
+
+    // Token rotates → the old cookie no longer matches → trust drops immediately.
+    activeTok = 'rotated-token';
+    expect(resolveTerminalWriteForRequest(req, false, isBound, getTok))
+      .toEqual({ hasWrite: false, platformReadonly: false });
+  });
+});
+
+describe('resolveTerminalAccessForRequest', () => {
+  const bound = () => true;
+  const unbound = () => false;
+  const token = () => TOK;
+  const cookie = (v: string) => ({ cookie: `botmux_dashboard_token=${v}` });
+
+  it('denies direct no-token and forged-role requests', () => {
+    expect(resolveTerminalAccessForRequest({}, false, false, unbound, token).hasRead).toBe(false);
+    expect(resolveTerminalAccessForRequest({ 'x-botmux-role': 'owner' }, false, false, bound, token))
+      .toEqual({ hasRead: false, hasWrite: false, platformReadonly: false });
+  });
+
+  it('accepts the view capability as read-only', () => {
+    expect(resolveTerminalAccessForRequest({}, false, true, unbound, token))
+      .toEqual({ hasRead: true, hasWrite: false, platformReadonly: false });
+  });
+
+  it('lets an authenticated local dashboard cookie view without platform binding', () => {
+    expect(resolveTerminalAccessForRequest(cookie(TOK), false, false, unbound, token))
+      .toEqual({ hasRead: true, hasWrite: false, platformReadonly: false });
+  });
+
+  it('denies the request instead of throwing when token rotation races the read', () => {
+    const unreadable = () => { throw new Error('token changed during read'); };
+    expect(() => resolveTerminalAccessForRequest(
+      cookie(TOK), false, false, unbound, unreadable,
+    )).not.toThrow();
+    expect(resolveTerminalAccessForRequest(
+      cookie(TOK), false, false, unbound, unreadable,
+    )).toEqual({ hasRead: false, hasWrite: false, platformReadonly: false });
+  });
+
+  it('keeps authenticated platform guest read-only and owner writable', () => {
+    expect(resolveTerminalAccessForRequest({ 'x-botmux-role': 'guest', ...cookie(TOK) }, false, false, bound, token))
+      .toEqual({ hasRead: true, hasWrite: false, platformReadonly: true });
+    expect(resolveTerminalAccessForRequest({ 'x-botmux-role': 'owner', ...cookie(TOK) }, false, false, bound, token))
+      .toEqual({ hasRead: true, hasWrite: true, platformReadonly: false });
+  });
+});

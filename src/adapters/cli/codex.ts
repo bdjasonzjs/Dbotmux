@@ -1,29 +1,23 @@
+import { execFile } from 'node:child_process';
 import { existsSync, statSync, openSync, readSync, closeSync, watch } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { promisify } from 'node:util';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
+import { parseDebugModelsJson } from './model-catalog-json.js';
 import type { CliAdapter, PtyHandle } from './types.js';
+import { codexHistoryPath, codexHome, codexSessionsRoot } from '../../services/codex-paths.js';
+import { findCodexRolloutSetByPid } from '../../services/codex-transcript.js';
+import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
+import { delay, scaleMs } from '../../utils/timing.js';
 
-/** Codex's global submit log — one JSON line per successful user submit across
- *  all sessions. Far better than the per-session rollout file, which Codex creates
- *  lazily at the first submit (chicken-and-egg: you can't use it to verify the
- *  *first* submit that we're trying to fix).
- *
- *  Round-4 B4: per home — a cloned codex bot runs with CODEX_HOME=<clone home>, so
- *  its history.jsonl is under that home; reading the global ~/.codex would cross-talk
- *  with the 本体. `home` undefined → global ~/.codex (本体, unchanged). */
-function historyPath(home?: string): string {
-  return join(home && home.trim() ? home : join(homedir(), '.codex'), 'history.jsonl');
-}
-const INITIAL_CONFIRM_TIMEOUT_MS = 5_000;
-const RESCUE_CONFIRM_TIMEOUT_MS = 2_000;
-const MAX_ENTER_ATTEMPTS = 5;
+const CODEX_ACTIVE_BUSY_PATTERN = /Working[^\r\n]{0,160}esc to interrupt/i;
 
-function delay(ms: number): Promise<void> {
-  return new Promise(r => setTimeout(r, ms));
-}
-
+/** Global submit log — Codex appends one JSON line here on every successful
+ *  user submit across all sessions. Far better than the per-session rollout
+ *  file, which Codex creates lazily at the first submit (chicken-and-egg:
+ *  you can't use it to verify the *first* submit that we're trying to fix). */
 function currentFileSize(path: string): number {
   if (!existsSync(path)) return 0;
   try { return statSync(path).size; } catch { return 0; }
@@ -34,13 +28,33 @@ interface HistoryMatch {
   cliSessionId?: string;
 }
 
-function submitResult(match: HistoryMatch): void | { submitted: true; cliSessionId?: string } {
-  return match.cliSessionId
-    ? { submitted: true, cliSessionId: match.cliSessionId }
+function readCliSessionId(parsed: unknown): string | undefined {
+  return parsed && typeof parsed === 'object' && typeof (parsed as any).session_id === 'string'
+    ? (parsed as any).session_id
     : undefined;
 }
 
-function matchHistoryDelta(path: string, fromByte: number, marker: string): HistoryMatch {
+function normaliseHistoryText(text: string): string {
+  return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+}
+
+function historyTextMatches(actual: string, expected: string): boolean {
+  return actual === expected || normaliseHistoryText(actual) === normaliseHistoryText(expected);
+}
+
+/** Optional ownership filter for a history match. `history.jsonl` is a single
+ *  global file shared by every Codex pane under one CODEX_HOME, so a concurrent
+ *  sibling pane submitting identical text can land its line first. When a filter
+ *  is supplied, a same-text line is only accepted if `acceptSid(sid)` is true —
+ *  a foreign sibling's line is skipped and scanning continues for the owned one.
+ *  The filter is re-evaluated on every call (not snapshotted) so a lazily-opened
+ *  owned rollout fd that appears AFTER its history line can still be accepted on
+ *  a later poll. */
+type HistorySidFilter = (cliSessionId: string | undefined) => boolean;
+
+function matchHistoryDelta(
+  path: string, fromByte: number, expectedText: string, acceptSid?: HistorySidFilter,
+): HistoryMatch {
   if (!existsSync(path)) return { found: false };
   let size: number;
   try { size = statSync(path).size; } catch { return { found: false }; }
@@ -54,25 +68,30 @@ function matchHistoryDelta(path: string, fromByte: number, marker: string): Hist
     closeSync(fd);
   }
   const delta = buf.toString('utf8');
-  for (const line of delta.split('\n')) {
-    if (!line.includes(marker)) continue;
+  const lines = delta.endsWith('\n') ? delta.split('\n') : delta.split('\n').slice(0, -1);
+  for (const line of lines) {
     try {
       const parsed = JSON.parse(line);
-      return {
-        found: true,
-        cliSessionId: typeof parsed.session_id === 'string' ? parsed.session_id : undefined,
-      };
+      if (typeof parsed?.text === 'string' && historyTextMatches(parsed.text, expectedText)) {
+        const cliSessionId = readCliSessionId(parsed);
+        // Skip a same-text line owned by a DIFFERENT pane (shared-CODEX_HOME
+        // collision). Keep scanning — the owned line may be later in this delta
+        // or arrive on a subsequent poll.
+        if (acceptSid && !acceptSid(cliSessionId)) continue;
+        return { found: true, cliSessionId };
+      }
     } catch {
-      return { found: true };
+      // Ignore partial/non-JSON lines. A later poll will see the completed
+      // history entry if Codex was still writing it.
     }
   }
   return { found: false };
 }
 
 async function waitForHistoryAppend(
-  path: string, fromByte: number, marker: string, timeoutMs: number,
+  path: string, fromByte: number, expectedText: string, timeoutMs: number, acceptSid?: HistorySidFilter,
 ): Promise<HistoryMatch> {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = Date.now() + scaleMs(timeoutMs);
   let wake: (() => void) | undefined;
   let watcher: { close: () => void } | undefined;
   try {
@@ -83,12 +102,11 @@ async function waitForHistoryAppend(
       fn?.();
     });
   } catch {
-    // fs.watch is best-effort only; polling below is the portable fallback
-    // and also covers dropped watch events.
+    // fs.watch is best-effort; bounded polling below remains authoritative.
   }
   try {
     while (Date.now() < deadline) {
-      const match = matchHistoryDelta(path, fromByte, marker);
+      const match = matchHistoryDelta(path, fromByte, expectedText, acceptSid);
       if (match.found) return match;
       const remaining = Math.max(0, deadline - Date.now());
       await new Promise<void>(resolve => {
@@ -105,24 +123,22 @@ async function waitForHistoryAppend(
   } finally {
     watcher?.close();
   }
-  return matchHistoryDelta(path, fromByte, marker);
+  return matchHistoryDelta(path, fromByte, expectedText, acceptSid);
 }
 
-/** Build a JSON-escaped full-content marker so substring-match against the raw
- *  history.jsonl file content (where text fields store \n as the two-char
- *  escape `\n`, not a literal newline) only accepts the complete prompt.
- *  A prefix marker is unsafe for Codex: multiline send-keys bursts can submit
- *  a first-line fragment before the paste detector commits the whole prompt. */
+/** Build a JSON-escaped prefix for a cheap raw-line prefilter before parsing
+ *  history.jsonl. The final match is exact against the decoded `text` field;
+ *  the prefix only avoids JSON-parsing unrelated lines from other sessions. */
 function historyMarker(content: string): string {
   return JSON.stringify(content).slice(1, -1);  // strip surrounding quotes
 }
 
 function latestCodexSessionForBotmuxSession(botmuxSessionId: string, home?: string): string | undefined {
-  const HISTORY_PATH = historyPath(home);
-  if (!existsSync(HISTORY_PATH)) return undefined;
+  const historyPath = home ? join(home, 'history.jsonl') : codexHistoryPath();
+  if (!existsSync(historyPath)) return undefined;
   try {
-    const size = statSync(HISTORY_PATH).size;
-    const fd = openSync(HISTORY_PATH, 'r');
+    const size = statSync(historyPath).size;
+    const fd = openSync(historyPath, 'r');
     const buf = Buffer.alloc(size);
     try {
       readSync(fd, buf, 0, size, 0);
@@ -136,7 +152,10 @@ function latestCodexSessionForBotmuxSession(botmuxSessionId: string, home?: stri
       if (!line.includes(marker)) continue;
       try {
         const parsed = JSON.parse(line);
-        if (typeof parsed.session_id === 'string') return parsed.session_id;
+        if (typeof parsed?.text === 'string' && parsed.text.includes(botmuxSessionId)) {
+          const sid = readCliSessionId(parsed);
+          if (sid) return sid;
+        }
       } catch {
         continue;
       }
@@ -148,15 +167,13 @@ function latestCodexSessionForBotmuxSession(botmuxSessionId: string, home?: stri
 }
 
 export function createCodexAdapter(pathOverride?: string): CliAdapter {
-  const bin = resolveCommand(pathOverride ?? 'codex');
+  // resolvedBin is lazy: setup constructs adapters only to read static
+  // modelChoices and must not shell out (see resolveCommand); the binary path
+  // is a spawn-time concern.
+  const rawBin = pathOverride ?? 'codex';
+  let cachedBin: string | undefined;
   return {
     id: 'codex',
-    // Round-4 B4: codex relocates its home via CODEX_HOME (verified). Classification
-    // from the ~/.codex inventory: symlink read-only persona; COPY auth.json/config.toml
-    // (mutable creds/config — codex may atomic-rename them, which would clobber a
-    // symlink / cross-pollute the 本体); seed NO memory (codex memory is live SQLite —
-    // copying a 2.3GB WAL would risk a corrupt DB); independentDirs empty (codex
-    // creates sessions/history/*.sqlite itself on first run in a fresh CODEX_HOME).
     cloneHome: {
       tier: 'full',
       envVar: 'CODEX_HOME',
@@ -167,29 +184,125 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       independentDirs: [],
       memorySeed: 'none',
     },
-    resolvedBin: bin,
+    mcpGateway: {
+      configPath: '~/.codex/config.toml',
+      format: 'codex-toml',
+    },
+    // codex 0.137's own filesystem profile can't express a read blocklist, so
+    // isolation is enforced by the worker's whole-process macOS Seatbelt wrapper.
+    // e2e verified: codex under `sandbox-exec -f <profile>` (with bypass) is
+    // blocked from denied paths and runs normally; its sessions/auth live in the
+    // per-bot BOT_HOME via CODEX_HOME redirection. (Read isolation does NOT consult
+    // authPaths — that only feeds the bwrap file sandbox below.)
+    supportsReadIsolation: true,
+    // Whole ~/.codex kept REAL, not just auth.json: codex writes SQLite state/log
+    // DBs (state_*.sqlite / logs_*.sqlite) + history/sessions there. The file
+    // sandbox is a fresh tmpfs root where ONLY allow-listed paths are bound in.
+    // A single-file carve-out (just auth.json) would technically still let codex
+    // create + fcntl-lock sibling DBs — verified: a fresh tmpfs supports SQLite
+    // byte-range locks and sibling creation just fine — but those live in the
+    // EPHEMERAL tmpfs: they vanish when the sandbox tears down (no persistence)
+    // and the daemon's transcript bridge / resume never sees them (they're not on
+    // the real host path). Binding the whole dir REAL is what keeps login +
+    // history + state persistent across sessions AND visible to the worker's
+    // bridge/resume on the same host path. NOTE this rationale is for the
+    // NON-redirected path; when CLI data is redirected to BOT_HOME the worker
+    // drops this host authPath (authPathsSurvivingCliDataRedirect) — codex then
+    // reads/writes its DBs under CODEX_HOME=BOT_HOME/codex instead, and exposing
+    // the host ~/.codex would only leak history/sessions it never touches.
+    authPaths: ['~/.codex'],
+    get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    supportsModelOverride: true,
-    supportsReasoningEffort: true,
-    buildArgs({ sessionId, resume, resumeSessionId, workingDir, cliHome, model, reasoningEffort }) {
+    buildArgs({ sessionId, resume, resumeSessionId, forkSession, workingDir, cliHome, model, reasoningEffort, disableCliBypass, bypassHookTrust, readIsolation, remoteWsUrl, remoteThreadId }) {
+      // Hybrid RPC input mode: attach this TUI to the botmux-owned app-server
+      // thread. User input is delivered out-of-band via JSON-RPC (turn/start,
+      // see codex-rpc-engine + worker), so the pane is a pure viewer — no paste
+      // path, no history.jsonl verify. --no-alt-screen keeps pane capture working.
+      if (remoteWsUrl && remoteThreadId) {
+        // -c check_for_update_on_startup=false: an RPC pane is a pure viewer with
+        // NO terminal input path, so codex's interactive "Update available … Press
+        // enter to continue" dialog would block the resume forever and freeze the
+        // Web terminal. Disable the check at the PROCESS level (never the user's
+        // global config). The bounded startup-dialog watcher is only a fail-safe.
+        return ['--remote', remoteWsUrl, 'resume', '--no-alt-screen', '-c', 'check_for_update_on_startup=false', remoteThreadId];
+      }
+      // Read isolation for Codex is enforced by the worker's Seatbelt wrapper,
+      // NOT by codex's own profile (codex 0.137 can't express a read blocklist).
+      // So spawn args are unchanged — keep bypass so codex's own nested sandbox
+      // is OFF and the outer Seatbelt profile is the sole enforcer.
       const baseArgs = [
-        '--dangerously-bypass-approvals-and-sandbox',
+        ...(!disableCliBypass ? ['--dangerously-bypass-approvals-and-sandbox'] : []),
+        // Codex 0.14x added a second interactive gate AFTER folder trust: the
+        // botmux-installed UserPromptSubmit + Stop hooks in ~/.codex/hooks.json
+        // must be manually trusted ("Press t to trust"), and every botmux upgrade
+        // rewrites codex-hook.sh → its trusted_hash changes → the gate re-fires. A
+        // botmux-managed plain-TUI pane has no human at its PTY to press `t`, so the
+        // first Lark turn wedges forever. This gate is TUI-only: this branch never
+        // runs for --remote (see the early return above), and the app-server rejects
+        // the flag. (`codex exec` DOES accept it, but botmux never launches exec.)
+        //
+        // This is a SEPARATE knob from the approval/sandbox bypass: the flag trusts
+        // ALL hook sources codex sees (user/project/plugin), not only botmux's, so it
+        // is gated by its own global toggle `bypassHookTrust` (default ON, operator can
+        // disable) — expressing "approvals bypassed, hook-trust review kept". Still
+        // ANDed with `!disableCliBypass`: a restricted bot never gets it regardless.
+        ...(!disableCliBypass && bypassHookTrust ? ['--dangerously-bypass-hook-trust'] : []),
         '--no-alt-screen',
+        '-c',
+        `shell_environment_policy.set.BOTMUX_SESSION_ID=${JSON.stringify(sessionId)}`,
+        // A botmux session cannot safely interact with Codex's startup update
+        // picker: the first queued Lark message can be consumed by the menu.
+        // Treat botmux as the runtime manager for every launch (sandboxed or
+        // not); the host-side daily monitor reports newer versions to the owner.
+        '-c',
+        'check_for_update_on_startup=false',
       ];
-      // 批4 §6.1：per-role 模型微调，走 codex -c 配置覆盖（对 fresh/resume 都生效）；
-      // 缺省 model/reasoningEffort=undefined → 不加任何 -c（与今天逐字节一致）。
-      if (model) baseArgs.push('-c', `model="${model}"`);
-      if (reasoningEffort) baseArgs.push('-c', `model_reasoning_effort="${reasoningEffort}"`);
+      // Under read isolation the worker denies bots.json, so `botmux send` (a shell
+      // subprocess) registers this bot from the worker-written cred FILE, keyed by
+      // SESSION_DATA_DIR + BOTMUX_LARK_APP_ID. Codex does NOT forward its env to shell
+      // subprocesses by default (only shell_environment_policy.set/inherit do), so
+      // without this those two vars never reach `botmux send` → "Bot not registered".
+      // Forward codex's full env to shell commands so the cred-file lookup works. No
+      // secret is forwarded — it lives only in the cred file (not env/argv), so it is
+      // NOT exposed to other bots via `ps aux`. (inherit rather than set: the two vars
+      // are already in codex's env from the worker.)
+      if (readIsolation) {
+        baseArgs.push(
+          '-c', 'shell_environment_policy.inherit="all"',
+          '-c', 'shell_environment_policy.ignore_default_excludes=true',
+        );
+      }
+      if (model && model.trim()) {
+        // Codex 接受 `--model <id>` / `-m <id>`，写全名最稳，错的会在 codex 自己启动时报。
+        baseArgs.push('--model', model.trim());
+      }
+      if (reasoningEffort) {
+        // Per-turn reasoning effort → codex model_reasoning_effort（进程级 -c 覆盖，
+        // 不动用户全局 config）。Codex 0.146.1 实测接受
+        // low/medium/high/xhigh/max/ultra，故原样透传，不做降级——收敛会静默改变
+        // 用户请求的档位。
+        baseArgs.push('-c', `model_reasoning_effort=${JSON.stringify(reasoningEffort)}`);
+      }
       // Codex app-server can keep its own cwd at $HOME; -C pins fresh agent roots.
+      // NOTE: canonicalization of workingDir for the file sandbox is done ONCE in
+      // worker.ts (only when sandboxRequested), so off-sandbox spawns keep the
+      // lexical path — realpath'ing here unconditionally would desync codex's cwd
+      // semantics vs the worker's lexical bridge/state tracking.
       const freshArgs = workingDir
         ? [...baseArgs, '-C', workingDir]
         : baseArgs;
-      if (!resume) return freshArgs;
-
-      // resume-fallback reads history.jsonl in THIS session's home (clone-aware).
-      const codexSessionId = resumeSessionId ?? latestCodexSessionForBotmuxSession(sessionId, cliHome);
-      if (!codexSessionId) return freshArgs;
-      return ['resume', ...baseArgs, codexSessionId];
+      const codexSessionId = resume
+        ? resumeSessionId ?? latestCodexSessionForBotmuxSession(sessionId, cliHome)
+        : undefined;
+      // Session fork: `codex fork <id>` copies the source rollout up to its tip
+      // into a NEW rollout + session id (session_meta records forked_from_id),
+      // leaving the source rollout untouched. Unlike Claude, Codex has no
+      // privilege-escalation guard on fork. Falls back to plain `resume` when we
+      // somehow lack a source id (nothing to fork from).
+      const codexArgs = codexSessionId
+        ? [forkSession ? 'fork' : 'resume', ...baseArgs, codexSessionId]
+        : freshArgs;
+      return codexArgs;
     },
 
     buildResumeCommand({ sessionId, cliSessionId, cliHome }) {
@@ -202,20 +315,32 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       return `codex resume ${sid}`;
     },
 
+    /** Import path: scan the rollout files under `<CODEX_HOME>/sessions` for
+     *  resumable sessions (session_meta carries the resume id + cwd). */
+    listResumableSessions({ limit, exclude }) {
+      return discoverRolloutSessions(codexSessionsRoot(), limit, exclude);
+    },
+
     async writeInput(pty: PtyHandle, content: string) {
-      // Codex's TUI in --no-alt-screen mode does NOT handle bracketed paste:
-      // wrapping content in \x1b[200~...\x1b[201~ via tmux paste-buffer
-      // makes Codex exit cleanly (code 0) — it parses the ESC as an abort.
-      // So we stick with the older `send-keys -l` raw-stream path that has
-      // worked historically.
+      // Codex's input mode treats every literal \n as Enter. The old path
+      // (`send-keys -l` with the whole multi-line blob) therefore submitted
+      // each line as its own turn — a single Lark message fragmented into
+      // several user messages / "Queued follow-up inputs" in the TUI, and a
+      // literal \t in the content also leaked through as a Tab keystroke.
       //
-      // Known limitation: Codex's input mode treats every \n as Enter, so a
-      // multi-line burst submits one-line fragments until Codex's internal
-      // paste-detection finally kicks in — visible as e.g. the tail of
-      // "Session ID: <uuid>" stranded in the input box. The verification
-      // loop below catches that case (the full content prefix never appears
-      // in history.jsonl) and surfaces it via user_notify rather than
-      // silently dropping the message.
+      // Fix: bracketed paste, same as coco.ts. tmux `load-buffer` +
+      // `paste-buffer -d -p` wraps the content in \x1b[200~...\x1b[201~ when
+      // the pane has bracketed paste on (Codex enables it), so embedded \n
+      // stay content and only the trailing Enter after the delay submits.
+      // The old "Codex exits on bracketed paste (parses ESC as abort)" note
+      // was true for a much earlier build; verified on codex 0.134.0 that a
+      // bracketed paste lands the whole multi-line message in the composer
+      // un-submitted, with the process staying alive and \t absorbed cleanly.
+      //
+      // The history.jsonl verification loop below is unchanged: it polls for
+      // the submitted prefix and, if it never appears, surfaces the failure
+      // via the worker's deferred recheck + Lark warning rather than silently
+      // dropping the message.
       const trySendEnter = (): boolean => {
         try {
           if (pty.sendSpecialKeys) pty.sendSpecialKeys('Enter');
@@ -228,46 +353,166 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
         }
       };
 
-      // Round-4 B4: this session's history.jsonl (clone reads its own CODEX_HOME via
-      // pty.claudeHome; 本体 → global ~/.codex when unset).
-      const HISTORY_PATH = historyPath(pty.claudeHome);
-      const baseByte = currentFileSize(HISTORY_PATH);
-      const marker = historyMarker(content);
+      const historyPath = codexHistoryPath();
+      const baseByte = currentFileSize(historyPath);
+
+      // Ownership filter for the shared global history.jsonl. An external App
+      // Server viewer cannot own the rollout fd: `codex --remote` is merely a
+      // second client and the existing App Server holds the actual thread. For
+      // that explicit mode accept ONLY its already-selected thread id. Normal
+      // local terminal sessions keep the PID/rollout ownership filter below.
+      const cliPid = typeof pty.cliPid === 'number' && Number.isInteger(pty.cliPid) && pty.cliPid > 0
+        ? pty.cliPid
+        : undefined;
+      const expectedRemoteSid = typeof pty.expectedCodexSessionId === 'string'
+        && pty.expectedCodexSessionId.trim()
+        ? pty.expectedCodexSessionId.trim()
+        : undefined;
+      const acceptSid: HistorySidFilter | undefined = expectedRemoteSid
+        ? (sid) => !!sid && sid.toLowerCase() === expectedRemoteSid.toLowerCase()
+        : cliPid
+          ? (sid) => {
+            if (!sid) return false;
+            const owned = findCodexRolloutSetByPid(cliPid);
+            // set unavailable (enumeration failed) → don't block the submit
+            // confirmation; the worker attach gate re-checks ownership.
+            if (!owned) return true;
+            return owned.has(sid.toLowerCase());
+          }
+          : undefined;
 
       try {
-        if (pty.sendText) pty.sendText(content);
-        else pty.write(content);
+        if (pty.pasteText) {
+          // tmux mode: load-buffer + paste-buffer -d -p. The `-p` flag emits
+          // bracketed-paste markers when the pane has them on (Codex default);
+          // `-d` deletes the buffer after so it doesn't accumulate.
+          pty.pasteText(content);
+        } else {
+          // Non-tmux fallback (raw PTY): wrap the markers ourselves.
+          pty.write('\x1b[200~' + content + '\x1b[201~');
+        }
       } catch {
         return { submitted: false };
       }
       await delay(200);
+      if (!trySendEnter()) return { submitted: false };
 
-      // Codex 0.140 in --no-alt-screen still needs multiple Enter presses for
-      // some multiline send-keys bursts before its paste detector submits the
-      // whole prompt. Keep the budget bounded, and check history before every
-      // press so a slow-but-already-confirmed submit stops immediately.
-      for (let attempt = 0; attempt < MAX_ENTER_ATTEMPTS; attempt++) {
-        const alreadySubmitted = matchHistoryDelta(HISTORY_PATH, baseByte, marker);
-        if (alreadySubmitted.found) return submitResult(alreadySubmitted);
-
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const match = await waitForHistoryAppend(historyPath, baseByte, content, 800, acceptSid);
+        if (match.found) {
+          return match.cliSessionId
+            ? { submitted: true, cliSessionId: match.cliSessionId }
+            : { submitted: true };
+        }
         if (!trySendEnter()) return { submitted: false };
-        const timeout = attempt === 0 ? INITIAL_CONFIRM_TIMEOUT_MS : RESCUE_CONFIRM_TIMEOUT_MS;
-        const match = await waitForHistoryAppend(HISTORY_PATH, baseByte, marker, timeout);
-        if (match.found) return submitResult(match);
-
+      }
+      const match = await waitForHistoryAppend(historyPath, baseByte, content, 800, acceptSid);
+      if (match.found) {
+        return match.cliSessionId
+          ? { submitted: true, cliSessionId: match.cliSessionId }
+          : { submitted: true };
       }
       // In-band budget exhausted. Hand the worker a recheck closure: a
       // slow-startup Codex (or one whose first turn is delayed by a heavy
       // initial prompt) may still append our marker after the retries gave
       // up, and the worker re-scans on a delay before warning the user.
-      const recheck = (): boolean => matchHistoryDelta(HISTORY_PATH, baseByte, marker).found;
+      const recheck = () => {
+        const late = matchHistoryDelta(historyPath, baseByte, content, acceptSid);
+        return late.found
+          ? { submitted: true, cliSessionId: late.cliSessionId }
+          : false;
+      };
       return { submitted: false, recheck };
     },
 
     completionPattern: undefined,
-    readyPattern: /›|\d+% left/,  // › for input box, or status bar pattern (e.g. "97% left")
+    // Codex redraws this status line while a turn is active. Require both text
+    // anchors on one line so transcript prose or an idle composer cannot revive
+    // a completed Lark card.
+    busyPattern: CODEX_ACTIVE_BUSY_PATTERN,
+    idleToBusyPattern: CODEX_ACTIVE_BUSY_PATTERN,
+    // Codex's update picker also renders `› 1. Update now`; a bare /›/ treats
+    // that menu as the composer and lets botmux's queued first message select
+    // the update. Keep accepting the composer marker anywhere in a TUI redraw,
+    // but reject numbered menu choices. This remains necessary for wrappers
+    // such as Aiden that cannot forward the startup-update config override.
+    readyPattern: /›(?!\s*\d+\.)|\d+% left/,
+    // Codex cold starts can exceed the worker's 15s soft first-prompt timeout.
+    // Wait for the real composer marker so the bare-shell guard does not treat
+    // a still-loading zsh wrapper as a failed launch.
+    deferFirstPromptTimeoutUntilReady: true,
+    // Native interactive controls that are safe and useful as the FIRST topic
+    // message (cold-start: an empty topic spawns a session to run them). /goal
+    // starts goal work, so it belongs here. /fast is deliberately NOT here: it
+    // is a tier toggle, not "start a unit of work", and owner policy is that a
+    // bare /fast in an empty topic must not spawn a session — it lives in the
+    // global PASSTHROUGH_COMMANDS instead (forwarded to Codex on an existing
+    // session; harmless unknown-command on other CLIs).
+    defaultPassthroughCommands: ['/goal'],
+    buildSessionRenameCommand: (title) => `/rename ${title}`,
     systemHints: BOTMUX_SHELL_HINTS,
+    // Codex 0.134.0+ accepts a message while the current turn is still running:
+    // it parks it ("Messages to be submitted after next tool call") via an
+    // active-turn STEER, not a deferred next-turn submit. Two rollout shapes
+    // result (both verified empirically on codex-cli 0.134.0):
+    //   - turn with no tool_call: the queued user event is written when the turn
+    //     ends → interleaved user1 → asstFinal1 → user2 → asstFinal2.
+    //   - turn with a tool_call: the queued input is steered into the SAME turn
+    //     and codex emits ONE merged final → user1 → user2 → assistant_final.
+    // CodexBridgeQueue handles both via HOL-block-drop (a user event arriving
+    // while the collecting turn has no finalText discards that turn), so the
+    // merge case attributes the combined reply to the last steered turn instead
+    // of wedging the queue. The submit log history.jsonl IS written at submit
+    // time even for a parked message, so writeInput's verification confirms the
+    // submit immediately and never spuriously reports a mid-turn send failure.
+    supportsTypeAhead: true,
+    reliableTurnTerminal: true,
+    // Worker's maybeEmitCodexStructuredRateLimit reads the rollout's
+    // `codex_rate_limited` terminal (isCodexRateLimitEvent) and emits a
+    // structured `limited` state — so codex is the rate-limit authority and the
+    // screen-scan `rate` heuristic is suppressed for it (see
+    // isStructuredRateLimitAuthoritative). Only codex among the codexBridgeQueue
+    // CLIs runs that emit (structuredBridgeIsCodex gate), so the flag stays here.
+    emitsStructuredRateLimit: true,
     altScreen: false,   // --no-alt-screen disables alternate screen
+    // Codex has no per-session skill injection like Claude's `--plugin-dir`.
+    // Verified empirically on codex 0.136.0 (via `codex debug prompt-input`,
+    // which dumps the model-visible skill list): config keys
+    // (skills.directories/paths/dirs/extra_dirs/...), env vars
+    // (CODEX_SKILLS_DIR/...), and `[[skills.config]]`'s `path` (enable/disable
+    // only — can't register an arbitrary path) all fail to add a scan root.
+    // Codex only reads hard-coded roots, so — like gemini/opencode/cursor — we
+    // install into Codex's global skills dir under CODEX_HOME (default ~/.codex;
+    // a getter so a custom CODEX_HOME is honored, matching where Codex actually
+    // scans). This is visible to a standalone `codex` too, but every botmux-*
+    // skill's description is tightly bound to "当前飞书话题", so implicit
+    // mis-fire risk is negligible.
+    get skillsDir(): string { return join(codexHome(), 'skills'); },
+    // 静态列表是 `codex debug models` visibility=list 的快照（2026-08）；
+    // live 探测（detectModels）会补充目录增量，live 不可用时以此兜底。
+    modelChoices: ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.2'],
+    // Live 模型枚举：`codex debug models`（官方支持，"Render the raw model
+    // catalog as JSON"）输出与 traex 同构的 JSON 目录，复用共享解析。整包可达
+    // 数百 KB，故 maxBuffer 给到 16MB、8s 超时兜底。仅 dashboard 在用户选中
+    // codex 时按需调用，不在 daemon/worker 启动路径上；任何异常（spawn 失败/
+    // 超时/输出非法）一律 fail-soft 返回 null，picker 回退到上面的 modelChoices。
+    async detectModels(): Promise<readonly string[] | null> {
+      try {
+        // lazy promisify：顶层 promisify(execFile) 会在部分 mock child_process
+        // 的测试 import 阶段炸（mock 无 execFile 导出）；推迟到调用时，fail-soft
+        // 的 try/catch 兜住（契约：任何异常 → null）。
+        const execFileAsync = promisify(execFile);
+        const { stdout } = await execFileAsync(this.resolvedBin, ['debug', 'models'], {
+          timeout: 8000,
+          maxBuffer: 16 * 1024 * 1024,
+          windowsHide: true,
+        });
+        const models = parseDebugModelsJson(stdout);
+        return models.length > 0 ? models : null;
+      } catch {
+        return null;
+      }
+    },
   };
 }
 

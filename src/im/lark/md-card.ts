@@ -19,10 +19,513 @@
  * the outer block (CommonMark spec).
  */
 
+import { homedir } from 'node:os';
+import { existsSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { resolve } from 'node:path';
 import MarkdownIt from 'markdown-it';
 import type Token from 'markdown-it/lib/token.mjs';
+import { t, type Locale } from '../../i18n/index.js';
+import {
+  REPLY_CARD_FOOTER_ELEMENT_ID,
+  REPLY_CARD_FOOTER_MARKER,
+} from './reply-card-footer-signature.js';
+import { buildFeedbackElement } from './skill-feedback-card.js';
+import type { FeedbackPolicy } from '../../services/feedback-policy.js';
+
+export { REPLY_CARD_FOOTER_MARKER } from './reply-card-footer-signature.js';
 
 const md = new MarkdownIt({ html: false, linkify: false, breaks: false });
+const MAX_LOCAL_HOME_LINK_REPAIRS = 256;
+
+export type LocalHomeLinkMode = 'filesystem' | 'lexical' | 'disabled';
+
+/** Native usage facts rendered in a Bot reply-card footer. Context is the
+ * latest context-window measurement; tokens are cumulative for the Session.
+ * Missing facts are omitted independently and must never be estimated. */
+export interface CardUsageSnapshot {
+  context: {
+    usedTokens: number;
+    windowTokens?: number;
+    percentUsed?: number;
+  } | null;
+  tokens: {
+    in: number;
+    out: number;
+  } | null;
+  /** Delta for the latest user turn (small, matches the CLI TUI's per-turn
+   *  ↑↓). Null for dialects without per-turn tracking. Rendered on the live
+   *  streaming card; the reply-card footer stays compact and omits it. */
+  turnTokens?: {
+    in: number;
+    out: number;
+  } | null;
+  /** Latest executor-reported model. Rendered by session-status cards only. */
+  model?: string;
+  /** Latest executor-reported reasoning effort. */
+  reasoningEffort?: string;
+}
+
+export interface ReplyCardFooter {
+  /** Fully wrapped markdown content, reusable inside the voice-button row. */
+  content: string;
+  /** Standalone footer element used by ordinary reply cards. */
+  element: {
+    tag: 'markdown';
+    element_id: typeof REPLY_CARD_FOOTER_ELEMENT_ID;
+    text_size: 'notation_small_v2';
+    content: string;
+  };
+}
+
+interface LocalHomeCandidate {
+  id: number;
+  start: number;
+  end: number;
+  value: string;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Find home-prefix occurrences that are worth asking markdown-it about. The
+ * scan deliberately over-matches prose and code: a unique, URL-safe marker is
+ * injected before each occurrence and only markers that markdown-it returns
+ * as the start of a real `link_open` href are accepted. This keeps CommonMark
+ * semantics (containers, code, tables, and all newline styles) in one parser
+ * instead of recreating source maps or inline rules here.
+ */
+function collectLocalHomeLinkCandidates(
+  input: string,
+  relativeHome: string,
+): LocalHomeCandidate[] {
+  const homeOccurrence = new RegExp(
+    `${escapeRegExp(relativeHome)}(?=$|[/?#>:()\\s\\\\])`,
+    'gi',
+  );
+  const candidates: LocalHomeCandidate[] = [];
+  for (const match of input.matchAll(homeOccurrence)) {
+    const start = match.index;
+    candidates.push({
+      id: candidates.length,
+      start,
+      end: start + match[0].length,
+      value: '',
+    });
+  }
+  return candidates;
+}
+
+function chooseLinkMarkerPrefix(input: string): string {
+  let prefix: string;
+  do {
+    prefix = `bmxlocallink${randomBytes(12).toString('hex')}x`;
+  } while (input.includes(prefix));
+  return prefix;
+}
+
+/** Return only candidates that markdown-it confirms start a real link href. */
+function validateLocalHomeLinkCandidates(
+  input: string,
+  candidates: LocalHomeCandidate[],
+): LocalHomeCandidate[] {
+  if (candidates.length === 0) return [];
+
+  const markerPrefix = chooseLinkMarkerPrefix(input);
+  const markedParts: string[] = [];
+  let sourceCursor = 0;
+  for (const candidate of candidates) {
+    const marker = `${markerPrefix}${candidate.id}x/`;
+    markedParts.push(input.slice(sourceCursor, candidate.start), marker);
+    sourceCursor = candidate.start;
+  }
+  markedParts.push(input.slice(sourceCursor));
+  const marked = markedParts.join('');
+
+  const byId = new Map(candidates.map(candidate => [candidate.id, candidate]));
+  const confirmed = new Set<number>();
+  const markerPattern = new RegExp(`^${escapeRegExp(markerPrefix)}(\\d+)x/`);
+  const anyMarkerPattern = new RegExp(`${escapeRegExp(markerPrefix)}\\d+x/`, 'g');
+  for (const token of md.parse(marked, {})) {
+    if (token.type !== 'inline') continue;
+    for (const child of token.children ?? []) {
+      if (child.type !== 'link_open') continue;
+      const href = child.attrGet('href') ?? '';
+      const markerMatch = href.match(markerPattern);
+      if (!markerMatch) continue;
+      const id = Number(markerMatch[1]);
+      const candidate = byId.get(id);
+      if (!candidate) continue;
+      const marker = markerMatch[0];
+      candidate.value = md.normalizeLinkText(
+        href.slice(marker.length).replace(anyMarkerPattern, ''),
+      );
+      confirmed.add(id);
+    }
+  }
+  return candidates.filter(candidate => confirmed.has(candidate.id));
+}
+
+/**
+ * Restore the leading slash when a model emits the current user's home path
+ * as a relative Markdown link destination. Codex file links are normally
+ * absolute (`/Users/alice/...` or `/home/alice/...`); without the slash,
+ * Feishu resolves the destination as a relative URL and cannot open it.
+ *
+ * The repair is intentionally narrow: it only matches the current host home
+ * prefix and only in destinations markdown-it recognizes as real inline links.
+ * Web links, existing absolute paths, other users' homes, and general
+ * relative links are left unchanged. An ambiguous home-shaped target is only
+ * repaired when the absolute file exists and the same target does not exist
+ * relative to the current working directory.
+ */
+export function normalizeLocalHomeLinks(
+  input: string,
+  homeDir = homedir(),
+  cwd = process.cwd(),
+  pathExists: (path: string) => boolean = existsSync,
+  mode: LocalHomeLinkMode = 'filesystem',
+): string {
+  if (mode === 'disabled') return input;
+  const relativeHome = homeDir.replace(/^\/+/, '').replace(/\/+$/, '');
+  if (!relativeHome || relativeHome === homeDir) return input;
+
+  const homePrefix = new RegExp(`^${escapeRegExp(relativeHome)}(?=$|[/?#])`, 'i');
+  const normalizedHome = resolve(homeDir);
+  const pathExistence = new Map<string, boolean>();
+  const cachedPathExists = (path: string): boolean => {
+    let exists = pathExistence.get(path);
+    if (exists === undefined) {
+      exists = pathExists(path);
+      pathExistence.set(path, exists);
+    }
+    return exists;
+  };
+
+  const confirmedDestinations = validateLocalHomeLinkCandidates(
+    input,
+    collectLocalHomeLinkCandidates(input, relativeHome),
+  );
+  // Filesystem mode caps synchronous probes over untrusted model output.
+  // Lexical mode performs no I/O, so it can repair every confirmed link.
+  const destinations = mode === 'filesystem'
+    ? confirmedDestinations.slice(0, MAX_LOCAL_HOME_LINK_REPAIRS)
+    : confirmedDestinations;
+  const repairs: Array<{ start: number; end: number }> = [];
+  for (const destination of destinations) {
+    const homeMatch = destination.value.match(homePrefix);
+    if (!homeMatch) continue;
+
+    const relativeTarget = destination.value.split(/[?#]/, 1)[0];
+    const absoluteTargetText = `${relativeHome}${destination.value.slice(homeMatch[0].length)}`
+      .split(/[?#]/, 1)[0];
+    const strippedRelativeTarget = relativeTarget.replace(/:\d+(?::\d+)?$/, '');
+    const strippedAbsoluteTargetText = absoluteTargetText.replace(/:\d+(?::\d+)?$/, '');
+    const targetTexts = [{ relative: relativeTarget, absolute: absoluteTargetText }];
+    const hasPositionSuffix = strippedRelativeTarget !== relativeTarget &&
+      strippedAbsoluteTargetText !== absoluteTargetText;
+    if (hasPositionSuffix) {
+      targetTexts.push({ relative: strippedRelativeTarget, absolute: strippedAbsoluteTargetText });
+    }
+
+    const targetCandidates = targetTexts.map(target => ({
+      relative: resolve(cwd, target.relative),
+      absolute: resolve('/', target.absolute),
+    }));
+    if (targetCandidates[0].absolute !== normalizedHome &&
+        !targetCandidates[0].absolute.startsWith(`${normalizedHome}/`)) continue;
+
+    // A numeric suffix can be a Codex source position. Never let removing it
+    // create a second candidate outside HOME (for example `..:123`). In
+    // filesystem mode the exact literal filename remains eligible; lexical
+    // mode cannot distinguish it safely, so it leaves the link unchanged.
+    const strippedCandidateIsSafe = targetCandidates.length === 1 ||
+      targetCandidates[1].absolute === normalizedHome ||
+      targetCandidates[1].absolute.startsWith(`${normalizedHome}/`);
+    if (mode === 'lexical' && !strippedCandidateIsSafe) continue;
+
+    if (mode === 'filesystem') {
+      const safeCandidates = strippedCandidateIsSafe ? targetCandidates : targetCandidates.slice(0, 1);
+      // Preserve the source spelling/case for cwd-relative disambiguation. On
+      // a case-sensitive filesystem, `Home/alice/a` and `home/alice/a` differ.
+      if (safeCandidates.some(target => cachedPathExists(target.relative))) continue;
+      if (!safeCandidates.some(target => cachedPathExists(target.absolute))) continue;
+    }
+
+    const rawHome = input.slice(destination.start, destination.end);
+    if (rawHome.toLowerCase() !== homeMatch[0].toLowerCase()) continue;
+    repairs.push({ start: destination.start, end: destination.end });
+  }
+
+  if (repairs.length === 0) return input;
+  const outputParts: string[] = [];
+  let outputCursor = 0;
+  for (const repair of repairs) {
+    outputParts.push(input.slice(outputCursor, repair.start), `/${relativeHome}`);
+    outputCursor = repair.end;
+  }
+  outputParts.push(input.slice(outputCursor));
+  return outputParts.join('');
+}
+
+/** Default footer brand when a bot has no custom `brandLabel` configured. */
+export const DEFAULT_BRAND_LABEL = '[botmux](https://github.com/deepcoldy/botmux)';
+
+/**
+ * Resolve the brand segment to render in a card footer from a bot's configured
+ * `brandLabel` (see {@link resolveBrandLabel}):
+ *   • `undefined` (unset)  → the default botmux link
+ *   • `''` / whitespace    → `null` (brand suppressed)
+ *   • any other string     → one trimmed line (markdown allowed)
+ * Returning `null` lets callers drop the brand — and, when there's also no
+ * recipient, the whole footer (HR included) — so an empty brand reads clean.
+ */
+export function brandFooterSegment(brand: string | undefined): string | null {
+  if (brand === undefined) return DEFAULT_BRAND_LABEL;
+  const normalized = brand
+    .trim()
+    .replace(/[ \t]*(?:\r\n?|\n|\u2028|\u2029)+[ \t]*/g, ' ');
+  return normalized || null;
+}
+
+function compactTokenCount(value: number): string {
+  const units = [
+    { threshold: 1_000_000_000, suffix: 'B' },
+    { threshold: 1_000_000, suffix: 'M' },
+    { threshold: 1_000, suffix: 'K' },
+  ] as const;
+  let unitIndex = units.findIndex(candidate => value >= candidate.threshold);
+  if (unitIndex < 0) return Math.round(value).toString();
+  let unit = units[unitIndex];
+  let scaled = value / unit.threshold;
+  // Avoid boundary artifacts such as 1000K/1000M after one-decimal rounding.
+  if (unitIndex > 0 && Number(scaled.toFixed(1)) >= 1_000) {
+    unit = units[--unitIndex];
+    scaled = value / unit.threshold;
+  }
+  return `${scaled.toFixed(1).replace(/\.0$/, '')}${unit.suffix}`;
+}
+
+function isNonNegativeFinite(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
+function compactRuntimeLabel(value: string | undefined, maxLength: number): string | undefined {
+  const normalized = value
+    ?.trim()
+    .replace(/[ \t]*(?:\r\n?|\n|\u2028|\u2029)+[ \t]*/g, ' ');
+  if (!normalized) return undefined;
+  const compact = normalized.length > maxLength
+    ? `${normalized.slice(0, Math.max(1, maxLength - 1))}…`
+    : normalized;
+  return compact
+    .replace(/[*_~`\[\]\\<>]/g, char => `\\${char}`)
+    .replace(/ /g, '\u00a0');
+}
+
+/** Strip a leading `provider/` routing namespace from a model id so the card
+ *  shows the bare model name (e.g. `model_hub/es1_orange_o48` \u2192
+ *  `es1_orange_o48`). Only a clean single-token prefix (alphanumerics, `.`, `_`,
+ *  `-`) followed by one slash is removed, so a value with no slash
+ *  (`gpt-5.6-sol`) or arbitrary text containing a slash is returned unchanged. */
+function stripModelProviderPrefix(value: string | undefined): string | undefined {
+  if (!value) return value;
+  return value.replace(/^[A-Za-z0-9._-]+\//, '');
+}
+
+/** Format usage as one segment shared by reply-card footers and the live
+ * streaming card. The caller supplies native facts; this module only formats
+ * them and never infers a context window or token count. Returns null when no
+ * valid native metric is available.
+ *
+ * `variant`:
+ *   - `'footer'` (default): minimal — context only. Reply-card footers are
+ *     cramped (brand · usage · 发送给), so the large cumulative token string is
+ *     dropped here (it lives on the streaming card / usage ledger). 上下文占用
+ *     is the one glanceable "how full am I" metric worth keeping.
+ *   - `'streaming'`: rich — context + `本轮 ↑X ↓Y`(per-turn delta, matches the
+ *     CLI TUI) + `累计 ↑A ↓B`(session total). The live card has room and
+ *     refreshes during execution. */
+export function cardUsageFooterSegment(
+  usage: CardUsageSnapshot,
+  locale?: Locale,
+  variant: 'footer' | 'streaming' = 'footer',
+): string | null {
+  const parts: string[] = [];
+  if (usage.context && isNonNegativeFinite(usage.context.usedTokens)) {
+    const used = compactTokenCount(usage.context.usedTokens);
+    const window = usage.context.windowTokens;
+    const windowSuffix = isNonNegativeFinite(window) && window > 0
+      ? `/${compactTokenCount(window)}`
+      : '';
+    const percentSuffix = isNonNegativeFinite(usage.context.percentUsed)
+      ? ` (${Math.min(100, Math.round(usage.context.percentUsed))}%)`
+      : '';
+    const suffix = `${windowSuffix}${percentSuffix}`;
+    parts.push(`${t('card.usage.context', undefined, locale)} ${used}${suffix}`);
+  }
+  // Footer variant is context-only (keeps the cramped reply-card footer clean);
+  // the token breakdown below is streaming-only.
+  if (variant !== 'streaming') {
+    return parts.length > 0 ? parts.join(' · ') : null;
+  }
+  // Per-turn delta (streaming only): small ↑↓ for the latest turn, labelled 本轮.
+  const turn = usage.turnTokens;
+  if (turn
+    && isNonNegativeFinite(turn.in)
+    && isNonNegativeFinite(turn.out)
+    && (turn.in > 0 || turn.out > 0)) {
+    parts.push(
+      `${t('card.usage.turn', undefined, locale)} `
+      + `↑${compactTokenCount(turn.in)} ↓${compactTokenCount(turn.out)}`,
+    );
+  }
+  if (usage.tokens
+    && isNonNegativeFinite(usage.tokens.in)
+    && isNonNegativeFinite(usage.tokens.out)
+    // Suppress an all-zero token line: a brand-new session (or a synthetic /
+    // zero-usage transcript record read before the real turn lands) yields
+    // in=out=0, which would render a meaningless "↑0 ↓0". Omit it like any
+    // other missing metric until there is real usage to show.
+    && (usage.tokens.in > 0 || usage.tokens.out > 0)) {
+    parts.push(
+      `${t('card.usage.total', undefined, locale)} `
+      + `↑${compactTokenCount(usage.tokens.in)} ↓${compactTokenCount(usage.tokens.out)}`,
+    );
+  }
+  // Runtime identity is formatted separately by cardUsageRuntimeSegment, then
+  // the streaming card appends it to this metric string with ` · ` in one
+  // continuous markdown paragraph. Keep this function metric-only so reply-card
+  // footers remain unchanged and the streaming renderer owns the tail layout.
+  return parts.length > 0 ? parts.join(' · ') : null;
+}
+
+/** Streaming-card runtime tail appended after
+ * {@link cardUsageFooterSegment}'s metric text. Returns `**model** effort`
+ * (model bolded within the shared grey markdown) or null when there is no model.
+ * `effort` is dropped when absent — no placeholder. `hasMetrics` prevents a
+ * standalone runtime-only row when native usage is unavailable. The
+ * model↔effort join uses a non-breaking space so the pair never wraps apart. */
+export function cardUsageRuntimeSegment(
+  usage: CardUsageSnapshot,
+  hasMetrics: boolean,
+): string | null {
+  if (!hasMetrics) return null;
+  // Strip a leading `provider/` routing prefix (e.g. `model_hub/es1_orange_o48`
+  // \u2192 `es1_orange_o48`) so the card shows the bare model name, not the relay's
+  // internal namespace. A value with no slash (e.g. `gpt-5.6-sol`) is untouched.
+  // Keep the tail compact so the continuous usage paragraph wraps predictably.
+  const model = compactRuntimeLabel(stripModelProviderPrefix(usage.model), 20);
+  if (!model) return null;
+  const reasoningEffort = compactRuntimeLabel(usage.reasoningEffort, 10);
+  return `**${model}**${reasoningEffort ? `\u00a0${reasoningEffort}` : ''}`;
+}
+
+/** Build the one canonical footer shared by all Bot Session reply cards.
+ * Ordering, i18n, the parser marker, grey styling, and recipient rendering live
+ * here so direct sends and daemon fallbacks cannot drift apart. */
+export function buildReplyCardFooter(opts: {
+  brand?: string;
+  recipientOpenIds?: readonly string[];
+  usage?: CardUsageSnapshot;
+  locale?: Locale;
+}): ReplyCardFooter | null {
+  const parts: string[] = [];
+  const brandSeg = brandFooterSegment(opts.brand);
+  if (brandSeg) parts.push(brandSeg);
+  let hasUsage = false;
+  if (opts.usage) {
+    const usageSeg = cardUsageFooterSegment(opts.usage, opts.locale);
+    if (usageSeg) { parts.push(usageSeg); hasUsage = true; }
+  }
+  const recipientOpenIds = [...new Set((opts.recipientOpenIds ?? []).filter(Boolean))];
+  const hasRecipient = recipientOpenIds.length > 0;
+  if (hasRecipient) {
+    parts.push(
+      `${t('card.sent_to', undefined, opts.locale)}`
+      + recipientOpenIds.map(id => `<at id=${id}></at>`).join(' '),
+    );
+  }
+  if (parts.length === 0) return null;
+
+  // The marker is a visible, versioned link that lets the parser identify a
+  // card's footer (and strip it before a bot-to-bot relay). It doubles as the
+  // first separator. But a BRAND-ONLY footer (no usage, no recipient — the
+  // common case now that usageDisplay defaults to the streaming card body and
+  // the reply-card footer is context-only) needs no marker: appending it renders
+  // a dangling "botmux ·". The default/repository brand is plain link text with
+  // no `@`, so it cannot trigger bot-to-bot pollution and does not need the
+  // ownership marker (the parser already treats a bare repo link as ordinary
+  // content, matching the long-standing "brand-only is undecidable, keep it"
+  // contract). Any footer carrying usage or a recipient is still signed.
+  const signMarker = hasUsage || hasRecipient;
+  let signedContent: string;
+  if (!signMarker) {
+    signedContent = parts[0]; // brand-only — no marker
+  } else if (parts.length > 1) {
+    signedContent = `${parts[0]} ${REPLY_CARD_FOOTER_MARKER} ${parts.slice(1).join(' · ')}`;
+  } else {
+    // usage-only / recipient-only (brand disabled) — still marked for parsing.
+    signedContent = `${parts[0]} ${REPLY_CARD_FOOTER_MARKER}`;
+  }
+  const content = `<font color='grey'>${signedContent}</font>`;
+  return {
+    content,
+    element: {
+      tag: 'markdown',
+      element_id: REPLY_CARD_FOOTER_ELEMENT_ID,
+      text_size: 'notation_small_v2',
+      content,
+    },
+  };
+}
+
+/** Clone a caller-supplied schema-2 card and append the canonical reply
+ * footer. Returns null for cards without a v2 `body.elements` array or when a
+ * caller-owned element already occupies the globally unique footer id. */
+export function appendReplyCardFooterToV2Card(
+  card: Record<string, unknown>,
+  opts: Parameters<typeof buildReplyCardFooter>[0],
+): Record<string, unknown> | null {
+  const cloned = JSON.parse(JSON.stringify(card)) as Record<string, unknown>;
+  if (cloned.schema !== '2.0') return null;
+  const body = cloned.body as { elements?: unknown } | undefined;
+  if (!body || !Array.isArray(body.elements)) return null;
+  const header = cloned.header as {
+    text_tag_list?: unknown;
+    i18n_text_tag_list?: unknown;
+  } | undefined;
+  const i18nHeaderTagLists = header?.i18n_text_tag_list
+    && typeof header.i18n_text_tag_list === 'object'
+    ? Object.values(header.i18n_text_tag_list as Record<string, unknown>)
+    : [];
+  if (
+    containsReplyCardFooterId(body.elements)
+    || containsReplyCardFooterId(header?.text_tag_list)
+    || containsReplyCardFooterId(i18nHeaderTagLists)
+  ) {
+    return null;
+  }
+  const footer = buildReplyCardFooter(opts);
+  if (footer) body.elements.push({ tag: 'hr' }, footer.element);
+  return cloned;
+}
+
+function containsReplyCardFooterId(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(containsReplyCardFooterId);
+  if (!value || typeof value !== 'object') return false;
+  const record = value as Record<string, unknown>;
+  if (record.element_id === REPLY_CARD_FOOTER_ELEMENT_ID) return true;
+  // Follow only documented component-child slots. Callback `value`, behavior
+  // payloads, and other arbitrary business JSON are deliberately outside the
+  // card component tree even when they contain tag/element_id-shaped fields.
+  return containsReplyCardFooterId(record.elements)
+    || containsReplyCardFooterId(record.columns)
+    || containsReplyCardFooterId(record.actions)
+    || containsReplyCardFooterId(record.extra);
+}
 
 /** Build a Feishu native `table` element from a `table_open … table_close` token slice. */
 function buildTableFromTokens(tokens: Token[]): any | null {
@@ -125,6 +628,16 @@ function unescapeFenceLines(input: string): string {
   return input.replace(/^[ ]{0,3}(?:\\`){3,}[^\n`]*$/gm, m => m.replace(/\\`/g, '`'));
 }
 
+/** Normalize source bytes that must be settled before the card is rendered. */
+export function prepareCardMarkdown(
+  input: string,
+  cwd = process.cwd(),
+  localHomeLinkMode: LocalHomeLinkMode = 'filesystem',
+): string {
+  input = unescapeFenceLines(input);
+  return normalizeLocalHomeLinks(input, homedir(), cwd, existsSync, localHomeLinkMode);
+}
+
 /**
  * Split markdown into card v2 body elements:
  *   1. Pipe tables → native `table` widget (Feishu's markdown widget can't
@@ -138,7 +651,28 @@ function unescapeFenceLines(input: string): string {
  * All non-table blocks are merged into a single `markdown` element to keep
  * card element counts modest.
  */
-export function buildCardBodyElements(input: string): any[] {
+export function buildCardBodyElements(
+  input: string,
+  cwd = process.cwd(),
+  localHomeLinkMode: LocalHomeLinkMode = 'filesystem',
+): any[] {
+  if (!input) return [];
+  // Recover model-escaped fences first so markdown-it can classify their
+  // contents as code before local-link normalization inspects link tokens.
+  input = prepareCardMarkdown(input, cwd, localHomeLinkMode);
+  // Pre-pass: a line that is nothing but 2+ images renders as a side-by-side
+  // image row (column_set) instead of stacked full-width images. Everything
+  // else flows through the markdown element builder unchanged. Fence-aware so
+  // image-looking lines inside ``` code blocks are left intact.
+  const elements: any[] = [];
+  for (const seg of splitImageRowSegments(input)) {
+    if (seg.type === 'imgrow') elements.push(imageRowElement(seg.keys));
+    else elements.push(...buildMarkdownElements(seg.content));
+  }
+  return elements;
+}
+
+function buildMarkdownElements(input: string): any[] {
   if (!input) return [];
   input = unescapeFenceLines(input);
   const tokens = md.parse(input, {});
@@ -213,6 +747,156 @@ export function buildCardBodyElements(input: string): any[] {
   return elements;
 }
 
+/** A single uploaded image rendered full-width (legacy single-image look). */
+function singleImgElement(imgKey: string): any {
+  return { tag: 'img', img_key: imgKey, alt: { tag: 'plain_text', content: '' }, mode: 'fit_horizontal', preview: true };
+}
+
+/**
+ * One row of N images side by side, each scaled to fit its column (aspect ratio
+ * preserved — wide menu cards keep their full content, just smaller). A
+ * `column_set` with equal weighted columns is used instead of the native
+ * `img_combination` widget because the latter crops images to fill square-ish
+ * cells, which would lop the sides off landscape images.
+ */
+function imageRowElement(imgKeys: string[]): any {
+  return {
+    tag: 'column_set',
+    flex_mode: 'none',
+    horizontal_spacing: 'small',
+    columns: imgKeys.map(k => ({
+      tag: 'column',
+      width: 'weighted',
+      weight: 1,
+      vertical_align: 'center',
+      elements: [singleImgElement(k)],
+    })),
+  };
+}
+
+/** A markdown image token: `![alt](src)`, capturing the src (img_key). */
+const IMG_TOKEN_SRC = /!\[[^\]]*\]\(([^)\s]+)\)/g;
+/**
+ * A whole line that is nothing but 2+ image tokens (the "image row" form).
+ * At most 3 leading spaces: a 4+-space indent is a CommonMark indented code
+ * block, whose contents `markdown-it` protects — the pre-pass must not yank an
+ * indented `![](k1) ![](k2)` line out of one and promote it to a native row.
+ */
+const IMG_ROW_LINE = /^ {0,3}(?:!\[[^\]]*\]\([^)\s]+\)\s*){2,}$/;
+/**
+ * Feishu-uploaded image keys look like `img_v2_<id>` / `img_v3_<id>` (the
+ * `<id>` is alphanumerics, `-` and `_`). Only a line whose every src is a full
+ * such key is promoted to a native `img` row — a model reply may emit a
+ * `![](https://…) ![](…)` URL line (or other non-key src like `img_v2foo.png`),
+ * and a native `img` element with a non-key as its "img_key" makes Feishu reject
+ * the whole card. Non-key lines fall through to the markdown widget unchanged
+ * (same as before this feature existed).
+ */
+const FEISHU_IMG_KEY = /^img_v\d+_[A-Za-z0-9_-]+$/i;
+
+type BodySegment = { type: 'text'; content: string } | { type: 'imgrow'; keys: string[] };
+
+/**
+ * Split a markdown body into segments, pulling out lines that consist solely of
+ * 2+ image tokens as `imgrow` segments (→ side-by-side row). Fence-aware: lines
+ * inside ``` / ~~~ code blocks are never treated as image rows.
+ */
+function splitImageRowSegments(input: string): BodySegment[] {
+  const segs: BodySegment[] = [];
+  let buf: string[] = [];
+  const flush = () => { if (buf.length) { segs.push({ type: 'text', content: buf.join('\n') }); buf = []; } };
+  // Track the open fence's char AND run length so a 4-backtick outer block
+  // isn't closed by an inner 3-backtick fence. Per CommonMark a closing fence
+  // is the same char, length ≥ the opening run, and nothing but whitespace
+  // after the run (no info string).
+  let fenceChar = '';
+  let fenceLen = 0;
+  for (const line of input.split('\n')) {
+    const fence = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+    if (fence) {
+      const run = fence[1];
+      const ch = run[0];
+      if (!fenceChar) {
+        fenceChar = ch;                           // opening fence
+        fenceLen = run.length;
+      } else if (ch === fenceChar && run.length >= fenceLen && fence[2].trim() === '') {
+        fenceChar = '';                           // valid closing fence
+        fenceLen = 0;
+      }
+      buf.push(line);
+      continue;
+    }
+    if (!fenceChar && IMG_ROW_LINE.test(line)) {
+      const keys = Array.from(line.matchAll(IMG_TOKEN_SRC), m => m[1]);
+      if (keys.every(k => FEISHU_IMG_KEY.test(k))) {
+        flush();
+        segs.push({ type: 'imgrow', keys });
+        continue;
+      }
+    }
+    buf.push(line);
+  }
+  flush();
+  return segs;
+}
+
+/**
+ * Build card body elements from a `botmux send` body whose images were uploaded
+ * via `--images` and referenced by `![alt](img:N)` placeholders (`N` is the
+ * 0-based --images index):
+ *
+ *   - `![](img:3)`    — single index → full-width inline image.
+ *   - `![](img:0,1)`  — 2+ comma-separated indices → one row of images side by
+ *                       side. Row width = group size: `img:0,1` two per row,
+ *                       `img:0,1,2` three per row. Each placeholder is one row.
+ *   - any image not named by a placeholder is appended full-width at the end.
+ *
+ * Placeholders are resolved to plain `![](img_key)` markdown (grouped ones onto
+ * a single line) and handed to {@link buildCardBodyElements}, whose image-row
+ * pre-pass turns multi-image lines into the actual `column_set` rows. This keeps
+ * one rendering path: a caller that embeds `![](img_key)` directly and puts two
+ * on a line (e.g. the menu poster) gets the same grid without using `--images`.
+ */
+export function buildImageCardElements(
+  md: string,
+  imageKeys: string[],
+  cwd = process.cwd(),
+  localHomeLinkMode: LocalHomeLinkMode = 'filesystem',
+): any[] {
+  if (imageKeys.length === 0) return md ? buildCardBodyElements(md, cwd, localHomeLinkMode) : [];
+
+  const used = new Set<number>();
+  const keyAt = (idx: number): string | null =>
+    Number.isInteger(idx) && idx >= 0 && idx < imageKeys.length ? imageKeys[idx] : null;
+
+  // Grouped placeholder `![](img:0,1[,2…])` → space-joined image tokens on one
+  // line so the row pre-pass picks them up.
+  let resolved = md.replace(/!\[[^\]]*\]\(img:(\d+(?:\s*,\s*\d+)+)\)/g, (full, list: string) => {
+    const keys: string[] = [];
+    for (const part of list.split(',')) {
+      const idx = Number(part.trim());
+      const key = keyAt(idx);
+      if (key) { used.add(idx); keys.push(key); }
+    }
+    if (keys.length === 0) return full;            // all out of range → literal
+    return keys.map(k => `![](${k})`).join(' ');
+  });
+  // Single-index placeholder `![alt](img:N)` → inline image (legacy).
+  resolved = resolved.replace(/!\[([^\]]*)\]\(img:(\d+)\)/g, (full, alt: string, idxStr: string) => {
+    const key = keyAt(Number(idxStr));
+    if (!key) return full;
+    used.add(Number(idxStr));
+    return `![${alt}](${key})`;
+  });
+
+  // Trailing: images never referenced by any placeholder → single full-width,
+  // each on its own line (stacked, legacy behaviour).
+  const trailing = imageKeys.map((k, i) => (used.has(i) ? '' : `![](${k})`)).filter(Boolean).join('\n\n');
+  if (trailing) resolved = resolved ? `${resolved}\n\n${trailing}` : trailing;
+
+  return buildCardBodyElements(resolved, cwd, localHomeLinkMode);
+}
+
 /**
  * Heuristic: does `text` contain markdown syntax that renders badly as plain
  * text in Feishu (code fences, headings, lists, bold, inline code, links,
@@ -238,29 +922,74 @@ export function hasMarkdown(text: string): boolean {
 /**
  * Build a complete Feishu interactive card (schema 2.0) from a markdown
  * body, with the same footer chrome `botmux send` uses: HR + small grey
- * `[botmux](github)` link + optional `发送给：@<owner>` mention.
+ * brand segment + optional `发送给：@<owner>` mention.
  *
  * `recipientOpenId` (when given) renders as `<at id=…></at>` in the
  * footer — typically the session owner. Pass `undefined` to omit the
  * addressing line (e.g. top-level broadcasts have no specific recipient).
+ *
+ * `brand` is the sending bot's configured `brandLabel` (see
+ * {@link brandFooterSegment}): unset → default botmux link, `''` → brand
+ * suppressed, else custom. When brand, usage, and recipient are all absent the
+ * whole footer (HR included) is omitted.
  */
-export function buildMarkdownCard(md: string, recipientOpenId?: string): string {
-  const elements = md ? buildCardBodyElements(md) : [];
-  const footerParts = recipientOpenId ? ['[botmux](https://github.com/deepcoldy/botmux)'] : [];
-  if (recipientOpenId) footerParts.push(`发送给：<at id=${recipientOpenId}></at>`);
-  if (footerParts.length > 0) {
+export function buildMarkdownCard(
+  md: string,
+  recipientOpenId?: string,
+  brand?: string,
+  locale?: Locale,
+  workingDir?: string,
+  localHomeLinkMode: LocalHomeLinkMode = 'filesystem',
+  usage?: CardUsageSnapshot,
+): string {
+  const elements = md ? buildCardBodyElements(md, workingDir, localHomeLinkMode) : [];
+  const footer = buildReplyCardFooter({
+    // Fork contract: an unaddressed reply card must not grow the default
+    // botmux footer merely because `brand` was omitted. Explicit custom brand
+    // values and addressed cards still use the upstream footer renderer.
+    brand: recipientOpenId ? brand : (brand === undefined ? '' : brand),
+    recipientOpenIds: recipientOpenId ? [recipientOpenId] : [],
+    usage,
+    locale,
+  });
+  // No brand, usage, or recipient → no footer at all (skip the orphan HR too).
+  if (footer) {
     elements.push({ tag: 'hr' });
-    elements.push({
-      tag: 'markdown',
-      text_size: 'notation_small_v2',
-      content: `<font color='grey'>${footerParts.join(' · ')}</font>`,
-    });
+    elements.push(footer.element);
   }
   return JSON.stringify({
     schema: '2.0',
     config: { update_multi: true },
     body: { direction: 'vertical', elements },
   });
+}
+
+/** Build the canonical final-answer card. Streaming/progress/session cards
+ * must keep using their existing builders and never call this helper. */
+export function buildCanonicalFinalReplyCard(opts: {
+  markdown: string;
+  feedback?: { policy: FeedbackPolicy };
+  recipientOpenId?: string;
+  brand?: string;
+  locale?: Locale;
+  workingDir?: string;
+  localHomeLinkMode?: LocalHomeLinkMode;
+  usage?: CardUsageSnapshot;
+}): string {
+  const elements = opts.markdown
+    ? buildCardBodyElements(opts.markdown, opts.workingDir, opts.localHomeLinkMode ?? 'filesystem')
+    : [];
+  if (opts.feedback) elements.push(buildFeedbackElement(opts.feedback.policy));
+  const footer = buildReplyCardFooter({
+    brand: opts.recipientOpenId
+      ? opts.brand
+      : (opts.brand === undefined ? '' : opts.brand),
+    recipientOpenIds: opts.recipientOpenId ? [opts.recipientOpenId] : [],
+    usage: opts.usage,
+    locale: opts.locale,
+  });
+  if (footer) elements.push({ tag: 'hr' }, footer.element);
+  return JSON.stringify({ schema: '2.0', config: { update_multi: true }, body: { direction: 'vertical', elements } });
 }
 
 /** Prefix every line with `> ` so Feishu's markdown widget renders it as a
@@ -293,8 +1022,25 @@ export function buildContextualReplyCard(opts: {
   assistantText: string;
   assistantLabel: string;
   recipientOpenId?: string;
+  brand?: string;
+  locale?: Locale;
+  workingDir?: string;
+  localHomeLinkMode?: LocalHomeLinkMode;
+  usage?: CardUsageSnapshot;
+  feedback?: { policy: FeedbackPolicy };
 }): string {
-  const { title, userText, assistantText, assistantLabel, recipientOpenId } = opts;
+  const {
+    title,
+    userText,
+    assistantText,
+    assistantLabel,
+    recipientOpenId,
+    brand,
+    locale,
+    workingDir,
+    localHomeLinkMode = 'filesystem',
+    usage,
+  } = opts;
   const elements: any[] = [];
 
   elements.push({
@@ -307,7 +1053,7 @@ export function buildContextualReplyCard(opts: {
     const u = userText.trim();
     elements.push({
       tag: 'markdown',
-      content: `**👤 你**\n\n${quoteLines(u || '(空)')}`,
+      content: `**👤 ${t('card.you', undefined, locale)}**\n\n${quoteLines(u || t('common.empty_paren', undefined, locale))}`,
     });
   }
 
@@ -318,19 +1064,21 @@ export function buildContextualReplyCard(opts: {
   });
 
   const bodyElements = assistantText.trim()
-    ? buildCardBodyElements(assistantText)
-    : [{ tag: 'markdown', content: '*(空)*' }];
+    ? buildCardBodyElements(assistantText, workingDir, localHomeLinkMode)
+    : [{ tag: 'markdown', content: `*${t('common.empty_paren', undefined, locale)}*` }];
   for (const el of bodyElements) elements.push(el);
 
-  const footerParts = recipientOpenId ? ['[botmux](https://github.com/deepcoldy/botmux)'] : [];
-  if (recipientOpenId) footerParts.push(`发送给：<at id=${recipientOpenId}></at>`);
-  if (footerParts.length > 0) {
+  if (opts.feedback) elements.push(buildFeedbackElement(opts.feedback.policy));
+
+  const footer = buildReplyCardFooter({
+    brand: recipientOpenId ? brand : (brand === undefined ? '' : brand),
+    recipientOpenIds: recipientOpenId ? [recipientOpenId] : [],
+    usage,
+    locale,
+  });
+  if (footer) {
     elements.push({ tag: 'hr' });
-    elements.push({
-      tag: 'markdown',
-      text_size: 'notation_small_v2',
-      content: `<font color='grey'>${footerParts.join(' · ')}</font>`,
-    });
+    elements.push(footer.element);
   }
 
   return JSON.stringify({

@@ -19,23 +19,50 @@
  * Attribution rule:
  *   - mark()           — push a pending turn anchored to Lark fingerprint.
  *   - ingest(events)   —
- *       * 'user' event whose text matches the active FIFO head, or a parked
- *         failed turn retained for late manual Enter, becomes 'started'.
- *       * 'user' event with no match: dropped, OR (adopt-only) synthesised
- *         as a started local turn ahead of any unstarted Lark turn so
- *         emit ordering reflects when the event landed.
- *       * 'assistant_final' event → the currently-collecting turn closes
- *         with finalText set; eligible for emit on the next drain.
- *       * 'turn_aborted' event → the currently-collecting turn is removed
- *         without emit and exposed to the lifecycle coordinator.
- *   - drainEmittable() — parked/unstarted holes do not block ready turns;
- *     ready output is ordered by authoritative transcript start time.
+ *       * 'user' event: first classify it — does it START the head pending
+ *         turn (fingerprint match, not tooOld) or SYNTHESISE a local turn
+ *         (adopt-only)? Only a 'user' event that does one of those triggers
+ *         HOL-block-drop: if a turn is still collecting with no finalText,
+ *         discard it. Codex 0.134.0 type-ahead is an active-turn STEER: a
+ *         queued message typed while a tool-running turn is in flight gets
+ *         pulled into that SAME turn, which emits one merged final (rollout:
+ *         user1 → user2 → assistant_final). The earlier turn never gets its
+ *         own final, so without this drop it sits at the queue head forever
+ *         and wedges drainEmittable(). A 'user' event that neither matches a
+ *         fingerprint nor synthesises a local turn (e.g. the startup
+ *         <environment_context>, or replayed history) is IGNORED and does NOT
+ *         drop the collecting turn — keying HOL-drop off the turn-start
+ *         decision reuses its tooOld/fingerprint freshness as one invariant.
+ *       * terminal event → the currently-collecting turn closes with
+ *         finalText set; an abort uses empty text plus an ambiguous terminal
+ *         outcome so durable delivery settles without inventing a reply.
+ *   - drainEmittable() — pop FIFO any leading turn that is started AND has
+ *     reached either terminal edge.
  */
 import { makeFingerprint, normaliseForFingerprint } from './bridge-turn-queue.js';
 import type { CodexBridgeEvent } from './codex-transcript.js';
 
+const UNMATCHED_REPLAY_WINDOW_MS = 5_000;
+const MAX_BUFFERED_UNMATCHED_EVENTS = 20;
+/** A verified submit may be parked in a type-ahead queue before its transcript
+ *  user event is written. Keep that hand-off busy for a bounded interval: long
+ *  enough for the active turn to finish and dequeue it, but never forever if
+ *  the CLI accepted the keypress without producing a structured event. */
+export const STRUCTURED_SUBMIT_START_GRACE_MS = 20_000;
+/** Maximum time an unconfirmed worker mark may remain at the attribution
+ *  head after the adapter write/verification path stops. This lease never
+ *  contributes to lifecycle busy: it exists only so a late transcript user
+ *  event can still claim the mark without allowing a silent write to wedge
+ *  every later turn forever. */
+export const STRUCTURED_UNCONFIRMED_ATTRIBUTION_GRACE_MS = 20_000;
+/** Maximum time a worker may wait for an adapter/history verification call.
+ *  This covers Codex/CoCo's in-band polling plus the 20s deferred recheck,
+ *  while remaining bounded if an adapter promise or recheck is stranded. */
+export const STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS = 30_000;
+
 export interface CodexPendingTurn {
   turnId: string;
+  dispatchAttempt?: number;
   started: boolean;
   /** A submit that is not yet confirmed. Parked turns keep their fingerprint
    * for a possible late manual Enter, but do not block later active turns. */
@@ -45,11 +72,26 @@ export interface CodexPendingTurn {
    *  the lower bound of the "did `botmux send` happen for this turn?"
    *  window. Optional only for legacy / test-injected turns. */
   markTimeMs?: number;
-  /** Authoritative rollout timestamp of the matching user event. This is the
-   * emit-gate lower bound when a parked turn is revived by a late Enter. */
+  /** Authoritative transcript timestamp of the matching user event. */
   startedAtMs?: number;
+  /** Wall-clock millis when an authoritative adapter/history check confirmed
+   *  the submit. Unverified writes deliberately leave this unset. */
+  submitConfirmedAtMs?: number;
+  /** Wall-clock millis anchoring the bounded attribution-only lease for an
+   *  unconfirmed mark. Unlike verification/confirmation leases, this never
+   *  gates screen-ready or reports the CLI busy. */
+  unconfirmedAttributionStartedAtMs?: number;
+  /** Wall-clock millis when worker-side authoritative submit verification
+   *  began. This closes the race where screen-ready arrives while writeInput
+   *  is still polling history, before it can return `submitted: true`. */
+  submitVerificationStartedAtMs?: number;
   /** Set once an assistant_final event closes this turn. */
   finalText?: string;
+  /** Explicit transcript terminal semantics. Undefined keeps the historical
+   *  assistant-final => completed behaviour. */
+  terminalStatus?: 'completed' | 'failed' | 'ambiguous';
+  terminalErrorCode?: string;
+  terminalErrorSummary?: string;
   /** Set when this turn was synthesised from a user_message that didn't
    *  match any pending Lark fingerprint. Adopt-only. The worker emit path
    *  formats these with both userText and finalText under a "终端本地对话"
@@ -58,6 +100,15 @@ export interface CodexPendingTurn {
   /** For local turns: the user's typed text, surfaced alongside the
    *  assistant reply so the Lark thread sees both sides of the exchange. */
   userText?: string;
+  sourceSessionId?: string;
+  /** True when the turn was delivered via Codex RPC (turn/start) and the
+   *  app-server has acknowledged it. RPC turns have no local transcript to
+   *  ingest, so they can never reach the started state; this flag keeps the
+   *  lifecycle gate asserted for the full server-side execution instead of
+   *  letting the bounded 20s confirmation lease expire mid-turn (which would
+   *  falsely release idle and prune a still-running turn). Cleared by the
+   *  terminal edge or an explicit stop. */
+  rpcActive?: boolean;
 }
 
 export interface CodexAbortedTurn {
@@ -71,10 +122,14 @@ export class CodexBridgeQueue {
   private collecting: CodexPendingTurn | null = null;
   private abortedTurns: CodexAbortedTurn[] = [];
   private localTurnsEnabled = false;
+  private bufferedUnmatched: CodexBridgeEvent[] = [];
+  private lastClosedAssistantFinalTimeMs: number | undefined;
   /** Lower bound (ms) for synthesising local turns — protects against a
    *  fresh-empty attach replaying historical iTerm conversation as
    *  "live" local input. Typically set to the moment adopt was wired up. */
   private localLowerBoundMs = 0;
+
+  constructor(private readonly now: () => number = Date.now) {}
 
   /** Register events as historical without producing pending-turn side
    *  effects. Used at attach time when resume mode wants to swallow prior
@@ -86,9 +141,10 @@ export class CodexBridgeQueue {
   /** Toggle adopt-mode local-turn synthesis. `lowerBoundMs` (typically
    *  Date.now() at adopt-time) protects against a fresh-empty attach
    *  feeding historical user_messages back as "live" local turns. */
-  setLocalTurns(enabled: boolean, lowerBoundMs: number = Date.now()): void {
+  setLocalTurns(enabled: boolean, lowerBoundMs: number = this.now()): void {
     this.localTurnsEnabled = enabled;
     this.localLowerBoundMs = lowerBoundMs;
+    if (enabled) this.bufferedUnmatched = [];
   }
 
   /** Push a pending Lark turn anchored to the message text. The fingerprint
@@ -96,25 +152,29 @@ export class CodexBridgeQueue {
    *  to start this turn. Pre-path-known marking is allowed: the worker can
    *  call this before late-attach has located the rollout file, and the
    *  ingest call after attach will still match correctly. */
-  mark(turnId: string, message: string, markTimeMs: number = Date.now()): void {
+  mark(turnId: string, message: string, markTimeMs: number = this.now(), dispatchAttempt?: number): void {
     this.queue.push({
       turnId,
+      dispatchAttempt,
       started: false,
       contentFingerprint: makeFingerprint(message),
       markTimeMs,
+      unconfirmedAttributionStartedAtMs: markTimeMs,
     });
+    this.replayBufferedUnmatched(markTimeMs);
   }
 
   hasStarted(turnId: string): boolean {
     return this.queue.some(t => t.turnId === turnId && t.started);
   }
 
-  /** Keep a failed/unconfirmed fingerprint available for a late manual Enter
-   * without letting it occupy the active FIFO head. Started turns are already
-   * authoritative transcript evidence and are never parked retroactively. */
+  /** Keep a failed/unconfirmed fingerprint available for a late manual Enter.
+   * A start may win the race with submitted:false handling, so started turns
+   * also retain the bounded failure marker until a terminal or coordinator
+   * eviction settles them. */
   park(turnId: string): boolean {
     const turn = this.queue.find(t => t.turnId === turnId);
-    if (!turn || turn.started) return false;
+    if (!turn) return false;
     turn.parked = true;
     return true;
   }
@@ -134,77 +194,438 @@ export class CodexBridgeQueue {
     const dropped = this.queue.splice(0);
     if (this.collecting && dropped.includes(this.collecting)) this.collecting = null;
     this.abortedTurns = [];
+    this.bufferedUnmatched = [];
+    this.lastClosedAssistantFinalTimeMs = undefined;
     return dropped;
   }
 
+  /** Remove one exact worker delivery attempt. Submit-confirmation cleanup is
+   *  pre-start-only by default: once the transcript has started a turn, only a
+   *  structured terminal may retire it. An authoritative failed/ambiguous
+   *  terminal may opt into removing a started attempt via `allowStarted`.
+   *  Matching dispatchAttempt keeps a replay of the same turnId isolated from
+   *  the retired delivery attempt. */
+  dropPendingTurn(
+    turnId: string,
+    dispatchAttempt?: number,
+    allowStarted = false,
+  ): CodexPendingTurn | null {
+    const index = this.queue.findIndex(turn =>
+      turn.turnId === turnId
+      && turn.dispatchAttempt === dispatchAttempt
+      && (allowStarted || !turn.started),
+    );
+    if (index < 0) return null;
+    const [dropped] = this.queue.splice(index, 1);
+    if (this.collecting === dropped) this.collecting = null;
+    if (allowStarted) this.refreshNextPreStartLease();
+    // A later turn's user event can already be buffered behind this failed
+    // head mark: ingestOne only matches the first unstarted fingerprint. Once
+    // the failed head is gone, replay recent events against the new head or it
+    // can remain unstarted forever and wedge fallback delivery.
+    const next = this.queue.find(turn => !turn.started);
+    if (next?.markTimeMs !== undefined) this.replayBufferedUnmatched(next.markTimeMs);
+    return dropped ?? null;
+  }
+
+  /** Remove expired pre-start queue heads that never reached transcript
+   *  start, whether positively confirmed or only retained for attribution.
+   *  Only the first unresolved fingerprint(s) are eligible, and never
+   *  while an earlier started turn is still running: that predecessor's final
+   *  is the dequeue boundary that refreshes the next legitimate type-ahead
+   *  lease. Dropping a stale head replays buffered events immediately, so a
+   *  later real turn can become started instead of remaining hidden behind a
+   *  dead fingerprint. */
+  pruneExpiredPreStartHeads(nowMs: number = this.now()): CodexPendingTurn[] {
+    const dropped: CodexPendingTurn[] = [];
+    for (;;) {
+      // A long-running predecessor legitimately keeps later confirmed input in
+      // the CLI's type-ahead queue. Its assistant_final refreshes the next head
+      // from local observation time, so expiring anything before that boundary
+      // would drop valid queued work.
+      if (this.queue.some(turn => turn.started && turn.finalText === undefined)) break;
+
+      const head = this.queue.find(turn => !turn.started && turn.finalText === undefined);
+      if (!head) break;
+
+      // An RPC turn is running server-side with no local transcript to ingest.
+      // It can never reach started, so the bounded lease must NOT be used to
+      // prune it — that would falsely release idle while the app-server is still
+      // executing. Keep it until the terminal edge or explicit stop.
+      if (head.rpcActive) break;
+
+      // An authoritative adapter/history check can legitimately outlive the
+      // shorter attribution lease. Do not prune under that in-flight await;
+      // once it finishes, finishSubmitVerification refreshes attribution from
+      // local observation time, and once this bounded verification lease
+      // expires the old mark becomes eligible again.
+      const verificationActive = head.submitVerificationStartedAtMs !== undefined
+        && nowMs - head.submitVerificationStartedAtMs <= STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS;
+      if (verificationActive) break;
+
+      const leaseStartedAtMs = head.submitConfirmedAtMs
+        ?? head.unconfirmedAttributionStartedAtMs;
+      if (leaseStartedAtMs === undefined) break;
+      const leaseGraceMs = head.submitConfirmedAtMs !== undefined
+        ? STRUCTURED_SUBMIT_START_GRACE_MS
+        : STRUCTURED_UNCONFIRMED_ATTRIBUTION_GRACE_MS;
+      if (nowMs - leaseStartedAtMs <= leaseGraceMs) break;
+
+      const removed = this.dropPendingTurn(head.turnId, head.dispatchAttempt);
+      if (!removed) break;
+      dropped.push(removed);
+      // dropPendingTurn replays buffered user/final events. If that starts the
+      // next real turn, the started-turn guard above stops the loop.
+    }
+    return dropped;
+  }
+
+  /** Record positive submit evidence from an adapter/history check. The turn
+   *  can still be waiting in the CLI's type-ahead queue, so this starts a
+   *  bounded hand-off lease until its transcript user event appears. */
+  confirmPendingTurn(
+    turnId: string,
+    confirmedAtMs: number = this.now(),
+    dispatchAttempt?: number,
+  ): boolean {
+    const turn = this.queue.find(candidate => candidate.turnId === turnId
+      && candidate.dispatchAttempt === dispatchAttempt
+      && candidate.finalText === undefined);
+    if (!turn) return false;
+    turn.submitVerificationStartedAtMs = undefined;
+    turn.unconfirmedAttributionStartedAtMs = undefined;
+    turn.submitConfirmedAtMs = confirmedAtMs;
+    return true;
+  }
+
+  /** Mark a turn as actively running server-side via Codex RPC. The app-server
+   *  ack for turn/start is authoritative confirmation that execution has begun,
+   *  but no local transcript event will follow to flip started. This flag keeps
+   *  the lifecycle gate asserted and protects the turn from lease expiry pruning
+   *  until the terminal edge (or an explicit stop) clears it. */
+  markRpcActive(turnId: string, dispatchAttempt?: number): boolean {
+    const turn = this.queue.find(candidate => candidate.turnId === turnId
+      && candidate.dispatchAttempt === dispatchAttempt
+      && candidate.finalText === undefined);
+    if (!turn) return false;
+    turn.rpcActive = true;
+    turn.submitVerificationStartedAtMs = undefined;
+    turn.unconfirmedAttributionStartedAtMs = undefined;
+    turn.submitConfirmedAtMs = undefined;
+    return true;
+  }
+
+  /** Clear the server-side active flag when an RPC turn reaches a terminal edge
+   *  or is otherwise retired. Without this, a completed RPC turn would keep the
+   *  lifecycle gate asserted forever (permanent false-busy). */
+  stopRpcActive(turnId: string, dispatchAttempt?: number): boolean {
+    const turn = this.queue.find(candidate => candidate.turnId === turnId
+      && candidate.dispatchAttempt === dispatchAttempt);
+    if (!turn || !turn.rpcActive) return false;
+    turn.rpcActive = undefined;
+    return true;
+  }
+
+  /** Start bounded adapter/history verification before awaiting writeInput. */
+  beginSubmitVerification(
+    turnId: string,
+    startedAtMs: number = this.now(),
+    dispatchAttempt?: number,
+  ): boolean {
+    const turn = this.queue.find(candidate => candidate.turnId === turnId
+      && candidate.dispatchAttempt === dispatchAttempt
+      && candidate.finalText === undefined);
+    if (!turn) return false;
+    turn.submitVerificationStartedAtMs = startedAtMs;
+    return true;
+  }
+
+  /** Finish verification without positive submit evidence. A bare mark remains
+   *  available for transcript attribution but no longer gates screen-ready. */
+  finishSubmitVerification(
+    turnId: string,
+    finishedAtMs: number = this.now(),
+    dispatchAttempt?: number,
+  ): boolean {
+    const turn = this.queue.find(candidate => candidate.turnId === turnId
+      && candidate.dispatchAttempt === dispatchAttempt);
+    if (!turn || turn.submitVerificationStartedAtMs === undefined) return false;
+    turn.submitVerificationStartedAtMs = undefined;
+    if (!turn.started && turn.submitConfirmedAtMs === undefined) {
+      turn.unconfirmedAttributionStartedAtMs = finishedAtMs;
+    }
+    return true;
+  }
+
+  /** Exact-attempt existence check for deferred callbacks. A replay reuses
+   *  turnId with a higher dispatchAttempt, so an old timer must treat that as
+   *  a missing target rather than mutating the new delivery generation. */
+  hasPendingTurn(turnId: string, dispatchAttempt?: number): boolean {
+    return this.queue.some(candidate => candidate.turnId === turnId
+      && candidate.dispatchAttempt === dispatchAttempt
+      && candidate.finalText === undefined);
+  }
+
+  /** True when buffered transcript replay has already closed this exact turn
+   *  before its RPC turn/start continuation installs rpcActive. */
+  hasTerminalTurn(turnId: string, dispatchAttempt?: number): boolean {
+    return this.queue.some(candidate => candidate.turnId === turnId
+      && candidate.dispatchAttempt === dispatchAttempt
+      && candidate.finalText !== undefined);
+  }
+
+  /** True while the transcript proves a turn is running, or while a verified
+   *  submit is in the bounded pre-start hand-off window. A bare worker mark is
+   *  never authoritative, preventing a dropped Enter from causing permanent
+   *  false-busy. */
+  hasBlockingTurn(nowMs: number = this.now()): boolean {
+    return this.queue.some(turn => {
+      if (turn.finalText !== undefined) return false;
+      if (turn.started) return true;
+      if (turn.rpcActive) return true;
+      const confirmed = turn.submitConfirmedAtMs !== undefined
+        && nowMs - turn.submitConfirmedAtMs <= STRUCTURED_SUBMIT_START_GRACE_MS;
+      const verifying = turn.submitVerificationStartedAtMs !== undefined
+        && nowMs - turn.submitVerificationStartedAtMs <= STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS;
+      return confirmed || verifying;
+    });
+  }
+
+  /** Remaining bounded pre-start verification/confirmation lease. The worker
+   *  uses this to re-drive a previously rejected ready signal once every active
+   *  lease expires. Started turns return undefined because their eventual
+   *  assistant_final is the authoritative re-drive. */
+  preStartLeaseRemainingMs(nowMs: number = this.now()): number | undefined {
+    if (this.queue.some(turn => (turn.started || turn.rpcActive) && turn.finalText === undefined)) return undefined;
+    const activeRemaining = this.queue.flatMap(candidate => {
+      if (candidate.started || candidate.finalText !== undefined) return [];
+      const leases: number[] = [];
+      if (candidate.submitConfirmedAtMs !== undefined) {
+        leases.push(STRUCTURED_SUBMIT_START_GRACE_MS - (nowMs - candidate.submitConfirmedAtMs));
+      }
+      if (candidate.submitVerificationStartedAtMs !== undefined) {
+        leases.push(STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS - (nowMs - candidate.submitVerificationStartedAtMs));
+      }
+      return leases.filter(remaining => remaining >= 0);
+    });
+    return activeRemaining.length > 0 ? Math.max(...activeRemaining) : undefined;
+  }
   /** Process newly-appended events. Idempotent on uuid: events with seen
    *  uuids are skipped, so callers can replay safely. */
   ingest(events: CodexBridgeEvent[]): void {
     for (const ev of events) {
       if (!ev.uuid || this.seen.has(ev.uuid)) continue;
       this.seen.add(ev.uuid);
-      if (ev.kind === 'user') {
-        const matches = (turn: CodexPendingTurn): boolean => {
-          const tooOld = turn.markTimeMs !== undefined && ev.timestampMs < turn.markTimeMs - 5_000;
-          if (tooOld) return false;
-          if (!turn.contentFingerprint) return true;
-          return normaliseForFingerprint(ev.text).includes(turn.contentFingerprint);
-        };
-        // Preserve strict FIFO among active submits. Only parked fingerprints
-        // may be searched out of order: they are definitive/unconfirmed
-        // failures retained solely so a later manual Enter can be attributed.
-        const active = this.queue.find(t => !t.started && !t.parked);
-        const parked = this.queue.find(t => !t.started && t.parked && matches(t));
-        const next = active && matches(active) ? active : parked;
-        let consumedNext = false;
-        if (next) {
-          next.started = true;
-          next.parked = false;
-          next.startedAtMs = ev.timestampMs;
-          this.collecting = next;
-          consumedNext = true;
-        }
-        if (!consumedNext && this.localTurnsEnabled && ev.timestampMs >= this.localLowerBoundMs - 5_000) {
-          // Adopt mode local input: user typed in iTerm, no Lark
-          // fingerprint match. Synthesise a local turn so the assistant
-          // reply still reaches Lark. Insert AHEAD of any unstarted Lark
-          // turn so emit order matches when the event hit the transcript.
-          const localTurn: CodexPendingTurn = {
-            turnId: `codex-local-${ev.uuid}`,
-            started: true,
-            isLocal: true,
-            userText: ev.text,
-            markTimeMs: ev.timestampMs,
-          };
-          const insertAt = this.queue.findIndex(t => !t.started);
-          if (insertAt === -1) this.queue.push(localTurn);
-          else this.queue.splice(insertAt, 0, localTurn);
-          this.collecting = localTurn;
-        }
-      } else if (ev.kind === 'assistant_final') {
-        if (this.collecting) {
-          this.collecting.finalText = ev.text;
-          this.collecting = null;
-        }
-      } else if (ev.kind === 'turn_aborted') {
-        if (this.collecting) {
-          const aborted = this.collecting;
-          this.drop(aborted.turnId);
-          this.abortedTurns.push({ turnId: aborted.turnId, reason: ev.text || 'turn_aborted' });
-        }
-      }
+      this.ingestOne(ev, true);
     }
   }
 
-  /** Consume transcript-backed abort terminals after attribution has already
-   * removed them from the active queue. The worker forwards these to the
-   * lifecycle coordinator so batch files stay retained and ordinary failure
-   * records receive a visible, bounded terminal transition. */
-  drainAbortedTurns(): CodexAbortedTurn[] {
-    return this.abortedTurns.splice(0);
+  private replayBufferedUnmatched(markTimeMs: number): void {
+    if (this.bufferedUnmatched.length === 0) return;
+    const replay = this.bufferedUnmatched.filter(ev => ev.timestampMs >= markTimeMs - UNMATCHED_REPLAY_WINDOW_MS);
+    this.bufferedUnmatched = [];
+    // Keep still-unmatched events buffered: more than one failed head can sit
+    // ahead of the successful turn. Each drop gets another chance to replay
+    // the same bounded event set against the new head.
+    for (const ev of replay) this.ingestOne(ev, true);
   }
 
-  /** Pop ready turns without letting parked/unstarted holes block them. */
+  private rememberUnmatched(ev: CodexBridgeEvent): void {
+    this.bufferedUnmatched.push(ev);
+    if (this.bufferedUnmatched.length > MAX_BUFFERED_UNMATCHED_EVENTS) {
+      this.bufferedUnmatched.splice(0, this.bufferedUnmatched.length - MAX_BUFFERED_UNMATCHED_EVENTS);
+    }
+  }
+
+  /** Refresh the next queued submit from the locally-observed terminal edge.
+   *  External transcript clocks may be skewed, so lease boundedness must use
+   *  this process's clock for both successful and aborted predecessors. */
+  private refreshNextPreStartLease(): void {
+    const nextPending = this.queue.find(turn => !turn.started
+      && turn.finalText === undefined);
+    if (!nextPending) return;
+    // RPC turns keep their own rpcActive flag for lifecycle gating; do not
+    // overwrite it with a bounded confirmation/attribution lease.
+    if (nextPending.rpcActive) return;
+    const observedAtMs = this.now();
+    if (nextPending.submitConfirmedAtMs !== undefined) {
+      nextPending.submitConfirmedAtMs = observedAtMs;
+    } else {
+      nextPending.unconfirmedAttributionStartedAtMs = observedAtMs;
+    }
+  }
+
+  private ingestOne(ev: CodexBridgeEvent, bufferUnmatched: boolean): void {
+    if (ev.kind === 'user') {
+      // First decide whether this user event is a REAL turn-start: either it
+      // matches the head pending Lark turn's fingerprint (and isn't tooOld),
+      // or — in adopt mode — it synthesises a local turn. Both the HOL-drop
+      // and the actual start key off this decision.
+      const matches = (turn: CodexPendingTurn): boolean => {
+        const tooOld = turn.markTimeMs !== undefined
+          && ev.timestampMs < turn.markTimeMs - UNMATCHED_REPLAY_WINDOW_MS;
+        if (tooOld) return false;
+        if (!turn.contentFingerprint) return true;
+        return normaliseForFingerprint(ev.text).includes(turn.contentFingerprint);
+      };
+      // Preserve strict FIFO among active submits. A parked fingerprint is a
+      // bounded failed-submit fallback and may be matched out of order only
+      // when the first active turn does not match this transcript row.
+      const active = this.queue.find(t => !t.started && !t.parked);
+      const parked = this.queue.find(t => !t.started && t.parked && matches(t));
+      const next = active && matches(active) ? active : parked;
+      const willStartNext = next !== undefined;
+      const willSynthLocal = !willStartNext && this.localTurnsEnabled && ev.timestampMs >= this.localLowerBoundMs - UNMATCHED_REPLAY_WINDOW_MS;
+
+      // HOL-block drop (codex 0.134.0 active-turn steer): when a real new
+      // turn-start arrives while a turn is still collecting with no finalText,
+      // codex steered/merged this input into the active turn — it processes
+      // both as ONE turn and emits a single combined assistant_final, so the
+      // collecting turn will NEVER get its own final. Drop it now, otherwise
+      // it sits at the queue head forever and `drainEmittable()` wedges
+      // (started, no finalText → breaks the FIFO scan). Gating on "is a real
+      // turn-start" reuses the tooOld/fingerprint freshness already proven for
+      // turn-start, so the same 5s-skew invariant applies to both: a replayed
+      // historical user event is tooOld → won't start a turn → won't evict a
+      // live collecting turn; and a non-matching stray user event (non-adopt)
+      // is ignored rather than treated as a turn boundary. Mirrors Claude's
+      // BridgeTurnQueue.handleTurnStart HOL drop (which keys off "no assistant
+      // text yet" — the streaming-transcript equivalent of "no finalText").
+      if ((willStartNext || willSynthLocal) && this.collecting && this.collecting.finalText === undefined) {
+        // A bounded submit-failure record is deliberately retained: it may be
+        // a late/manual Enter and must not be silently classified as consumed.
+        // Detach collection so the real successor can start, but let the
+        // coordinator's TTL/count cap retire the failed predecessor. Healthy
+        // active-turn steering keeps master's immediate HOL-drop behavior.
+        if (!this.collecting.parked) {
+          const idx = this.queue.indexOf(this.collecting);
+          if (idx >= 0) this.queue.splice(idx, 1);
+        }
+        this.collecting = null;
+      }
+
+      if (willStartNext) {
+        next!.started = true;
+        next!.startedAtMs = ev.timestampMs;
+        next!.submitVerificationStartedAtMs = undefined;
+        next!.unconfirmedAttributionStartedAtMs = undefined;
+        next!.sourceSessionId = ev.sourceSessionId;
+        // Anchor the bridge-fallback suppression window to when the turn
+        // ACTUALLY started processing (the transcript user event's
+        // timestamp), not when the worker marked it. With type-ahead the
+        // worker marks turn N+1 immediately after turn N (both at flush
+        // time), but CoCo only writes turn N+1's user event when it
+        // dequeues it — i.e. after turn N's assistant_final. Without this
+        // override the [markTimeMs, nextTurn.markTimeMs) windows are all
+        // bunched at flush time, so turn N's own `botmux send` (which
+        // lands seconds later, after the model replies) falls OUTSIDE its
+        // own window and the fallback isn't suppressed → duplicate emit.
+        // `max` (not bare assignment) keeps the lower bound from ever
+        // moving backwards: a dequeue event can only be at or after the
+        // mark, and the -5s tooOld tolerance must not be able to widen the
+        // window into a previous turn's sends. Mirrors what Claude's
+        // BridgeTurnQueue.handleTurnStart does with eventTimeMs.
+        //
+        // Hermes is the exception: its SQLite message timestamps can be
+        // committed near turn completion, after in-turn `botmux send` markers
+        // have already landed. Preserve the original worker mark so those
+        // markers stay inside the bridge-fallback suppression window. For
+        // adjacent queued Hermes turns, still advance the next turn to at
+        // least the previous assistant final so batch-drain boundaries don't
+        // collapse to back-to-back enqueue times.
+        if (next!.markTimeMs === undefined) {
+          next!.markTimeMs = ev.preserveMarkTimeMs === true && this.lastClosedAssistantFinalTimeMs !== undefined
+            ? this.lastClosedAssistantFinalTimeMs
+            : ev.timestampMs;
+        } else if (ev.preserveMarkTimeMs === true) {
+          if (this.lastClosedAssistantFinalTimeMs !== undefined) {
+            next!.markTimeMs = Math.max(next!.markTimeMs, this.lastClosedAssistantFinalTimeMs);
+          }
+        } else {
+          next!.markTimeMs = Math.max(next!.markTimeMs, ev.timestampMs);
+        }
+        this.collecting = next!;
+      } else if (willSynthLocal) {
+        // Adopt mode local input: user typed in iTerm, no Lark
+        // fingerprint match. Synthesise a local turn so the assistant
+        // reply still reaches Lark. Insert AHEAD of any unstarted Lark
+        // turn so emit order matches when the event hit the transcript.
+        const localTurn: CodexPendingTurn = {
+          turnId: `codex-local-${ev.uuid}`,
+          started: true,
+          isLocal: true,
+          userText: ev.text,
+          markTimeMs: ev.timestampMs,
+          startedAtMs: ev.timestampMs,
+          sourceSessionId: ev.sourceSessionId,
+        };
+        const insertAt = this.queue.findIndex(t => !t.started);
+        if (insertAt === -1) this.queue.push(localTurn);
+        else this.queue.splice(insertAt, 0, localTurn);
+        this.collecting = localTurn;
+      } else if (bufferUnmatched && !this.localTurnsEnabled) {
+        // Cursor can write the Lark/user line to JSONL before the daemon IPC
+        // that marks the turn reaches this worker. Keep a tiny recent buffer
+        // so mark() can replay it instead of losing the line to `seen`.
+        this.rememberUnmatched(ev);
+      }
+    } else if (ev.kind === 'assistant_final') {
+      if (this.collecting) {
+        if (this.collecting.sourceSessionId && ev.sourceSessionId && this.collecting.sourceSessionId !== ev.sourceSessionId) return;
+        this.collecting.finalText = ev.text;
+        this.collecting.terminalStatus = ev.terminalStatus;
+        this.collecting.terminalErrorCode = ev.terminalErrorCode;
+        this.collecting.terminalErrorSummary = ev.terminalErrorSummary;
+        this.lastClosedAssistantFinalTimeMs = ev.timestampMs;
+        this.collecting = null;
+        // CoCo-style type-ahead writes the next user event only after this
+        // final dequeues it. Refresh the next turn's pre-start lease at that
+        // hand-off boundary instead of letting either its confirmed lease or
+        // attribution-only lease expire while the predecessor was legitimately
+        // running.
+        this.refreshNextPreStartLease();
+      } else if (bufferUnmatched && !this.localTurnsEnabled) {
+        this.rememberUnmatched(ev);
+      }
+    } else if (ev.kind === 'turn_aborted') {
+      if (!this.collecting) {
+        if (bufferUnmatched && !this.localTurnsEnabled) this.rememberUnmatched(ev);
+        return;
+      }
+      if (this.collecting.sourceSessionId && ev.sourceSessionId && this.collecting.sourceSessionId !== ev.sourceSessionId) return;
+      // Interrupted Codex turns have no assistant_final. Close with empty text
+      // so the worker skips final_output but still publishes the authoritative
+      // exact-attempt turn_terminal required by reliable durable delivery.
+      // Side effects may already have happened, so mirror TRAE-X and classify
+      // an otherwise-untyped abort as ambiguous rather than completed/failed.
+      this.collecting.finalText = '';
+      this.collecting.terminalStatus = ev.terminalStatus ?? 'ambiguous';
+      this.collecting.terminalErrorCode = ev.terminalErrorCode ?? 'structured_turn_aborted';
+      this.abortedTurns.push({
+        turnId: this.collecting.turnId,
+        reason: ev.text || 'turn_aborted',
+      });
+      this.collecting = null;
+      this.lastClosedAssistantFinalTimeMs = ev.timestampMs;
+      this.refreshNextPreStartLease();
+    }
+  }
+
+  /** Consume transcript-backed abort terminals for the fork's batch/ordinary
+   *  failure coordinator. Removing the exact attempt here prevents it from
+   *  being mistaken for a completed empty reply; callers retain the batch
+   *  descriptor and surface the bounded no-resend warning instead. */
+  drainAbortedTurns(): CodexAbortedTurn[] {
+    const aborted = this.abortedTurns.splice(0);
+    for (const event of aborted) this.drop(event.turnId);
+    return aborted;
+  }
+
+  /** Pop terminal turns in attribution order. A parked unstarted fingerprint
+   *  is only a late-Enter candidate and may be skipped; once it actually
+   *  starts, a missing terminal remains a fail-closed blocker until the
+   *  coordinator's bounded TTL/count eviction removes it. Empty final text is
+   *  still an authoritative terminal edge. */
   drainEmittable(): CodexPendingTurn[] {
     const out: CodexPendingTurn[] = [];
     let index = 0;
@@ -214,7 +635,7 @@ export class CodexBridgeQueue {
         index += 1;
         continue;
       }
-      if (!turn.started || !turn.finalText) break;
+      if (!turn.started || turn.finalText === undefined) break;
       this.queue.splice(index, 1);
       if (this.collecting === turn) this.collecting = null;
       out.push(turn);
@@ -232,4 +653,25 @@ export class CodexBridgeQueue {
   peek(): readonly CodexPendingTurn[] {
     return this.queue;
   }
+}
+
+/** Explicit mutation boundary for lease expiry. Pruning can replay a buffered
+ *  successor user+final pair, so callers must drain/emit in the same call
+ *  stack; keeping that invariant here prevents a status/query path from
+ *  silently creating an unconsumed completion. */
+export function pruneExpiredPreStartHeadsAndEmit(
+  queue: CodexBridgeQueue,
+  emitReady: () => void,
+  nowMs?: number,
+  /** Settle exact durable attempts before a replayed successor is emitted.
+   *  The queue removal can expose buffered successor user/final events, so
+   *  running this after emitReady would publish N+1 ahead of N's terminal. */
+  onDropped?: (dropped: readonly CodexPendingTurn[]) => void,
+): CodexPendingTurn[] {
+  const dropped = queue.pruneExpiredPreStartHeads(nowMs);
+  if (dropped.length > 0) {
+    onDropped?.(dropped);
+    emitReady();
+  }
+  return dropped;
 }

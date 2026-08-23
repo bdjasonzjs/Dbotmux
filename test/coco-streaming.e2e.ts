@@ -49,6 +49,8 @@ interface PtySession {
 function spawnCoco(args: string[], cwd = '/tmp'): PtySession {
   const bin = resolveCommand('coco');
   const chunks: { time: number; raw: string }[] = [];
+  let trustHandled = false;
+  let startupTail = '';
   const proc = pty.spawn(bin, args, {
     name: 'xterm-256color',
     cols: 300,
@@ -56,7 +58,15 @@ function spawnCoco(args: string[], cwd = '/tmp'): PtySession {
     cwd,
     env: { ...process.env } as Record<string, string>,
   });
-  proc.onData(data => chunks.push({ time: Date.now(), raw: data }));
+  proc.onData(data => {
+    chunks.push({ time: Date.now(), raw: data });
+    if (trustHandled) return;
+    startupTail = stripAnsi(startupTail + data).slice(-2_000);
+    if (/Yes, I trust this folder|Yes, continue/.test(startupTail)) {
+      trustHandled = true;
+      proc.write('\r');
+    }
+  });
   return {
     proc,
     chunks,
@@ -71,7 +81,7 @@ function spawnCoco(args: string[], cwd = '/tmp'): PtySession {
 // ─── Regexes from terminal-renderer.ts (for diagnostic analysis) ─────────────
 
 const OUTPUT_MARKER_RE = /^[●·⎿✓⚠★☐☑⏵✽✻]|^\s+⎿/;
-const STATUS_BAR_RE = /bypass permissions|⏵⏵|shift\+tab|\/model|auto-update|agent full mode|IDE: \w+/;
+const STATUS_BAR_RE = /bypass permissions|⏵⏵|\d+% left|shift\+tab|\/model|auto-update|agent full mode|IDE: \w+/;
 const BARE_PROMPT_RE = /^[❯>]\s*$/;
 const INPUT_ECHO_RE = /^[❯>]\s+\S/;
 const LOGO_RE = /[▐▛█▜▝▘]{2,}/;

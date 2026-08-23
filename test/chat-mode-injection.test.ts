@@ -6,7 +6,11 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 
-vi.mock('node:child_process', () => ({ execSync: vi.fn(() => ''), execFileSync: vi.fn(() => '') }));
+vi.mock('node:child_process', async (importOriginal) => ({
+  ...await importOriginal<typeof import('node:child_process')>(),
+  execSync: vi.fn(() => ''),
+  execFileSync: vi.fn(() => ''),
+}));
 vi.mock('node:fs', async () => { const memfs = await import('memfs'); return memfs.fs; });
 vi.mock('../src/config.js', () => ({
   config: {

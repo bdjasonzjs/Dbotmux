@@ -19,6 +19,11 @@ vi.mock('../src/services/base-relay.js', () => ({
 vi.mock('../src/utils/logger.js', () => ({
   logger: { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn(), isDebug: () => false },
 }));
+vi.mock('../src/services/subtask-parent-orchestrator.js', () => ({
+  resolveParentOrchestrator: vi.fn(() => ({
+    name: '克劳德', openId: 'ou_claude', larkAppId: 'app_claude', source: 'legacy_claude_fallback',
+  })),
+}));
 
 import { makeDispatchExecutors, safeText, parentToChildSummon, MAX_SUMMON_BUDGET } from '../src/services/outbox-dispatcher-executors.js';
 import type { OutboxCommand, SubTask } from '../src/services/subtask-store.js';

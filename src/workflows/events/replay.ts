@@ -1,3 +1,9 @@
+/**
+ * Frozen v2 event projector retained only for migration/archive verification.
+ * It must remain byte-semantics compatible with historical events.ndjson, but
+ * it is no longer an execution or recovery entrypoint.
+ */
+
 import type {
   ActivityCanceledEvent,
   ActivityFailedEvent,
@@ -13,6 +19,10 @@ import type {
   ConditionEvaluatedEvent,
   EffectAttemptedEvent,
   LeaseSignedEvent,
+  LoopFinishedEvent,
+  LoopIterationFinishedEvent,
+  LoopIterationStartedEvent,
+  LoopStartedEvent,
   NodeCanceledEvent,
   NodeFailedEvent,
   NodeRetryingEvent,
@@ -33,6 +43,7 @@ import type {
 } from './types.js';
 import type { WorkflowEvent } from './schema.js';
 import type { ErrorClass, ErrorPayload, OutputRef } from './payloads.js';
+import { workActivityId } from '../migration/v2-read-only-ids.js';
 
 // ─── State shapes ───────────────────────────────────────────────────────────
 
@@ -217,14 +228,38 @@ export type RunState = {
       cliId?: string;
       displayName?: string;
       workingDir?: string;
+      cliPathOverride?: string;
     }
   >;
+};
+
+export type LoopIterationState = {
+  iteration: number;
+  status: 'running' | 'approved' | 'rejected' | 'failed' | 'cancelled';
+  bodyActivityIds: string[];
+  decisionActivityId?: string;
+  waitResolvedEventId?: string;
+  decisionBy?: string;
+  decisionComment?: string;
+  timedOut?: boolean;
+};
+
+export type LoopState = {
+  loopId: string;
+  status: 'running' | 'succeeded' | 'failed' | 'cancelled';
+  iteration: number;
+  maxIterations: number;
+  iterations: LoopIterationState[];
+  output?: OutputRef;
+  errorCode?: string;
+  errorClass?: ErrorClass;
 };
 
 export type Snapshot = {
   run: RunState;
   nodes: Map<string, NodeState>;
   activities: Map<string, ActivityState>;
+  loops: Map<string, LoopState>;
   /** Convenience: terminal outputs by activityId (succeeded events only). */
   outputs: Map<string, OutputRef>;
   /** Last seq seen.  0 if the log is empty. */
@@ -328,6 +363,7 @@ export function replay(events: WorkflowEvent[]): Snapshot {
   const run: RunState = { runId, status: 'pending' };
   const nodes = new Map<string, NodeState>();
   const activities = new Map<string, ActivityState>();
+  const loops = new Map<string, LoopState>();
   const outputs = new Map<string, OutputRef>();
   // Wait tracking: activityId -> resolved (true if waitResolved/Deadline seen)
   const waitsOpen = new Set<string>();
@@ -362,6 +398,31 @@ export function replay(events: WorkflowEvent[]): Snapshot {
 
   function currentAttempt(a: ActivityState): AttemptState | undefined {
     return a.attempts.find((at) => at.attemptId === a.currentAttemptId);
+  }
+
+  function getLoop(loopId: string): LoopState {
+    let loop = loops.get(loopId);
+    if (!loop) {
+      loop = {
+        loopId,
+        status: 'running',
+        iteration: 0,
+        maxIterations: 0,
+        iterations: [],
+      };
+      loops.set(loopId, loop);
+    }
+    return loop;
+  }
+
+  function getLoopIteration(loop: LoopState, iteration: number): LoopIterationState {
+    let it = loop.iterations.find((candidate) => candidate.iteration === iteration);
+    if (!it) {
+      it = { iteration, status: 'running', bodyActivityIds: [] };
+      loop.iterations.push(it);
+      loop.iterations.sort((a, b) => a.iteration - b.iteration);
+    }
+    return it;
   }
 
   for (const e of events) {
@@ -468,6 +529,74 @@ export function replay(events: WorkflowEvent[]): Snapshot {
         break;
       }
 
+      // ─── Loop lifecycle ─────────────────────────────────────────────
+      case 'loopStarted': {
+        const p = (e as LoopStartedEvent).payload as LoopStartedEvent['payload'];
+        if (!('ref' in p)) {
+          const loop = getLoop(p.loopId);
+          loop.status = 'running';
+          loop.maxIterations = p.maxIterations;
+        }
+        break;
+      }
+      case 'loopIterationStarted': {
+        const p = (e as LoopIterationStartedEvent).payload as LoopIterationStartedEvent['payload'];
+        if (!('ref' in p)) {
+          const loop = getLoop(p.loopId);
+          loop.status = 'running';
+          loop.iteration = p.iteration;
+          const it = getLoopIteration(loop, p.iteration);
+          it.status = 'running';
+        }
+        break;
+      }
+      case 'loopIterationFinished': {
+        const p = (e as LoopIterationFinishedEvent).payload as LoopIterationFinishedEvent['payload'];
+        if (!('ref' in p)) {
+          const loop = getLoop(p.loopId);
+          loop.iteration = Math.max(loop.iteration, p.iteration);
+          const it = getLoopIteration(loop, p.iteration);
+          it.status = p.resolution;
+          it.decisionActivityId = p.decisionActivityId;
+          it.waitResolvedEventId = p.waitResolvedEventId;
+          it.decisionBy = p.by;
+          it.decisionComment = p.comment;
+          it.timedOut = p.timedOut;
+        }
+        break;
+      }
+      case 'loopFinished': {
+        const p = (e as LoopFinishedEvent).payload as LoopFinishedEvent['payload'];
+        if (!('ref' in p)) {
+          const loop = getLoop(p.loopId);
+          loop.iteration = p.finalIteration;
+          loop.status =
+            p.resolution === 'approved'
+              ? 'succeeded'
+              : p.resolution === 'cancelled'
+                ? 'cancelled'
+                : 'failed'; // body-failed / timeout / max-iterations-exceeded
+          loop.output = p.outputRef;
+          loop.errorCode = p.errorCode;
+          loop.errorClass = p.errorClass;
+          if (p.outputRef) {
+            outputs.set(workActivityId(runId, p.loopId), p.outputRef);
+          }
+          // Close any still-running iteration so the dashboard / ops
+          // surface doesn't display the loop as "failed but iteration
+          // X is somehow still running" (codex Step 3 review Medium —
+          // /tmp/wf-loop-v02.md §10.8 design compromise resolved).
+          if (loop.status !== 'succeeded') {
+            const inflight = loop.iterations.find((it) => it.status === 'running');
+            if (inflight) {
+              inflight.status =
+                p.resolution === 'cancelled' ? 'cancelled' : 'failed';
+            }
+          }
+        }
+        break;
+      }
+
       // ─── Scheduling ─────────────────────────────────────────────────
       case 'conditionEvaluated': {
         const p = (e as ConditionEvaluatedEvent).payload as ConditionEvaluatedEvent['payload'];
@@ -492,6 +621,14 @@ export function replay(events: WorkflowEvent[]): Snapshot {
           });
           a.currentAttemptId = p.attemptId;
           a.status = 'pending';
+          for (const loop of loops.values()) {
+            const it = loop.iterations.find((candidate) => candidate.iteration === loop.iteration);
+            if (!it) continue;
+            if (!p.activityId.includes(`::loop::${loop.loopId}.${it.iteration}::`)) continue;
+            if (!it.bodyActivityIds.includes(p.activityId)) {
+              it.bodyActivityIds.push(p.activityId);
+            }
+          }
           // Codex round 4 fix: capture activity→node ownership so we can
           // project node.status on later activity-level events.
           a.ownerNodeId = p.nodeId;
@@ -914,6 +1051,7 @@ export function replay(events: WorkflowEvent[]): Snapshot {
     run,
     nodes,
     activities,
+    loops,
     outputs,
     lastSeq,
     danglingActivities,

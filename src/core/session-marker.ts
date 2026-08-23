@@ -1,0 +1,274 @@
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { readManagedOriginCapability } from './managed-origin-capability.js';
+import {
+  readLinuxBootIdentity,
+  readProcessStartIdentity,
+} from '../utils/process-identity.js';
+
+export {
+  readLinuxBootIdentity,
+  readProcessStartIdentity,
+} from '../utils/process-identity.js';
+
+export interface AncestorSessionContext {
+  sessionId: string;
+  turnId?: string;
+  dispatchAttempt?: number;
+}
+
+interface IdentityBoundSessionMarker extends AncestorSessionContext {
+  procStart?: string;
+}
+
+export interface AuthenticatedAncestorSessionContext extends AncestorSessionContext {
+  markerPid: number;
+  procStart: string;
+}
+
+export class SessionMarkerAuthenticationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SessionMarkerAuthenticationError';
+  }
+}
+
+function systemPsBin(): string | undefined {
+  for (const candidate of ['/usr/bin/ps', '/bin/ps']) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+function readParentPid(pid: number): number | undefined {
+  if (process.platform === 'linux') {
+    try {
+      const raw = readFileSync(`/proc/${pid}/stat`, 'utf8');
+      const closeParen = raw.lastIndexOf(')');
+      if (closeParen < 0) return undefined;
+      const fields = raw.slice(closeParen + 2).trim().split(/\s+/);
+      const parent = Number(fields[1]);
+      return Number.isSafeInteger(parent) && parent > 0 ? parent : undefined;
+    } catch { return undefined; }
+  }
+  const ps = systemPsBin();
+  if (!ps) return undefined;
+  try {
+    const out = execFileSync(ps, ['-o', 'ppid=', '-p', String(pid)], {
+      encoding: 'utf-8', timeout: 2000, stdio: ['ignore', 'pipe', 'ignore'],
+      env: { PATH: '/usr/bin:/bin', LANG: 'C' },
+    }).trim();
+    const parent = Number(out);
+    return Number.isSafeInteger(parent) && parent > 0 ? parent : undefined;
+  } catch { return undefined; }
+}
+
+function parseDispatchAttempt(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
+    ? value
+    : undefined;
+}
+
+function parseIdentityBoundSessionMarker(raw: string): IdentityBoundSessionMarker {
+  const text = raw.trim();
+  if (!text.startsWith('{')) return { sessionId: text };
+  try {
+    const parsed = JSON.parse(text) as {
+      sessionId?: unknown; turnId?: unknown; dispatchAttempt?: unknown; procStart?: unknown;
+    };
+    const dispatchAttempt = parseDispatchAttempt(parsed.dispatchAttempt);
+    return {
+      sessionId: typeof parsed.sessionId === 'string' ? parsed.sessionId : '',
+      ...(typeof parsed.turnId === 'string' ? { turnId: parsed.turnId } : {}),
+      ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+      ...(typeof parsed.procStart === 'string' ? { procStart: parsed.procStart } : {}),
+    };
+  } catch {
+    return { sessionId: '' };
+  }
+}
+
+/**
+ * Strong marker lookup for authority-bearing commands. Unlike the legacy
+ * read/reply resolver, this requires the worker's JSON procStart binding and
+ * verifies it against the live ancestor process before returning identity.
+ */
+export function findAuthenticatedAncestorSessionContext(
+  dataDir: string,
+  startPid: number = process.ppid,
+): AuthenticatedAncestorSessionContext | null {
+  const markersDir = join(dataDir, '.botmux-cli-pids');
+  if (!existsSync(markersDir)) return null;
+
+  let pid = startPid;
+  for (let depth = 0; depth < 8 && pid > 1; depth++) {
+    const markerPath = join(markersDir, String(pid));
+    if (existsSync(markerPath)) {
+      let marker: IdentityBoundSessionMarker;
+      try {
+        marker = parseIdentityBoundSessionMarker(readFileSync(markerPath, 'utf-8'));
+      } catch (err) {
+        throw new SessionMarkerAuthenticationError(
+          `无法读取 CLI process marker ${markerPath}：${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      if (!marker.sessionId || !marker.procStart) {
+        throw new SessionMarkerAuthenticationError(
+          '后台进程信息不完整，暂时不能执行变更。请运行 botmux restart 后重试。',
+        );
+      }
+      if (!marker.turnId) {
+        throw new SessionMarkerAuthenticationError(
+          '当前会话还没有绑定到这条消息，暂时不能执行变更。请在原话题重新发送一次；如果仍失败，请运行 botmux restart。',
+        );
+      }
+      const liveStart = readProcessStartIdentity(pid);
+      if (!liveStart || liveStart !== marker.procStart) {
+        throw new SessionMarkerAuthenticationError(
+          `CLI process marker ${markerPath} 已过期或 PID 被复用，拒绝授权`,
+        );
+      }
+      return {
+        sessionId: marker.sessionId,
+        turnId: marker.turnId,
+        ...(marker.dispatchAttempt !== undefined ? { dispatchAttempt: marker.dispatchAttempt } : {}),
+        markerPid: pid,
+        procStart: marker.procStart,
+      };
+    }
+    const parent = readParentPid(pid);
+    if (!parent) break;
+    pid = parent;
+  }
+  return null;
+}
+
+/**
+ * Is a process-tree marker safe to treat as THIS process's session origin?
+ *
+ * Two ways a marker lies, both seen in production:
+ *  - Recycled PID: the file was written by a since-exited process, and the kernel
+ *    later handed the same PID number to an unrelated process now sitting in our
+ *    ancestry. When the marker carries a procStart birth-stamp we can prove this
+ *    directly (the live process's start ≠ the recorded one).
+ *  - Stale/foreign session: a legacy marker (written before procStart existed) on
+ *    a reused PID names a DIFFERENT session than `BOTMUX_SESSION_ID`. That env var
+ *    is injected at spawn, never mutates, and is inherited across every reparent,
+ *    so it is ground truth for the session this process belongs to; a marker that
+ *    disagrees with it is not ours and cannot be verified any other way.
+ *
+ * This exact pair leaked a PR review across bots: a June legacy marker (no
+ * procStart) on a recycled low PID routed a `botmux send` into a different bot's
+ * long-closed session. The recycled process was alive, so liveness alone said
+ * nothing — only the birth-stamp mismatch OR the env disagreement exposes it.
+ */
+function isTrustworthyAncestorMarker(
+  pid: number,
+  marker: IdentityBoundSessionMarker,
+  envSessionId: string | undefined,
+): boolean {
+  if (marker.procStart && readProcessStartIdentity(pid) !== marker.procStart) return false;
+  if (envSessionId && marker.sessionId !== envSessionId) return false;
+  return true;
+}
+
+/**
+ * Walk the process tree looking for a CLI-pid marker written by the botmux
+ * worker. Legacy markers contain just the session id; new markers are JSON and
+ * also carry the current inbound turn id so long-lived CLI processes can route
+ * `botmux send` to the correct topic alias on the 2nd/Nth turn.
+ *
+ * A matched marker is honored only when `isTrustworthyAncestorMarker` clears it
+ * against `envSessionId` (the caller threads in the inherited BOTMUX_SESSION_ID;
+ * resolveSessionContext and the v3 relay client both pass it explicitly). When
+ * omitted, only the procStart birth-stamp check applies — the function never
+ * reads the ambient global env itself, so it stays pure and its callers decide
+ * what "ground truth" is. An untrustworthy marker — empty, a recycled PID, or a
+ * different session than the authoritative env — is skipped and the walk keeps
+ * climbing; a genuine ancestor marker may sit higher, and if none does the caller
+ * falls back to the env id.
+ */
+export function findAncestorSessionContext(
+  dataDir: string,
+  startPid: number = process.ppid,
+  envSessionId?: string,
+): AncestorSessionContext | null {
+  const markersDir = join(dataDir, '.botmux-cli-pids');
+  if (!existsSync(markersDir)) return null;
+
+  let pid = startPid;
+  for (let depth = 0; depth < 8 && pid > 1; depth++) {
+    const markerPath = join(markersDir, String(pid));
+    if (existsSync(markerPath)) {
+      let marker: IdentityBoundSessionMarker;
+      try { marker = parseIdentityBoundSessionMarker(readFileSync(markerPath, 'utf-8')); }
+      catch { return { sessionId: '' }; }
+      if (marker.sessionId && isTrustworthyAncestorMarker(pid, marker, envSessionId)) {
+        return {
+          sessionId: marker.sessionId,
+          ...(marker.turnId ? { turnId: marker.turnId } : {}),
+          ...(marker.dispatchAttempt !== undefined ? { dispatchAttempt: marker.dispatchAttempt } : {}),
+        };
+      }
+      // Marker present but not ours: keep climbing (see doc comment above).
+    }
+    const parent = readParentPid(pid);
+    if (!parent) break;
+    pid = parent;
+  }
+  return null;
+}
+
+/**
+ * Resolve the owning session for an in-session subcommand (`botmux send`, etc.).
+ *
+ * Primary signal: the process-tree marker walk above — it carries the fresh
+ * per-turn turnId, so it's preferred whenever it resolves a session id.
+ *
+ * Fallback: `BOTMUX_SESSION_ID` from the environment. The marker walk depends on
+ * an unbroken ancestry between this process and the CLI's spawn pid. That link
+ * is severed whenever the subcommand runs in a detached/backgrounded process
+ * (`run_in_background`, `nohup`, `&`, `setsid` → reparented to init/pid 1),
+ * nested deeper than the 8-level walk, or under a separate pid-namespace — in all
+ * of which the marker walk returns null even though we ARE inside a botmux
+ * session. The worker injects `BOTMUX_SESSION_ID` into the CLI's env, and every
+ * descendant inherits it regardless of reparenting, so it stays correct. The
+ * session id never changes after spawn, so this fallback can't route to the wrong
+ * session; turnId is intentionally omitted (env can't be refreshed per-turn for a
+ * long-lived CLI — callers fall back to `BOTMUX_TURN_ID` when they need it).
+ */
+export function resolveSessionContext(
+  dataDir: string,
+  envSessionId: string | undefined,
+  startPid: number = process.ppid,
+  originChannelId: string | undefined = process.env.BOTMUX_ORIGIN_CHANNEL_ID,
+): AncestorSessionContext | null {
+  // Pass envSessionId as ground truth so the walk rejects a recycled-PID marker
+  // that names a different (stale/foreign) session than the one we belong to.
+  const fromMarker = findAncestorSessionContext(dataDir, startPid, envSessionId);
+  // A live process-tree marker is the primary source whenever it is visible.
+  // Per-session capability snapshots may survive SIGKILL or a later config
+  // change that disables read isolation; they are only a fallback for the
+  // macOS profile where the shared marker directory is intentionally hidden.
+  if (fromMarker && fromMarker.sessionId) return fromMarker;
+  // Read-isolated macOS sessions cannot read the shared PID-marker directory.
+  // Their exact per-session capability carve-out carries one atomically rotated
+  // turn snapshot, preserving fresh routing without treating the tuple itself
+  // as daemon authority. It is consulted only when no live marker is visible,
+  // so fields from two generations are never mixed.
+  const protectedClaim = envSessionId
+    ? readManagedOriginCapability(dataDir, envSessionId, undefined, originChannelId)
+    : null;
+  if (protectedClaim) {
+    return {
+      sessionId: protectedClaim.sessionId,
+      ...(protectedClaim.turnId ? { turnId: protectedClaim.turnId } : {}),
+      ...(protectedClaim.dispatchAttempt !== undefined
+        ? { dispatchAttempt: protectedClaim.dispatchAttempt }
+        : {}),
+    };
+  }
+  if (envSessionId) return { sessionId: envSessionId };
+  return fromMarker;
+}

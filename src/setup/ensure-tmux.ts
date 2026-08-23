@@ -20,14 +20,28 @@
  * /tmp/tmux-UID/default"), because `tmux -V` would pass but every subsequent
  * tmux command would fail. Functional probe + soft fallback fixes both.
  */
-import { execSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { unlinkSync } from 'node:fs';
+import { join } from 'node:path';
 import { detectPlatform, type PackageManager, type PlatformInfo } from './detect-platform.js';
+import {
+  isBotmuxManagedTmuxEnvKey,
+  isBotmuxManagedTmuxServerGlobalEnvKey,
+} from '../utils/child-env.js';
 
 export interface TmuxResult {
   installed: boolean;
   version?: string;
   /** True iff we ran an installer (vs. tmux was already present). */
   freshInstall: boolean;
+  /**
+   * False only when the version probe authoritatively returns ENOENT. True also
+   * covers timeout/EMFILE/EACCES, where presence cannot be disproved and startup
+   * must not hard-fail with a misleading PATH diagnosis. Lets the start-gate
+   * distinguish "tmux genuinely absent" from "probe got no answer" (see
+   * shouldHardFailStartupForMissingTmux). Set on every return.
+   */
+  binaryPresent?: boolean;
   /** Which strategy actually ran the install. */
   strategy?: PackageManager;
   /** When installed=false: human-readable reason for the caller's warning. */
@@ -36,17 +50,53 @@ export interface TmuxResult {
   manualCommand?: string;
 }
 
-function probeTmuxVersion(): string | undefined {
+type TmuxVersionProbe =
+  | { ok: true; version: string }
+  | { ok: false; reason: string; binaryPresent: boolean; retryable: boolean };
+
+export type TmuxFunctionalProbe =
+  | { ok: true; version: string }
+  | { ok: false; reason: string; binaryPresent: boolean; retryable: boolean; version?: string };
+
+function childFailureReason(command: string, failure: any, timeoutMs: number): string {
+  const nested = failure?.error;
+  const code = failure?.code ?? nested?.code;
+  const signal = failure?.signal ?? nested?.signal;
+  const stderr = (failure?.stderr?.toString?.() ?? nested?.stderr?.toString?.() ?? '').trim();
+
+  if (code === 'ENOENT') return `${command} 启动失败：找不到 tmux 可执行文件（ENOENT）`;
+  if (code === 'EACCES') return `${command} 启动失败：tmux 不可执行（EACCES）`;
+  if (code === 'EMFILE' || code === 'ENFILE') return `${command} 启动失败：文件描述符耗尽（${code}）`;
+  if (code === 'ETIMEDOUT' || signal || failure?.killed || nested?.killed) {
+    const detail = signal ? `，signal=${signal}` : '';
+    return `${command} 探测超时（${timeoutMs}ms${detail}）`;
+  }
+  if (stderr) return `${command} 失败：${stderr}`;
+  if (typeof failure?.status === 'number') return `${command} 失败（exit ${failure.status}）`;
+  const message = nested?.message ?? failure?.message;
+  return `${command} 启动/探测失败${message ? `：${message}` : ''}`;
+}
+
+function probeTmuxVersion(): TmuxVersionProbe {
   try {
-    const out = execSync('tmux -V', {
+    const out = execFileSync('tmux', ['-V'], {
       encoding: 'utf-8',
-      stdio: ['ignore', 'pipe', 'ignore'],
+      stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 3000,
       env: tmuxEnv(),
     });
-    return out.trim();
-  } catch {
-    return undefined;
+    return { ok: true, version: out.trim() };
+  } catch (err: any) {
+    const code = err?.code;
+    return {
+      ok: false,
+      reason: childFailureReason('tmux -V', err, 3000),
+      // Only ENOENT proves absence. Timeout/EMFILE/EACCES must not be turned
+      // into the old, misleading "not on PATH" diagnosis or a startup hard
+      // gate; they prove only that this particular probe got no answer.
+      binaryPresent: code !== 'ENOENT',
+      retryable: code !== 'ENOENT' && code !== 'EACCES',
+    };
   }
 }
 
@@ -71,10 +121,121 @@ function probeTmuxVersion(): string | undefined {
  * when forwarding caller-provided env). TMUX_TMPDIR is intentionally left
  * alone — it just changes the socket directory and is the user's deliberate
  * override if set.
+ *
+ * tmuxEnv ALSO strips botmux's own session/bot-scoped vars and daemon-side
+ * bare creds (isBotmuxManagedTmuxEnvKey): when botmux's first `tmux
+ * new-session` boots the server, tmux copies this client env into the server's
+ * *global* environment, which then leaks into every co-tenant session on the
+ * socket — including the user's own interactive tmux. The pane gets the
+ * correct per-session values from the env(1) wrapper injection instead, so
+ * this strip is invisible to botmux's own sessions.
  */
+const TMUX_PATH_EXTRAS = [
+  '/opt/homebrew/bin',
+  '/opt/homebrew/sbin',
+  '/usr/local/bin',
+  '/usr/local/sbin',
+  '/usr/bin',
+  '/bin',
+  '/usr/sbin',
+  '/sbin',
+];
+
+function withTmuxSearchPath(pathValue: string | undefined): string {
+  const seen = new Set<string>();
+  const merged: string[] = [];
+  for (const part of [...(pathValue?.split(':') ?? []), ...TMUX_PATH_EXTRAS]) {
+    if (!part || seen.has(part)) continue;
+    seen.add(part);
+    merged.push(part);
+  }
+  return merged.join(':');
+}
+
 export function tmuxEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  const { TMUX: _tmux, TMUX_PANE: _pane, ...rest } = env;
-  return rest;
+  const rest: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(env)) {
+    // TMUX/TMUX_PANE would re-target a dead parent server; botmux-managed keys
+    // would seed the server's shared global env and leak to co-tenant sessions.
+    if (key === 'TMUX' || key === 'TMUX_PANE') continue;
+    if (isBotmuxManagedTmuxEnvKey(key)) continue;
+    rest[key] = value;
+  }
+  return {
+    ...rest,
+    PATH: withTmuxSearchPath(rest.PATH),
+  };
+}
+
+export interface TmuxGlobalEnvScrubResult {
+  /** False means no tmux server answered (or tmux was temporarily unavailable). */
+  serverFound: boolean;
+  removed: string[];
+  failed: string[];
+}
+
+/**
+ * Remove botmux-managed values from an already-running tmux server's global
+ * environment. This repairs servers started by pre-isolation botmux builds,
+ * including a user-owned server that survives while no bmx-* session exists.
+ * Running panes keep their process environments; only future panes inherit the
+ * cleaned table.
+ *
+ * socketName exists for isolated tests. Production intentionally targets the
+ * default server after tmuxEnv() strips a possibly-stale parent $TMUX pointer.
+ */
+export function scrubTmuxServerGlobalEnv(socketName?: string): TmuxGlobalEnvScrubResult {
+  const socketArgs = socketName ? ['-L', socketName] : [];
+  let output: string;
+  try {
+    output = execFileSync('tmux', [...socketArgs, 'show-environment', '-g'], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 3000,
+      env: tmuxEnv(),
+    });
+  } catch {
+    return { serverFound: false, removed: [], failed: [] };
+  }
+  if (typeof output !== 'string') {
+    return { serverFound: false, removed: [], failed: [] };
+  }
+
+  const names = output.split('\n')
+    // `show-environment -g` prints `NAME=value`, or `-NAME` for an explicitly
+    // removed entry. Take the name in both shapes.
+    .map(line => (line.startsWith('-') ? line.slice(1) : line.split('=', 1)[0]).trim())
+    .filter(name => name.length > 0 && isBotmuxManagedTmuxServerGlobalEnvKey(name));
+
+  const removed: string[] = [];
+  const failed: string[] = [];
+  for (const name of new Set(names)) {
+    try {
+      execFileSync('tmux', [...socketArgs, 'set-environment', '-g', '-u', name], {
+        stdio: 'ignore',
+        timeout: 2000,
+        env: tmuxEnv(),
+      });
+      removed.push(name);
+    } catch {
+      // Keep the exact failed key observable to callers without exposing its
+      // (potentially sensitive) old value in logs.
+      failed.push(name);
+    }
+  }
+  return { serverFound: true, removed, failed };
+}
+
+function cleanupTmuxProbeSocket(sockName: string, env: NodeJS.ProcessEnv = process.env): void {
+  if (typeof process.getuid !== 'function') return;
+
+  const baseDir = env.TMUX_TMPDIR || '/tmp';
+  const socketPath = join(baseDir, `tmux-${process.getuid()}`, sockName);
+  try {
+    unlinkSync(socketPath);
+  } catch {
+    // Best-effort: some tmux builds unlink the socket themselves.
+  }
 }
 
 /**
@@ -92,9 +253,10 @@ export function tmuxEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv
  * reason can surface in the bootstrap warning without spilling onto the
  * user's terminal.
  */
-export function probeTmuxFunctional(): { ok: true; version: string } | { ok: false; reason: string } {
-  const version = probeTmuxVersion();
-  if (!version) return { ok: false, reason: 'tmux 二进制不在 PATH 上' };
+export function probeTmuxFunctional(): TmuxFunctionalProbe {
+  const versionProbe = probeTmuxVersion();
+  if (!versionProbe.ok) return versionProbe;
+  const version = versionProbe.version;
   const sockName = `bmx-probe-${process.pid}-${Date.now()}`;
   // env: tmuxEnv() — without this, if the daemon inherited TMUX from a tmux
   // session that has since died, this probe would target the dead server
@@ -106,14 +268,51 @@ export function probeTmuxFunctional(): { ok: true; version: string } | { ok: fal
     env: tmuxEnv(),
   });
   if (run.status !== 0) {
-    const stderr = (run.stderr?.toString() ?? '').trim();
-    return { ok: false, reason: stderr || `tmux new-session 失败 (exit ${run.status})` };
+    spawnSync('tmux', ['-L', sockName, 'kill-server'], { stdio: 'ignore', timeout: 3000, env: tmuxEnv() });
+    cleanupTmuxProbeSocket(sockName);
+    return {
+      ok: false,
+      reason: childFailureReason('tmux new-session', run, 5000),
+      binaryPresent: true,
+      retryable: (run.error as NodeJS.ErrnoException | undefined)?.code !== 'EACCES',
+      version,
+    };
   }
-  // Tear down the probe server. Best-effort — if this leaks, the kernel
-  // will GC the abstract socket when the (now-empty) tmux server exits on
-  // its own once the only client (which we didn't attach) goes away.
+  // Tear down the probe server and remove the socket file. Some platforms leave
+  // bmx-probe-* sockets behind after the server exits; thousands of stale
+  // entries make later probe storms slower and easier to time out.
   spawnSync('tmux', ['-L', sockName, 'kill-server'], { stdio: 'ignore', timeout: 3000, env: tmuxEnv() });
+  cleanupTmuxProbeSocket(sockName);
   return { ok: true, version };
+}
+
+/**
+ * Worker-side gate probe with a short exponential backoff. A daemon restart can
+ * wake many worker processes at once; if the host is briefly under fd/process
+ * pressure, one failed spawn must not immediately become a user-facing hard
+ * gate. The retries stay local to the worker and callers should still stagger
+ * their restart path so all workers do not retry in lockstep.
+ */
+export function probeTmuxFunctionalWithRetry(opts: { attempts?: number; baseDelayMs?: number } = {}): TmuxFunctionalProbe {
+  const attempts = Math.max(1, Math.floor(opts.attempts ?? 3));
+  const baseDelayMs = Math.max(0, Math.floor(opts.baseDelayMs ?? 150));
+  let result = probeTmuxFunctional();
+  let completed = 1;
+
+  while (!result.ok && result.retryable && completed < attempts) {
+    const backoff = baseDelayMs * (2 ** (completed - 1));
+    const jitter = baseDelayMs > 0 ? Math.floor(Math.random() * baseDelayMs) : 0;
+    try {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, backoff + jitter);
+    } catch { /* SharedArrayBuffer unavailable: retry immediately */ }
+    result = probeTmuxFunctional();
+    completed += 1;
+  }
+
+  if (!result.ok && completed > 1) {
+    return { ...result, reason: `${result.reason}（已退避重试 ${completed - 1} 次）` };
+  }
+  return result;
 }
 
 /** Wrap a system command with the appropriate sudo prefix for the current
@@ -129,7 +328,7 @@ function sudoPrefix(cmd: string[], info: PlatformInfo): string[] | undefined {
 /** Build the install argv for a given package manager. Pure: returns argv[]
  *  ready for spawnSync, no side effects. Returns undefined if escalation
  *  isn't possible. */
-function buildInstallArgv(pm: PackageManager, pkg: string, info: PlatformInfo): string[] | undefined {
+export function buildInstallArgv(pm: PackageManager, pkg: string, info: PlatformInfo): string[] | undefined {
   switch (pm) {
     case 'brew':    return ['brew', 'install', pkg];
     case 'conda':   return ['conda', 'install', '-y', '-c', 'conda-forge', pkg];
@@ -148,7 +347,7 @@ function buildInstallArgv(pm: PackageManager, pkg: string, info: PlatformInfo): 
  *  (which is pure) — it runs once just before the apt install attempt.
  *  Failure here is non-fatal; the actual install will fail loudly if it
  *  can't find the package. */
-function aptUpdateBeforeInstall(info: PlatformInfo): void {
+export function aptUpdateBeforeInstall(info: PlatformInfo): void {
   const argv = sudoPrefix(['apt-get', 'update'], info);
   if (!argv) return;
   try {
@@ -157,7 +356,7 @@ function aptUpdateBeforeInstall(info: PlatformInfo): void {
 }
 
 /** Suggest the manual command we'd have run, for the failure message. */
-function suggestManualCommand(pm: PackageManager, pkg: string): string {
+export function suggestManualCommand(pm: PackageManager, pkg: string): string {
   switch (pm) {
     case 'brew': return `brew install ${pkg}`;
     case 'conda': return `conda install -y -c conda-forge ${pkg}`;
@@ -171,7 +370,7 @@ function suggestManualCommand(pm: PackageManager, pkg: string): string {
   }
 }
 
-function runInstall(argv: string[]): boolean {
+export function runInstall(argv: string[]): boolean {
   const result = spawnSync(argv[0]!, argv.slice(1), {
     stdio: 'inherit',
     timeout: 10 * 60_000, // 10 min — apt-get on slow networks
@@ -188,18 +387,21 @@ export async function ensureTmux(info?: PlatformInfo): Promise<TmuxResult> {
   // that pass -V but fail every actual tmux command.
   const initialProbe = probeTmuxFunctional();
   if (initialProbe.ok) {
-    return { installed: true, version: initialProbe.version, freshInstall: false };
+    return { installed: true, version: initialProbe.version, freshInstall: false, binaryPresent: true };
   }
 
-  // If the binary exists but the server can't start, no amount of
-  // `apt-get install tmux` will help — surface the underlying reason and
-  // let the caller fall back to PTY backend.
-  const versionPresent = probeTmuxVersion();
-  if (versionPresent) {
+  // Only an authoritative ENOENT should enter the installer path. A timeout,
+  // EMFILE or permission failure is not evidence that PATH is missing; surface
+  // the real probe reason and let the per-session gate retry later.
+  if (initialProbe.binaryPresent) {
     return {
       installed: false,
       freshInstall: false,
-      reason: `${versionPresent} 已安装但启动 server 失败：${initialProbe.reason}`,
+      binaryPresent: true,
+      version: initialProbe.version,
+      reason: initialProbe.version
+        ? `${initialProbe.version} 已安装但启动 server 失败：${initialProbe.reason}`
+        : initialProbe.reason,
       manualCommand: '排查 ~/.tmux.conf / /tmp 权限 / libevent 依赖后再试',
     };
   }
@@ -221,7 +423,7 @@ export async function ensureTmux(info?: PlatformInfo): Promise<TmuxResult> {
       const postInstall = probeTmuxFunctional();
       if (postInstall.ok) {
         console.log(`✅ tmux ${postInstall.version} 安装完成 (via ${pm})`);
-        return { installed: true, version: postInstall.version, freshInstall: true, strategy: pm };
+        return { installed: true, version: postInstall.version, freshInstall: true, strategy: pm, binaryPresent: true };
       }
       tried.push(`${pm}（装上了但 server 起不来：${postInstall.reason}）`);
     } else {
@@ -243,9 +445,14 @@ export async function ensureTmux(info?: PlatformInfo): Promise<TmuxResult> {
   if (!platform.hasTty && !platform.isRoot && !platform.passwordlessSudo && platform.os === 'linux') {
     reasonLines.push('提示：当前不是交互式 TTY 且 sudo 需要密码，systemd/pm2 自启下无法弹密码 — 先在 shell 跑一次 `botmux start`，或配置 NOPASSWD sudoers。');
   }
+  const finalVersionProbe = probeTmuxVersion();
   return {
     installed: false,
     freshInstall: false,
+    // An install attempt may have landed the binary even though the server
+    // probe still fails — re-check PATH so the start-gate doesn't treat a
+    // present-but-broken tmux as "genuinely absent".
+    binaryPresent: finalVersionProbe.ok || finalVersionProbe.binaryPresent,
     reason: reasonLines.join('\n'),
     manualCommand: manual,
   };

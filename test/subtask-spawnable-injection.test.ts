@@ -7,7 +7,11 @@
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
 
-vi.mock('node:child_process', () => ({ execSync: vi.fn(() => ''), execFileSync: vi.fn(() => '') }));
+vi.mock('node:child_process', async (importOriginal) => ({
+  ...await importOriginal<typeof import('node:child_process')>(),
+  execSync: vi.fn(() => ''),
+  execFileSync: vi.fn(() => ''),
+}));
 vi.mock('../src/config.js', () => ({
   config: {
     web: { externalHost: 'localhost' },

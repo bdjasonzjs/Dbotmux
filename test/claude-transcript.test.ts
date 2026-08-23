@@ -10,11 +10,13 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, appendFileSync, openSync, writeSync, closeSync, ftruncateSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, basename } from 'node:path';
+import { shouldSuppressBridgeEmit } from '../src/services/bridge-fallback-gate.js';
 import {
   drainTranscript,
   pickAssistantTextEvents,
   extractAssistantText,
   joinAssistantText,
+  trailingAssistantText,
   findLatestJsonl,
   findJsonlContainingFingerprint,
   jsonlContainsFingerprint,
@@ -23,6 +25,9 @@ import {
   readFirstEventTimestamp,
   findJsonlsContainingExactContent,
   splitTranscriptEventsByCutoff,
+  isTranscriptRateLimitEvent,
+  classifyClaudeTerminalEvent,
+  apiErrorMessageText,
   type TranscriptEvent,
 } from '../src/services/claude-transcript.js';
 
@@ -128,6 +133,191 @@ describe('pickAssistantTextEvents', () => {
       { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'no-uuid' }] } },
     ];
     expect(pickAssistantTextEvents(events)).toEqual([]);
+  });
+
+  it('drops the rate_limit API-error record so its text is not forwarded as a reply', () => {
+    // rate_limit is surfaced as a `limited` state, not an assistant answer.
+    const events: TranscriptEvent[] = [
+      { type: 'assistant', uuid: 'rl', isApiErrorMessage: true, error: 'rate_limit', apiErrorStatus: 429, message: { role: 'assistant', content: [{ type: 'text', text: "You've hit your session limit · resets 10:40pm" }] } },
+    ];
+    expect(pickAssistantTextEvents(events)).toEqual([]);
+  });
+
+  it('drops non-rate API-error text because structured terminal handling owns it', () => {
+    const events: TranscriptEvent[] = [
+      { type: 'assistant', uuid: 'se', isApiErrorMessage: true, error: 'server_error', message: { role: 'assistant', content: [{ type: 'text', text: 'API Error: 500 internal' }] } },
+    ];
+    expect(pickAssistantTextEvents(events)).toEqual([]);
+  });
+});
+
+describe('isTranscriptRateLimitEvent', () => {
+  it('is true for a rate_limit error record', () => {
+    const ev: TranscriptEvent = { type: 'assistant', uuid: 'r', error: 'rate_limit', apiErrorStatus: 429, isApiErrorMessage: true, message: { role: 'assistant', content: [{ type: 'text', text: "You've hit your session limit · resets 10:40pm" }] } };
+    expect(isTranscriptRateLimitEvent(ev)).toBe(true);
+  });
+
+  it('is true when only apiErrorStatus is 429 (defensive)', () => {
+    const ev: TranscriptEvent = { type: 'assistant', uuid: 'r2', apiErrorStatus: 429, isApiErrorMessage: true, message: { role: 'assistant', content: [] } };
+    expect(isTranscriptRateLimitEvent(ev)).toBe(true);
+  });
+
+  it('is false for a normal assistant reply', () => {
+    const ev: TranscriptEvent = { type: 'assistant', uuid: 'ok', message: { role: 'assistant', content: [{ type: 'text', text: 'here is your answer' }] } };
+    expect(isTranscriptRateLimitEvent(ev)).toBe(false);
+  });
+
+  it('is false for other API errors (server_error, auth, terms-400)', () => {
+    for (const error of ['server_error', 'authentication_failed', 'unknown', 'invalid_request']) {
+      const ev: TranscriptEvent = { type: 'assistant', uuid: 'e', error, isApiErrorMessage: true, message: { role: 'assistant', content: [{ type: 'text', text: 'API Error' }] } };
+      expect(isTranscriptRateLimitEvent(ev), `error=${error}`).toBe(false);
+    }
+  });
+
+  it('is false for the system/turn_duration terminal marker', () => {
+    const ev: TranscriptEvent = { type: 'system', subtype: 'turn_duration', uuid: 'td' };
+    expect(isTranscriptRateLimitEvent(ev)).toBe(false);
+  });
+
+  it('apiErrorMessageText recovers the human retry clock from the record text', () => {
+    const ev: TranscriptEvent = { type: 'assistant', uuid: 'r', error: 'rate_limit', message: { role: 'assistant', content: [{ type: 'text', text: "You've hit your session limit · resets 10:40pm (America/Los_Angeles)" }] } };
+    expect(apiErrorMessageText(ev)).toContain('resets 10:40pm');
+  });
+});
+
+describe('classifyClaudeTerminalEvent', () => {
+  it('classifies the observed unknown + unexpected EOF fixture as retryable failure', () => {
+    const ev: TranscriptEvent = {
+      type: 'assistant',
+      uuid: 'fixture-error',
+      isApiErrorMessage: true,
+      error: 'unknown',
+      message: {
+        role: 'assistant',
+        stop_reason: 'stop_sequence',
+        content: [{ type: 'text', text: 'API Error: provider disconnected: unexpected EOF' }],
+      },
+    };
+
+    expect(classifyClaudeTerminalEvent(ev)).toEqual({
+      status: 'failed',
+      errorCode: 'provider_unexpected_eof',
+      retryable: true,
+    });
+  });
+
+  it.each([
+    ['authentication_failed', undefined, 'API Error: authentication failed', 'provider_authentication_failed'],
+    ['invalid_request', 400, 'API Error: invalid request', 'provider_invalid_request'],
+    ['permission_error', 403, 'API Error: permission denied', 'provider_permission_denied'],
+    ['unknown', 404, 'API Error: endpoint not found', 'provider_invalid_request'],
+  ])('classifies %s as non-retryable', (error, apiErrorStatus, text, errorCode) => {
+    const ev: TranscriptEvent = {
+      type: 'assistant',
+      uuid: `non-retry-${error}`,
+      isApiErrorMessage: true,
+      error,
+      apiErrorStatus,
+      message: {
+        role: 'assistant',
+        stop_reason: 'stop_sequence',
+        content: [{ type: 'text', text }],
+      },
+    };
+
+    expect(classifyClaudeTerminalEvent(ev)).toEqual({
+      status: 'failed',
+      errorCode,
+      retryable: false,
+    });
+  });
+
+  it('does not promote an unrecognized unknown API error into an automatic retry', () => {
+    const ev: TranscriptEvent = {
+      type: 'assistant',
+      uuid: 'unknown-other',
+      isApiErrorMessage: true,
+      error: 'unknown',
+      message: {
+        role: 'assistant',
+        stop_reason: 'stop_sequence',
+        content: [{ type: 'text', text: 'API Error: something unfamiliar happened' }],
+      },
+    };
+
+    expect(classifyClaudeTerminalEvent(ev)).toEqual({
+      status: 'ambiguous',
+      errorCode: 'provider_unknown_error',
+      retryable: false,
+    });
+  });
+
+  it('does not let transient-looking text override an explicit auth failure', () => {
+    const ev: TranscriptEvent = {
+      type: 'assistant',
+      uuid: 'auth-eof',
+      isApiErrorMessage: true,
+      error: 'authentication_failed',
+      apiErrorStatus: 401,
+      message: {
+        role: 'assistant',
+        stop_reason: 'stop_sequence',
+        content: [{ type: 'text', text: 'authentication failed after unexpected EOF' }],
+      },
+    };
+
+    expect(classifyClaudeTerminalEvent(ev)).toEqual({
+      status: 'failed',
+      errorCode: 'provider_authentication_failed',
+      retryable: false,
+    });
+  });
+
+  it('keeps 429 on the existing rate-limit path instead of ordinary recovery', () => {
+    const ev: TranscriptEvent = {
+      type: 'assistant',
+      uuid: 'rate-limit',
+      isApiErrorMessage: true,
+      error: 'rate_limit',
+      apiErrorStatus: 429,
+      message: {
+        role: 'assistant',
+        stop_reason: 'stop_sequence',
+        content: [{ type: 'text', text: 'rate limited' }],
+      },
+    };
+
+    expect(classifyClaudeTerminalEvent(ev)).toEqual({
+      status: 'rate_limited',
+      errorCode: 'provider_rate_limited',
+      retryable: false,
+    });
+  });
+
+  it.each([
+    ['server_error', 524, 'API Error: upstream timed out'],
+    ['unknown', undefined, 'API Error: 厂商资源问题断连：http2: client connection lost'],
+    ['unknown', undefined, 'API Error: Connection closed mid-response. The response above may be incomplete.'],
+    ['unknown', undefined, 'API Error: InternalServerException: Try your request again.'],
+  ])('classifies verified transient provider shape %s/%s as retryable', (error, apiErrorStatus, text) => {
+    const ev: TranscriptEvent = {
+      type: 'assistant',
+      uuid: `transient-${error}-${apiErrorStatus ?? 'none'}`,
+      isApiErrorMessage: true,
+      error,
+      apiErrorStatus,
+      message: {
+        role: 'assistant',
+        stop_reason: 'stop_sequence',
+        content: [{ type: 'text', text }],
+      },
+    };
+
+    expect(classifyClaudeTerminalEvent(ev)).toEqual({
+      status: 'failed',
+      errorCode: 'provider_server_error',
+      retryable: true,
+    });
   });
 });
 
@@ -1469,5 +1659,107 @@ describe('splitTranscriptEventsByCutoff', () => {
     );
     expect(history).toEqual([]);
     expect(live).toEqual([boundaryLarkEvent]);
+  });
+});
+
+// ─── trailingAssistantText：误兜底回归（PR#174 material-longer 闸 × 整轮拼接） ──
+//
+// 2026-06-11 现场：一个长工作轮（多次 tool_use、13 段过程旁白）结束时模型已
+// 显式 `botmux send`（窗口内最大 contentLength=749），但 joinAssistantText 把
+// 整轮旁白拼成 normalized 1530 当 finalText，material-longer 闸（≥2× 且 +120）
+// 判「未被覆盖」放行兜底，把整轮旁白拼贴发进了群。
+// 修复：非 adopt 的兜底 final 改取「最后一次 tool_use 之后的尾部 assistant
+// 文本」= 真正的收尾回答（该现场 normalized 903 < 749×2 → 正确抑制）。
+describe('trailingAssistantText', () => {
+  const aText = (uuid: string, text: string): TranscriptEvent => ({
+    type: 'assistant', uuid, message: { role: 'assistant', content: [{ type: 'text', text }] },
+  });
+  const aTool = (uuid: string): TranscriptEvent => ({
+    type: 'assistant', uuid, message: { role: 'assistant', content: [{ type: 'tool_use', id: `tu-${uuid}`, name: 'Bash', input: {} } as any] },
+  });
+  const aThinking = (uuid: string): TranscriptEvent => ({
+    type: 'assistant', uuid, message: { role: 'assistant', content: [{ type: 'thinking', thinking: 'hmm' } as any] },
+  });
+  const toolResult = (uuid: string): TranscriptEvent => ({
+    type: 'user', uuid, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'x' } as any] },
+  });
+  const metaLine = (type: string): TranscriptEvent => ({ type } as TranscriptEvent);
+
+  it('pure-text turn (no tool_use): identical to joinAssistantText', () => {
+    const events = [aText('a1', 'first'), aText('a2', 'second')];
+    expect(trailingAssistantText(events, ['a1', 'a2'])).toBe('first\n\nsecond');
+    expect(trailingAssistantText(events, ['a1', 'a2'])).toBe(joinAssistantText(events));
+  });
+
+  it('narration + tool_use + final: returns ONLY the text after the last tool_use', () => {
+    const events = [
+      aText('a1', '旁白：我先看看代码。'),
+      aTool('t1'), toolResult('r1'),
+      aText('a2', '旁白：红了，10 个失败。'),
+      aTool('t2'), toolResult('r2'),
+      aText('a3', '修复完成，PR 已开。'),
+    ];
+    expect(trailingAssistantText(events, ['a1', 'a2', 'a3'])).toBe('修复完成，PR 已开。');
+  });
+
+  it('multi-segment final after the last tool_use is fully collected', () => {
+    const events = [
+      aTool('t1'), toolResult('r1'),
+      aText('a1', '结论第一段。'),
+      aText('a2', '结论第二段。'),
+    ];
+    expect(trailingAssistantText(events, ['a1', 'a2'])).toBe('结论第一段。\n\n结论第二段。');
+  });
+
+  it('thinking lines and non-message meta lines inside the tail are crossed, not boundaries', () => {
+    const events = [
+      aText('a1', '旁白'),
+      aTool('t1'), toolResult('r1'),
+      aText('a2', '收尾上半'),
+      aThinking('th1'),
+      metaLine('last-prompt'), metaLine('ai-title'),
+      aText('a3', '收尾下半'),
+    ];
+    expect(trailingAssistantText(events, ['a1', 'a2', 'a3'])).toBe('收尾上半\n\n收尾下半');
+  });
+
+  it('turn ending in a tool_use (no final text): returns empty — nothing to fall back with', () => {
+    const events = [aText('a1', '旁白'), aTool('t1'), toolResult('r1')];
+    expect(trailingAssistantText(events, ['a1'])).toBe('');
+  });
+
+  it('only collects uuids belonging to THIS turn (a previous turn final right before is not swept in)', () => {
+    const events = [
+      aText('prev', '上一轮的收尾。'),
+      aText('a1', '本轮收尾。'),
+    ];
+    expect(trailingAssistantText(events, ['a1'])).toBe('本轮收尾。');
+  });
+
+  it('field replay of the 2026-06-11 leak: gate passes the joined narration (bug) but suppresses the trailing final (fix)', () => {
+    // 形状还原：旁白若干段 + 多次工具调用 + 精炼收尾；窗口内已有
+    // contentLength=749 的显式 send marker。
+    const narration = Array.from({ length: 12 }, (_, i) => `过程旁白第 ${i} 段：`.padEnd(60, '细'));
+    const finalText = '最终收尾回答：'.padEnd(900, '答');
+    const events: TranscriptEvent[] = [];
+    const uuids: string[] = [];
+    narration.forEach((t, i) => {
+      events.push(aText(`n${i}`, t), aTool(`t${i}`), toolResult(`r${i}`));
+      uuids.push(`n${i}`);
+    });
+    events.push(aText('final', finalText));
+    uuids.push('final');
+
+    const markers = [{ sentAtMs: 5_000, contentLength: 749 }];
+    const turnBase = { markTimeMs: 1_000, isLocal: false };
+
+    const joined = joinAssistantText(events);
+    const trailing = trailingAssistantText(events, uuids);
+    expect(trailing).toBe(finalText);
+
+    // 旧行为：整轮拼接远超 749×2 → 闸放行 → 误兜底（这就是回归本体）
+    expect(shouldSuppressBridgeEmit({ ...turnBase, finalText: joined }, undefined, markers, false)).toBe(false);
+    // 新行为：尾段 900 < 749×2 → 抑制 ✓
+    expect(shouldSuppressBridgeEmit({ ...turnBase, finalText: trailing }, undefined, markers, false)).toBe(true);
   });
 });

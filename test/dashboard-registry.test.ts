@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,22 +9,30 @@ beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'botmux-reg-'));
   mkdirSync(dir, { recursive: true });
 });
-afterEach(() => rmSync(dir, { recursive: true, force: true }));
+afterEach(() => {
+  vi.useRealTimers();
+  rmSync(dir, { recursive: true, force: true });
+});
 
-function writeDesc(larkAppId: string, port: number, hbAgo = 0) {
+function writeDesc(larkAppId: string, port: number, hbAgo = 0, bootInstanceId?: string) {
   writeFileSync(join(dir, `${larkAppId}.json`), JSON.stringify({
     larkAppId, botName: larkAppId, botIndex: 0, ipcPort: port,
     pid: 1, startedAt: Date.now(), lastHeartbeat: Date.now() - hbAgo,
+    ...(bootInstanceId ? { bootInstanceId } : {}),
+    ...(bootInstanceId ? { workflowIpcProtocol: 'v1' } : {}),
   }));
 }
 
 describe('DaemonRegistry', () => {
   it('reads existing descriptors on start', async () => {
-    writeDesc('appA', 7892);
+    const bootInstanceId = 'B'.repeat(43);
+    writeDesc('appA', 7892, 0, bootInstanceId);
     const reg = new DaemonRegistry(dir);
     await reg.start();
     expect(reg.list().length).toBe(1);
     expect(reg.getByAppId('appA')?.ipcPort).toBe(7892);
+    expect(reg.getByAppId('appA')?.bootInstanceId).toBe(bootInstanceId);
+    expect(reg.getByAppId('appA')?.workflowIpcProtocol).toBe('v1');
     reg.stop();
   });
 
@@ -43,5 +51,29 @@ describe('DaemonRegistry', () => {
     expect(reg.list()).toEqual([]);
     reg.stop();
     rmSync(empty, { recursive: true, force: true });
+  });
+
+  it('polls descriptors so missed fs.watch heartbeat updates do not mark daemons stale', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    writeDesc('appA', 7892);
+
+    const reg = new DaemonRegistry(dir, { refreshIntervalMs: 1_000 });
+    await reg.start();
+
+    // Simulate a platform where fs.watch misses the daemon's atomic descriptor rewrite.
+    (reg as unknown as { watcher?: { close(): void } }).watcher?.close();
+
+    expect(reg.list().length).toBe(1);
+
+    vi.setSystemTime(95_000);
+    expect(reg.list()).toEqual([]);
+
+    writeDesc('appA', 7892);
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(reg.list().length).toBe(1);
+    expect(reg.getByAppId('appA')?.ipcPort).toBe(7892);
+    reg.stop();
   });
 });

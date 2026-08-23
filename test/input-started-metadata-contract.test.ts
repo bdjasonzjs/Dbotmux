@@ -7,12 +7,12 @@ describe('dequeue-time turn metadata contract', () => {
   const workerSource = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
 
   it('does not switch caller metadata merely because a message arrived', () => {
-    const start = daemonSource.indexOf('// Arrival updates activity only.');
-    const end = daemonSource.indexOf('// If waiting for repo selection', start);
+    const start = daemonSource.indexOf('// Arrival updates activity and the per-turn reply target only.');
+    const end = daemonSource.indexOf('// The first owner may have failed', start);
     const arrivalBlock = daemonSource.slice(start, end);
 
     expect(start).toBeGreaterThanOrEqual(0);
-    expect(arrivalBlock).not.toContain('lastCallerOpenId');
+    expect(arrivalBlock).not.toContain('ds.session.lastCallerOpenId =');
   });
 
   it('does not switch title/last input before the worker starts the input', () => {
@@ -22,17 +22,17 @@ describe('dequeue-time turn metadata contract', () => {
 
     expect(liveWorkerBlock).not.toContain('beginNewTurn(ds, parsed.content)');
     expect(liveWorkerBlock).not.toContain('rememberLastCliInput(ds, promptContent, msgContent)');
-    expect(liveWorkerBlock).toContain("type: 'message'");
+    expect(liveWorkerBlock).toContain('sendWorkerInput(ds, cliInput');
     expect(liveWorkerBlock).toContain('metadata:');
   });
 
   it('emits plural callers from the actual worker batch-start path', () => {
-    const start = workerSource.indexOf("type: 'input_started'");
-    const end = workerSource.indexOf('originalContent:', start) + 200;
+    const start = workerSource.indexOf('const activeBatch = batch ?? item.codexBatch');
+    const end = workerSource.indexOf('originalContent:', start) + 300;
     const inputStartedBlock = workerSource.slice(start, end);
 
     expect(start).toBeGreaterThanOrEqual(0);
-    expect(inputStartedBlock).toContain('callers: batch?.callers');
+    expect(inputStartedBlock).toContain('callers: activeBatch?.callers');
     expect(inputStartedBlock).toContain('pendingCount: pendingMessages.length');
   });
 });

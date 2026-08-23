@@ -20,26 +20,30 @@ describe('per-role model passthrough — inert + link (批4 §6.1/§6.3)', () =>
     expect(withModel[i + 1]).toBe('claude-haiku-4-5');
     // 逐字节回归：从 withModel 去掉 [--model, m] 后，必须与基线完全相等（无其它漂移）
     expect([...withModel.slice(0, i), ...withModel.slice(i + 2)]).toEqual(baseline);
-    expect(a.supportsModelOverride).toBe(true);
   });
 
-  it('codex: unset → byte-identical (no -c override); set → adds -c model/effort only', () => {
+  it('codex: unset → byte-identical; set → adds upstream --model plus reasoning -c only', () => {
     const a = createCodexAdapter();
     const baseline = a.buildArgs({ ...base });
     expect(a.buildArgs({ ...base, model: undefined, reasoningEffort: undefined })).toEqual(baseline);
     expect(baseline.join(' ')).not.toContain('model=');
 
     const withBoth = a.buildArgs({ ...base, model: 'gpt-x', reasoningEffort: 'high' });
-    expect(withBoth.join(' ')).toContain('model="gpt-x"');
+    const modelIndex = withBoth.indexOf('--model');
+    expect(modelIndex).toBeGreaterThanOrEqual(0);
+    expect(withBoth[modelIndex + 1]).toBe('gpt-x');
     expect(withBoth.join(' ')).toContain('model_reasoning_effort="high"');
-    // 逐字节回归：去掉两组 -c override 后等于基线
+    // 逐字节回归：只去掉新增的 --model pair 和 reasoning -c pair 后等于基线；
+    // 不能把 baseline 自带的 shell/update 两组 -c 一起滤掉。
+    const reasoningIndex = withBoth.indexOf('model_reasoning_effort="high"');
+    expect(reasoningIndex).toBeGreaterThan(0);
+    expect(withBoth[reasoningIndex - 1]).toBe('-c');
     const stripped = withBoth.filter((arg, idx) => {
-      if (arg === '-c') return false;
-      if (idx > 0 && withBoth[idx - 1] === '-c') return false;
-      return true;
+      return idx !== modelIndex
+        && idx !== modelIndex + 1
+        && idx !== reasoningIndex - 1
+        && idx !== reasoningIndex;
     });
     expect(stripped).toEqual(baseline);
-    expect(a.supportsModelOverride).toBe(true);
-    expect(a.supportsReasoningEffort).toBe(true);
   });
 });

@@ -1,9 +1,15 @@
+import { execFile } from 'node:child_process';
 import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
 import { join } from 'node:path';
+import { promisify } from 'node:util';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
+import { parseDebugModelsJson } from './model-catalog-json.js';
 import { cocoCacheRoot } from '../../services/coco-paths.js';
+import { delay, scaleMs } from '../../utils/timing.js';
+import { installCocoAskPlugin } from '../coco-ask-plugin.js';
+import { TRAE_MIGRATION_DONE_MARKERS } from './traex.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 
 /** CoCo's global submit log (one JSON line per user submit, mode:"user"). Used
@@ -27,10 +33,6 @@ function defaultCocoCacheBase(): string {
  *  3): single-quote and escape any embedded single quotes. */
 function shQuote(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
-}
-
-function delay(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function currentFileSize(path: string): number {
@@ -112,7 +114,7 @@ function historyDeltaContains(path: string, fromByte: number, prefix: string): b
 async function waitForHistoryAppend(
   path: string, fromByte: number, prefix: string, timeoutMs: number,
 ): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = Date.now() + scaleMs(timeoutMs);
   while (Date.now() < deadline) {
     if (historyDeltaContains(path, fromByte, prefix)) return true;
     await delay(100);
@@ -130,17 +132,13 @@ function submitPrefix(content: string): string {
 }
 
 export function createCocoAdapter(pathOverride?: string): CliAdapter {
-  const bin = resolveCommand(pathOverride ?? 'coco');
+  // resolvedBin is lazy: setup constructs adapters only to read static
+  // modelChoices and must not shell out (see resolveCommand); the binary path
+  // is a spawn-time concern.
+  const rawBin = pathOverride ?? 'coco';
+  let cachedBin: string | undefined;
   return {
     id: 'coco',
-    // Round-4: coco is a STATE-ONLY clone tier. Only session/cache state isolates
-    // (via XDG_CACHE_HOME → CoCo writes <cloneDir>/coco/); persona/config/memory
-    // stay in ~/.coco + ~/.trae ($HOME, no relocation env) and are SHARED. botmux
-    // does NOT enforce read-only on them — the current coco version was OBSERVED
-    // not to write them during a session (sharedEntries=[] means no writable copy
-    // is made). 'state-only' is never auto-selected by default; explicit ref only.
-    // NOTE: envVar=XDG_CACHE_HOME relocates the WHOLE process-tree cache (ripgrep/
-    // plugins/event-queue too), all under the clone-scoped dir.
     cloneHome: {
       tier: 'state-only',
       envVar: 'XDG_CACHE_HOME',
@@ -151,16 +149,33 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
       independentDirs: [],
       memorySeed: 'none',
     },
-    resolvedBin: bin,
+    // ~/.trae/cli kept REAL (shared with traex): login + shared Trae state incl.
+    // the codex-style SQLite DBs (fcntl locks don't work unless the dir is bound
+    // real). ~/.cache/coco kept REAL too: the transcript bridge reads events.jsonl
+    // at the REAL ~/.cache/coco/sessions/<sid>/ path (see coco-transcript.ts) —
+    // without the rw bind the CLI's writes would be invisible to the daemon.
+    // NOT widened to the whole ~/.trae (that root holds hooks/plugins/skills/
+    // traecli.toml, and authPaths are readWrite → a chat-driven sandbox could
+    // mutate shared hook/plugin code). Coco runs the SAME traecli binary as traex,
+    // so it hits the same first-run migration prompt; the done-markers it needs
+    // are exposed READ-ONLY via sandboxReadonlyPaths() below.
+    authPaths: ['~/.trae/cli', '~/.cache/coco'],
+    sandboxReadonlyPaths: () => [...TRAE_MIGRATION_DONE_MARKERS],
+    get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume }) {
+    buildArgs({ sessionId, resume, model, disableCliBypass }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', sessionId);
       } else {
         args.push('--session-id', sessionId);
       }
-      args.push('--yolo');
+      if (!disableCliBypass) args.push('--yolo');
+      if (model && model.trim()) {
+        // CoCo expects nested key path for model override. `model=...` exits 1,
+        // while `model.name=...` starts correctly.
+        args.push('--config', `model.name=${model.trim()}`);
+      }
       args.push('--disallowed-tool', 'EnterPlanMode', '--disallowed-tool', 'ExitPlanMode');
       return args;
     },
@@ -260,7 +275,7 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
       // silently mask a real submit failure on a new install.
       if (!existsSync(HISTORY_PATH) && baseByte === 0) {
         if (await waitForHistoryAppend(HISTORY_PATH, baseByte, prefix, 1200)) {
-          return undefined;
+          return { submitted: true };
         }
         if (!existsSync(HISTORY_PATH)) {
           return undefined;
@@ -272,12 +287,12 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
 
       for (let attempt = 0; attempt < 3; attempt++) {
         if (await waitForHistoryAppend(HISTORY_PATH, baseByte, prefix, 800)) {
-          return undefined;
+          return { submitted: true };
         }
         if (!trySendEnter()) return { submitted: false };
       }
       if (await waitForHistoryAppend(HISTORY_PATH, baseByte, prefix, 800)) {
-        return undefined;
+        return { submitted: true };
       }
       // In-band budget exhausted. Hand the worker a recheck closure: a slow
       // CoCo (cold start, large initial prompt, heavy hooks) may still
@@ -288,14 +303,66 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
     },
 
     completionPattern: undefined,
-    // `⏵⏵` only shows when CoCo runs with --yolo (bypass permissions). Adopted
-    // CoCo processes started by the user manually usually don't have that flag,
-    // so the status bar shows just the model badge `⬡ <model>` instead. Match
-    // either — without this, idle detection never fires for adopt mode and the
-    // transcript bridge never drains.
-    readyPattern: /⏵⏵|⬡/,
+    // Legacy CoCo 0.120.x used `⏵⏵` in --yolo mode and `⬡ <model>` otherwise.
+    // CoCo 0.201.x is TraeCode-based and renders a Codex-style composer plus a
+    // `Context 100% left` status bar. Keep both generations, while excluding
+    // numbered startup selectors (`❯ 1. Yes, continue`) so a folder-trust gate
+    // cannot release the first queued message into the menu.
+    readyPattern: /(?:^|[\n\r])\s*[›❯](?!\s*\d+\.)|\d+% left|⏵⏵|⬡/,
     systemHints: BOTMUX_SHELL_HINTS,
+    // CoCo 0.120.32+ accepts a new message while the current turn is still
+    // running: it parks it in the TUI's own queue ("↑ Press up to edit queued
+    // messages") and processes it after the current turn finishes — input is
+    // neither dropped nor garbled (the earlier concern that downgraded CoCo to
+    // wait-for-idle). Crucially it writes the queued message's events.jsonl
+    // user event only at DEQUEUE time, so the transcript the bridge fallback
+    // reads stays interleaved (user1 → asst1 → user2 → asst2) and the
+    // CodexBridgeQueue's single-`collecting` attribution stays correct without
+    // the queued_command upgrade Claude needed. The submit log history.jsonl
+    // IS written at submit time (even for a queued message), so writeInput's
+    // verification still confirms the submit. Codex (0.134.0+) also runs with
+    // type-ahead, but via an active-turn steer rather than CoCo's strict
+    // dequeue-deferral — see codex.ts and CodexBridgeQueue's HOL-block-drop.
+    supportsTypeAhead: true,
     altScreen: false,
+    // AskUserQuestion 接管：装一个 CoCo 插件（hooks.json: PreToolUse/AskUserQuestion）
+    // 把事件转发到 `botmux hook coco`，弹成飞书选择卡。CoCo 的 hook 不能用 directive
+    // 代答，答案由 daemon 在结算后按键驱动原生 picker 回灌（见 coco-picker-keys.ts +
+    // daemon /api/asks coco 分支 + worker driveCocoPicker）。asksViaHook 置 true 以
+    // 关掉 botmux-ask skill 兜底，避免 skill 与 hook 双重弹卡。
+    asksViaHook: true,
+    ensureAskHook() { installCocoAskPlugin(this.resolvedBin); },
+    // CoCo/Trae CLI reads the same skill root as the Trae-flavoured adapter.
+    skillsDir: '~/.trae/skills',
+    modelChoices: [
+      'Seed-Dogfooding-2.0',
+      'Doubao-Seed-2.0-Code',
+      'Doubao-Seed-Code',
+      'Gemini-3.1-Pro-Preview',
+    ],
+    // Live 模型枚举：coco 与 traex 共用同一 traecli 二进制（见 coco.ts 顶部
+    // 说明），`coco debug models` 输出与 `traex debug models` 同构的 JSON 目录，
+    // 复用共享解析。整包可达数百 KB，故 maxBuffer 给到 16MB、8s 超时兜底。
+    // 仅 dashboard 在用户选中 coco 时按需调用，不在 daemon/worker 启动路径上；
+    // 任何异常（spawn 失败/超时/输出非法）一律 fail-soft 返回 null，picker
+    // 回退到上面的 modelChoices。
+    async detectModels(): Promise<readonly string[] | null> {
+      try {
+        // lazy promisify：顶层 promisify(execFile) 会在部分 mock child_process
+        // 的测试 import 阶段炸（mock 无 execFile 导出）；推迟到调用时，fail-soft
+        // 的 try/catch 兜住（契约：任何异常 → null）。
+        const execFileAsync = promisify(execFile);
+        const { stdout } = await execFileAsync(this.resolvedBin, ['debug', 'models'], {
+          timeout: 8000,
+          maxBuffer: 16 * 1024 * 1024,
+          windowsHide: true,
+        });
+        const models = parseDebugModelsJson(stdout);
+        return models.length > 0 ? models : null;
+      } catch {
+        return null;
+      }
+    },
   };
 }
 

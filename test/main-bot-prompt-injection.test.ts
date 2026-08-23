@@ -151,11 +151,13 @@ describe('PR-5 — architecture contract: no ad-hoc worker fork outside worker-p
     const { readdirSync, statSync } = require('node:fs');
     const srcDir = join(__dirname, '..', 'src');
     // Whitelist files allowed to fork workers (real spawner + tests in test/).
-    // worker-pool.ts is THE spawner; workflows/daemon-spawn.ts spawns daemons,
-    // not worker processes, so it's also allowed but should not inject
-    // BOTMUX_SESSION_ID (different env contract).
+    // worker-pool.ts owns conversation workers; the v3 workflow engine has a
+    // separate shared short-lived worker factory. workflows/daemon-spawn.ts
+    // spawns daemons, not conversation workers, so it is also allowed but must
+    // not inherit this session env contract.
     const allow = new Set([
       'worker-pool.ts',
+      'worker-process.ts',
       'daemon-spawn.ts',
     ]);
     const offenders: string[] = [];

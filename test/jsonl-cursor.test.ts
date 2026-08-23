@@ -1,9 +1,9 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { baselineJsonlCursor } from '../src/services/jsonl-cursor.js';
+import { baselineJsonlCursor, scanJsonlFromOffset } from '../src/services/jsonl-cursor.js';
 
 let dir: string;
 let path: string;
@@ -20,6 +20,35 @@ afterEach(() => {
 describe('baselineJsonlCursor', () => {
   it('returns zero cursor for a missing file', () => {
     expect(baselineJsonlCursor(path)).toEqual({ newOffset: 0, pendingTail: '' });
+  });
+
+  it('keeps trailing partial tail when the tail probe starts mid-UTF8 codepoint', () => {
+    const totalBytes = 64 * 1024 + 1;
+    const prefix = '你';
+    const pendingTail = '{"uuid":"partial"';
+    const fillerBytes = totalBytes - Buffer.byteLength(prefix, 'utf8') - 1 - Buffer.byteLength(pendingTail, 'utf8');
+    const history = `${prefix}${'a'.repeat(fillerBytes)}\n`;
+    writeFileSync(path, history + pendingTail, 'utf8');
+
+    const cursor = baselineJsonlCursor(path);
+    expect(cursor).toEqual({
+      newOffset: Buffer.byteLength(history, 'utf8'),
+      pendingTail,
+    });
+  });
+
+  it('keeps exact end offset when the tail probe starts mid-UTF8 codepoint and file ends with newline', () => {
+    const totalBytes = 64 * 1024 + 1;
+    const prefix = '你';
+    const fillerBytes = totalBytes - Buffer.byteLength(prefix, 'utf8') - 1;
+    const content = `${prefix}${'a'.repeat(fillerBytes)}\n`;
+    writeFileSync(path, content, 'utf8');
+
+    const cursor = baselineJsonlCursor(path);
+    expect(cursor).toEqual({
+      newOffset: Buffer.byteLength(content, 'utf8'),
+      pendingTail: '',
+    });
   });
 
   it('jumps to the end of complete JSONL history without parsing it', () => {
@@ -43,5 +72,111 @@ describe('baselineJsonlCursor', () => {
     const cursor = baselineJsonlCursor(path);
     expect(cursor.newOffset).toBe(Buffer.byteLength(largeHistory));
     expect(cursor.pendingTail).toBe('{"uuid":"tail"}');
+  });
+});
+
+describe('scanJsonlFromOffset', () => {
+  it('preserves UTF-8 multi-byte characters split across chunk boundaries', () => {
+    const text = '{"text":"ab你cd"}\n';
+    writeFileSync(path, text, 'utf8');
+
+    const lines: Array<{ line: string; lineStart: number }> = [];
+    const cursor = scanJsonlFromOffset(path, 0, {
+      chunkSize: Buffer.byteLength('ab', 'utf8') + 1,
+      onLine: (line, lineStart) => lines.push({ line, lineStart }),
+    });
+
+    expect(lines).toEqual([{ line: '{"text":"ab你cd"}', lineStart: 0 }]);
+    expect(cursor).toEqual({
+      newOffset: Buffer.byteLength(text, 'utf8'),
+      pendingTail: '',
+    });
+  });
+
+  it('keeps durable byte offsets correct when starting inside a UTF-8 codepoint', () => {
+    const prefix = '中';
+    const firstLine = 'broken-prefix\n';
+    const appendedLine = '{"type":"event_msg"}\n';
+    const text = prefix + firstLine + appendedLine;
+    writeFileSync(path, text, 'utf8');
+
+    const lines: Array<{ line: string; lineStart: number }> = [];
+    const cursor = scanJsonlFromOffset(path, 1, {
+      chunkSize: 2,
+      onLine: (line, lineStart) => lines.push({ line, lineStart }),
+    });
+
+    expect(lines).toHaveLength(2);
+    expect(lines[1]).toEqual({
+      line: '{"type":"event_msg"}',
+      lineStart: Buffer.byteLength(prefix + firstLine, 'utf8'),
+    });
+    expect(cursor).toEqual({
+      newOffset: Buffer.byteLength(text, 'utf8'),
+      pendingTail: '',
+    });
+
+    const nextLine = '{"type":"token_count"}\n';
+    appendFileSync(path, nextLine, 'utf8');
+    const followUpLines: Array<{ line: string; lineStart: number }> = [];
+    const followUpCursor = scanJsonlFromOffset(path, cursor!.newOffset, {
+      chunkSize: 3,
+      onLine: (line, lineStart) => followUpLines.push({ line, lineStart }),
+    });
+
+    expect(followUpLines).toEqual([{
+      line: '{"type":"token_count"}',
+      lineStart: Buffer.byteLength(text, 'utf8'),
+    }]);
+    expect(followUpCursor).toEqual({
+      newOffset: Buffer.byteLength(text + nextLine, 'utf8'),
+      pendingTail: '',
+    });
+  });
+
+  it('does not repeatedly concatenate an accumulated long line on every chunk', () => {
+    const longLine = 'x'.repeat(256 * 1024);
+    const secondLine = '{"type":"complete"}';
+    const text = `${longLine}\n${secondLine}\n`;
+    writeFileSync(path, text, 'utf8');
+
+    const concatSpy = vi.spyOn(Buffer, 'concat');
+    try {
+      const lines: Array<{ line: string; lineStart: number }> = [];
+      const cursor = scanJsonlFromOffset(path, 0, {
+        chunkSize: 1024,
+        onLine: (line, lineStart) => lines.push({ line, lineStart }),
+      });
+
+      expect(lines).toEqual([
+        { line: longLine, lineStart: 0 },
+        { line: secondLine, lineStart: Buffer.byteLength(`${longLine}\n`, 'utf8') },
+      ]);
+      expect(cursor).toEqual({
+        newOffset: Buffer.byteLength(text, 'utf8'),
+        pendingTail: '',
+      });
+      expect(concatSpy.mock.calls.length).toBeLessThanOrEqual(1);
+
+      concatSpy.mockClear();
+      const appended = '{"type":"next"}\n';
+      appendFileSync(path, appended, 'utf8');
+      const followUpLines: Array<{ line: string; lineStart: number }> = [];
+      const followUpCursor = scanJsonlFromOffset(path, cursor!.newOffset, {
+        chunkSize: 3,
+        onLine: (line, lineStart) => followUpLines.push({ line, lineStart }),
+      });
+      expect(followUpLines).toEqual([{
+        line: '{"type":"next"}',
+        lineStart: Buffer.byteLength(text, 'utf8'),
+      }]);
+      expect(followUpCursor).toEqual({
+        newOffset: Buffer.byteLength(text + appended, 'utf8'),
+        pendingTail: '',
+      });
+      expect(concatSpy.mock.calls.length).toBeLessThanOrEqual(1);
+    } finally {
+      concatSpy.mockRestore();
+    }
   });
 });

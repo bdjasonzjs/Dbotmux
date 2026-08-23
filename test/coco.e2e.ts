@@ -39,6 +39,8 @@ interface PtySession {
 function spawnCoco(args: string[], cwd = '/tmp'): PtySession {
   const bin = resolveCommand('coco');
   const chunks: { time: number; raw: string }[] = [];
+  let trustHandled = false;
+  let startupTail = '';
   const proc = pty.spawn(bin, args, {
     name: 'xterm-256color',
     cols: 200,
@@ -46,7 +48,15 @@ function spawnCoco(args: string[], cwd = '/tmp'): PtySession {
     cwd,
     env: { ...process.env } as Record<string, string>,
   });
-  proc.onData(data => chunks.push({ time: Date.now(), raw: data }));
+  proc.onData(data => {
+    chunks.push({ time: Date.now(), raw: data });
+    if (trustHandled) return;
+    startupTail = stripAnsi(startupTail + data).slice(-2_000);
+    if (/Yes, I trust this folder|Yes, continue/.test(startupTail)) {
+      trustHandled = true;
+      proc.write('\r');
+    }
+  });
   return {
     proc,
     chunks,
@@ -168,7 +178,11 @@ describe('CoCo adapter: PTY spawn', () => {
     const args = adapter.buildArgs({ sessionId: sid, resume: false });
 
     session = spawnCoco(args);
-    await waitForQuiescence(session, 3000);
+    // CoCo 0.201.x continuously animates decorative `◆◆` glyphs even while
+    // the composer is ready, so raw byte-length quiescence is no longer a
+    // valid startup condition. Give the real process a bounded startup window;
+    // the assertions below still inspect its actual output for argv failures.
+    await delay(8_000);
 
     const plain = session.plainOutput();
     expect(plain.length).toBeGreaterThan(0);
@@ -201,7 +215,7 @@ describe('CoCo first-input submission (IdleDetector + readyPattern)', () => {
     }
   });
 
-  it('BUG: without readyPattern, idle fires before TUI is ready', async () => {
+  it('CONTROL: without readyPattern, idle is driven by quiescence alone', async () => {
     const { IdleDetector } = await import('../src/utils/idle-detector.js');
     const adapter = createCocoAdapter();
     const sid = `e2e-bug-${Date.now()}`;
@@ -228,17 +242,21 @@ describe('CoCo first-input submission (IdleDetector + readyPattern)', () => {
     });
 
     const elapsed = idleFiredAt ? idleFiredAt - spawnTs : -1;
-    console.log(`[bug] No readyPattern → idle fired after ${elapsed}ms (before TUI ready)`);
+    console.log(`[control] No readyPattern → quiescence idle fired after ${elapsed}ms`);
 
     expect(idleFiredAt).toBeGreaterThan(0);
-    expect(elapsed, 'fires prematurely (< 5s) — input box not rendered yet').toBeLessThan(5000);
+    // The historical 0.120.x build fired before the composer (<5s). Current
+    // 0.201.x can spend longer on its workspace-trust transition, but without
+    // readyPattern the detector must still be governed only by its bounded
+    // quiescence window rather than waiting for a composer marker.
+    expect(elapsed, 'quiescence-only control should not wait for the 20s cap').toBeLessThan(20_000);
 
     detector.dispose();
   }, 30_000);
 
   it('FIX: with readyPattern, idle does not fire until the ready prompt is rendered', async () => {
     const { IdleDetector } = await import('../src/utils/idle-detector.js');
-    const adapter = createCocoAdapter(); // has readyPattern: /⏵⏵|⬡/
+    const adapter = createCocoAdapter();
     const sid = `e2e-fix-${Date.now()}`;
     const args = adapter.buildArgs({ sessionId: sid, resume: false });
 
@@ -278,7 +296,7 @@ describe('CoCo first-input submission (IdleDetector + readyPattern)', () => {
     );
 
     expect(idleFiredAt, 'idle should eventually fire').toBeGreaterThan(0);
-    expect(readySeenAt, 'CoCo must emit a readyPattern glyph (⏵⏵/⬡) — guards against TUI glyph changes').toBeGreaterThan(0);
+    expect(readySeenAt, 'CoCo must emit a legacy or TraeCode composer marker — guards against TUI glyph changes').toBeGreaterThan(0);
     // The real contract: readyPattern suppresses quiescence until the input
     // prompt renders, so idle must not fire before the glyph is seen.
     expect(idleFiredAt, 'idle must not fire before the ready prompt is rendered').toBeGreaterThanOrEqual(readySeenAt);

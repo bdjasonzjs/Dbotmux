@@ -12,6 +12,10 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
   const scopeApplyMock = vi.fn();
   class FakeClient {
     application = { scope: { list: scopeListMock, apply: scopeApplyMock } };
+    // checkRequiredScopes now reads scopes via client.request() (GET empty-body
+    // 411 guard) instead of the generated scope.list; delegate to the same
+    // scopeListMock so existing mockResolved/mockRejected setups still apply.
+    request = (...args: unknown[]) => scopeListMock(...args);
     constructor(_: unknown) {}
   }
   return {
@@ -30,6 +34,7 @@ import {
   checkCriticalScopesByApplicationInfo,
   listTenantScopeGrantStatuses,
   listGrantedTenantScopes,
+  readCriticalScopesFromApplicationInfo,
   checkRequiredScopes,
   applyScopesUnverified,
   buildScopeDeepLink,
@@ -37,7 +42,12 @@ import {
   buildRemainingSteps,
   BOTMUX_REQUIRED_SCOPES,
   TENANT_SCOPE_GRANT_STATUS_GRANTED,
+  DOC_FEATURE_SCOPES,
+  DOC_WATCH_SCOPES,
+  VC_MEETING_BOT_EVENTS,
+  VC_MEETING_FEATURE_SCOPES,
 } from '../src/setup/verify-permissions.js';
+import { DOC_COMMENT_OAUTH_SCOPES } from '../src/utils/user-token.js';
 
 const scopeListMock = (sdk as any).__scopeListMock as ReturnType<typeof vi.fn>;
 const scopeApplyMock = (sdk as any).__scopeApplyMock as ReturnType<typeof vi.fn>;
@@ -139,6 +149,35 @@ describe('validateCredentials', () => {
       expect.stringContaining('open.larksuite.com'),
       expect.any(Object),
     );
+  });
+});
+
+describe('readCriticalScopesFromApplicationInfo', () => {
+  it('uses the effective application-info scopes and reports missing critical names', async () => {
+    fetchMock
+      .mockResolvedValueOnce({ json: async () => ({ code: 0, tenant_access_token: 'tenant-token' }) })
+      .mockResolvedValueOnce({
+        json: async () => ({ code: 0, data: { app: { scopes: [{ scope: 'im:message' }] } } }),
+      });
+    const result = await readCriticalScopesFromApplicationInfo('cli_x', 'secret');
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.granted).toEqual(['im:message']);
+      expect(result.missingCritical.map(scope => scope.name)).toContain('contact:user.base:readonly');
+      expect(result.missingCritical.map(scope => scope.name)).not.toContain('im:message');
+    }
+    expect(fetchMock.mock.calls[1][0]).toContain('/open-apis/application/v6/applications/cli_x');
+  });
+
+  it('fails closed when application self-inspection is unavailable', async () => {
+    fetchMock
+      .mockResolvedValueOnce({ json: async () => ({ code: 0, tenant_access_token: 'tenant-token' }) })
+      .mockResolvedValueOnce({ json: async () => ({ code: 99991672, msg: 'forbidden' }) });
+    expect(await readCriticalScopesFromApplicationInfo('cli_x', 'secret')).toEqual({
+      ok: false,
+      error: 'need_self_manage',
+      message: 'missing application:application:self_manage',
+    });
   });
 });
 
@@ -248,6 +287,19 @@ describe('checkRequiredScopes (helper, not in main path)', () => {
     }
   });
 
+  it('treats im:chat.members:write_only as CRITICAL (拉群刚需) so its absence is surfaced', async () => {
+    scopeListMock.mockResolvedValue({
+      code: 0,
+      data: { scopes: [{ scope_name: 'im:message', grant_status: 2 }] }, // write_only NOT granted
+    });
+    const r = await checkRequiredScopes('cli_x', 'sec', 'feishu');
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.missingCritical.some(s => s.name === 'im:chat.members:write_only')).toBe(true);
+      expect(r.missingOptional.some(s => s.name === 'im:chat.members:write_only')).toBe(false);
+    }
+  });
+
   it('returns need_self_manage when scope.list returns 99991672', async () => {
     scopeListMock.mockResolvedValue({ code: 99991672, msg: 'no permission' });
     const r = await checkRequiredScopes('cli_x', 'sec', 'feishu');
@@ -324,6 +376,15 @@ describe('BOTMUX_REQUIRED_SCOPES', () => {
     expect(names).toContain('contact:user.base:readonly');
   });
 
+  it('requires im:message.group_msg so the bot can fetch group history (botmux history)', () => {
+    // 没有这个 scope 时 listChatMessages 拿不到群里非 @bot 的历史消息，
+    // botmux history 失效。标 critical 是为了让启动自检在它缺失时也会 DM
+    // 管理员——非 critical 的缺失只在同时缺 critical 时才会被提示。
+    const entry = BOTMUX_REQUIRED_SCOPES.find(s => s.name === 'im:message.group_msg');
+    expect(entry, 'im:message.group_msg should be in BOTMUX_REQUIRED_SCOPES').toBeDefined();
+    expect(entry?.critical).toBe(true);
+  });
+
   it('every required scope exists in lark-scopes.json manifest (no bare names that Lark API would never return)', async () => {
     // Regression: BOTMUX_REQUIRED_SCOPES used bare names `im:chat` /
     // `im:message.group_at_msg` that don't exist in Lark's scope catalog —
@@ -348,5 +409,55 @@ describe('BOTMUX_REQUIRED_SCOPES', () => {
       missing,
       `BOTMUX_REQUIRED_SCOPES entries not in lark-scopes.json: ${missing.map(s => s.name).join(', ')}`,
     ).toEqual([]);
+  });
+
+  it('DOC_FEATURE_SCOPES are valid manifest scopes and match DOC_COMMENT_OAUTH_SCOPES (no drift)', async () => {
+    const { readFileSync } = await import('node:fs');
+    const { fileURLToPath } = await import('node:url');
+    const { dirname, join } = await import('node:path');
+    const here = dirname(fileURLToPath(import.meta.url));
+    const manifest = JSON.parse(readFileSync(join(here, '..', 'src', 'setup', 'lark-scopes.json'), 'utf-8'));
+    const declared = new Set<string>([...(manifest.scopes?.tenant ?? []), ...(manifest.scopes?.user ?? [])]);
+
+    const missing = DOC_FEATURE_SCOPES.filter(s => !declared.has(s.name));
+    expect(missing, `DOC_FEATURE_SCOPES not in lark-scopes.json: ${missing.map(s => s.name).join(', ')}`).toEqual([]);
+
+    // The startup-check list and the OAuth-request list must stay name-aligned.
+    expect(DOC_FEATURE_SCOPES.map(s => s.name).sort()).toEqual([...DOC_COMMENT_OAUTH_SCOPES].sort());
+    // Doc-feature scopes are opt-in → must never be critical (would nag every bot).
+    expect(DOC_FEATURE_SCOPES.every(s => !s.critical)).toBe(true);
+    expect(DOC_WATCH_SCOPES.map(s => s.name).sort()).toEqual([
+      'docs:document.comment:create',
+      'docs:document.comment:read',
+      'wiki:wiki:readonly',
+    ]);
+    expect(DOC_WATCH_SCOPES.every(s => !s.critical)).toBe(true);
+  });
+
+  it('VC meeting feature scopes are valid manifest scopes and opt-in only', async () => {
+    const { readFileSync } = await import('node:fs');
+    const { fileURLToPath } = await import('node:url');
+    const { dirname, join } = await import('node:path');
+    const here = dirname(fileURLToPath(import.meta.url));
+    const manifest = JSON.parse(readFileSync(join(here, '..', 'src', 'setup', 'lark-scopes.json'), 'utf-8'));
+    const declared = new Set<string>([...(manifest.scopes?.tenant ?? []), ...(manifest.scopes?.user ?? [])]);
+
+    const missing = VC_MEETING_FEATURE_SCOPES.filter(s => !declared.has(s.name));
+    expect(missing, `VC_MEETING_FEATURE_SCOPES not in lark-scopes.json: ${missing.map(s => s.name).join(', ')}`).toEqual([]);
+    expect(VC_MEETING_FEATURE_SCOPES.map(s => s.name).sort()).toEqual([
+      'vc:meeting.bot.join:write',
+      'vc:meeting.meetingevent:read',
+      'vc:meeting.message:write',
+    ]);
+    expect(VC_MEETING_FEATURE_SCOPES.every(s => !s.critical)).toBe(true);
+  });
+
+  it('VC meeting bot event checklist uses the confirmed Open Platform keys', () => {
+    expect([...VC_MEETING_BOT_EVENTS]).toEqual([
+      'vc.bot.meeting_invited_v1',
+      'vc.bot.meeting_activity_v1',
+      'vc.bot.meeting_ended_v1',
+      'vc.meeting.participant_meeting_joined_v1',
+    ]);
   });
 });

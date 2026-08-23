@@ -1,51 +1,228 @@
-// Groups & Bots page: chat × bot membership matrix + add-bots modal.
-// The aggregator at /api/groups fans out to all online daemons and merges chats
-// by chatId; the dashboard displays this as a matrix where each cell shows
-// whether a bot is a member of a given chat.
-import { escapeHtml, t } from './ui.js';
+import { t } from './ui.js';
+import type {
+  EffectiveRoleValue,
+  RoleProfileEntryLike,
+  RoleProfileSummaryLike,
+} from './role-profile-match.js';
+import {
+  emptyGroupsSnapshot,
+  fetchGroupsSnapshot,
+  type GroupBot,
+  type GroupChat,
+  type GroupFilters,
+  type GroupsSnapshot,
+} from './groups-api.js';
+import { effectiveRoleKey, loadEffectiveRoleMap } from './role-batch.js';
 
-let cache: { chats: any[]; bots: any[] } = { chats: [], bots: [] };
+export {
+  emptyGroupsSnapshot,
+  fetchGroupsSnapshot,
+};
+export type {
+  GroupBot,
+  GroupChat,
+  GroupFilters,
+  GroupsSnapshot,
+};
 
-function pageHtml(): string {
-  return `<section class="page">
-<div class="page-heading">
-  <div>
-    <p class="eyebrow">${t('nav.groups')}</p>
-    <h1>${t('groups.title')}</h1>
-    <p>${t('groups.subtitle')}</p>
-  </div>
-</div>
-<form id="g-filters" class="filters">
-  <input type="search" name="q" placeholder="${t('groups.search')}" />
-  <label><input type="checkbox" name="missing"> ${t('groups.missingOnly')}</label>
-  <button type="button" id="g-refresh">${t('groups.refresh')}</button>
-  <button type="button" id="g-create" class="primary">${t('groups.create')}</button>
-</form>
-<table>
-  <thead id="g-head"></thead>
-  <tbody id="g-body"></tbody>
-</table>
-<dialog id="g-drawer"></dialog>
-</section>`;
+const PROFILE_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
+const GROUP_ROLE_CONTEXT_CONCURRENCY = 6;
+export const GROUPS_PAGE_SIZE = 30;
+
+export interface RoleProfileContext {
+  profiles: RoleProfileSummaryLike[];
+  entriesById: Map<string, RoleProfileEntryLike[]>;
+  groupRoleContentByBot: Map<string, EffectiveRoleValue>;
+  loaded: boolean;
 }
 
-async function loadGroups(): Promise<void> {
-  const r = await fetch('/api/groups');
-  cache = await r.json();
+export interface GroupPageWindow<T> {
+  rows: T[];
+  page: number;
+  totalPages: number;
+  from: number;
+  to: number;
+  total: number;
 }
 
-/** Fetch /api/groups once and return the parsed payload without mutating
- *  `cache` — used by refreshUntilSeen so we can decide whether to commit. */
-async function fetchGroups(): Promise<{ chats: any[]; bots: any[] }> {
-  const r = await fetch('/api/groups');
-  return r.json();
+export type SaveProfileEntryStatus = 'chat' | 'team' | 'empty' | 'error';
+
+export interface SaveProfileEntry {
+  larkAppId: string;
+  botName?: string;
+  content: string;
+  status: SaveProfileEntryStatus;
+}
+
+export interface GroupAddBotResult {
+  id?: unknown;
+  ok?: unknown;
+  error?: unknown;
+}
+
+export interface AddBotsSummary {
+  rows: GroupAddBotResult[];
+  okCount: number;
+  failed: number;
+}
+
+export interface RoleProfileBootstrapStatus {
+  kind: 'ok' | 'warn';
+  text: string;
+}
+
+export function roleKey(larkAppId: string, chatId: string): string {
+  return effectiveRoleKey(larkAppId, chatId);
+}
+
+/** Keep the expensive group coverage matrix bounded to one client-side page. */
+export function paginateGroupRows<T>(
+  rows: T[],
+  requestedPage: number,
+  pageSize = GROUPS_PAGE_SIZE,
+): GroupPageWindow<T> {
+  const safePageSize = Number.isFinite(pageSize) ? Math.max(1, Math.floor(pageSize)) : GROUPS_PAGE_SIZE;
+  const total = rows.length;
+  const totalPages = Math.max(1, Math.ceil(total / safePageSize));
+  const normalizedPage = Number.isFinite(requestedPage) ? Math.floor(requestedPage) : 1;
+  const page = Math.min(totalPages, Math.max(1, normalizedPage));
+  const start = (page - 1) * safePageSize;
+  const to = Math.min(total, start + safePageSize);
+  return {
+    rows: rows.slice(start, to),
+    page,
+    totalPages,
+    from: total === 0 ? 0 : start + 1,
+    to,
+    total,
+  };
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  worker: (item: T) => Promise<R>,
+): Promise<R[]> {
+  if (items.length === 0) return [];
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.min(Math.max(1, limit), items.length);
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex++;
+      results[index] = await worker(items[index]);
+    }
+  }));
+  return results;
+}
+
+export function isValidProfileId(profileId: string): boolean {
+  return PROFILE_ID_RE.test(profileId) && profileId !== '.' && profileId !== '..';
+}
+
+export function suggestRoleProfileIdFromChat(value: string): string {
+  const cleaned = String(value ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 64);
+  return isValidProfileId(cleaned) ? cleaned : 'profile';
+}
+
+export async function fetchRoleProfileSummaries(): Promise<RoleProfileSummaryLike[]> {
+  const r = await fetch('/api/role-profiles');
+  const body = await r.json().catch(() => ({}));
+  return Array.isArray(body.profiles) ? body.profiles as RoleProfileSummaryLike[] : [];
+}
+
+export async function loadGroupRoleProfileContext(snapshot: GroupsSnapshot): Promise<RoleProfileContext> {
+  const nextProfiles = await fetchRoleProfileSummaries();
+  const detailPairs = await mapWithConcurrency(nextProfiles, GROUP_ROLE_CONTEXT_CONCURRENCY, async profile => {
+    try {
+      const r = await fetch(`/api/role-profiles/${encodeURIComponent(profile.profileId)}`);
+      const body = await r.json().catch(() => ({}));
+      return [profile.profileId, Array.isArray(body.entries) ? body.entries as RoleProfileEntryLike[] : []] as const;
+    } catch {
+      return [profile.profileId, [] as RoleProfileEntryLike[]] as const;
+    }
+  });
+
+  const seenRoleKeys = new Set<string>();
+  const roleTargets: Array<{ chatId: string; larkAppId: string }> = [];
+  for (const chat of snapshot.chats ?? []) {
+    for (const bot of chat.memberBots ?? []) {
+      // Profile matching intentionally considers explicit chat roles only.
+      // /api/groups already tells us whether one exists, so skip every
+      // unconfigured membership instead of reading its effective team role.
+      if (!bot?.inChat || !bot?.hasRole || !bot?.larkAppId) continue;
+      const key = roleKey(bot.larkAppId, chat.chatId);
+      if (seenRoleKeys.has(key)) continue;
+      seenRoleKeys.add(key);
+      roleTargets.push({ chatId: chat.chatId, larkAppId: bot.larkAppId });
+    }
+  }
+  const nextGroupRoles = await loadEffectiveRoleMap(roleTargets);
+
+  return {
+    profiles: nextProfiles,
+    entriesById: new Map(detailPairs),
+    groupRoleContentByBot: nextGroupRoles,
+    loaded: true,
+  };
+}
+
+export async function collectGroupProfileEntries(chat: GroupChat): Promise<SaveProfileEntry[]> {
+  const inChat = (chat.memberBots ?? []).filter(bot => bot?.inChat && bot?.larkAppId);
+  return mapWithConcurrency(inChat, GROUP_ROLE_CONTEXT_CONCURRENCY, async bot => {
+    try {
+      const r = await fetch(`/api/roles/${encodeURIComponent(bot.larkAppId)}/${encodeURIComponent(chat.chatId)}`);
+      const body = await r.json().catch(() => ({}));
+      const hasEffectiveRole = body?.hasEffectiveRole ?? body?.hasRole;
+      const effectiveContent = 'effectiveContent' in body ? body.effectiveContent : body.content;
+      const content = hasEffectiveRole ? String(effectiveContent ?? '').trim() : '';
+      const source = body?.effectiveSource === 'chat' || body?.effectiveSource === 'team'
+        ? body.effectiveSource as SaveProfileEntryStatus
+        : null;
+      return {
+        larkAppId: bot.larkAppId,
+        botName: bot.botName,
+        content,
+        status: content ? (source ?? 'chat') : 'empty',
+      };
+    } catch {
+      return {
+        larkAppId: bot.larkAppId,
+        botName: bot.botName,
+        content: '',
+        status: 'error' as const,
+      };
+    }
+  });
+}
+
+export function availableBotsForPicker(
+  bots: GroupBot[],
+  excludeIds?: Set<string>,
+): GroupBot[] {
+  return bots.filter(bot => !excludeIds || !excludeIds.has(bot.larkAppId));
+}
+
+export function filterGroupChats(chats: GroupChat[], filters: GroupFilters): GroupChat[] {
+  const q = filters.q.trim().toLowerCase();
+  return chats
+    .filter(chat => !q ||
+      (chat.name ?? '').toLowerCase().includes(q) ||
+      chat.chatId.toLowerCase().includes(q) ||
+      (chat.ownerId ?? '').toLowerCase().includes(q)
+    )
+    .filter(chat => !filters.missingOnly || (chat.memberBots ?? []).some(member => !member.inChat));
 }
 
 /** True iff every expected bot id appears in the row's memberBots with
  *  inChat:true. Used by refreshUntilSeen to defer committing a canonical
- *  snapshot until all invited bots have caught up Lark-side. Exported so
- *  tests can exercise the predicate without spinning up jsdom. */
-export function allExpectedInChat(row: any, expectedBotIds: Set<string>): boolean {
+ *  snapshot until all invited bots have caught up Lark-side. */
+export function allExpectedInChat(row: GroupChat | null | undefined, expectedBotIds: Set<string>): boolean {
   if (expectedBotIds.size === 0) return true;
   const members = (row?.memberBots ?? []) as Array<{ larkAppId: string; inChat: boolean }>;
   for (const id of expectedBotIds) {
@@ -54,543 +231,69 @@ export function allExpectedInChat(row: any, expectedBotIds: Set<string>): boolea
   return true;
 }
 
-/** Render the bot-picker checkboxes shared by "Create new group" and
- *  "Add bots". Always iterates `bots` in its given order (the aggregator
- *  hands cache.bots back sorted by botIndex), so both modals show the
- *  same order. `excludeIds` removes bots that are already in the chat
- *  for the Add-bots flow. Exported for tests. */
-export function renderBotCheckboxes(
-  bots: Array<{ larkAppId: string; botName?: string }>,
-  excludeIds?: Set<string>,
-): string {
-  return bots
-    .filter(b => !excludeIds || !excludeIds.has(b.larkAppId))
-    .map(b => `
-      <label class="checkbox-row">
-        <input type="checkbox" name="bot" value="${escapeHtml(b.larkAppId)}">
-        ${escapeHtml(b.botName ?? b.larkAppId)} <small>(${escapeHtml(b.larkAppId)})</small>
-      </label>
-    `).join('');
+export function summarizeAddBotsResult(result: GroupAddBotResult[]): AddBotsSummary {
+  const rows = Array.isArray(result) ? result : [];
+  const okCount = rows.filter(row => !!row?.ok).length;
+  return { rows, okCount, failed: rows.length - okCount };
 }
 
-export async function renderGroupsPage(root: HTMLElement) {
-  root.innerHTML = pageHtml();
-  const head = root.querySelector<HTMLElement>('#g-head')!;
-  const body = root.querySelector<HTMLElement>('#g-body')!;
-  const form = root.querySelector<HTMLFormElement>('#g-filters')!;
-  const refreshBtn = root.querySelector<HTMLButtonElement>('#g-refresh')!;
-  const drawer = root.querySelector<HTMLDialogElement>('#g-drawer')!;
+export function roleProfileBootstrapStatus(
+  profileId: string,
+  messageId?: unknown,
+  error?: unknown,
+): RoleProfileBootstrapStatus | null {
+  const cleanProfileId = String(profileId ?? '').trim();
+  if (!cleanProfileId) return null;
 
-  refreshBtn.onclick = async () => {
-    refreshBtn.disabled = true;
-    try { await loadGroups(); rerender(); } finally { refreshBtn.disabled = false; }
+  if (error) {
+    return {
+      kind: 'warn',
+      text: t('groups.roleProfileBootstrapFailed', {
+        name: cleanProfileId,
+        reason: String(error),
+      }),
+    };
+  }
+
+  const cleanMessageId = typeof messageId === 'string' && messageId.trim() ? messageId.trim() : '';
+  if (cleanMessageId) {
+    return {
+      kind: 'ok',
+      text: t('groups.roleProfileBootstrapSent', {
+        name: cleanProfileId,
+        messageId: cleanMessageId,
+      }),
+    };
+  }
+
+  return {
+    kind: 'ok',
+    text: t('groups.roleProfileBootstrapDone', { name: cleanProfileId }),
   };
+}
 
-  const createBtn = root.querySelector<HTMLButtonElement>('#g-create')!;
-  createBtn.onclick = () => openCreateModal();
-
-  await loadGroups();
-
-  function openCreateModal() {
-    const allBots = cache.bots;
-    if (allBots.length === 0) {
-      alert(t('groups.noBotsOnline'));
-      return;
-    }
-    drawer.innerHTML = `
-      <article>
-        <header><h3>${t('groups.createTitle')}</h3></header>
-        <p>${t('groups.createHelp')}</p>
-        <form id="g-createform">
-          <label class="form-row">
-            <span>${t('groups.name')}</span>
-            <input type="text" name="name" placeholder="${t('groups.namePlaceholder')}" maxlength="60">
-          </label>
-          <label class="form-row">
-            <span>${t('groups.bindDir')}</span>
-            <input type="text" name="bindWorkingDir" placeholder="e.g. ~/projects/botmux">
-            <small>${t('groups.bindDirHelp')}</small>
-          </label>
-          <fieldset>
-            <legend>${t('groups.botPicker')}</legend>
-            ${renderBotCheckboxes(allBots)}
-          </fieldset>
-          <div class="actions">
-            <button type="submit" class="primary">${t('groups.createSubmit')}</button>
-            <button type="button" id="g-create-cancel">${t('groups.cancel')}</button>
-          </div>
-        </form>
-      </article>`;
-    drawer.showModal();
-
-    drawer.querySelector<HTMLButtonElement>('#g-create-cancel')!.onclick = () => drawer.close();
-
-    drawer.querySelector<HTMLFormElement>('#g-createform')!.onsubmit = async ev => {
-      ev.preventDefault();
-      const fd = new FormData(ev.target as HTMLFormElement);
-      const name = ((fd.get('name') as string) ?? '').trim();
-      const bindWorkingDir = ((fd.get('bindWorkingDir') as string) ?? '').trim();
-      const ids = fd.getAll('bot') as string[];
-      if (ids.length === 0) { alert('Pick at least one bot.'); return; }
-      const submitBtn = (ev.target as HTMLFormElement).querySelector<HTMLButtonElement>('button[type=submit]');
-      if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = 'Creating...'; }
-      try {
-        const r = await fetch('/api/groups/create', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ name: name || undefined, larkAppIds: ids, bindWorkingDir: bindWorkingDir || undefined }),
-        });
-        const respBody = await r.json();
-        if (respBody.ok && respBody.chatId) {
-          renderCreateSuccess(respBody);
-          // Lark's chat.list has eventual consistency: the chat we just
-          // created via /api/groups/create often doesn't appear in the next
-          // /api/groups response for a few seconds. Without intervention the
-          // background refresh would overwrite cache with a stale snapshot
-          // and the new group would silently vanish from the matrix until
-          // the user hit Refresh manually.
-          //
-          // Optimistic insert: render the new group instantly using the
-          // creator's larkAppId + the form's selected bot ids minus any
-          // invalidBotIds Lark rejected. The refresh poll below keeps
-          // re-fetching until Lark confirms ALL expected bots show inChat,
-          // then commits the canonical response; until then we keep the
-          // optimistic row. Stopping on first sight of just `chatId` would
-          // commit a partial-membership snapshot — see Codex review.
-          const invalidBotIds: string[] = Array.isArray(respBody.invalidBotIds) ? respBody.invalidBotIds : [];
-          const validIds = ids.filter(id => !invalidBotIds.includes(id));
-          const expectedBotIds = new Set<string>(validIds);
-          if (typeof respBody.creator === 'string' && respBody.creator) expectedBotIds.add(respBody.creator);
-          injectOptimisticChat(respBody.chatId, name || respBody.chatId, validIds, respBody.creator);
-          rerender();
-          void refreshUntilSeen(respBody.chatId, expectedBotIds).catch(() => { /* tolerate */ });
-        } else {
-          alert(`Failed: ${respBody.error ?? r.status}`);
-          drawer.close();
-        }
-      } catch (e) {
-        alert('Network error: ' + e);
-        drawer.close();
-      }
-    };
-
-    function injectOptimisticChat(
-      chatId: string,
-      displayName: string,
-      memberIds: string[],
-      creator: string | undefined,
-    ): void {
-      const inChatSet = new Set(memberIds);
-      if (creator) inChatSet.add(creator);
-      const memberBots = cache.bots.map((b: any) => ({
-        larkAppId: b.larkAppId,
-        botName: b.botName,
-        inChat: inChatSet.has(b.larkAppId),
-        oncallChat: null,
-      }));
-      const optimistic = {
-        chatId,
-        name: displayName,
-        ownerId: creator ?? null,
-        memberBots,
-      };
-      // Drop any duplicate (defensive — shouldn't fire, but cheap) and
-      // prepend so the new row lands at the top of the matrix.
-      cache.chats = [optimistic, ...cache.chats.filter((c: any) => c.chatId !== chatId)];
-    }
-
-    async function refreshUntilSeen(chatId: string, expectedBotIds: Set<string>): Promise<void> {
-      // Total budget ≈ 0.6 + 5*1.2 = ~6.6s. Commit only when the row is
-      // present AND every expected bot reports inChat:true — otherwise we'd
-      // overwrite our optimistic ✓ marks with a partial canonical snapshot
-      // (creator daemon often lags vs. invitee daemons on Lark's side).
-      // If the budget runs out the optimistic row stays put; next manual
-      // Refresh will reconcile.
-      const delays = [600, 1200, 1200, 1200, 1200, 1200];
-      for (const d of delays) {
-        await new Promise(r => setTimeout(r, d));
-        let next: { chats: any[]; bots: any[] };
-        try { next = await fetchGroups(); }
-        catch { continue; }
-        const row = (next.chats ?? []).find((c: any) => c.chatId === chatId);
-        if (row && allExpectedInChat(row, expectedBotIds)) {
-          cache = next;
-          rerender();
-          return;
-        }
-      }
-    }
-  }
-
-  function renderCreateSuccess(resp: any) {
-    const chatId = String(resp.chatId);
-    const appLink = `https://applink.feishu.cn/client/chat/open?openChatId=${encodeURIComponent(chatId)}`;
-    const invalidBots = (resp.invalidBotIds ?? []) as string[];
-    const invalidUsers = (resp.invalidUserIds ?? []) as string[];
-    const auto = resp.autoInvitedOpenId as string | null | undefined;
-    const rejected = !!resp.autoInviteRejected;
-    const ownerTo = resp.ownerTransferredTo as string | null | undefined;
-    const transferErr = resp.transferError as string | null | undefined;
-    const notifyMsgId = resp.notifyMessageId as string | null | undefined;
-    const notifyErr = resp.notifyError as string | null | undefined;
-    const binds = Array.isArray(resp.oncallBindings) ? resp.oncallBindings as any[] : [];
-    const bindOk = binds.filter(b => b?.ok).length;
-    const bindFailed = binds.filter(b => !b?.ok);
-    const bindNote = binds.length > 0
-      ? bindFailed.length === 0
-        ? `<p class="hint-ok">已绑定目录：<code>${escapeHtml(resp.bindResolvedPath ?? '')}</code>（${bindOk}/${binds.length} bots）</p>`
-        : `<p class="hint-warn">目录绑定部分失败：成功 ${bindOk}/${binds.length}。${bindFailed.map(b => `<br><code>${escapeHtml(b.larkAppId ?? '?')}</code>: ${escapeHtml(b.error ?? 'unknown')}`).join('')}</p>`
-      : '';
-    let inviteNote: string;
-    if (auto) {
-      const transferLine = ownerTo
-        ? `<br><small>群主已从机器人转让给你。</small>`
-        : transferErr
-          ? `<br><small class="hint-warn-inline">⚠ 自动转让群主失败（${escapeHtml(transferErr)}），你现在是成员但群主仍是机器人。</small>`
-          : '';
-      const notifyLine = notifyMsgId
-        ? `<br><small>机器人已在群里 @ 了你（消息 id <code>${escapeHtml(notifyMsgId)}</code>），看飞书通知就能进群。</small>`
-        : notifyErr
-          ? `<br><small class="hint-warn-inline">⚠ 自动 @ 通知失败（${escapeHtml(notifyErr)}），新群可能不会主动出现在你侧边栏，建议从下面按钮跳进去。</small>`
-          : '';
-      inviteNote = `<p class="hint-ok">已自动邀请你（<code>${escapeHtml(auto)}</code>）作为成员。${transferLine}${notifyLine}</p>`;
-    } else if (rejected) {
-      inviteNote = `<p class="hint-warn">飞书拒绝了自动邀请（你的 open_id 在创建者 bot 的 scope 下不可用）。<strong>你目前不是新群成员</strong>，需要让群里的某个机器人手动把你加进来。</p>`;
-    } else {
-      inviteNote = `<p class="hint-warn">没在 dashboard 缓存里找到 ownerOpenId，<strong>没有自动邀请你</strong>。点开下面链接前，先让群里任一机器人手动把你加进去。</p>`;
-    }
-    const invalidNote = [
-      invalidBots.length ? `<li>无效 bot id: <code>${invalidBots.map(escapeHtml).join(', ')}</code></li>` : '',
-      invalidUsers.length ? `<li>无效用户 open_id: <code>${invalidUsers.map(escapeHtml).join(', ')}</code></li>` : '',
-    ].filter(Boolean).join('');
-
-    drawer.innerHTML = `
-      <article>
-        <header><h3>${t('groups.successTitle')}</h3></header>
-        <p><b>chatId:</b> <code>${escapeHtml(chatId)}</code> <button type="button" data-copy="${escapeHtml(chatId)}">${t('sessions.copy')}</button></p>
-        <p><b>创建者:</b> <code>${escapeHtml(resp.creator ?? '?')}</code></p>
-        ${inviteNote}
-        ${bindNote}
-        ${invalidNote ? `<ul>${invalidNote}</ul>` : ''}
-        <div class="actions">
-          <a class="btn-link primary" href="${appLink}" target="_blank" rel="noopener">${t('groups.openGroup')}</a>
-          <button type="button" id="g-create-close">${t('sessions.dismiss')}</button>
-        </div>
-      </article>`;
-
-    drawer.querySelectorAll<HTMLButtonElement>('[data-copy]').forEach(b => {
-      b.onclick = () => {
-        navigator.clipboard.writeText(b.dataset.copy ?? '');
-        b.textContent = t('sessions.copied');
-        setTimeout(() => { b.textContent = t('sessions.copy'); }, 800);
-      };
-    });
-    drawer.querySelector<HTMLButtonElement>('#g-create-close')!.onclick = () => drawer.close();
-  }
-
-  function renderHead() {
-    head.innerHTML = `<tr>
-      <th>${t('groups.chat')}</th>
-      ${cache.bots.map(b => `<th>${escapeHtml(b.botName ?? b.larkAppId)}</th>`).join('')}
-      <th>${t('groups.actions')}</th>
-    </tr>`;
-  }
-
-  function rerender() {
-    renderHead();
-    const f = new FormData(form);
-    const q = ((f.get('q') as string) ?? '').toLowerCase();
-    const onlyMissing = !!f.get('missing');
-
-    const filtered = cache.chats
-      .filter(c => !q ||
-        (c.name ?? '').toLowerCase().includes(q) ||
-        c.chatId.toLowerCase().includes(q) ||
-        (c.ownerId ?? '').toLowerCase().includes(q)
-      )
-      .filter(c => !onlyMissing || c.memberBots.some((m: any) => !m.inChat));
-
-    if (filtered.length === 0) {
-      body.innerHTML = `<tr><td colspan="${cache.bots.length + 2}" class="empty">${t('groups.empty')}</td></tr>`;
-      return;
-    }
-    body.innerHTML = filtered.map(c => `<tr data-chat="${escapeHtml(c.chatId)}">
-      <td>
-        <strong>${escapeHtml(c.name ?? c.chatId)}</strong><br>
-        <small><code>${escapeHtml(c.chatId)}</code></small>
-      </td>
-      ${cache.bots.map(b => {
-        const m = c.memberBots.find((m: any) => m.larkAppId === b.larkAppId);
-        const cell = !m ? '?' : m.error ? '!' : m.inChat ? '✓' : '✗';
-        const cls = !m ? 'cell-unknown' : m.error ? 'cell-error' : m.inChat ? 'cell-in' : 'cell-out';
-        return `<td class="${cls}" title="${escapeHtml(m?.error ?? '')}">${cell}</td>`;
-      }).join('')}
-      <td>
-        <button class="add-bots" type="button">${t('groups.addBots')}</button>
-        <button class="manage-chat" type="button">${t('groups.manage')}</button>
-      </td>
-    </tr>`).join('');
-  }
-  rerender();
-
-  body.addEventListener('click', async e => {
-    const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('button.add-bots');
-    if (!btn) return;
-    const tr = btn.closest<HTMLTableRowElement>('tr[data-chat]')!;
-    const chatId = tr.dataset.chat!;
-    const chat = cache.chats.find(c => c.chatId === chatId);
-    if (!chat) return;
-    // Iterate cache.bots (botIndex-sorted by the aggregator) so this modal's
-    // order matches "Create new group" exactly. memberBots is only used to
-    // compute which bots to hide as already-in-chat.
-    const inChatSet = new Set<string>(
-      chat.memberBots.filter((m: any) => m.inChat).map((m: any) => m.larkAppId),
-    );
-    const missing = cache.bots.filter((b: any) => !inChatSet.has(b.larkAppId));
-    if (!missing.length) {
-      alert('All configured bots are already in this chat.');
-      return;
-    }
-    drawer.innerHTML = `
-      <article>
-        <header><h3>${t('groups.addBots')} · ${escapeHtml(chat.name ?? chat.chatId)}</h3></header>
-        <p>${t('groups.createHelp')}</p>
-        <form id="g-addform">
-          ${renderBotCheckboxes(cache.bots, inChatSet)}
-          <div class="actions">
-            <button type="submit" class="primary">${t('groups.addBots')}</button>
-            <button type="button" id="g-cancel">${t('groups.cancel')}</button>
-          </div>
-        </form>
-      </article>`;
-    drawer.showModal();
-
-    drawer.querySelector<HTMLButtonElement>('#g-cancel')!.onclick = () => drawer.close();
-
-    drawer.querySelector<HTMLFormElement>('#g-addform')!.onsubmit = async ev => {
-      ev.preventDefault();
-      const fd = new FormData(ev.target as HTMLFormElement);
-      const ids = fd.getAll('bot') as string[];
-      if (ids.length === 0) { alert('Pick at least one bot.'); return; }
-      try {
-        const r = await fetch(`/api/groups/${encodeURIComponent(chatId)}/add-bots`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ larkAppIds: ids }),
-        });
-        const respBody = await r.json();
-        if (respBody.error === 'no_proxy_bot') {
-          alert('No bot is currently in this chat — add one manually in Feishu first, then retry.');
-        } else if (respBody.result) {
-          const lines = respBody.result.map((x: any) =>
-            `${x.id}: ${x.ok ? 'OK' : `failed (${x.error ?? 'unknown'})`}`
-          ).join('\n');
-          alert(lines);
-          // Refresh after change
-          await loadGroups();
-          rerender();
-        } else {
-          alert(`Unexpected response: ${JSON.stringify(respBody)}`);
-        }
-      } catch (e) {
-        alert('Network error: ' + e);
-      } finally {
-        drawer.close();
-      }
-    };
-  });
-
-  body.addEventListener('click', async e => {
-    const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('button.manage-chat');
-    if (!btn) return;
-    const tr = btn.closest<HTMLTableRowElement>('tr[data-chat]')!;
-    const chatId = tr.dataset.chat!;
-    const chat = cache.chats.find(c => c.chatId === chatId);
-    if (!chat) return;
-    openManageDrawer(chat);
-  });
-
-  function openManageDrawer(chat: any) {
-    const inChat = chat.memberBots.filter((m: any) => m.inChat) as any[];
-    // Lark `owner_id` returns app_id format for bot owners (string match works).
-    // For user owners it'll be an open_id which won't match any larkAppId.
-    const ownerAppId = typeof chat.ownerId === 'string' ? chat.ownerId : '';
-    drawer.innerHTML = `
-      <article>
-        <header><h3>${t('groups.manageTitle', { name: chat.name ?? chat.chatId })}</h3></header>
-        <p><b>chatId:</b> <code>${escapeHtml(chat.chatId)}</code></p>
-        <p><b>${t('groups.owner')}:</b> <code>${escapeHtml(chat.ownerId ?? t('common.unknown'))}</code></p>
-
-        <fieldset>
-          <legend>${t('groups.oncall')}</legend>
-          <p><small>${t('groups.oncallHelp')}</small></p>
-          ${inChat.length === 0
-            ? `<p class="empty">没有机器人在群里</p>`
-            : inChat.map((m: any) => {
-              const enabled = !!m.oncallChat;
-              const wd = m.oncallChat?.workingDir ?? '';
-              return `
-                <div class="oncall-row" data-bot="${escapeHtml(m.larkAppId)}">
-                  <label class="checkbox-row">
-                    <input type="checkbox" data-action="toggle" ${enabled ? 'checked' : ''}>
-                    <strong>${escapeHtml(m.botName ?? m.larkAppId)}</strong>
-                    <small>(${escapeHtml(m.larkAppId)})</small>
-                  </label>
-                  <div class="oncall-row-body">
-                    <input type="text" data-input="workingDir" placeholder="e.g. /root/iserver/botmux"
-                           value="${escapeHtml(wd)}" ${enabled ? '' : 'disabled'}>
-                    <button type="button" data-action="save">${t('groups.save')}</button>
-                    <span class="oncall-status" data-status></span>
-                  </div>
-                </div>
-              `;
-            }).join('')}
-        </fieldset>
-
-        <fieldset>
-          <legend>${t('groups.leaveTitle')}</legend>
-          ${inChat.length === 0
-            ? `<p class="empty">没有机器人在群里</p>`
-            : inChat.map((m: any) => `
-              <label class="checkbox-row">
-                <input type="checkbox" name="leave-bot" value="${escapeHtml(m.larkAppId)}">
-                ${escapeHtml(m.botName ?? m.larkAppId)}
-                <small>${m.larkAppId === ownerAppId ? '· 群主' : ''}</small>
-              </label>
-            `).join('')}
-        </fieldset>
-
-        <div class="actions">
-          <button id="g-leave-btn" type="button" ${inChat.length === 0 ? 'disabled' : ''}>${t('groups.leaveSelected')}</button>
-          <button id="g-disband-btn" type="button" class="contrast" ${inChat.length === 0 ? 'disabled' : ''}>${t('groups.disband')}</button>
-        </div>
-        <p class="hint-warn"><small>${t('groups.dangerHint')}</small></p>
-        <form method="dialog"><button>${t('sessions.dismiss')}</button></form>
-      </article>`;
-    drawer.showModal();
-
-    // Oncall row interactions: toggle enables/disables the input; Save commits.
-    drawer.querySelectorAll<HTMLDivElement>('.oncall-row').forEach(row => {
-      const appId = row.dataset.bot!;
-      const cb = row.querySelector<HTMLInputElement>('input[data-action=toggle]')!;
-      const input = row.querySelector<HTMLInputElement>('input[data-input=workingDir]')!;
-      const saveBtn = row.querySelector<HTMLButtonElement>('button[data-action=save]')!;
-      const statusEl = row.querySelector<HTMLSpanElement>('[data-status]')!;
-      cb.addEventListener('change', () => {
-        input.disabled = !cb.checked;
-        if (cb.checked) input.focus();
-      });
-      saveBtn.addEventListener('click', async () => {
-        statusEl.textContent = '';
-        statusEl.className = 'oncall-status';
-        const want = cb.checked;
-        const wd = input.value.trim();
-        if (want && !wd) {
-          statusEl.textContent = t('groups.needWorkingDir');
-          statusEl.classList.add('hint-warn-inline');
-          return;
-        }
-        saveBtn.disabled = true;
-        try {
-          const url = `/api/groups/${encodeURIComponent(chat.chatId)}/oncall/${encodeURIComponent(appId)}`;
-          const r = want
-            ? await fetch(url, {
-                method: 'PUT',
-                headers: { 'content-type': 'application/json' },
-                body: JSON.stringify({ workingDir: wd }),
-              })
-            : await fetch(url, { method: 'DELETE' });
-          const body = await r.json().catch(() => ({}));
-          if (r.ok && body.ok) {
-            statusEl.textContent = want
-              ? `✓ 已绑定 → ${body.resolvedPath ?? wd}`
-              : '✓ 已解绑';
-            statusEl.classList.add('hint-ok');
-            // Refresh aggregator cache + matrix; drawer state stays as-is
-            // (current row reflects the just-saved values).
-            try { await loadGroups(); rerender(); } catch { /* tolerate */ }
-          } else {
-            statusEl.textContent = `✗ ${body.error ?? r.status}`;
-            statusEl.classList.add('hint-warn-inline');
-          }
-        } catch (e: any) {
-          statusEl.textContent = `✗ ${e?.message ?? e}`;
-          statusEl.classList.add('hint-warn-inline');
-        } finally {
-          saveBtn.disabled = false;
-        }
-      });
-    });
-
-    drawer.querySelector<HTMLButtonElement>('#g-leave-btn')!.onclick = async () => {
-      const checked = [...drawer.querySelectorAll<HTMLInputElement>('input[name=leave-bot]:checked')]
-        .map(i => i.value);
-      if (checked.length === 0) { alert('至少选一个机器人'); return; }
-      if (!confirm(`确定让 ${checked.length} 个机器人退出群聊？该 bot 在此群的会话会一并关闭。`)) return;
-      try {
-        const r = await fetch(`/api/groups/${encodeURIComponent(chat.chatId)}/leave`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ larkAppIds: checked }),
-        });
-        const respBody = await r.json();
-        const lines = (respBody.result ?? []).map((x: any) => {
-          if (!x.ok) return `${x.larkAppId}: 失败 (${x.error ?? 'unknown'})`;
-          const closed = (x.closedSessions ?? []) as any[];
-          const failed = closed.filter(c => !c.ok).length;
-          const ok = closed.length - failed;
-          const note = closed.length === 0
-            ? ''
-            : failed === 0 ? `（关闭 ${ok} 个会话）` : `（关闭 ${ok} 个，${failed} 个失败）`;
-          return `${x.larkAppId}: OK${note}`;
-        }).join('\n');
-        alert(lines || `Unexpected: ${JSON.stringify(respBody)}`);
-        await loadGroups(); rerender();
-      } catch (e) {
-        alert('Network error: ' + e);
-      } finally {
-        drawer.close();
-      }
-    };
-
-    drawer.querySelector<HTMLButtonElement>('#g-disband-btn')!.onclick = async () => {
-      if (inChat.length === 0) return;
-      if (!confirm(`确定解散群聊「${chat.name ?? chat.chatId}」？此操作不可恢复，本群所有机器人会话也会一并关闭。`)) return;
-      // Try the owner bot first (highest success probability), then fall back
-      // to other in-chat bots in case our ownerId match was wrong (e.g. owner
-      // is a user, but a creator-bot with operate_as_owner scope is in chat).
-      const ordered = [...inChat].sort((a, b) =>
-        (b.larkAppId === ownerAppId ? 1 : 0) - (a.larkAppId === ownerAppId ? 1 : 0)
-      );
-      const errs: string[] = [];
-      for (const m of ordered) {
-        try {
-          const r = await fetch(`/api/groups/${encodeURIComponent(chat.chatId)}/disband`, {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ larkAppId: m.larkAppId }),
-          });
-          const respBody = await r.json();
-          if (respBody.ok) {
-            const closed = (respBody.closedSessions ?? []) as any[];
-            const failed = closed.filter(c => !c.ok).length;
-            const ok = closed.length - failed;
-            const closedNote = closed.length === 0
-              ? ''
-              : failed === 0 ? `\n关闭了 ${ok} 个会话。` : `\n关闭了 ${ok} 个会话，${failed} 个会话关闭失败。`;
-            alert(`已解散（由 ${m.botName ?? m.larkAppId} 执行）${closedNote}`);
-            await loadGroups(); rerender();
-            drawer.close();
-            return;
-          }
-          errs.push(`${m.botName ?? m.larkAppId}: ${respBody.error ?? r.status}`);
-        } catch (e) {
-          errs.push(`${m.botName ?? m.larkAppId}: ${e}`);
-        }
-      }
-      alert(`所有在群机器人均无法解散：\n${errs.join('\n')}\n\n建议改用「退出群聊」。`);
-    };
-  }
-
-  form.addEventListener('input', rerender);
+export function injectOptimisticChat(
+  snapshot: GroupsSnapshot,
+  chatId: string,
+  displayName: string,
+  memberIds: string[],
+  creator: string | undefined,
+): GroupsSnapshot {
+  const inChatSet = new Set(memberIds);
+  if (creator) inChatSet.add(creator);
+  const optimistic: GroupChat = {
+    chatId,
+    name: displayName,
+    ownerId: creator ?? null,
+    memberBots: snapshot.bots.map(bot => ({
+      larkAppId: bot.larkAppId,
+      botName: bot.botName,
+      inChat: inChatSet.has(bot.larkAppId),
+      oncallChat: null,
+    })),
+  };
+  return {
+    bots: snapshot.bots,
+    chats: [optimistic, ...snapshot.chats.filter(chat => chat.chatId !== chatId)],
+  };
 }

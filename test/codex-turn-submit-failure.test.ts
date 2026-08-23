@@ -218,10 +218,11 @@ describe('Codex ordinary submit-failure worker wiring', () => {
         }) +
         line({
           timestamp: '2026-07-19T13:00:00.500Z',
-          type: 'response_item',
+          type: 'event_msg',
           payload: {
-            type: 'message', role: 'assistant', phase: 'final_answer',
-            content: [{ type: 'output_text', text: `batch reply\n${batchReceiptLine('2', 3)}` }],
+            type: 'task_complete',
+            turn_id: 'turn-batch-t2',
+            last_agent_message: `batch reply\n${batchReceiptLine('2', 3)}`,
           },
         }),
       );

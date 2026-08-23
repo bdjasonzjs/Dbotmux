@@ -3,8 +3,17 @@
     "larkAppId": "cli_xxx_bot1",
     "larkAppSecret": "your_secret_1",
     "cliId": "claude-code",
+    "model": "sonnet",
+    "disableCliBypass": true,
     "allowedUsers": ["alice@company.com"],
-    "workingDir": "~/projects"
+    "allowedChatGroups": ["oc_xxx_team"],
+    "workingDir": "~/projects",
+    "customPassthroughCommands": ["/goal", "/export"],
+    "startupCommands": ["/effort ultracode"],
+    "env": {
+      "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic",
+      "ANTHROPIC_AUTH_TOKEN": "your-glm-coding-plan-key"
+    }
   },
   {
     "larkAppId": "cli_xxx_bot2",
@@ -17,7 +26,29 @@
     "larkAppId": "cli_xxx_bot3",
     "larkAppSecret": "your_secret_3",
     "cliId": "gemini",
+    "model": "gemini-2.5-pro",
     "allowedUsers": ["charlie@company.com"],
+    "workingDir": "~/projects"
+  },
+  {
+    "larkAppId": "cli_xxx_bot4",
+    "larkAppSecret": "your_secret_4",
+    "cliId": "mtr",
+    "allowedUsers": ["dana@company.com"],
+    "workingDir": "~/projects"
+  },
+  {
+    "larkAppId": "cli_xxx_bot5",
+    "larkAppSecret": "your_secret_5",
+    "cliId": "mira",
+    "allowedUsers": ["erin@company.com"],
+    "workingDir": "~/projects"
+  },
+  {
+    "larkAppId": "cli_xxx_bot6",
+    "larkAppSecret": "your_secret_6",
+    "cliId": "pi",
+    "allowedUsers": ["frank@company.com"],
     "workingDir": "~/projects"
   }
 ]

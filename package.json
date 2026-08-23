@@ -14,27 +14,52 @@
     "README.en.md",
     "LICENSE"
   ],
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
   "scripts": {
-    "build": "tsc && cp src/setup/lark-scopes.json dist/setup/ && pnpm dashboard:bundle && chmod +x dist/cli.js",
-    "dashboard:bundle": "esbuild src/dashboard/web/app.ts --bundle --outfile=dist/dashboard-web/app.js --platform=browser --format=iife --minify && cp src/dashboard/web/index.html dist/dashboard-web/index.html && cp src/dashboard/web/style.css dist/dashboard-web/style.css && cp src/dashboard/web/terminal-replay.html dist/dashboard-web/terminal-replay.html",
+    "build": "pnpm audit:domains && node scripts/clean-dist.mjs && tsc && pnpm typecheck:scripts && node scripts/generate-runtime-build-id.mjs && cp src/setup/lark-scopes.json dist/setup/ && pnpm dashboard:bundle && chmod +x dist/cli.js && node scripts/audit-dist.mjs",
+    "typecheck:scripts": "tsc -p tsconfig.scripts.json",
+    "workflow-core:build": "node scripts/build-workflow-core-package.mjs",
+    "workflow-core:test": "pnpm workflow-core:build && node scripts/test-workflow-core-package.mjs",
+    "workflow-core:pack": "pnpm workflow-core:build && node scripts/pack-workflow-core-package.mjs",
+    "audit:domains": "node scripts/audit-public-domains.mjs",
+    "dashboard:bundle": "node scripts/build-dashboard.mjs",
+    "dashboard:watch": "node scripts/build-dashboard.mjs --watch",
     "daemon": "tsx src/index-daemon.ts",
     "daemon:start": "node dist/cli.js start",
     "daemon:stop": "node dist/cli.js stop",
     "daemon:restart": "node dist/cli.js restart",
     "daemon:logs": "node dist/cli.js logs",
     "daemon:status": "node dist/cli.js status",
-    "test": "vitest run",
-    "test:codex": "vitest run test/codex-input.e2e.ts",
-    "test:gemini": "vitest run test/gemini-input.e2e.ts",
-    "test:agy": "vitest run test/agy-input.e2e.ts",
+    "use:here": "node scripts/claim-botmux-bin.mjs",
+    "creds:sync": "node dist/cli.js suspend --isolated",
+    "switch:here": "pnpm build && pnpm use:here",
+    "test": "vitest run --project unit",
+    "test:all": "vitest run --maxWorkers=12",
+    "test:e2e": "vitest run --project e2e",
+    "test:bench": "tsx scripts/bench-tests.ts",
+    "test:codex": "vitest run --project e2e test/codex-input.e2e.ts",
+    "test:gemini": "vitest run --project e2e test/gemini-input.e2e.ts",
+    "test:agy": "vitest run --project e2e test/agy-input.e2e.ts",
+    "bench:resource": "node --expose-gc --import tsx scripts/bench-resource.ts",
     "test:e2e-browser:setup": "tsx test/e2e-browser/setup-login.ts",
     "test:e2e-browser": "tsx scripts/run-e2e.ts",
     "report:dashboard": "tsx scripts/report-dashboard.ts",
+    "desktop:bundle": "node scripts/build-desktop-icons.mjs && esbuild src/desktop/main.ts --bundle --outfile=dist/desktop/main.cjs --platform=node --format=cjs --external:electron && esbuild src/desktop/preload.ts --bundle --outfile=dist/desktop/preload.cjs --platform=node --format=cjs --external:electron && esbuild src/desktop/renderer/app.ts --bundle --outfile=dist/desktop/renderer/app.js --platform=browser --format=iife && cp src/desktop/renderer/index.html dist/desktop/renderer/index.html && cp src/desktop/renderer/style.css dist/desktop/renderer/style.css && cp -R src/desktop/assets dist/desktop/assets",
+    "desktop:runtime": "node scripts/prepare-desktop-runtime.mjs",
+    "desktop:smoke": "tsx scripts/desktop-smoke.ts",
+    "desktop:install:local": "bash src/desktop/install-local.sh",
+    "desktop:dev": "pnpm build && pnpm desktop:bundle && electron dist/desktop/main.cjs",
+    "desktop:pack": "pnpm desktop:pack:local",
+    "desktop:pack:local": "node scripts/desktop-pack-local.mjs",
     "prepublishOnly": "npm run build",
     "prepare": "git config core.hooksPath scripts/git-hooks 2>/dev/null || true"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.66.1",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@napi-rs/canvas": "^0.1.65",
     "@xterm/addon-unicode11": "^0.9.0",
     "@xterm/headless": "^6.0.0",
@@ -44,8 +69,12 @@
     "node-pty": "^1.1.0",
     "pm2": "^6.0.0",
     "qrcode": "^1.5.4",
+    "proxy-agent": "^6.5.0",
     "qrcode-terminal": "^0.12.0",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
     "ws": "^8.19.0",
+    "yaml": "^2.9.0",
     "zod": "^3.23.0"
   },
   "devDependencies": {
@@ -54,16 +83,23 @@
     "@types/markdown-it": "^14.1.2",
     "@types/node": "^22.0.0",
     "@types/qrcode-terminal": "^0.12.2",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@types/react-test-renderer": "19.1.0",
     "@types/ws": "^8.18.1",
+    "electron": "^37.0.0",
+    "electron-builder": "^26.0.0",
     "esbuild": "^0.28.0",
     "memfs": "^4.57.1",
     "playwright": "^1.58.2",
+    "react-test-renderer": "19.2.7",
     "tsx": "^4.20.5",
     "typescript": "^5.3.0",
     "vitest": "^4.0.18"
   },
   "pnpm": {
     "onlyBuiltDependencies": [
+      "electron",
       "node-pty"
     ]
   },
@@ -71,5 +107,9 @@
     "node": ">=22"
   },
   "packageManager": "pnpm@9.5.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/deepcoldy/botmux.git"
+  },
   "license": "MIT"
 }

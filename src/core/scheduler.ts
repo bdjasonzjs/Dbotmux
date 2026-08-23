@@ -1,12 +1,19 @@
 import { Cron } from 'croner';
 import * as scheduleStore from '../services/schedule-store.js';
+import { scheduleTimeZone, zonedTomorrowAt } from '../utils/timezone.js';
+import { emitHookEvent } from '../services/hook-runner.js';
 import { logger } from '../utils/logger.js';
 import { dashboardEventBus } from './dashboard-events.js';
-import type { ScheduledTask, ParsedSchedule } from '../types.js';
+import type { ScheduledTask, ParsedSchedule, ScheduleExecutionPosition } from '../types.js';
 
 // Callback set by daemon to execute a scheduled task
 let executeCallback: ((task: ScheduledTask) => Promise<void>) | null = null;
 let tickTimer: NodeJS.Timeout | null = null;
+// Last effective schedule timezone seen by the tick loop. When it changes
+// (dashboard config / env / host), enabled CRON tasks' persisted nextRunAt was
+// computed under the OLD zone and must be recomputed — otherwise they'd fire
+// once at the stale wall-clock time. null = not yet initialized (first tick).
+let lastTickTz: string | null = null;
 
 /** Owner-filter state — each daemon process runs its own scheduler but only
  *  executes tasks whose larkAppId matches.  Legacy tasks without a larkAppId
@@ -18,6 +25,22 @@ const TICK_INTERVAL_MS = 30_000;          // poll every 30s
 const ONESHOT_GRACE_SECONDS = 120;        // one-shots fire even if <2min late
 const MIN_GRACE_SECONDS = 120;            // catch-up window lower bound
 const MAX_GRACE_SECONDS = 2 * 60 * 60;    // catch-up window upper bound (2h)
+
+function emitScheduleFiredHook(task: ScheduledTask, status: 'ok' | 'error', error?: unknown): void {
+  emitHookEvent('schedule.fired', {
+    id: task.id,
+    name: task.name,
+    schedule: task.schedule,
+    status,
+    error: error ? (error instanceof Error ? error.message : String(error)) : undefined,
+    chatId: task.chatId,
+    rootMessageId: task.rootMessageId,
+    chatType: task.chatType,
+    scope: task.scope,
+    larkAppId: task.larkAppId,
+    runAt: Date.now(),
+  });
+}
 
 export function setExecuteCallback(cb: (task: ScheduledTask) => Promise<void>): void {
   executeCallback = cb;
@@ -140,9 +163,9 @@ function parseChineseSchedule(input: string): { parsed: ParsedSchedule; rest: st
   if (m) {
     const t = parseTimeHM(m[1]);
     if (t) {
-      const d = new Date();
-      d.setDate(d.getDate() + 1);
-      d.setHours(t.hour, t.minute, 0, 0);
+      // 「明天HH:MM」是墙上时间：解析到 scheduleTimeZone()（与 cron 触发/显示同源），
+      // 而非主机本地 setHours() —— 否则在非目标时区主机上，一次性与重复类会错开一个时差。
+      const d = zonedTomorrowAt(scheduleTimeZone(), t.hour, t.minute);
       return { parsed: { kind: 'once', runAt: d.toISOString(), display: `明天 ${t.hour}:${String(t.minute).padStart(2,'0')}` }, rest: t.rest };
     }
   }
@@ -194,11 +217,15 @@ export function parseSchedule(input: string): ParsedSchedule {
     }
   }
 
-  // ISO timestamp
+  // ISO timestamp. NOTE: a string WITH an explicit offset/Z is absolute; a bare
+  // `YYYY-MM-DDTHH:MM` (no offset) is parsed by JS in the HOST-local zone, NOT
+  // scheduleTimeZone() — this is deliberate (an explicit timestamp carries its
+  // own zone contract; we don't reinterpret it). Only the DISPLAY uses the
+  // effective zone. The NL「明天HH:MM」path (above) is the tz-aware one.
   if (/^\d{4}-\d{2}-\d{2}(T| |$)/.test(s)) {
     const dt = new Date(s);
     if (!isNaN(dt.getTime())) {
-      return { kind: 'once', runAt: dt.toISOString(), display: `once at ${dt.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}` };
+      return { kind: 'once', runAt: dt.toISOString(), display: `once at ${dt.toLocaleString('zh-CN', { timeZone: scheduleTimeZone() })}` };
     }
   }
 
@@ -246,6 +273,79 @@ export function parseNaturalSchedule(input: string): ParseNLResult | null {
   return { parsed: zh.parsed, prompt, name };
 }
 
+function extractExecutionPositionModifier(prompt: string): {
+  executionPosition?: Extract<ScheduleExecutionPosition, 'top-level' | 'new-topic'>;
+  prompt: string;
+} {
+  const topLevelZh = prompt.match(/^\s*(?:群消息顶层|群顶层|顶层)(?:执行|运行)?[\s,，、:：。-]+(.+)$/s);
+  if (topLevelZh && topLevelZh[1].trim()) return { executionPosition: 'top-level', prompt: topLevelZh[1].trim() };
+  const topLevelEn = prompt.match(/^\s*(?:group\s+)?top[\s-]?level[\s,:：-]+(.+)$/is);
+  if (topLevelEn && topLevelEn[1].trim()) return { executionPosition: 'top-level', prompt: topLevelEn[1].trim() };
+
+  const zh = prompt.match(/^\s*(?:每次|每回|每天|每日)?\s*[开起另一个新的\s]*新[开起另一个新的\s]*话题[\s,，、:：。-]*(.+)$/s);
+  if (zh && zh[1].trim()) return { executionPosition: 'new-topic', prompt: zh[1].trim() };
+  const en = prompt.match(/^\s*(?:every\s+run\s+in\s+a\s+)?new[\s-]?topic[\s,:：-]+(.+)$/is);
+  if (en && en[1].trim()) return { executionPosition: 'new-topic', prompt: en[1].trim() };
+  return { prompt };
+}
+
+/** Backward-compatible parser; `deliver:new-topic` means a routing modifier
+ * was present. New callers should also read extractScheduleModifiers.position. */
+export function extractDeliveryMode(prompt: string): { deliver: 'origin' | 'new-topic'; prompt: string } {
+  const parsed = extractExecutionPositionModifier(prompt);
+  return parsed.executionPosition
+    ? { deliver: 'new-topic', prompt: parsed.prompt }
+    : { deliver: 'origin', prompt };
+}
+
+/**
+ * Detect a leading "silent" keyword in a /schedule prompt and strip it.  Lets
+ * users write `/schedule 每30分钟 静默 检查服务，挂了才报警` so fires post no
+ * "🕐 task started" banner and the model decides whether to `botmux send`.
+ * The keyword must be followed by whitespace/punctuation — a prompt that
+ * merely *starts with* 静默 as part of a longer word (静默模式…) is left
+ * untouched only when nothing separates it, so document the spaced form.
+ */
+export function extractSilentMode(prompt: string): { silent: boolean; prompt: string } {
+  const zh = prompt.match(/^\s*(?:静默|悄悄)(?:执行|运行|地)?[\s,，、:：。-]+(.+)$/s);
+  if (zh && zh[1].trim()) return { silent: true, prompt: zh[1].trim() };
+  const en = prompt.match(/^\s*silent(?:ly)?[\s,:：-]+(.+)$/is);
+  if (en && en[1].trim()) return { silent: true, prompt: en[1].trim() };
+  return { silent: false, prompt };
+}
+
+/**
+ * Extract both /schedule prompt modifiers regardless of their order.
+ * `deliver:new-topic` remains a compatibility token indicating that a position
+ * modifier was present. `executionPosition` carries the unambiguous modern
+ * value: group top level or a fresh topic on every run.
+ */
+export function extractScheduleModifiers(prompt: string): {
+  deliver: 'origin' | 'new-topic';
+  executionPosition?: Extract<ScheduleExecutionPosition, 'top-level' | 'new-topic'>;
+  silent: boolean;
+  prompt: string;
+} {
+  let deliver: 'origin' | 'new-topic' = 'origin';
+  let executionPosition: Extract<ScheduleExecutionPosition, 'top-level' | 'new-topic'> | undefined;
+  let silent = false;
+  let rest = prompt;
+  // Two keywords max — loop twice so either order is handled.
+  for (let i = 0; i < 2; i++) {
+    const d = extractExecutionPositionModifier(rest);
+    if (d.executionPosition) {
+      deliver = 'new-topic';
+      executionPosition = d.executionPosition;
+      rest = d.prompt;
+      continue;
+    }
+    const s = extractSilentMode(rest);
+    if (s.silent) { silent = true; rest = s.prompt; continue; }
+    break;
+  }
+  return { deliver, ...(executionPosition ? { executionPosition } : {}), silent, prompt: rest };
+}
+
 // ─── next-run computation ───────────────────────────────────────────────────
 
 /** Compute the next run time for a parsed schedule. Returns ISO string, or null if exhausted. */
@@ -270,7 +370,7 @@ export function computeNextRun(parsed: ParsedSchedule, lastRunAt?: string): stri
   if (parsed.kind === 'cron') {
     if (!parsed.expr) return null;
     try {
-      const job = new Cron(parsed.expr, { timezone: 'Asia/Shanghai' });
+      const job = new Cron(parsed.expr, { timezone: scheduleTimeZone() });
       const next = job.nextRun(new Date(now));
       return next ? next.toISOString() : null;
     } catch {
@@ -288,7 +388,7 @@ function computeGraceSeconds(parsed: ParsedSchedule): number {
     periodSec = parsed.minutes * 60;
   } else if (parsed.kind === 'cron' && parsed.expr) {
     try {
-      const job = new Cron(parsed.expr, { timezone: 'Asia/Shanghai' });
+      const job = new Cron(parsed.expr, { timezone: scheduleTimeZone() });
       const first = job.nextRun(new Date());
       const second = first ? job.nextRun(first) : null;
       periodSec = first && second ? (second.getTime() - first.getTime()) / 1000 : MIN_GRACE_SECONDS;
@@ -307,6 +407,17 @@ function computeGraceSeconds(parsed: ParsedSchedule): number {
 async function tick(): Promise<void> {
   const tasks = scheduleStore.listTasks();
   const now = Date.now();
+
+  // Re-align to a changed effective timezone before the fire loop.
+  const tz = scheduleTimeZone();
+  if (lastTickTz !== null && lastTickTz !== tz) {
+    applyCronRealign(planCronRealign(tasks, taskBelongsToThisDaemon));
+    // Tell the dashboard/web the effective zone changed so open tabs re-render
+    // schedule times in the new zone (even when no cron task needed recompute).
+    dashboardEventBus.publish({ type: 'schedule.timezone', body: { timezone: tz } });
+    logger.info(`[scheduler] schedule timezone ${lastTickTz} → ${tz}; re-aligned enabled cron next-runs`);
+  }
+  lastTickTz = tz;
 
   for (const task of tasks) {
     if (!task.enabled) continue;
@@ -356,6 +467,7 @@ async function tick(): Promise<void> {
             type: 'schedule.fired',
             body: { id: taskId, runAt: Date.now(), status: 'ok' },
           });
+          emitScheduleFiredHook(task, 'ok');
         })
         .catch(err => {
           logger.error(`[scheduler] Task "${task.name}" failed: ${err.message}`);
@@ -369,8 +481,41 @@ async function tick(): Promise<void> {
               error: err instanceof Error ? err.message : String(err),
             },
           });
+          emitScheduleFiredHook(task, 'error', err);
         });
     }
+  }
+}
+
+/**
+ * Plan which enabled CRON tasks need their `nextRunAt` recomputed after the
+ * effective schedule timezone changed. CRON is the only tz-dependent kind
+ * (wall-clock); `interval` is a relative period and `once` is a fixed instant,
+ * so both are skipped. `computeNextRun()` returns the next FUTURE occurrence,
+ * so applying these updates never causes an immediate or duplicate fire.
+ * Pure (no store writes) → unit-testable; tick() applies the returned plan.
+ */
+export function planCronRealign(
+  tasks: ScheduledTask[],
+  belongs: (t: ScheduledTask) => boolean = () => true,
+): Array<{ id: string; nextRunAt: string }> {
+  const updates: Array<{ id: string; nextRunAt: string }> = [];
+  for (const task of tasks) {
+    if (!task.enabled || task.parsed.kind !== 'cron') continue;
+    if (!belongs(task)) continue;
+    const next = computeNextRun(task.parsed);
+    if (next && next !== task.nextRunAt) updates.push({ id: task.id, nextRunAt: next });
+  }
+  return updates;
+}
+
+/** Persist a realign plan AND publish `schedule.updated` per task so the
+ *  dashboard aggregator + open web tabs reflect the new nextRunAt (a bare
+ *  scheduleStore.updateTask inside the daemon does not reach them on its own). */
+function applyCronRealign(updates: Array<{ id: string; nextRunAt: string }>): void {
+  for (const u of updates) {
+    scheduleStore.updateTask(u.id, { nextRunAt: u.nextRunAt });
+    dashboardEventBus.publish({ type: 'schedule.updated', body: { id: u.id, patch: { nextRunAt: u.nextRunAt } } });
   }
 }
 
@@ -388,6 +533,20 @@ export function startScheduler(): void {
       if (next) scheduleStore.updateTask(task.id, { nextRunAt: next });
     }
   }
+
+  // Startup re-align: if the effective timezone changed while the daemon was
+  // STOPPED (config/env edited during downtime), enabled cron tasks' persisted
+  // FUTURE nextRunAt is stale (the live-change path in tick() couldn't catch it).
+  // Recompute future-dated ones — idempotent when tz is unchanged (same next
+  // occurrence). Past-due values are left for tick()'s catch-up/fast-forward so
+  // a genuine missed run isn't silently dropped.
+  const startupNow = Date.now();
+  applyCronRealign(planCronRealign(
+    tasks,
+    t => taskBelongsToThisDaemon(t) && !!t.nextRunAt && new Date(t.nextRunAt).getTime() > startupNow,
+  ));
+  // Seed lastTickTz so the first tick doesn't redundantly re-align what we just did.
+  lastTickTz = scheduleTimeZone();
 
   // Run first tick shortly after startup, then on interval
   setTimeout(() => { tick().catch(err => logger.error(`[scheduler] tick error: ${err.message}`)); }, 5000);
@@ -409,6 +568,8 @@ export function addTask(params: {
   chatId: string;
   rootMessageId?: string;
   scope?: 'thread' | 'chat';
+  executionPosition?: ScheduleExecutionPosition;
+  topicTitle?: string;
   chatType?: 'group' | 'p2p' | 'topic_group';
   larkAppId?: string;
   creatorChatId?: string;
@@ -416,10 +577,22 @@ export function addTask(params: {
   creatorLarkAppId?: string;
   parsed?: ParsedSchedule;
   repeat?: { times: number | null; completed: number };
-  deliver?: 'origin' | 'local';
+  deliver?: 'origin' | 'local' | 'new-topic';
+  silent?: boolean;
 }): ScheduledTask {
   const parsed = params.parsed ?? parseSchedule(params.schedule);
   const nextRunAt = computeNextRun(parsed) ?? undefined;
+  const executionPosition: ScheduleExecutionPosition = params.executionPosition
+    ?? (params.deliver === 'new-topic'
+      ? 'new-topic'
+      : params.scope === 'chat'
+        ? 'top-level'
+        : params.rootMessageId ? 'topic' : 'top-level');
+  if (executionPosition === 'topic' && !params.rootMessageId) {
+    throw new Error('topic_root_required');
+  }
+  const topicTitle = normalizeTopicTitle(params.topicTitle);
+  const scope: 'thread' | 'chat' = executionPosition === 'topic' ? 'thread' : 'chat';
   const task = scheduleStore.createTask({
     name: params.name,
     schedule: params.schedule,
@@ -428,7 +601,9 @@ export function addTask(params: {
     workingDir: params.workingDir,
     chatId: params.chatId,
     rootMessageId: params.rootMessageId,
-    scope: params.scope,
+    scope,
+    executionPosition,
+    topicTitle,
     chatType: params.chatType,
     larkAppId: params.larkAppId,
     creatorChatId: params.creatorChatId,
@@ -436,10 +611,32 @@ export function addTask(params: {
     creatorLarkAppId: params.creatorLarkAppId,
     nextRunAt,
     repeat: params.repeat,
-    deliver: params.deliver ?? 'origin',
+    // Delivery shape is now expressed by scope/rootMessageId. Persist only the
+    // local-vs-chat distinction; schedule-store also normalizes legacy values.
+    deliver: params.deliver === 'local' ? 'local' : 'origin',
+    silent: params.silent,
   });
   logger.info(`[scheduler] Added task "${task.name}" (${task.id}) — ${parsed.display}, next: ${nextRunAt ?? 'N/A'}`);
   return task;
+}
+
+export function normalizeTopicTitle(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed) return undefined;
+  const chars = Array.from(trimmed);
+  if (chars.length > 200) throw new Error('topic_title_too_long');
+  return trimmed;
+}
+
+export function resolveTaskExecutionPosition(
+  task: Pick<ScheduledTask, 'executionPosition' | 'scope' | 'rootMessageId' | 'deliver'>,
+): ScheduleExecutionPosition {
+  if (task.executionPosition === 'top-level' || task.executionPosition === 'topic' || task.executionPosition === 'new-topic') {
+    return task.executionPosition === 'topic' && !task.rootMessageId ? 'top-level' : task.executionPosition;
+  }
+  if (task.deliver === 'new-topic') return 'new-topic';
+  if (task.scope === 'chat') return 'top-level';
+  return task.rootMessageId ? 'topic' : 'top-level';
 }
 
 export function removeTask(id: string): boolean {
@@ -511,6 +708,7 @@ export function runNow(id: string): { ok: boolean; error?: string } {
         type: 'schedule.fired',
         body: { id, runAt: Date.now(), status: 'ok' },
       });
+      emitScheduleFiredHook(task, 'ok');
     },
     err => {
       const msg = err instanceof Error ? err.message : String(err);
@@ -519,6 +717,7 @@ export function runNow(id: string): { ok: boolean; error?: string } {
         type: 'schedule.fired',
         body: { id, runAt: Date.now(), status: 'error', error: msg },
       });
+      emitScheduleFiredHook(task, 'error', err);
     },
   );
   return { ok: true };
@@ -542,6 +741,129 @@ export function setEnabled(id: string, enabled: boolean): { ok: boolean; error?:
   dashboardEventBus.publish({
     type: 'schedule.updated',
     body: { id, patch: { enabled } },
+  });
+  return { ok: true };
+}
+
+/**
+ * Cycle a task's execution position: retained topic → group top level → fresh
+ * topic per run → retained topic (or group top level when no root is retained).
+ * Silent tasks skip the fresh-topic state because that state needs a visible
+ * seed message. The `deliver` response remains for cached clients.
+ */
+export function toggleDelivery(id: string): {
+  ok: boolean;
+  error?: string;
+  deliver?: 'origin' | 'new-topic';
+  executionPosition?: ScheduleExecutionPosition;
+} {
+  const task = scheduleStore.getTask(id);
+  if (!task) return { ok: false, error: 'not_found' };
+  if (task.deliver === 'local') return { ok: false, error: 'local_not_toggleable' };
+  const current = resolveTaskExecutionPosition(task);
+  let executionPosition: ScheduleExecutionPosition;
+  if (current === 'topic') executionPosition = 'top-level';
+  else if (current === 'top-level') executionPosition = 'new-topic';
+  else executionPosition = task.rootMessageId ? 'topic' : 'top-level';
+  if (executionPosition === current) return { ok: false, error: 'topic_root_required' };
+  const scope: 'chat' | 'thread' = executionPosition === 'topic' ? 'thread' : 'chat';
+  scheduleStore.updateTask(id, { scope, executionPosition });
+  const deliver = executionPosition === 'new-topic' ? 'new-topic' : 'origin';
+  dashboardEventBus.publish({
+    type: 'schedule.updated',
+    body: { id, patch: { scope, executionPosition } },
+  });
+  return { ok: true, deliver, executionPosition };
+}
+
+/**
+ * Update editable fields of a scheduled task (name, prompt, schedule, silent,
+ * execution position and retained topic root).
+ * Re-parses the schedule expression and recomputes nextRunAt when the schedule
+ * string changes. A legacy `deliver` input is accepted and normalized to
+ * `origin` for normal writes. Legacy `deliver:new-topic` still maps to the
+ * explicit fresh-topic position for cached clients.
+ * Emits a `schedule.updated` event so the dashboard reflects changes live.
+ */
+export function updateTask(
+  id: string,
+  updates: {
+    name?: string;
+    prompt?: string;
+    schedule?: string;
+    deliver?: 'origin' | 'new-topic';
+    silent?: boolean;
+    executionPosition?: ScheduleExecutionPosition;
+    rootMessageId?: string;
+    topicTitle?: string;
+  },
+): { ok: boolean; error?: string } {
+  const task = scheduleStore.getTask(id);
+  if (!task) return { ok: false, error: 'not_found' };
+
+  const patch: Record<string, unknown> = {};
+  const eventPatch: Record<string, unknown> = {};
+  if (updates.name !== undefined) patch.name = updates.name;
+  if (updates.prompt !== undefined) patch.prompt = updates.prompt;
+  if (updates.silent !== undefined) {
+    patch.silent = updates.silent === true ? true : undefined;
+    eventPatch.silent = updates.silent === true;
+  }
+
+  const legacyPosition = updates.deliver === 'new-topic'
+    ? 'new-topic'
+    : undefined;
+  const executionPosition = updates.executionPosition ?? legacyPosition;
+  const nextRootMessageId = updates.rootMessageId ?? task.rootMessageId;
+  if (executionPosition === 'topic' && !nextRootMessageId) {
+    return { ok: false, error: 'topic_root_required' };
+  }
+  if (updates.topicTitle !== undefined) {
+    try { patch.topicTitle = normalizeTopicTitle(updates.topicTitle); }
+    catch (err) { return { ok: false, error: err instanceof Error ? err.message : String(err) }; }
+  }
+  if (updates.rootMessageId !== undefined) patch.rootMessageId = updates.rootMessageId;
+  if (executionPosition !== undefined) {
+    patch.scope = executionPosition === 'topic' ? 'thread' : 'chat';
+    patch.executionPosition = executionPosition;
+    patch.deliver = 'origin';
+  } else if (updates.deliver !== undefined) {
+    patch.deliver = 'origin';
+  }
+
+  // Re-parse + recompute next run when the schedule expression changes.
+  if (updates.schedule !== undefined && updates.schedule !== task.schedule) {
+    let parsed: ParsedSchedule;
+    try {
+      parsed = parseSchedule(updates.schedule);
+    } catch (err) {
+      return { ok: false, error: `invalid_schedule: ${err instanceof Error ? err.message : String(err)}` };
+    }
+    patch.schedule = updates.schedule;
+    patch.parsed = parsed;
+    const next = computeNextRun(parsed);
+    patch.nextRunAt = next ?? undefined;
+  }
+
+  scheduleStore.updateTask(id, patch);
+  dashboardEventBus.publish({
+    type: 'schedule.updated',
+    body: { id, patch: { ...patch, ...eventPatch } },
+  });
+  return { ok: true };
+}
+
+/**
+ * Delete a scheduled task. Emits a `schedule.deleted` event so the dashboard
+ * drops the row immediately without waiting for the next poll.
+ */
+export function removeTaskForDashboard(id: string): { ok: boolean; error?: string } {
+  const task = scheduleStore.getTask(id);
+  if (!task) return { ok: false, error: 'not_found' };
+  scheduleStore.removeTask(id);
+  dashboardEventBus.publish({
+    type: 'schedule.deleted',
+    body: { id },
   });
   return { ok: true };
 }

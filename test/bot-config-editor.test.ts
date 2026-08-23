@@ -2,13 +2,59 @@ import { describe, expect, it } from 'vitest';
 import {
   applyBotConfigEdits,
   assertUniqueBotProcessNames,
+  assertOwnerWhenChatGroups,
+  botProcessEnv,
   botProcessName,
+  canonicalMobileKey,
+  entryNeedsContactResolve,
+  findInvalidAllowedUserEntries,
+  hasOwnerEntry,
+  isMobileEntry,
+  isValidAllowedUserEntry,
   normalizeBotConfig,
+  normalizeMobileEntry,
   parseBotConfigsJson,
   parseBotSelection,
   removeBotConfig,
   resolveCliId,
 } from '../src/setup/bot-config-editor.js';
+
+describe('botProcessEnv', () => {
+  it('keeps valid process env keys and stringifies primitive values', () => {
+    expect(botProcessEnv({
+      env: {
+        HTTPS_PROXY: 'http://127.0.0.1:7890',
+        OPENAI_TIMEOUT_MS: 30000,
+        FEATURE_FLAG: true,
+        EMPTY_VALUE: '',
+      },
+    })).toEqual({
+      HTTPS_PROXY: 'http://127.0.0.1:7890',
+      OPENAI_TIMEOUT_MS: '30000',
+      FEATURE_FLAG: 'true',
+      EMPTY_VALUE: '',
+    });
+  });
+
+  it('drops invalid keys and non-primitive values', () => {
+    expect(botProcessEnv({
+      env: {
+        '1BAD': 'x',
+        'BAD-NAME': 'x',
+        OK_NAME: ['x'],
+        ALSO_OK: { nested: true },
+        NULLISH: null,
+        VALID_NAME: false,
+      },
+    })).toEqual({ VALID_NAME: 'false' });
+  });
+
+  it('returns an empty object when env is missing or not an object', () => {
+    expect(botProcessEnv({})).toEqual({});
+    expect(botProcessEnv({ env: [] })).toEqual({});
+    expect(botProcessEnv({ env: 'HTTPS_PROXY=x' })).toEqual({});
+  });
+});
 
 describe('parseBotSelection', () => {
   const bots = [
@@ -42,6 +88,7 @@ describe('parseBotSelection', () => {
 
   it('selects by custom process name', () => {
     expect(parseBotSelection('botmux-claude-main', bots)).toBe(0);
+    expect(parseBotSelection('claude-main', bots)).toBe(0);
   });
 
   it('selects by app id', () => {
@@ -51,6 +98,75 @@ describe('parseBotSelection', () => {
   it('rejects unknown selections', () => {
     expect(parseBotSelection('botmux-9', bots)).toBeUndefined();
     expect(parseBotSelection('missing', bots)).toBeUndefined();
+  });
+});
+
+describe('mobile allowedUsers entries', () => {
+  it('normalizeMobileEntry strips spaces and dashes', () => {
+    expect(normalizeMobileEntry('+86 130-1111-2222')).toBe('+8613011112222');
+    expect(normalizeMobileEntry(' 130 1111 2222 ')).toBe('13011112222');
+  });
+
+  it('isMobileEntry accepts CN bare 11-digit and + country-code E.164', () => {
+    expect(isMobileEntry('13011112222')).toBe(true);        // CN, no +86
+    expect(isMobileEntry('+8613011112222')).toBe(true);      // CN with code
+    expect(isMobileEntry('+14155550123')).toBe(true);        // US
+    expect(isMobileEntry('+86 130-1111-2222')).toBe(true);   // spaced/dashed
+  });
+
+  it('isMobileEntry rejects things that are not phone numbers', () => {
+    expect(isMobileEntry('alice')).toBe(false);              // bare prefix
+    expect(isMobileEntry('alice@example.com')).toBe(false);  // email
+    expect(isMobileEntry('12345')).toBe(false);              // too short / not CN
+    expect(isMobileEntry('2011112222')).toBe(false);         // 10-digit non-CN, no +
+    expect(isMobileEntry('ou_abc')).toBe(false);             // open_id
+    expect(isMobileEntry('+123')).toBe(false);               // too short for E.164
+  });
+
+  it('isValidAllowedUserEntry treats a valid mobile as valid', () => {
+    expect(isValidAllowedUserEntry('13011112222')).toBe(true);
+    expect(isValidAllowedUserEntry('+14155550123')).toBe(true);
+    expect(findInvalidAllowedUserEntries(['13011112222', 'alice'])).toEqual(['alice']);
+  });
+
+  it('isMobileEntry accepts the full 15-digit E.164 upper bound', () => {
+    // E.164 caps the national+country number at 15 digits. The old /\+\d{6,14}/
+    // bound rejected the max-length case; guard against that regression.
+    expect(isMobileEntry('+123456789012345')).toBe(true);   // 15 digits — max E.164
+    expect(isMobileEntry('+12345678901234')).toBe(true);    // 14 digits
+    expect(isMobileEntry('+1234567890123456')).toBe(false); // 16 digits — over spec
+  });
+
+  it('entryNeedsContactResolve covers every addressable form incl. bare mobile', () => {
+    // This shared predicate is the SINGLE gate the daemon startup / throw-fallback
+    // / allowed-users-apply all consult. A bare mobile MUST return true, else a
+    // mobile-only owner is never resolved to an ou_ and gets fail-closed locked
+    // out on every cold start (the P1 this fix closes).
+    expect(entryNeedsContactResolve('13011112222')).toBe(true);      // CN bare mobile
+    expect(entryNeedsContactResolve('+14155550123')).toBe(true);     // E.164 mobile
+    expect(entryNeedsContactResolve('+8613011112222')).toBe(true);   // CN +86
+    expect(entryNeedsContactResolve('alice@example.com')).toBe(true);// email
+    expect(entryNeedsContactResolve('on_abc')).toBe(true);           // union_id
+    expect(entryNeedsContactResolve('ou_abc')).toBe(true);           // literal ou_ (diag)
+    expect(entryNeedsContactResolve('alice')).toBe(false);           // bare prefix — unaddressable
+    expect(entryNeedsContactResolve('')).toBe(false);
+  });
+
+  it('canonicalMobileKey reconciles CN bare↔+86 WITHOUT colliding US +1 numbers', () => {
+    const key = (n: string) => canonicalMobileKey(normalizeMobileEntry(n));
+    // CN bare 11-digit and its +86 form fold to the same key (both directions).
+    expect(key('13011112222')).toBe(key('+8613011112222'));
+    expect(key('13011112222')).toBe(key('8613011112222'));
+    // Overseas E.164 with + is trusted as-is (country code preserved).
+    expect(key('+14155550123')).toBe('14155550123');
+    // CRITICAL anti-collision: a US +1 3XX number must NOT fold to the same key
+    // as a CN bare 13X number (both are 11 digits starting with 1). The old
+    // strip-+-then-assume-CN key SET collided these and bound the owner to the
+    // wrong person / evicted a co-owner on map overwrite.
+    expect(key('+13011112222')).not.toBe(key('13011112222'));
+    // Different real numbers never share a key.
+    expect(key('+14155550123')).not.toBe(key('+14155550999'));
+    expect(key('13011112222')).not.toBe(key('13111112222'));
   });
 });
 
@@ -67,6 +183,7 @@ describe('applyBotConfigEdits', () => {
       larkAppSecret: 'old_secret',
       cliId: 'claude-code',
       cliPathOverride: '/opt/old/claude',
+      model: 'sonnet',
       workingDir: '~/old',
       oncallChats: [{ chatId: 'oc_1', workingDir: '~/repo' }],
     }, {
@@ -75,8 +192,9 @@ describe('applyBotConfigEdits', () => {
       larkAppSecret: 'new_secret',
       cliChoice: '4',
       cliPathOverride: '/opt/new/codex',
+      model: 'gpt-5-codex',
       workingDir: '~/new',
-      allowedUsers: 'alice,bob',
+      allowedUsers: 'alice@example.com,ou_bob',
     });
 
     expect(updated).toEqual({
@@ -85,10 +203,219 @@ describe('applyBotConfigEdits', () => {
       larkAppSecret: 'new_secret',
       cliId: 'codex',
       cliPathOverride: '/opt/new/codex',
+      model: 'gpt-5-codex',
       workingDir: '~/new',
-      allowedUsers: ['alice', 'bob'],
+      allowedUsers: ['alice@example.com', 'ou_bob'],
       oncallChats: [{ chatId: 'oc_1', workingDir: '~/repo' }],
     });
+  });
+
+  it('sets wrapperCli (aiden gateway) and clears it when switching to a plain CLI', () => {
+    const gateway = applyBotConfigEdits({
+      larkAppId: 'app',
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+    }, {
+      cliChoice: 'claude-code',
+      wrapperCli: 'aiden x claude',
+    });
+    expect(gateway.cliId).toBe('claude-code');
+    expect(gateway.wrapperCli).toBe('aiden x claude');
+
+    // Switching to a plain CLI passes wrapperCli: null → the stale prefix is dropped.
+    const plain = applyBotConfigEdits(gateway, { cliChoice: '4', wrapperCli: null });
+    expect(plain.cliId).toBe('codex');
+    expect(plain.wrapperCli).toBeUndefined();
+  });
+
+  it('leaves wrapperCli untouched when the field is undefined', () => {
+    const out = applyBotConfigEdits({
+      larkAppId: 'app',
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+      wrapperCli: 'aiden x claude',
+    }, { workingDir: '~/x' });
+    expect(out.wrapperCli).toBe('aiden x claude');
+  });
+
+  it('sets and normalizes cliRuntime with an equal downgrade path shadow', () => {
+    const out = applyBotConfigEdits({
+      larkAppId: 'app',
+      larkAppSecret: 'secret',
+      cliId: 'codex',
+      cliPathOverride: '/opt/old/codex',
+    }, {
+      cliRuntime: {
+        id: 'vendor-codex',
+        displayName: 'VendorCodex',
+        executable: 'vendor-codex',
+        update: { provider: 'auto' },
+      },
+    });
+
+    expect(out.cliRuntime).toMatchObject({
+      id: 'vendor-codex',
+      displayName: 'VendorCodex',
+      executable: 'vendor-codex',
+      update: { provider: 'auto' },
+    });
+    expect(out.cliPathOverride).toBe('vendor-codex');
+  });
+
+  it('implements cliRuntime tri-state and keeps it when the edit omits the field', () => {
+    const base = {
+      larkAppId: 'app',
+      larkAppSecret: 'secret',
+      cliId: 'codex',
+      cliRuntime: {
+        id: 'vendor-codex',
+        displayName: 'VendorCodex',
+        executable: 'vendor-codex',
+        update: { provider: 'none' },
+      },
+    };
+    const kept = applyBotConfigEdits(base, { model: 'gpt-5' });
+    expect(kept.cliRuntime).toEqual(base.cliRuntime);
+    expect(kept.cliPathOverride).toBe('vendor-codex');
+    const cleared = applyBotConfigEdits(kept, { cliRuntime: null });
+    expect(cleared.cliRuntime).toBeUndefined();
+    expect(cleared.cliPathOverride).toBeUndefined();
+  });
+
+  it('treats an empty interactive cliPathOverride answer as preserve', () => {
+    const base = {
+      larkAppId: 'app',
+      larkAppSecret: 'secret',
+      cliId: 'codex',
+      cliRuntime: {
+        id: 'vendor-codex',
+        displayName: 'VendorCodex',
+        executable: 'vendor-codex',
+        update: { provider: 'none' as const },
+      },
+      cliPathOverride: 'vendor-codex',
+    };
+
+    const out = applyBotConfigEdits(base, {
+      model: 'gpt-5',
+      cliPathOverride: '   ',
+    });
+
+    expect(out.cliRuntime).toEqual(base.cliRuntime);
+    expect(out.cliPathOverride).toBe('vendor-codex');
+    expect(out.model).toBe('gpt-5');
+  });
+
+  it('lets an explicit legacy cliPathOverride replace cliRuntime', () => {
+    const out = applyBotConfigEdits({
+      larkAppId: 'app',
+      larkAppSecret: 'secret',
+      cliId: 'codex',
+      cliRuntime: {
+        id: 'vendor-codex',
+        executable: 'vendor-codex',
+        update: { provider: 'none' },
+      },
+    }, { cliPathOverride: '/opt/legacy/codex' });
+    expect(out.cliRuntime).toBeUndefined();
+    expect(out.cliPathOverride).toBe('/opt/legacy/codex');
+  });
+
+  it('clears a stale Codex runtime when switching to a non-Codex adapter', () => {
+    const out = applyBotConfigEdits({
+      larkAppId: 'app',
+      larkAppSecret: 'secret',
+      cliId: 'codex',
+      cliRuntime: {
+        id: 'vendor-codex',
+        executable: 'vendor-codex',
+        update: { provider: 'none' },
+      },
+    }, { cliChoice: 'claude-code' });
+    expect(out.cliId).toBe('claude-code');
+    expect(out.cliRuntime).toBeUndefined();
+    expect(out.cliPathOverride).toBeUndefined();
+  });
+
+  it('does not strand a runtime shadow when TUI switches to a non-Codex adapter with a blank path answer', () => {
+    const out = applyBotConfigEdits({
+      larkAppId: 'app',
+      larkAppSecret: 'secret',
+      cliId: 'codex',
+      cliRuntime: {
+        id: 'vendor-codex',
+        executable: 'vendor-codex',
+        update: { provider: 'none' },
+      },
+      cliPathOverride: 'vendor-codex',
+    }, { cliChoice: 'claude-code', cliPathOverride: '' });
+
+    expect(out.cliId).toBe('claude-code');
+    expect(out.cliRuntime).toBeUndefined();
+    expect(out.cliPathOverride).toBeUndefined();
+  });
+
+  it('rejects an explicit runtime combined with another executable source', () => {
+    const base = { larkAppId: 'app', larkAppSecret: 'secret', cliId: 'codex' };
+    const cliRuntime = { id: 'vendor-codex', executable: 'vendor-codex' };
+    expect(() => applyBotConfigEdits(base, {
+      cliRuntime,
+      cliPathOverride: '/opt/legacy/codex',
+    })).toThrow(/conflicts with cliPathOverride/);
+    expect(() => applyBotConfigEdits(base, {
+      cliRuntime,
+      wrapperCli: 'gateway codex',
+    })).toThrow(/cannot be combined with wrapperCli/);
+    expect(() => applyBotConfigEdits(base, {
+      cliChoice: 'claude-code',
+      cliRuntime,
+    })).toThrow(/only for cliId "codex"/);
+  });
+
+  it('edits and clears allowedChatGroups', () => {
+    const edited = applyBotConfigEdits({
+      larkAppId: 'app',
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+      allowedChatGroups: ['oc_old'],
+    }, {
+      allowedChatGroups: 'oc_team, oc_project',
+    });
+    expect(edited.allowedChatGroups).toEqual(['oc_team', 'oc_project']);
+
+    const cleared = applyBotConfigEdits(edited, { allowedChatGroups: '-' });
+    expect(cleared.allowedChatGroups).toBeUndefined();
+  });
+
+  it('rejects bare email prefixes in allowedUsers (only full email or ou_ accepted)', () => {
+    expect(() => applyBotConfigEdits({
+      larkAppId: 'app', larkAppSecret: 'secret', cliId: 'claude-code',
+    }, { allowedUsers: 'alice' })).toThrow(/完整邮箱|open_id/);
+
+    expect(() => applyBotConfigEdits({
+      larkAppId: 'app', larkAppSecret: 'secret', cliId: 'claude-code',
+    }, { allowedUsers: 'ou_abc, bob' })).toThrow(/bob/);
+  });
+
+  it('accepts full emails and open_ids in allowedUsers', () => {
+    const edited = applyBotConfigEdits({
+      larkAppId: 'app', larkAppSecret: 'secret', cliId: 'claude-code',
+    }, { allowedUsers: 'alice@example.com, ou_abc' });
+    expect(edited.allowedUsers).toEqual(['alice@example.com', 'ou_abc']);
+  });
+
+  it('accepts mobile numbers in allowedUsers (CN bare 11-digit + E.164)', () => {
+    const edited = applyBotConfigEdits({
+      larkAppId: 'app', larkAppSecret: 'secret', cliId: 'claude-code',
+    }, { allowedUsers: '13011112222, +14155550123, on_x' });
+    expect(edited.allowedUsers).toEqual(['13011112222', '+14155550123', 'on_x']);
+  });
+
+  it('accepts zmx as a backendType', () => {
+    const edited = applyBotConfigEdits({
+      larkAppId: 'app', larkAppSecret: 'secret', cliId: 'claude-code',
+    }, { backendType: 'zmx' });
+    expect(edited.backendType).toBe('zmx');
   });
 
   it('keeps fields unchanged on empty input and clears optional fields with dash', () => {
@@ -98,6 +425,7 @@ describe('applyBotConfigEdits', () => {
       cliId: 'claude-code',
       name: 'old-name',
       cliPathOverride: '/opt/legacy/claude',
+      model: 'opus',
       backendType: 'tmux',
       allowedUsers: ['alice'],
     }, {
@@ -106,6 +434,7 @@ describe('applyBotConfigEdits', () => {
       cliChoice: '',
       name: '-',
       cliPathOverride: '-',
+      model: '-',
       backendType: '-',
       allowedUsers: '-',
     });
@@ -145,6 +474,32 @@ describe('applyBotConfigEdits', () => {
     expect(updated.cliId).toBe('codex');
   });
 
+  it('trims and clears the optional model field', () => {
+    const updated = applyBotConfigEdits({
+      larkAppId: 'app',
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+    }, { model: '  opus  ' });
+    expect(updated.model).toBe('opus');
+
+    const cleared = applyBotConfigEdits(updated, { model: '-' });
+    expect(cleared.model).toBeUndefined();
+  });
+
+  // 防回归：cli.ts 的 promptEditBotConfig 在切换 CLI 时会把 input.model 设成
+  // null 强制清空旧 model — 这里只测 applyBotConfigEdits 把 null 解释为
+  // "删字段"的契约，覆盖"切 CLI 后旧 model 残留"边界。
+  it('input.model === null clears the field even when cliChoice also changes', () => {
+    const updated = applyBotConfigEdits({
+      larkAppId: 'app',
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+      model: 'opus',
+    }, { cliChoice: 'aiden', model: null });
+    expect(updated.cliId).toBe('aiden');
+    expect(updated.model).toBeUndefined();
+  });
+
   it('rejects unknown cliChoice instead of silently storing typos', () => {
     expect(() => applyBotConfigEdits({
       larkAppId: 'app',
@@ -162,13 +517,36 @@ describe('resolveCliId', () => {
   });
 
   it('maps setup menu indices to cliIds', () => {
+    // 序号以 src/setup/bot-config-editor.ts 的 CLI_ID_CHOICES 为准；
+    // 新 CLI 一律追加尾部，历史序号保持稳定（脚本化 setup 依赖）。
     expect(resolveCliId('1')).toBe('claude-code');
     expect(resolveCliId('4')).toBe('codex');
+    expect(resolveCliId('7')).toBe('opencode');
+    expect(resolveCliId('9')).toBe('mtr');
+    expect(resolveCliId('10')).toBe('hermes');
+    expect(resolveCliId('11')).toBe('codex-app');
+    expect(resolveCliId('12')).toBe('mira');
+    expect(resolveCliId('13')).toBe('seed');
+    expect(resolveCliId('14')).toBe('traex');
+    expect(resolveCliId('15')).toBe('pi');
+    expect(resolveCliId('16')).toBe('copilot');
+    expect(resolveCliId('20')).toBe('kimi');
+    expect(resolveCliId('21')).toBe('genius');
+    expect(resolveCliId('22')).toBe('grok');
+    expect(resolveCliId('23')).toBe('kiro-cli');
   });
 
   it('passes through literal cliIds unchanged', () => {
     expect(resolveCliId('codex')).toBe('codex');
+    expect(resolveCliId('codex-app')).toBe('codex-app');
     expect(resolveCliId('opencode')).toBe('opencode');
+    expect(resolveCliId('mtr')).toBe('mtr');
+    expect(resolveCliId('hermes')).toBe('hermes');
+    expect(resolveCliId('mira')).toBe('mira');
+    expect(resolveCliId('pi')).toBe('pi');
+    expect(resolveCliId('copilot')).toBe('copilot');
+    expect(resolveCliId('grok')).toBe('grok');
+    expect(resolveCliId('kiro-cli')).toBe('kiro-cli');
   });
 
   it('throws on typos so they do not leak into bots.json', () => {
@@ -278,5 +656,47 @@ describe('removeBotConfig', () => {
       removed: { larkAppId: 'app_a' },
       bots: [],
     });
+  });
+});
+
+describe('allowedUsers entry validation', () => {
+  it('isValidAllowedUserEntry accepts ou_ open_ids and full emails, rejects prefixes', () => {
+    expect(isValidAllowedUserEntry('ou_abc123')).toBe(true);
+    expect(isValidAllowedUserEntry('alice@example.com')).toBe(true);
+    expect(isValidAllowedUserEntry('alice')).toBe(false);
+    expect(isValidAllowedUserEntry('alice@company')).toBe(false); // no TLD
+    expect(isValidAllowedUserEntry('')).toBe(false);
+  });
+
+  it('findInvalidAllowedUserEntries surfaces only the bad entries', () => {
+    expect(findInvalidAllowedUserEntries(['ou_a', 'alice@example.com', 'bob', 'carol']))
+      .toEqual(['bob', 'carol']);
+    expect(findInvalidAllowedUserEntries(['ou_a', 'alice@example.com'])).toEqual([]);
+  });
+
+  it('hasOwnerEntry is true only when an ou_/email entry exists', () => {
+    expect(hasOwnerEntry(['ou_a'])).toBe(true);
+    expect(hasOwnerEntry(['alice@example.com'])).toBe(true);
+    expect(hasOwnerEntry(['alice'])).toBe(false);
+    expect(hasOwnerEntry([])).toBe(false);
+    expect(hasOwnerEntry(undefined)).toBe(false);
+  });
+});
+
+describe('assertOwnerWhenChatGroups', () => {
+  it('throws when allowedChatGroups is set but no owner in allowedUsers', () => {
+    expect(() => assertOwnerWhenChatGroups({ allowedChatGroups: ['oc_team'] }))
+      .toThrow(/owner/);
+    expect(() => assertOwnerWhenChatGroups({ allowedChatGroups: ['oc_team'], allowedUsers: [] }))
+      .toThrow(/owner/);
+  });
+
+  it('passes when an owner exists or no chat groups configured', () => {
+    expect(() => assertOwnerWhenChatGroups({ allowedChatGroups: ['oc_team'], allowedUsers: ['ou_admin'] }))
+      .not.toThrow();
+    expect(() => assertOwnerWhenChatGroups({ allowedChatGroups: ['oc_team'], allowedUsers: ['admin@example.com'] }))
+      .not.toThrow();
+    expect(() => assertOwnerWhenChatGroups({})).not.toThrow();
+    expect(() => assertOwnerWhenChatGroups({ allowedUsers: [] })).not.toThrow();
   });
 });

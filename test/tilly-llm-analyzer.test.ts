@@ -31,22 +31,19 @@ async function freshImport() {
 beforeEach(() => { tempDir = mkdtempSync(join(tmpdir(), 'tilly-llm-')); });
 afterEach(() => { rmSync(tempDir, { recursive: true, force: true }); });
 
-/** 2026-05-25: analyzer 切到 coco CLI 后 fake 也跟着改。coco 接口是把
- *  整个 envelope JSON 写到 stdout，{message:{content: <LLM 文本>}}。
- *  helper name 保留 makeFakeCodex (legacy 兼容)，但实际产出 coco envelope。 */
+/** 测试二进制遵守 coco-cli.ts 的唯一调用契约：最终回复写到
+ *  `--output-last-message <file>`，stdout 完全不参与解析。helper name 保留
+ *  makeFakeCodex 只是为了让历史用例的局部变量名保持稳定。 */
 function makeFakeCodex(jsonStr: string, exitCode = 0): string {
   const fp = join(tempDir, 'fake-coco.sh');
-  // coco 输出 stdout envelope，把传入的 jsonStr 当 message.content
-  const envelope = JSON.stringify({
-    session_id: 'test',
-    agent_states: {},
-    message: { role: 'assistant', content: jsonStr },
-    stats: {},
-  }).replace(/'/g, "'\\''");
   const body = `#!/bin/bash
-cat <<'ENVELOPE'
-${envelope}
-ENVELOPE
+out=''
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = '--output-last-message' ]; then out="$2"; shift 2; else shift; fi
+done
+cat > "$out" <<'COCO_OUTPUT'
+${jsonStr}
+COCO_OUTPUT
 exit ${exitCode}
 `;
   writeFileSync(fp, body, 'utf-8');
@@ -460,10 +457,13 @@ describe('tilly-llm-analyzer (P3 commit #3)', () => {
       // 用 fake coco script 把 prompt 写到 tmp 文件给我们检查
       const promptCapture = join(tempDir, 'captured-prompt.txt');
       const fakeBody = `#!/bin/bash
-# 收 prompt (last argv) 写到文件然后回 fake JSON
-echo "$@" | awk '{ for(i=NF;i>=1;i--) { if($i ~ /^---/) break; print $i; exit } }' > /dev/null
-cat > '${promptCapture}' <<< "\${@: -1}"
-echo '{"session_id":"t","agent_states":{},"message":{"role":"assistant","content":"{\\"todos\\":[],\\"progress\\":[],\\"blockers\\":[],\\"noteworthy\\":[]}"},"stats":{}}'
+prompt="\${@: -1}"
+out=''
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = '--output-last-message' ]; then out="$2"; shift 2; else shift; fi
+done
+cat > '${promptCapture}' <<< "$prompt"
+echo '{"todos":[],"progress":[],"blockers":[],"noteworthy":[]}' > "$out"
 `;
       const fp = join(tempDir, 'fake-coco-capture.sh');
       writeFileSync(fp, fakeBody, 'utf-8');
@@ -482,8 +482,13 @@ echo '{"session_id":"t","agent_states":{},"message":{"role":"assistant","content
     it('knownHandled 非空 → prompt 含结构化 JSON + 截断 + 控字符清理', async () => {
       const promptCapture = join(tempDir, 'captured-prompt.txt');
       const fakeBody = `#!/bin/bash
-cat > '${promptCapture}' <<< "\${@: -1}"
-echo '{"session_id":"t","agent_states":{},"message":{"role":"assistant","content":"{\\"todos\\":[],\\"progress\\":[],\\"blockers\\":[],\\"noteworthy\\":[]}"},"stats":{}}'
+prompt="\${@: -1}"
+out=''
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = '--output-last-message' ]; then out="$2"; shift 2; else shift; fi
+done
+cat > '${promptCapture}' <<< "$prompt"
+echo '{"todos":[],"progress":[],"blockers":[],"noteworthy":[]}' > "$out"
 `;
       const fp = join(tempDir, 'fake-coco-capture2.sh');
       writeFileSync(fp, fakeBody, 'utf-8');
@@ -537,8 +542,13 @@ echo '{"session_id":"t","agent_states":{},"message":{"role":"assistant","content
     it('v2.1 commit 4 follow-up: knownHandled summary 含 fake closing tag / UNTRUSTED_DATA / at 不会污染 prompt', async () => {
       const promptCapture = join(tempDir, 'captured-prompt-inj.txt');
       const fakeBody = `#!/bin/bash
-cat > '${promptCapture}' <<< "\${@: -1}"
-echo '{"session_id":"t","agent_states":{},"message":{"role":"assistant","content":"{\\"todos\\":[],\\"progress\\":[],\\"blockers\\":[],\\"noteworthy\\":[]}"},"stats":{}}'
+prompt="\${@: -1}"
+out=''
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = '--output-last-message' ]; then out="$2"; shift 2; else shift; fi
+done
+cat > '${promptCapture}' <<< "$prompt"
+echo '{"todos":[],"progress":[],"blockers":[],"noteworthy":[]}' > "$out"
 `;
       const fp = join(tempDir, 'fake-coco-inj.sh');
       writeFileSync(fp, fakeBody, 'utf-8');
@@ -579,17 +589,21 @@ echo '{"session_id":"t","agent_states":{},"message":{"role":"assistant","content
     });
   });
 
-  it('2026-05-25 (松松): args 走 coco --print --output-format json + 禁所有 agentic tool', async () => {
-    // Analyzer 切到 coco CLI (trae)；不需要 codex sandbox 那套，coco 自带
-    // --disallowed-tool 控制。这条 test verify 源码用 coco 接口。
-    const { readFileSync } = await import('node:fs');
-    const { join } = await import('node:path');
-    const src = readFileSync(join(__dirname, '..', 'src', 'services', 'tilly-llm-analyzer.ts'), 'utf-8');
-    expect(src).toContain("'--print'");
-    expect(src).toContain("'--output-format', 'json'");
-    expect(src).toContain("'--disallowed-tool'");
-    expect(src).toContain('Bash,Edit,Replace,Read,Write,Search,WebFetch');
-    expect(src).not.toContain('--dangerously-bypass-approvals-and-sandbox');
+  it('coco 单入口使用 output-last-message，并逐项禁用全部 agentic tool', async () => {
+    const { buildCocoExecArgs, COCO_JUDGE_DISALLOWED_TOOLS } = await import('../src/services/coco-cli.js');
+    const args = buildCocoExecArgs({ prompt: 'PROMPT', outFile: '/tmp/result.txt' });
+    expect(args.slice(0, 5)).toEqual([
+      'exec', '--skip-git-repo-check', '--ephemeral', '--output-last-message', '/tmp/result.txt',
+    ]);
+    expect(args.at(-1)).toBe('PROMPT');
+    expect(args).not.toContain('--print');
+    expect(args).not.toContain('--output-format');
+    expect(args).not.toContain('--dangerously-bypass-approvals-and-sandbox');
+    for (const tool of COCO_JUDGE_DISALLOWED_TOOLS) {
+      const i = args.indexOf(tool);
+      expect(i).toBeGreaterThan(0);
+      expect(args[i - 1]).toBe('--disallowed-tool');
+    }
   });
 
   it('P3-rev1 #3: prompt wraps untrusted data with explicit boundary', async () => {
@@ -640,8 +654,15 @@ describe('coco --resume 已禁用 (regression lock)', () => {
 
   function makeArgvCoco(argvOut: string): string {
     const fp = join(rtmp, `fake-coco-${Math.random().toString(36).slice(2)}.sh`);
-    const env = JSON.stringify({ session_id: 'sess_x', agent_states: {}, message: { role: 'assistant', content: '{"todos":[],"progress":[],"blockers":[],"noteworthy":[]}' }, stats: {} });
-    writeFileSync(fp, `#!/bin/bash\nprintf '%s\\n' "$@" > '${argvOut}'\ncat <<'ENV'\n${env}\nENV\nexit 0\n`, 'utf-8');
+    writeFileSync(fp, `#!/bin/bash
+printf '%s\\n' "$@" > '${argvOut}'
+out=''
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = '--output-last-message' ]; then out="$2"; shift 2; else shift; fi
+done
+echo '{"todos":[],"progress":[],"blockers":[],"noteworthy":[]}' > "$out"
+exit 0
+`, 'utf-8');
     chmodSync(fp, 0o755);
     return fp;
   }

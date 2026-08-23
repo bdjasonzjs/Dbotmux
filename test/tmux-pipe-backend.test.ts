@@ -12,6 +12,9 @@
  *   - captureCurrentScreen issues capture-pane -e -p -S -
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 vi.mock('node:child_process', () => ({
   execSync: vi.fn(),
@@ -25,10 +28,14 @@ vi.mock('node:fs', async () => {
     ...actual,
     openSync: vi.fn(() => 7),
     createReadStream: vi.fn(() => {
-      const handlers: Record<string, Array<(...a: any[]) => void>> = {};
+      const handlers: Record<string, Array<(...a: unknown[]) => void>> = {};
       return {
-        on(event: string, cb: any) { (handlers[event] ??= []).push(cb); return this; },
-        emit(event: string, ...args: any[]) { for (const cb of handlers[event] ?? []) cb(...args); },
+        on(event: string, cb: (...args: unknown[]) => void) {
+          handlers[event] ??= [];
+          handlers[event].push(cb);
+          return this;
+        },
+        emit(event: string, ...args: unknown[]) { for (const cb of handlers[event] ?? []) cb(...args); },
         destroy: vi.fn(),
       };
     }),
@@ -39,12 +46,38 @@ vi.mock('node:fs', async () => {
 
 import { execSync, execFileSync, spawnSync } from 'node:child_process';
 import { unlinkSync, createReadStream } from 'node:fs';
-import { TmuxPipeBackend, normaliseCaptureLineEndings } from '../src/adapters/backend/tmux-pipe-backend.js';
+import {
+  TmuxPipeBackend,
+  normaliseCaptureLineEndings,
+  tmuxLifecycleInitialDelayMs,
+  setStartupTmuxRetrySleepForTests,
+} from '../src/adapters/backend/tmux-pipe-backend.js';
+
+// Startup retries sleep synchronously (Atomics.wait — immune to fake timers);
+// stub the sleep for the whole suite so retry tests don't add real seconds.
+setStartupTmuxRetrySleepForTests(() => {});
 
 const mockedExecSync = vi.mocked(execSync);
 const mockedExecFileSync = vi.mocked(execFileSync);
 const mockedSpawnSync = vi.mocked(spawnSync);
 const mockedUnlinkSync = vi.mocked(unlinkSync);
+
+type FakeShell = {
+  readonly dir: string;
+  readonly path: string;
+};
+
+function createFakeShell(name: 'fish'): FakeShell {
+  const dir = mkdtempSync(join(tmpdir(), 'bmx-fake-shell-'));
+  const path = join(dir, name);
+  writeFileSync(path, '#!/bin/sh\nexec "$@"\n');
+  chmodSync(path, 0o755);
+  return { dir, path };
+}
+
+function cleanupFakeShell(shell: FakeShell): void {
+  rmSync(shell.dir, { recursive: true, force: true });
+}
 
 function getExecFileCalls() {
   return mockedExecFileSync.mock.calls
@@ -58,6 +91,20 @@ function spawnOpts() {
     rows: 50,
     env: process.env as Record<string, string>,
   };
+}
+
+function newSessionArgs(): string[] {
+  const call = mockedExecFileSync.mock.calls.find(([_, args]) => {
+    return Array.isArray(args) && args.includes('new-session');
+  });
+  if (!call) throw new Error('expected tmux new-session call');
+  return call[1] as string[];
+}
+
+function scriptIndex(args: readonly string[]): number {
+  const index = args.indexOf('-c');
+  if (index < 0) throw new Error('expected shell -c script in argv');
+  return index;
 }
 
 beforeEach(() => {
@@ -85,6 +132,145 @@ describe('TmuxPipeBackend.spawn', () => {
     expect(pipeCalls[0]).toContain('-O');
     expect(pipeCalls[0]).toContain("'0:2.0'");
     expect(pipeCalls[0]).toMatch(/cat > '.*botmux-pipe-.*\.fifo'/);
+  });
+
+  it('retries pipe-pane after a transient connect failure instead of failing the session start', () => {
+    // Startup herd after an outage: the first pipe-pane routinely eats an
+    // instant ECONNREFUSED from the stalled shared server. One spaced retry
+    // must recover instead of surfacing "会话启动失败" to the chat.
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      let pipeAttempts = 0;
+      mockedExecSync.mockImplementation(((cmd: any) => {
+        if (String(cmd).includes('pipe-pane')) {
+          pipeAttempts += 1;
+          if (pipeAttempts === 1) {
+            throw Object.assign(new Error('cmd failed'), {
+              status: 1,
+              signal: null,
+              stderr: Buffer.from('error connecting to /tmp/tmux-0/default (Connection refused)'),
+            });
+          }
+        }
+        return Buffer.from('') as any;
+      }) as any);
+
+      const be = new TmuxPipeBackend('0:2.0');
+      const exits: unknown[] = [];
+      be.onExit((code, signal) => exits.push([code, signal]));
+      expect(() => be.spawn('', [], spawnOpts())).not.toThrow();
+
+      expect(pipeAttempts).toBe(2);
+      expect(exits).toEqual([]);
+      expect(errSpy.mock.calls.some(call => String(call[0]).includes('pipe-pane attach failed'))).toBe(true);
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  it('still throws (and fires exit) when pipe-pane keeps hitting connect errors after all retries', () => {
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      let pipeAttempts = 0;
+      mockedExecSync.mockImplementation(((cmd: any) => {
+        if (String(cmd).includes('pipe-pane')) {
+          pipeAttempts += 1;
+          throw Object.assign(new Error('cmd failed'), {
+            status: 1,
+            signal: null,
+            stderr: Buffer.from('error connecting to /tmp/tmux-0/default (Connection refused)'),
+          });
+        }
+        return Buffer.from('') as any;
+      }) as any);
+
+      const be = new TmuxPipeBackend('0:2.0');
+      const exits: unknown[] = [];
+      be.onExit((code, signal) => exits.push([code, signal]));
+      expect(() => be.spawn('', [], spawnOpts())).toThrow();
+
+      expect(pipeAttempts).toBe(3);            // initial + 2 retries
+      expect(exits).toEqual([[1, null]]);
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  it('fails pipe-pane FAST on a server-answered deterministic rejection (pane genuinely gone)', () => {
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      let pipeAttempts = 0;
+      mockedExecSync.mockImplementation(((cmd: any) => {
+        if (String(cmd).includes('pipe-pane')) {
+          pipeAttempts += 1;
+          throw Object.assign(new Error('cmd failed'), {
+            status: 1,
+            signal: null,
+            stderr: Buffer.from("can't find pane: 0:2.0"),
+          });
+        }
+        return Buffer.from('') as any;
+      }) as any);
+
+      const be = new TmuxPipeBackend('0:2.0');
+      const exits: unknown[] = [];
+      be.onExit((code, signal) => exits.push([code, signal]));
+      expect(() => be.spawn('', [], spawnOpts())).toThrow();
+
+      expect(pipeAttempts).toBe(1);            // no pointless retries
+      expect(exits).toEqual([[1, null]]);
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  it('retries new-session on a connect failure and treats duplicate-session-on-retry as success', () => {
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      let newSessionAttempts = 0;
+      mockedExecFileSync.mockImplementation(((_bin: any, args: any) => {
+        if (Array.isArray(args) && args.includes('new-session')) {
+          newSessionAttempts += 1;
+          if (newSessionAttempts === 1) {
+            // Timed-out first attempt: the client was killed but the server may
+            // have created the session anyway.
+            throw Object.assign(new Error('timed out'), { status: null, signal: 'SIGTERM', killed: true });
+          }
+          // Retry discovers the session DOES exist server-side.
+          throw Object.assign(new Error('cmd failed'), {
+            status: 1,
+            signal: null,
+            stderr: Buffer.from('duplicate session: bmx-owned'),
+          });
+        }
+        return '' as any;
+      }) as any);
+
+      const be = new TmuxPipeBackend('bmx-owned', { createSession: true, ownsSession: true });
+      expect(() => be.spawn('echo', [], spawnOpts())).not.toThrow();
+      expect(newSessionAttempts).toBe(2);
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  it('does NOT retry new-session on a server-answered deterministic rejection', () => {
+    let newSessionAttempts = 0;
+    mockedExecFileSync.mockImplementation(((_bin: any, args: any) => {
+      if (Array.isArray(args) && args.includes('new-session')) {
+        newSessionAttempts += 1;
+        throw Object.assign(new Error('cmd failed'), {
+          status: 1,
+          signal: null,
+          stderr: Buffer.from('usage: new-session [...]'),
+        });
+      }
+      return '' as any;
+    }) as any);
+
+    const be = new TmuxPipeBackend('bmx-owned', { createSession: true, ownsSession: true });
+    expect(() => be.spawn('echo', [], spawnOpts())).toThrow();
+    expect(newSessionAttempts).toBe(1);
   });
 });
 
@@ -123,11 +309,19 @@ describe('TmuxPipeBackend input addressing', () => {
     be.pasteText('multi\nline');
 
     const calls = getExecFileCalls();
-    expect(calls[0][1]).toContain('load-buffer');
+    const loadArgs = calls[0][1] as string[];
+    expect(loadArgs).toContain('load-buffer');
     expect((calls[0][2] as any).input).toBe('multi\nline');
+    const bIdx = loadArgs.indexOf('-b');
+    expect(bIdx).toBeGreaterThanOrEqual(0);
+    const bufferName = loadArgs[bIdx + 1];
+    expect(bufferName).toMatch(/^botmux-[a-f0-9]{16}$/);
 
     const pasteArgs = calls[1][1] as string[];
     expect(pasteArgs).toContain('paste-buffer');
+    const pasteBIdx = pasteArgs.indexOf('-b');
+    expect(pasteBIdx).toBeGreaterThanOrEqual(0);
+    expect(pasteArgs[pasteBIdx + 1]).toBe(bufferName);
     const tIdx = pasteArgs.indexOf('-t');
     expect(pasteArgs[tIdx + 1]).toBe('0:5.0');
     // -p forces bracketed-paste markers, REQUIRED for CoCo/Ink to treat the
@@ -136,6 +330,65 @@ describe('TmuxPipeBackend input addressing', () => {
     // the input box (replies-to-previous-message off-by-one). Regression guard
     // for PR #25, which added -p only to the unused TmuxBackend.
     expect(pasteArgs).toContain('-p');
+  });
+
+  it('uses a fresh named tmux buffer for each paste', () => {
+    const be = new TmuxPipeBackend('0:5.0');
+    be.spawn('', [], spawnOpts());
+    mockedExecFileSync.mockClear();
+    be.pasteText('one');
+    be.pasteText('two');
+
+    const loadCalls = getExecFileCalls()
+      .map(call => call[1] as string[])
+      .filter(args => args.includes('load-buffer'));
+    const firstBuffer = loadCalls[0][loadCalls[0].indexOf('-b') + 1];
+    const secondBuffer = loadCalls[1][loadCalls[1].indexOf('-b') + 1];
+    expect(firstBuffer).not.toBe(secondBuffer);
+  });
+
+  it('deletes the named buffer when paste-buffer fails (cleanup, no leak)', () => {
+    const be = new TmuxPipeBackend('0:5.0');
+    be.spawn('', [], spawnOpts());
+    mockedExecFileSync.mockClear();
+    // load-buffer succeeds, paste-buffer throws → the -d delete never runs, so
+    // the finally{} must delete the SAME named buffer. guardedSend swallows the
+    // failure (pane ALIVE via the default execSync mock) so pasteText must not throw.
+    mockedExecFileSync.mockImplementation(((_cmd: string, args?: string[]) => {
+      if (Array.isArray(args) && args.includes('paste-buffer')) throw new Error('no server running');
+      return '' as any;
+    }) as any);
+
+    expect(() => be.pasteText('boom')).not.toThrow();
+
+    const calls = getExecFileCalls().map(call => call[1] as string[]);
+    const loadArgs = calls.find(args => args.includes('load-buffer'))!;
+    const bufferName = loadArgs[loadArgs.indexOf('-b') + 1];
+    const deleteArgs = calls.find(args => args.includes('delete-buffer'));
+    expect(deleteArgs).toBeDefined();
+    expect(deleteArgs![deleteArgs!.indexOf('-b') + 1]).toBe(bufferName);
+  });
+
+  it('reports paste rejection when paste-buffer fails after load-buffer cleanup', () => {
+    const be = new TmuxPipeBackend('0:5.0');
+    be.spawn('', [], spawnOpts());
+    mockedExecFileSync.mockClear();
+    mockedExecFileSync.mockImplementation(((_cmd: string, args?: string[]) => {
+      if (Array.isArray(args) && args.includes('paste-buffer')) throw new Error('no server running');
+      return Buffer.from('');
+    }));
+
+    expect(be.pasteText('boom')).toBe(false);
+  });
+
+  it('reports paste rejection after backend exit without sending Enter-bound content', () => {
+    const be = new TmuxPipeBackend('0:5.0');
+    be.spawn('', [], spawnOpts());
+    be.kill();
+    mockedExecFileSync.mockClear();
+
+    expect(be.pasteText('after exit')).toBe(false);
+    expect(mockedExecFileSync).not.toHaveBeenCalled();
   });
 
   it('write delegates to sendText (literal send-keys)', () => {
@@ -193,8 +446,11 @@ describe('TmuxPipeBackend.captureCurrentScreen', () => {
       .mockReturnValueOnce('0\n' as any)  // alternate_on probe
       .mockReturnValueOnce('line1\nline2\nline3\n' as any);
     const out = be.captureCurrentScreen();
-    // Each \n must become \r\n; existing \r\n must not be doubled.
-    expect(out).toBe('line1\r\nline2\r\nline3\r\n');
+    // Each \n must become \r\n; existing \r\n must not be doubled. The web seed
+    // also strips the trailing newline (see composeSeedBody) so it doesn't
+    // scroll the receiving xterm a row past the content. Cursor query is mocked
+    // empty here → no CUP appended.
+    expect(out).toBe('line1\r\nline2\r\nline3');
   });
 
   it('preserves existing \\r\\n untouched', () => {
@@ -205,7 +461,8 @@ describe('TmuxPipeBackend.captureCurrentScreen', () => {
     mockedExecSync
       .mockReturnValueOnce('0\n' as any)
       .mockReturnValueOnce('a\r\nb\nc\r\n' as any);
-    expect(be.captureCurrentScreen()).toBe('a\r\nb\r\nc\r\n');
+    // \r\n preserved; trailing newline stripped for the seed.
+    expect(be.captureCurrentScreen()).toBe('a\r\nb\r\nc');
   });
 
   it('prefixes alt-buffer enter sequence when pane is in alt screen', () => {
@@ -217,9 +474,10 @@ describe('TmuxPipeBackend.captureCurrentScreen', () => {
       .mockReturnValueOnce('1\n' as any)        // alternate_on=1 (Claude TUI)
       .mockReturnValueOnce('claude prompt\n' as any);
     const out = be.captureCurrentScreen();
-    // Must start with: enter alt buffer + home + clear, then the snapshot.
+    // Must start with: enter alt buffer + home + clear, then the snapshot
+    // (trailing newline stripped for the seed; cursor query mocked empty).
     expect(out.startsWith('\x1b[?1049h\x1b[H\x1b[2J')).toBe(true);
-    expect(out.endsWith('claude prompt\r\n')).toBe(true);
+    expect(out.endsWith('claude prompt')).toBe(true);
   });
 
   it('does NOT prefix alt-buffer enter when pane is on main buffer', () => {
@@ -231,8 +489,22 @@ describe('TmuxPipeBackend.captureCurrentScreen', () => {
       .mockReturnValueOnce('0\n' as any)        // alternate_on=0 (zsh prompt)
       .mockReturnValueOnce('$ ls\n' as any);
     const out = be.captureCurrentScreen();
-    expect(out).toBe('$ ls\r\n');
+    expect(out).toBe('$ ls');                   // trailing newline stripped
     expect(out).not.toContain('\x1b[?1049h');
+  });
+
+  it('restores the pane cursor (CUP) so the live redraw lands on the right row', () => {
+    const be = new TmuxPipeBackend('0:2.0');
+    be.spawn('', [], spawnOpts());
+    mockedExecSync.mockReset();
+    mockedExecSync.mockReturnValue(Buffer.from('') as any);
+    mockedExecSync
+      .mockReturnValueOnce('0\n' as any)          // alternate_on=0 (main buffer)
+      .mockReturnValueOnce('STATUS\nTIP\nINPUT\n' as any)  // capture-pane
+      .mockReturnValueOnce('6 10\n' as any);      // cursor_x=6 cursor_y=10
+    const out = be.captureCurrentScreen();
+    // Trailing newline stripped, then CUP to (y+1=11, x+1=7).
+    expect(out).toBe('STATUS\r\nTIP\r\nINPUT\x1b[11;7H');
   });
 });
 
@@ -333,11 +605,37 @@ describe('TmuxPipeBackend managed session', () => {
     expect(newSessionCall![1]).toContain('bmx-owned');
 
     const optionCalls = mockedExecSync.mock.calls.map(c => String(c[0]));
-    expect(optionCalls.some(c => c.includes('set-option') && c.includes('status off'))).toBe(true);
+    expect(optionCalls.some(c => c.includes('set-option') && c.includes('status on'))).toBe(true);
     expect(optionCalls.some(c => c.includes('set-option') && c.includes('mouse on'))).toBe(true);
     expect(optionCalls.some(c => c.includes('set-option') && c.includes('history-limit 50000'))).toBe(true);
     expect(optionCalls.some(c => c.includes('set-option') && c.includes('window-size largest'))).toBe(true);
     expect(optionCalls.some(c => c.includes('set-option -s set-clipboard on'))).toBe(true);
+  });
+
+  it('uses fish script syntax and omits the POSIX _ sentinel when launchShell is fish', () => {
+    const shell = createFakeShell('fish');
+    try {
+      const be = new TmuxPipeBackend('bmx-fish-pipe', { createSession: true, ownsSession: true });
+      be.spawn('/bin/echo', ['hello'], {
+        ...spawnOpts(),
+        launchShell: shell.path,
+      });
+
+      const args = newSessionArgs();
+      const cIdx = scriptIndex(args);
+      const script = args[cIdx + 1] ?? '';
+      expect(args.slice(cIdx - 2, cIdx + 2)).toEqual([shell.path, '-i', '-c', script]);
+      expect(args[cIdx + 2]).toBe('/tmp');
+      expect(args[cIdx + 2]).not.toBe('_');
+      expect(script).toContain('cd -- $argv[1]');
+      expect(script).toContain('set -e argv[1]');
+      expect(script).toContain('exec /usr/bin/env $argv');
+      expect(script).not.toContain('cd -- "$1" && shift');
+      expect(script).not.toContain('"$@"');
+      expect(script).not.toMatch(/\bshift\b/);
+    } finally {
+      cleanupFakeShell(shell);
+    }
   });
 
   it('resizes owned tmux sessions and only records adopted pane resize', () => {
@@ -353,53 +651,370 @@ describe('TmuxPipeBackend managed session', () => {
 });
 
 describe('TmuxPipeBackend lifecycle watcher', () => {
-  it('fires exit when the tmux pane disappears', () => {
+  const isPaneProbe = (args: any) =>
+    Array.isArray(args) && args.includes('display-message') && args.includes('#{pane_id}');
+  const PANE_OK = (_bin: any, args: any) => isPaneProbe(args) ? '%1\n' as any : '' as any;
+  const PANE_GONE = (_bin: any, args: any) => {
+    if (isPaneProbe(args)) throw Object.assign(new Error('no pane'), { status: 1, signal: null });
+    return '' as any;
+  };
+
+  it('fires exit when the tmux pane disappears — but only after 3 consecutive failures (backed-off probes)', () => {
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     vi.useFakeTimers();
     try {
-      mockedExecSync.mockImplementation((cmd: any) => {
-        if (String(cmd).includes("display-message") && String(cmd).includes("#{pane_id}")) return '%1\n' as any;
+      mockedExecFileSync.mockImplementation(PANE_OK);
+      const be = new TmuxPipeBackend('bmx-owned', { ownsSession: true });
+      const exits: Array<[number | null, string | null]> = [];
+      be.onExit((code, signal) => exits.push([code, signal]));
+      be.spawn('', [], spawnOpts());
+      mockedExecFileSync.mockImplementation(PANE_GONE);
+
+      // Failed probes back off (1s → 3s → 9s): miss#1 at the initial delay,
+      // miss#2 3s later. Two misses are NOT enough — the gate rides them out.
+      vi.advanceTimersByTime(tmuxLifecycleInitialDelayMs('bmx-owned') + 3_000);
+      expect(exits).toEqual([]);
+
+      // miss#3 lands 9s after miss#2, trips the gate; the final lenient
+      // confirm also fails and the server cross-check answers ⇒ now we detach.
+      vi.advanceTimersByTime(9_000);
+      expect(exits).toEqual([[1, null]]);
+    } finally {
+      vi.useRealTimers();
+      errSpy.mockRestore();
+    }
+  });
+
+  it('treats an empty pane id as a failure (debounced the same way)', () => {
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    vi.useFakeTimers();
+    try {
+      mockedExecFileSync.mockImplementation(PANE_OK);
+      const be = new TmuxPipeBackend('bmx-owned', { ownsSession: true });
+      const exits: Array<[number | null, string | null]> = [];
+      be.onExit((code, signal) => exits.push([code, signal]));
+      be.spawn('', [], spawnOpts());
+      mockedExecFileSync.mockImplementation((_bin: any, args: any) => isPaneProbe(args) ? '\n' as any : '' as any);
+
+      vi.advanceTimersByTime(tmuxLifecycleInitialDelayMs('bmx-owned') + 3_000);
+      expect(exits).toEqual([]);
+      vi.advanceTimersByTime(9_000);
+      expect(exits).toEqual([[1, null]]);
+    } finally {
+      vi.useRealTimers();
+      errSpy.mockRestore();
+    }
+  });
+
+  it('does NOT detach on a single transient probe failure that then recovers', () => {
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    vi.useFakeTimers();
+    try {
+      mockedExecFileSync.mockImplementation(PANE_OK);
+      const be = new TmuxPipeBackend('bmx-owned', { ownsSession: true });
+      const exits: Array<[number | null, string | null]> = [];
+      be.onExit((code, signal) => exits.push([code, signal]));
+      be.spawn('', [], spawnOpts());
+
+      // One failure, then sustained success — the false signal must be ignored.
+      mockedExecFileSync.mockImplementation(PANE_GONE);
+      vi.advanceTimersByTime(tmuxLifecycleInitialDelayMs('bmx-owned'));
+      mockedExecFileSync.mockImplementation(PANE_OK);
+      vi.advanceTimersByTime(10_000);
+
+      expect(exits).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+      errSpy.mockRestore();
+    }
+  });
+
+  it('resets the failure counter on an intervening success (never 3-in-a-row)', () => {
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    vi.useFakeTimers();
+    try {
+      mockedExecFileSync.mockImplementation(PANE_OK);
+      const be = new TmuxPipeBackend('bmx-owned', { ownsSession: true });
+      const exits: Array<[number | null, string | null]> = [];
+      be.onExit((code, signal) => exits.push([code, signal]));
+      be.spawn('', [], spawnOpts());
+
+      mockedExecFileSync.mockImplementation(PANE_GONE);
+      vi.advanceTimersByTime(tmuxLifecycleInitialDelayMs('bmx-owned') + 3_000); // 2 failures (probes back off 1s→3s)
+      mockedExecFileSync.mockImplementation(PANE_OK);
+      vi.advanceTimersByTime(9_000);          // success → reset (next probe 9s out)
+      mockedExecFileSync.mockImplementation(PANE_GONE);
+      vi.advanceTimersByTime(4_000);          // 2 more failures at 1s + 3s (gate back to 2)
+
+      expect(exits).toEqual([]);              // never reached 3 consecutive
+    } finally {
+      vi.useRealTimers();
+      errSpy.mockRestore();
+    }
+  });
+
+  it('stays attached when the final lenient confirm probe succeeds', () => {
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    vi.useFakeTimers();
+    try {
+      let paneIdCalls = 0;
+      mockedExecFileSync.mockImplementation((_bin: any, args: any) => {
+        if (isPaneProbe(args)) {
+          paneIdCalls += 1;
+          if (paneIdCalls <= 3) {
+            throw Object.assign(new Error('no pane'), { status: 1, signal: null });
+          }
+          return '%1\n' as any;
+        }
         return '' as any;
       });
       const be = new TmuxPipeBackend('bmx-owned', { ownsSession: true });
       const exits: Array<[number | null, string | null]> = [];
       be.onExit((code, signal) => exits.push([code, signal]));
       be.spawn('', [], spawnOpts());
-      mockedExecSync.mockImplementation((cmd: any) => {
-        if (String(cmd).includes("display-message") && String(cmd).includes("#{pane_id}")) {
-          throw new Error('no pane');
+
+      vi.advanceTimersByTime(tmuxLifecycleInitialDelayMs('bmx-owned') + 12_000);
+      expect(exits).toEqual([]);              // recovered on the confirm, no detach
+      expect(paneIdCalls).toBe(4);
+    } finally {
+      vi.useRealTimers();
+      errSpy.mockRestore();
+    }
+  });
+
+  it('never trips the gate on connection-level clean errors (server stall ⇒ instant ECONNREFUSED)', () => {
+    // 2026-08-20 incident: a briefly stalled shared server refuses connects
+    // instantly (unix-socket accept backlog overflow). The clean exit-1 +
+    // "error connecting" stderr must classify as UNKNOWN, not authoritative
+    // missing — misreading it tore down every live session across all bots.
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    vi.useFakeTimers();
+    try {
+      mockedExecFileSync.mockImplementation(PANE_OK);
+      const be = new TmuxPipeBackend('bmx-owned', { ownsSession: true });
+      const exits: Array<[number | null, string | null]> = [];
+      be.onExit((code, signal) => exits.push([code, signal]));
+      be.spawn('', [], spawnOpts());
+      mockedExecFileSync.mockImplementation((_bin: any, args: any) => {
+        if (isPaneProbe(args)) {
+          throw Object.assign(new Error('cmd failed'), {
+            status: 1,
+            signal: null,
+            stderr: Buffer.from('error connecting to /tmp/tmux-0/default (Connection refused)'),
+          });
         }
         return '' as any;
       });
 
-      vi.advanceTimersByTime(2_000);
-
-      expect(exits).toEqual([[1, null]]);
+      // Well past the old 3-miss window but inside the 60s outage escalation.
+      vi.advanceTimersByTime(tmuxLifecycleInitialDelayMs('bmx-owned') + 30_000);
+      expect(exits).toEqual([]);
+      expect(errSpy.mock.calls.some(call => String(call[0]).includes('keeping managed session attached'))).toBe(true);
     } finally {
       vi.useRealTimers();
+      errSpy.mockRestore();
     }
   });
 
-  it('fires exit when tmux display-message succeeds with empty pane id', () => {
+  it('escalates to pane-exit when the server stays continuously unreachable past the outage window', () => {
+    // Connection-level errors are unknown, but a genuinely DEAD server also
+    // produces them forever — and its panes died with it. An unbroken run
+    // longer than the escalation window must eventually declare the pane gone
+    // so the worker can restart/resume instead of holding a zombie session.
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     vi.useFakeTimers();
     try {
-      mockedExecSync.mockImplementation((cmd: any) => {
-        if (String(cmd).includes("display-message") && String(cmd).includes("#{pane_id}")) return '%1\n' as any;
-        return '' as any;
-      });
+      mockedExecFileSync.mockImplementation(PANE_OK);
       const be = new TmuxPipeBackend('bmx-owned', { ownsSession: true });
       const exits: Array<[number | null, string | null]> = [];
       be.onExit((code, signal) => exits.push([code, signal]));
       be.spawn('', [], spawnOpts());
-      mockedExecSync.mockImplementation((cmd: any) => {
-        if (String(cmd).includes("display-message") && String(cmd).includes("#{pane_id}")) return '\n' as any;
+      mockedExecFileSync.mockImplementation((_bin: any, args: any) => {
+        if (isPaneProbe(args)) {
+          throw Object.assign(new Error('cmd failed'), {
+            status: 1,
+            signal: null,
+            stderr: Buffer.from('error connecting to /tmp/tmux-0/default (Connection refused)'),
+          });
+        }
         return '' as any;
       });
 
-      vi.advanceTimersByTime(2_000);
-
+      vi.advanceTimersByTime(tmuxLifecycleInitialDelayMs('bmx-owned') + 80_000);
       expect(exits).toEqual([[1, null]]);
+      expect(errSpy.mock.calls.some(call => String(call[0]).includes('continuously unreachable'))).toBe(true);
     } finally {
       vi.useRealTimers();
+      errSpy.mockRestore();
+    }
+  });
+
+  it('stays attached when panes read missing but the server itself does not answer (cross-check)', () => {
+    // Defense in depth: even an authoritative-looking missing verdict must not
+    // destroy state while an independent list-sessions cross-check says the
+    // server is not answering — covers unrecognised stderr wordings / future
+    // tmux message changes that slip past the connection-error classifier.
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    vi.useFakeTimers();
+    try {
+      mockedExecFileSync.mockImplementation(PANE_OK);
+      const be = new TmuxPipeBackend('bmx-owned', { ownsSession: true });
+      const exits: Array<[number | null, string | null]> = [];
+      be.onExit((code, signal) => exits.push([code, signal]));
+      be.spawn('', [], spawnOpts());
+      mockedExecFileSync.mockImplementation((_bin: any, args: any) => {
+        if (isPaneProbe(args)) {
+          throw Object.assign(new Error('no pane'), { status: 1, signal: null });
+        }
+        if (Array.isArray(args) && args.includes('list-sessions')) {
+          throw Object.assign(new Error('cmd failed'), {
+            status: 1,
+            signal: null,
+            stderr: Buffer.from('error connecting to /tmp/tmux-0/default (Connection refused)'),
+          });
+        }
+        return '' as any;
+      });
+
+      vi.advanceTimersByTime(tmuxLifecycleInitialDelayMs('bmx-owned') + 13_000);
+      expect(exits).toEqual([]);
+      expect(errSpy.mock.calls.some(call => String(call[0]).includes('treating as server outage'))).toBe(true);
+    } finally {
+      vi.useRealTimers();
+      errSpy.mockRestore();
+    }
+  });
+
+  it('tears down when panes read missing AND the cross-check says the server is DOWN (no server running)', () => {
+    // Regression guard for the sole-session hang: when a managed session is the
+    // only session on its socket, its pane dying makes tmux exit, so BOTH the
+    // pane probe and the list-sessions cross-check return authoritative
+    // "no server running" — NOT a connection-level error. That is 'down'
+    // (server gone ⇒ this pane provably gone), so teardown must proceed.
+    // The earlier cross-check collapsed 'down' into "not answering" and stayed
+    // attached forever: each authoritative-missing probe reset the outage
+    // clock, so the 60s escalation never fired and the worker hung until the
+    // next write. Distinct from the connection-level case above (stay attached).
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    vi.useFakeTimers();
+    try {
+      mockedExecFileSync.mockImplementation(PANE_OK);
+      const be = new TmuxPipeBackend('bmx-owned', { ownsSession: true });
+      const exits: Array<[number | null, string | null]> = [];
+      be.onExit((code, signal) => exits.push([code, signal]));
+      be.spawn('', [], spawnOpts());
+      // Sole session's pane died → tmux server exited. EVERY tmux invocation
+      // (pane probe AND list-sessions cross-check) now returns authoritative
+      // "no server running".
+      mockedExecFileSync.mockImplementation((_bin: any, _args: any) => {
+        throw Object.assign(new Error('no server'), {
+          status: 1,
+          signal: null,
+          stderr: Buffer.from('no server running on /tmp/tmux-0/default'),
+        });
+      });
+
+      // Well past the ~13s backed-off teardown window, but far short of the 60s
+      // escalation clock — proving teardown comes from the 'down' cross-check,
+      // not from the outage escalation.
+      vi.advanceTimersByTime(tmuxLifecycleInitialDelayMs('bmx-owned') + 15_000);
+      expect(exits).toEqual([[1, null]]);
+      expect(errSpy.mock.calls.some(call => String(call[0]).includes('pane gone after'))).toBe(true);
+      // Must NOT have stayed attached via the outage path.
+      expect(errSpy.mock.calls.some(call => String(call[0]).includes('treating as server outage'))).toBe(false);
+    } finally {
+      vi.useRealTimers();
+      errSpy.mockRestore();
+    }
+  });
+
+  it('never detaches when tmux probes time out or fail to spawn (unknown, not missing)', () => {
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    vi.useFakeTimers();
+    try {
+      const be = new TmuxPipeBackend('bmx-owned', { ownsSession: true });
+      const exits: Array<[number | null, string | null]> = [];
+      be.onExit((code, signal) => exits.push([code, signal]));
+      be.spawn('', [], spawnOpts());
+      mockedExecFileSync.mockImplementation((_bin: any, args: any) => {
+        if (isPaneProbe(args)) {
+          throw Object.assign(new Error('spawn tmux EMFILE'), { code: 'EMFILE', status: null, signal: null });
+        }
+        return '' as any;
+      });
+
+      vi.advanceTimersByTime(tmuxLifecycleInitialDelayMs('bmx-owned') + 10_000);
+      expect(exits).toEqual([]);
+      expect(errSpy.mock.calls.some(call => String(call[0]).includes('keeping managed session attached'))).toBe(true);
+    } finally {
+      vi.useRealTimers();
+      errSpy.mockRestore();
+    }
+  });
+
+  it('fires exit IMMEDIATELY when the adopted CLI pid disappears (pid is decisive, not debounced)', () => {
+    // The pid check is a pure process.kill(pid,0) syscall — it can only report
+    // ESRCH/EPERM, never a transient timeout — so it must NOT be debounced:
+    // delaying teardown would route Lark input into the user's bare shell.
+    vi.useFakeTimers();
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(((pid: number, signal?: NodeJS.Signals | 0) => {
+      if (pid === 4242 && signal === 0) {
+        const err: NodeJS.ErrnoException = new Error('gone');
+        err.code = 'ESRCH';
+        throw err;
+      }
+      return true;
+    }) as typeof process.kill);
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      mockedExecFileSync.mockImplementation(PANE_OK);
+      const be = new TmuxPipeBackend('0:2.0', { cliPid: 4242 });
+      const exits: Array<[number | null, string | null]> = [];
+      be.onExit((code, signal) => exits.push([code, signal]));
+      be.spawn('', [], spawnOpts());
+      mockedExecSync.mockClear();
+
+      vi.advanceTimersByTime(tmuxLifecycleInitialDelayMs('0:2.0'));
+      expect(exits).toEqual([[1, null]]);
+
+      const cancelCall = mockedExecSync.mock.calls
+        .map(c => String(c[0]))
+        .find(c => c.includes('pipe-pane'));
+      expect(cancelCall).toBeDefined();
+      expect(cancelCall).toContain("'0:2.0'");
+      expect(cancelCall).not.toContain('cat >');
+    } finally {
+      errSpy.mockRestore();
+      killSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it('kill() during a pending (sub-threshold) failure streak stops the watcher cleanly', () => {
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    vi.useFakeTimers();
+    try {
+      mockedExecFileSync.mockImplementation(PANE_OK);
+      const be = new TmuxPipeBackend('bmx-owned', { ownsSession: true });
+      const exits: Array<[number | null, string | null]> = [];
+      be.onExit((code, signal) => exits.push([code, signal]));
+      be.spawn('', [], spawnOpts());
+
+      mockedExecFileSync.mockImplementation(PANE_GONE);
+      vi.advanceTimersByTime(tmuxLifecycleInitialDelayMs('bmx-owned') + 1_000);
+      expect(exits).toEqual([]);
+
+      be.kill();                              // explicit close mid-streak
+      mockedExecFileSync.mockClear();
+      vi.advanceTimersByTime(10_000);         // watcher must be stopped
+
+      expect(exits).toEqual([]);              // kill() does not fire onExit
+      const probeAfterKill = mockedExecFileSync.mock.calls
+        .some(c => (c[1] as string[]).includes('display-message'));
+      expect(probeAfterKill).toBe(false);     // no further probing after kill
+    } finally {
+      vi.useRealTimers();
+      errSpy.mockRestore();
     }
   });
 });
@@ -437,10 +1052,28 @@ describe('TmuxPipeBackend send failure handling', () => {
 
     mockedExecFileSync.mockImplementation((_bin: any, args: any) => {
       if ((args as string[]).includes('send-keys')) throw new Error('transient tmux error');
+      if ((args as string[]).includes('#{pane_id}')) return '%1\n' as any;
       return '' as any;
     });
     // Liveness probe succeeds ⇒ pane ALIVE ⇒ transient error, just dropped.
-    mockedExecSync.mockReturnValue('' as any);
+
+    expect(() => be.sendText('hi')).not.toThrow();
+    expect(exits).toEqual([]);
+  });
+
+  it('drops the write without teardown when the follow-up pane probe is unknown', () => {
+    const be = new TmuxPipeBackend('bmx-busy', { ownsSession: true });
+    const exits: Array<[number | null, string | null]> = [];
+    be.onExit((c, s) => exits.push([c, s]));
+    be.spawn('', [], spawnOpts());
+
+    mockedExecFileSync.mockImplementation((_bin: any, args: any) => {
+      if ((args as string[]).includes('send-keys')) throw new Error('tmux write timed out');
+      if ((args as string[]).includes('#{pane_id}')) {
+        throw Object.assign(new Error('spawn tmux EMFILE'), { code: 'EMFILE', status: null, signal: null });
+      }
+      return '' as any;
+    });
 
     expect(() => be.sendText('hi')).not.toThrow();
     expect(exits).toEqual([]);
@@ -535,18 +1168,41 @@ describe('TmuxPipeBackend.kill', () => {
 });
 
 describe('TmuxPipeBackend.onData', () => {
-  it('forwards fifo bytes to registered listeners', () => {
+  function lastStream() {
+    return vi.mocked(createReadStream).mock.results.at(-1)!.value as any;
+  }
+
+  it('forwards a whole fifo chunk to registered listeners', () => {
     const be = new TmuxPipeBackend('0:2.0');
     be.spawn('', [], spawnOpts());
     const received: string[] = [];
     be.onData(d => received.push(d));
 
-    // Simulate the fifo emitting a chunk by reaching into the mock stream.
-    // We re-derive the createReadStream return by accessing private state
-    // through a fresh call — here we trust that the stream's 'data' handler
-    // was registered (verified separately by build & runtime).
-    // For coverage, a follow-up integration test in the e2e suite drives a
-    // real tmux pipe-pane.
-    expect(received).toEqual([]);
+    lastStream().emit('data', Buffer.from('hello 你好\n', 'utf8'));
+    expect(received).toEqual(['hello 你好\n']);
+  });
+
+  it('reassembles a multi-byte char split across two chunks (no U+FFFD)', () => {
+    // Regression: the fifo emits raw Buffers at libuv's 64KB highWaterMark,
+    // which can fall mid-character. Decoding each chunk independently with
+    // chunk.toString('utf8') split one wide glyph into replacement chars and
+    // shifted every following column — the intermittent web-terminal "错位"
+    // during CLI re-renders. StringDecoder must buffer the partial bytes.
+    const be = new TmuxPipeBackend('0:2.0');
+    be.spawn('', [], spawnOpts());
+    const received: string[] = [];
+    be.onData(d => received.push(d));
+
+    // `┌`(0xE2 0x94 0x8C) and `─`(0xE2 0x94 0x80) are 3 bytes each. Cut one
+    // byte into `─` so that character straddles the chunk boundary, exactly
+    // like a 64KB split during a full-screen redraw.
+    const full = Buffer.from('┌─┐', 'utf8');
+    const stream = lastStream();
+    stream.emit('data', full.subarray(0, 4)); // `┌` + first byte of `─`
+    stream.emit('data', full.subarray(4));    // remaining bytes of `─` + `┐`
+
+    const joined = received.join('');
+    expect(joined).toBe('┌─┐');
+    expect(joined).not.toContain('�');
   });
 });

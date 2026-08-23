@@ -1,11 +1,27 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, statSync, watch } from 'node:fs';
-import { join, dirname } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import {
+  closeSync,
+  constants,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  watch,
+  writeFileSync,
+} from 'node:fs';
+import { basename, dirname, join } from 'node:path';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { dashboardEventBus } from '../core/dashboard-events.js';
-import { computeInputHash } from '../workflows/events/idempotency.js';
-import type { ScheduledTask, ParsedSchedule } from '../types.js';
+import { computeInputHash } from '../utils/canonical-input-hash.js';
+import { withFileLockSync } from '../utils/file-lock.js';
+import { fsyncDirectorySyncPortable } from '../utils/fs-durability.js';
+import { botHomePath } from '../adapters/cli/read-isolation.js';
+import type { ScheduledTask, ParsedSchedule, ScheduleExecutionPosition } from '../types.js';
 
 // ─── Idempotency types (events doc v0.1.2 §2.2) ─────────────────────────────
 
@@ -42,7 +58,6 @@ export class IdempotencyConflictError extends Error {
  *
  * Includes only the fields that callers control as task **input** (events
  * doc v0.1.2 §3.5 ScheduleCanonicalInput).  Excludes:
- *   - `chatType` (advisory, derived)
  *   - `creator*` (audit metadata, not input)
  *   - `enabled`, `nextRunAt`, `lastRunAt`, `lastStatus`, `lastError`,
  *     `lastDeliveryError` (runtime state, mutates over task lifetime)
@@ -57,18 +72,22 @@ export class IdempotencyConflictError extends Error {
  * canonical input freezes the resolved schedule shape (`parsed.kind` and
  * whichever of `parsed.runAt`/`parsed.minutes`/`parsed.expr` applies).
  */
-function canonicalScheduleInput(t: {
+export function canonicalScheduleInput(t: {
   name: string;
   schedule: string;
   parsed?: ParsedSchedule;
   prompt: string;
   workingDir: string;
   chatId: string;
+  chatType?: 'group' | 'p2p' | 'topic_group';
   rootMessageId?: string;
   scope?: 'thread' | 'chat';
+  executionPosition?: ScheduleExecutionPosition;
+  topicTitle?: string;
   larkAppId?: string;
   repeat?: { times: number | null; completed?: number };
-  deliver?: 'origin' | 'local';
+  deliver?: 'origin' | 'local' | 'new-topic';
+  silent?: boolean;
 }): unknown {
   return {
     name: t.name,
@@ -87,22 +106,84 @@ function canonicalScheduleInput(t: {
     prompt: t.prompt,
     workingDir: t.workingDir,
     chatId: t.chatId,
+    // This changes how the future worker session replies (especially P2P), so
+    // it is provider input rather than advisory display metadata.
+    chatType: t.chatType,
     rootMessageId: t.rootMessageId,
     scope: t.scope,
+    executionPosition: t.executionPosition,
+    topicTitle: t.topicTitle,
     larkAppId: t.larkAppId,
     // Strip `completed` — it mutates after the task starts running, but
     // `times` is the durable user intent.
     repeat: t.repeat ? { times: t.repeat.times } : undefined,
-    deliver: t.deliver ?? 'origin',
+    deliver: t.deliver === 'local' ? 'local' : 'origin',
+    // `silent: false`/absent normalizes to undefined (dropped by
+    // computeInputHash) so pre-existing tasks keep their canonical hash.
+    silent: t.silent === true ? true : undefined,
   };
 }
 
-let tasks: Map<string, ScheduledTask> = new Map();
-let loaded = false;
-let cachedMtime = 0;
+// ─── Per-bot store scope ─────────────────────────────────────────────────────
+//
+// Schedules are stored PER BOT inside each bot's BOT_HOME
+// (`<botmuxHome>/bots/<appId>/schedules.json`) instead of one shared
+// `data/schedules.json`. Why: the bot's own BOT_HOME is already readWrite
+// inside the file sandbox while sibling BOT_HOMEs are denied by construction —
+// so a sandboxed `botmux schedule add` can take the RMW sibling lock
+// (`schedules.json.lock`) on BOTH platforms without any policy special-case,
+// and one bot's task prompts/routing are no longer readable by every other
+// sandboxed bot (the leak the old shared-file grant had to accept).
+//
+// Callers bind the store to one bot before use: the daemon binds its own bot
+// at startup, the CLI binds the session's bot (or an explicit --lark-app-id).
+// Cross-bot reads/writes stay possible for UNsandboxed callers via the
+// explicit-appId variants below; inside a sandbox they fail closed (EPERM).
 
-function getFilePath(): string {
-  return join(config.session.dataDir, 'schedules.json');
+interface FileState {
+  tasks: Map<string, ScheduledTask>;
+  loaded: boolean;
+  version: string;
+}
+
+const fileStates = new Map<string, FileState>();
+let scopeAppId: string | null = null;
+
+/** Bind the store's default file to one bot. Daemon: own bot at startup.
+ *  CLI: the session's bot / explicit --lark-app-id before any store call. */
+export function setScheduleScope(appId: string): void {
+  scopeAppId = appId;
+}
+
+export function getScheduleScope(): string | null {
+  return scopeAppId;
+}
+
+function requireScope(): string {
+  if (!scopeAppId) {
+    throw new Error(
+      '[schedule-store] no bot scope bound — call setScheduleScope(<larkAppId>) before using the schedule store',
+    );
+  }
+  return scopeAppId;
+}
+
+/** The per-bot schedules file: `<botmuxHome>/bots/<appId>/schedules.json`. */
+export function scheduleFilePathFor(appId: string): string {
+  return join(botHomePath(dirname(config.session.dataDir), appId), 'schedules.json');
+}
+
+function getFilePath(appId?: string): string {
+  return scheduleFilePathFor(appId ?? requireScope());
+}
+
+function stateFor(fp: string): FileState {
+  let s = fileStates.get(fp);
+  if (!s) {
+    s = { tasks: new Map(), loaded: false, version: 'missing' };
+    fileStates.set(fp, s);
+  }
+  return s;
 }
 
 function getOutputDir(): string {
@@ -115,6 +196,19 @@ export function getTaskOutputDir(taskId: string): string {
 
 function ensureDir(d: string): void {
   if (!existsSync(d)) mkdirSync(d, { recursive: true });
+}
+
+function fileVersion(fp: string): string {
+  try {
+    const stat = statSync(fp);
+    // Atomic rename can replace a file without advancing mtime on coarse
+    // filesystems. Include inode/size/ctime so a stale process notices the
+    // replacement before serving another read.
+    return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+  } catch (err: any) {
+    if (err?.code === 'ENOENT') return 'missing';
+    throw err;
+  }
 }
 
 /**
@@ -138,6 +232,13 @@ function migrate(raw: any): ScheduledTask | null {
     }
   }
 
+  const executionPosition: ScheduleExecutionPosition | undefined =
+    raw.executionPosition === 'top-level' || raw.executionPosition === 'topic' || raw.executionPosition === 'new-topic'
+      ? raw.executionPosition
+      : raw.deliver === 'new-topic'
+        ? 'new-topic'
+        : undefined;
+
   return {
     id: raw.id,
     name: raw.name,
@@ -147,6 +248,11 @@ function migrate(raw: any): ScheduledTask | null {
     workingDir: raw.workingDir,
     chatId: raw.chatId,
     rootMessageId: raw.rootMessageId,
+    scope: raw.scope === 'thread' || raw.scope === 'chat' ? raw.scope : undefined,
+    executionPosition,
+    topicTitle: typeof raw.topicTitle === 'string' && raw.topicTitle.trim()
+      ? Array.from(raw.topicTitle.trim()).slice(0, 200).join('')
+      : undefined,
     chatType: raw.chatType,
     larkAppId: raw.larkAppId,
     creatorChatId: raw.creatorChatId,
@@ -160,58 +266,175 @@ function migrate(raw: any): ScheduledTask | null {
     lastError: raw.lastError,
     lastDeliveryError: raw.lastDeliveryError,
     repeat: raw.repeat,
-    deliver: raw.deliver ?? 'origin',
+    deliver: raw.deliver === 'local' ? 'local' : 'origin',
+    silent: raw.silent === true ? true : undefined,
   };
 }
 
-function load(): void {
-  ensureDir(dirname(getFilePath()));
-  const fp = getFilePath();
-  let currentMtime = 0;
-  if (existsSync(fp)) {
-    try { currentMtime = statSync(fp).mtimeMs; } catch { /* ignore */ }
-  }
-
-  // Reload if file has been modified externally (e.g. by `botmux schedule add`)
-  // or on first load.
-  if (loaded && currentMtime === cachedMtime) return;
-
-  tasks = new Map();
-  if (existsSync(fp)) {
-    try {
-      const data = JSON.parse(readFileSync(fp, 'utf-8'));
-      let migratedCount = 0;
-      for (const [id, raw] of Object.entries(data)) {
-        const migrated = migrate(raw);
-        if (migrated) {
-          tasks.set(id, migrated);
-          if (!(raw as any).parsed) migratedCount++;
-        }
-      }
-      if (!loaded) {
-        logger.info(`Loaded ${tasks.size} scheduled tasks from ${fp}${migratedCount ? ` (migrated ${migratedCount} legacy)` : ''}`);
-      } else {
-        logger.info(`[schedule-store] Reloaded ${tasks.size} tasks (file mtime changed)`);
-      }
-      if (migratedCount > 0) save(); // persist migration
-    } catch (err) {
-      logger.error(`Failed to load schedules: ${err}`);
-      tasks = new Map();
-    }
-  }
-  cachedMtime = currentMtime;
-  loaded = true;
+interface DiskSnapshot {
+  map: Map<string, ScheduledTask>;
+  migratedCount: number;
 }
 
-function save(): void {
-  ensureDir(dirname(getFilePath()));
-  const fp = getFilePath();
-  const tmpFp = fp + '.tmp';
+function readDiskSnapshot(fp: string, strict: boolean): DiskSnapshot {
+  const map = new Map<string, ScheduledTask>();
+  if (!existsSync(fp)) return { map, migratedCount: 0 };
+
+  try {
+    const data = JSON.parse(readFileSync(fp, 'utf-8'));
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+      throw new Error('schedules.json root must be an object');
+    }
+    let migratedCount = 0;
+    for (const [id, raw] of Object.entries(data)) {
+      const migrated = migrate(raw);
+      if (migrated) {
+        map.set(id, migrated);
+        if (!(raw as any).parsed) migratedCount++;
+      }
+    }
+    return { map, migratedCount };
+  } catch (err) {
+    if (strict) throw err;
+    logger.error(`Failed to load schedules: ${err}`);
+    return { map: new Map(), migratedCount: 0 };
+  }
+}
+
+function serializeTasks(map: ReadonlyMap<string, ScheduledTask>): string {
   const obj: Record<string, ScheduledTask> = {};
-  for (const [k, v] of tasks) obj[k] = v;
-  writeFileSync(tmpFp, JSON.stringify(obj, null, 2), 'utf-8');
-  renameSync(tmpFp, fp);
-  try { cachedMtime = statSync(fp).mtimeMs; } catch { /* ignore */ }
+  for (const [id, task] of map) obj[id] = task;
+  return JSON.stringify(obj, null, 2);
+}
+
+// Deliberately inert outside Vitest. This lets the durability regression test
+// inject a failure after the temp file is fsynced but before the atomic rename,
+// without weakening or monkey-patching Node's filesystem API in production.
+let beforeRenameTestHook: (() => void) | undefined;
+export function __setScheduleStoreBeforeRenameTestHook(hook?: () => void): void {
+  if (process.env.NODE_ENV !== 'test') {
+    throw new Error('schedule-store persistence hook is test-only');
+  }
+  beforeRenameTestHook = hook;
+}
+
+/**
+ * Crash-durable replace. The random O_EXCL temp prevents two writers from
+ * sharing a staging file; the caller's schedules.json lock serializes the
+ * reload/mutate/commit transaction. The old file remains authoritative until
+ * rename, and the parent fsync makes the rename durable before callers see the
+ * new in-memory snapshot.
+ */
+function persistDiskSnapshot(fp: string, map: ReadonlyMap<string, ScheduledTask>): void {
+  const parent = dirname(fp);
+  ensureDir(parent);
+  const tmpFp = join(
+    parent,
+    `.${basename(fp)}.tmp.${process.pid}.${randomBytes(8).toString('hex')}`,
+  );
+  let fd: number | undefined;
+  let renamed = false;
+  try {
+    fd = openSync(
+      tmpFp,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600,
+    );
+    writeFileSync(fd, serializeTasks(map), 'utf-8');
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
+    beforeRenameTestHook?.();
+    renameSync(tmpFp, fp);
+    renamed = true;
+    fsyncDirectorySyncPortable(parent);
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* best effort */ }
+    }
+    if (!renamed) {
+      try { unlinkSync(tmpFp); } catch { /* absent or already cleaned */ }
+    }
+  }
+}
+
+function installSnapshot(map: Map<string, ScheduledTask>, fp: string): void {
+  const s = stateFor(fp);
+  s.tasks = map;
+  s.version = fileVersion(fp);
+  s.loaded = true;
+}
+
+interface MutationResult<T> {
+  result: T;
+  changed: boolean;
+}
+
+/**
+ * Every schedules.json mutation goes through one cross-process transaction:
+ * lock -> force reload -> mutate an isolated map -> durable replace -> publish
+ * to memory. A failed write therefore cannot create an in-memory ghost, and a
+ * stale daemon/CLI process cannot overwrite another process's newer update.
+ */
+function mutateTasks<T>(
+  mutate: (working: Map<string, ScheduledTask>) => MutationResult<T>,
+  appId?: string,
+): T {
+  const fp = getFilePath(appId);
+  ensureDir(dirname(fp));
+  return withFileLockSync(fp, () => {
+    const working = readDiskSnapshot(fp, true).map;
+    const outcome = mutate(working);
+    if (outcome.changed) persistDiskSnapshot(fp, working);
+    // Install only after the commit succeeds. No-op/idempotent mutations still
+    // refresh a stale process from the authoritative disk snapshot.
+    installSnapshot(working, fp);
+    return outcome.result;
+  });
+}
+
+function load(appId?: string): void {
+  const fp = getFilePath(appId);
+  ensureDir(dirname(fp));
+  const state = stateFor(fp);
+  const currentVersion = fileVersion(fp);
+
+  // Reload if the file has been atomically replaced externally (e.g. by
+  // `botmux schedule add`) or on first load.
+  if (state.loaded && currentVersion === state.version) return;
+
+  const snapshot = readDiskSnapshot(fp, false);
+  let nextMap = snapshot.map;
+
+  // Persist legacy normalization under the same mutation lock. Re-read inside
+  // the lock so migration cannot overwrite a concurrent modern writer.
+  if (snapshot.migratedCount > 0) {
+    try {
+      nextMap = withFileLockSync(fp, () => {
+        const current = readDiskSnapshot(fp, true);
+        if (current.migratedCount > 0) persistDiskSnapshot(fp, current.map);
+        return current.map;
+      });
+    } catch (err) {
+      // Reading remains backward compatible even if the optional normalization
+      // write fails. Future mutations still fail closed on malformed storage.
+      logger.error(`[schedule-store] Failed to persist legacy migration: ${err}`);
+      // A different process may have committed between our optimistic read and
+      // lock acquisition. Never pair that newer file version with the stale
+      // pre-lock map, or this process could serve stale data indefinitely.
+      nextMap = readDiskSnapshot(fp, false).map;
+    }
+  }
+
+  if (!state.loaded) {
+    logger.info(
+      `Loaded ${nextMap.size} scheduled tasks from ${fp}` +
+      `${snapshot.migratedCount ? ` (migrated ${snapshot.migratedCount} legacy)` : ''}`,
+    );
+  } else {
+    logger.info(`[schedule-store] Reloaded ${nextMap.size} tasks (file changed)`);
+  }
+  installSnapshot(nextMap, fp);
 }
 
 /**
@@ -240,6 +463,8 @@ export function createTask(params: {
   chatId: string;
   rootMessageId?: string;
   scope?: 'thread' | 'chat';
+  executionPosition?: ScheduleExecutionPosition;
+  topicTitle?: string;
   chatType?: 'group' | 'p2p' | 'topic_group';
   larkAppId?: string;
   creatorChatId?: string;
@@ -247,87 +472,101 @@ export function createTask(params: {
   creatorLarkAppId?: string;
   nextRunAt?: string;
   repeat?: { times: number | null; completed: number };
-  deliver?: 'origin' | 'local';
+  deliver?: 'origin' | 'local' | 'new-topic';
+  silent?: boolean;
 }): ScheduledTask {
-  load();
-
-  if (params.id) {
-    const existing = tasks.get(params.id);
-    if (existing) {
-      const existingHash = computeInputHash(canonicalScheduleInput(existing));
-      const incomingHash = computeInputHash(canonicalScheduleInput(params));
-      if (existingHash === incomingHash) {
-        // create-or-return-identical: same id + same canonical input → no-op.
-        // Do NOT mutate `enabled`, `nextRunAt`, `lastRunAt` etc — those are
-        // runtime state that the caller has no business overwriting via the
-        // create path.  Use `updateTask` / `enableTask` for those.
-        logger.debug(
-          `[schedule-store] createTask: returning existing task ${params.id} (canonical input identical)`,
-        );
-        return existing;
+  // Route to the OWNING bot's file: a task explicitly created for another bot
+  // (`--lark-app-id` / dashboard admin flows) must land in that bot's store so
+  // its daemon (the only one that executes it) can see it. Sandboxed callers
+  // can only reach their own BOT_HOME — a cross-bot write fails closed (EPERM).
+  return mutateTasks(working => {
+    if (params.id) {
+      const existing = working.get(params.id);
+      if (existing) {
+        const existingHash = computeInputHash(canonicalScheduleInput(existing));
+        const incomingHash = computeInputHash(canonicalScheduleInput(params));
+        if (existingHash === incomingHash) {
+          // create-or-return-identical: same id + same canonical input → no-op.
+          // Do NOT mutate `enabled`, `nextRunAt`, `lastRunAt` etc — those are
+          // runtime state that the caller has no business overwriting via the
+          // create path.  Use `updateTask` / `enableTask` for those.
+          logger.debug(
+            `[schedule-store] createTask: returning existing task ${params.id} (canonical input identical)`,
+          );
+          return { result: existing, changed: false };
+        }
+        throw new IdempotencyConflictError({
+          taskId: params.id,
+          existingInputHash: existingHash,
+          incomingInputHash: incomingHash,
+        });
       }
-      throw new IdempotencyConflictError({
-        taskId: params.id,
-        existingInputHash: existingHash,
-        incomingInputHash: incomingHash,
-      });
+      // id given but new task — fall through to create with that id.
     }
-    // id given but new task — fall through to create with that id.
-  }
 
-  const task: ScheduledTask = {
-    id: params.id ?? randomUUID().substring(0, 8),
-    name: params.name,
-    schedule: params.schedule,
-    parsed: params.parsed,
-    prompt: params.prompt,
-    workingDir: params.workingDir,
-    chatId: params.chatId,
-    rootMessageId: params.rootMessageId,
-    scope: params.scope,
-    chatType: params.chatType,
-    larkAppId: params.larkAppId,
-    creatorChatId: params.creatorChatId,
-    creatorRootMessageId: params.creatorRootMessageId,
-    creatorLarkAppId: params.creatorLarkAppId,
-    enabled: true,
-    createdAt: new Date().toISOString(),
-    nextRunAt: params.nextRunAt,
-    repeat: params.repeat,
-    deliver: params.deliver ?? 'origin',
-  };
-  tasks.set(task.id, task);
-  save();
-  return task;
+    let id = params.id ?? randomUUID().substring(0, 8);
+    while (!params.id && working.has(id)) id = randomUUID().substring(0, 8);
+    const task: ScheduledTask = {
+      id,
+      name: params.name,
+      schedule: params.schedule,
+      parsed: params.parsed,
+      prompt: params.prompt,
+      workingDir: params.workingDir,
+      chatId: params.chatId,
+      rootMessageId: params.rootMessageId,
+      scope: params.scope,
+      executionPosition: params.executionPosition,
+      topicTitle: params.topicTitle,
+      chatType: params.chatType,
+      larkAppId: params.larkAppId,
+      creatorChatId: params.creatorChatId,
+      creatorRootMessageId: params.creatorRootMessageId,
+      creatorLarkAppId: params.creatorLarkAppId,
+      enabled: true,
+      createdAt: new Date().toISOString(),
+      nextRunAt: params.nextRunAt,
+      repeat: params.repeat,
+      // Legacy `deliver:new-topic` is converted by scheduler.addTask into the
+      // explicit executionPosition field before reaching the store.
+      deliver: params.deliver === 'local' ? 'local' : 'origin',
+      silent: params.silent === true ? true : undefined,
+    };
+    working.set(task.id, task);
+    return { result: task, changed: true };
+  }, params.larkAppId);
 }
 
-export function getTask(id: string): ScheduledTask | undefined {
-  load();
-  return tasks.get(id);
+export function getTask(id: string, appId?: string): ScheduledTask | undefined {
+  load(appId);
+  return stateFor(getFilePath(appId)).tasks.get(id);
 }
 
-export function removeTask(id: string): boolean {
-  load();
-  const existed = tasks.delete(id);
-  if (existed) {
-    save();
-    logger.info(`[schedule-store] Removed task ${id}`);
-  }
+export function removeTask(id: string, appId?: string): boolean {
+  const existed = mutateTasks(working => {
+    const removed = working.delete(id);
+    return { result: removed, changed: removed };
+  }, appId);
+  if (existed) logger.info(`[schedule-store] Removed task ${id}`);
   return existed;
 }
 
 export function updateTask(
   id: string,
   updates: Partial<Pick<ScheduledTask,
-    'enabled' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastError' | 'lastDeliveryError' | 'repeat' | 'rootMessageId' | 'chatType'
+    'enabled' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastError' | 'lastDeliveryError' | 'repeat' | 'rootMessageId' | 'scope' | 'executionPosition' | 'topicTitle' | 'chatType' | 'deliver' | 'name' | 'prompt' | 'schedule' | 'parsed' | 'silent' | 'workingDir'
   >>,
+  appId?: string,
 ): void {
-  load();
-  const task = tasks.get(id);
-  if (task) {
-    Object.assign(task, updates);
-    save();
-  }
+  mutateTasks(working => {
+    const task = working.get(id);
+    if (!task) return { result: undefined, changed: false };
+    Object.assign(
+      task,
+      updates.deliver === 'new-topic' ? { ...updates, deliver: 'origin' as const } : updates,
+    );
+    return { result: undefined, changed: true };
+  }, appId);
 }
 
 /**
@@ -335,39 +574,92 @@ export function updateTask(
  * finite repeat count and we've hit it, the task is removed.
  */
 export function markRun(id: string, success: boolean, error?: string, deliveryError?: string): void {
-  load();
-  const task = tasks.get(id);
-  if (!task) return;
+  const completedRepeat = mutateTasks(working => {
+    const task = working.get(id);
+    if (!task) return { result: undefined, changed: false };
 
-  const now = new Date().toISOString();
-  task.lastRunAt = now;
-  task.lastStatus = success ? 'ok' : 'error';
-  task.lastError = success ? undefined : error;
-  task.lastDeliveryError = deliveryError;
+    const now = new Date().toISOString();
+    task.lastRunAt = now;
+    task.lastStatus = success ? 'ok' : 'error';
+    task.lastError = success ? undefined : error;
+    task.lastDeliveryError = deliveryError;
 
-  // Advance repeat counter
-  if (task.repeat) {
-    task.repeat.completed = (task.repeat.completed ?? 0) + 1;
-    const times = task.repeat.times;
-    if (times !== null && times !== undefined && times > 0 && task.repeat.completed >= times) {
-      tasks.delete(id);
-      save();
-      logger.info(`[schedule-store] Task ${id} removed after completing ${times} runs`);
-      return;
+    // Advance repeat counter
+    if (task.repeat) {
+      task.repeat.completed = (task.repeat.completed ?? 0) + 1;
+      const times = task.repeat.times;
+      if (times !== null && times !== undefined && times > 0 && task.repeat.completed >= times) {
+        working.delete(id);
+        return { result: times, changed: true };
+      }
     }
-  }
 
-  // One-shot: disable after run. Otherwise next_run was already advanced by scheduler.
-  if (task.parsed.kind === 'once') {
-    task.enabled = false;
-    task.nextRunAt = undefined;
+    // One-shot: disable after run. Otherwise next_run was already advanced by scheduler.
+    if (task.parsed.kind === 'once') {
+      task.enabled = false;
+      task.nextRunAt = undefined;
+    }
+    return { result: undefined, changed: true };
+  });
+  if (completedRepeat !== undefined) {
+    logger.info(`[schedule-store] Task ${id} removed after completing ${completedRepeat} runs`);
   }
-  save();
 }
 
-export function listTasks(): ScheduledTask[] {
-  load();
-  return [...tasks.values()];
+export function listTasks(appId?: string): ScheduledTask[] {
+  load(appId);
+  return [...stateFor(getFilePath(appId)).tasks.values()];
+}
+
+/** Aggregate view across several bots' stores (unsandboxed admin CLI). Bots
+ *  whose store cannot be read (sandbox deny / missing BOT_HOME) are skipped —
+ *  callers inside a sandbox naturally collapse to their own bot. */
+export function listTasksForBots(appIds: readonly string[]): Array<ScheduledTask & { _storeAppId: string }> {
+  const out: Array<ScheduledTask & { _storeAppId: string }> = [];
+  for (const appId of appIds) {
+    try {
+      for (const t of listTasks(appId)) out.push({ ...t, _storeAppId: appId });
+    } catch { /* unreadable (sandboxed sibling / bad appId) → skip */ }
+  }
+  return out;
+}
+
+/** Bulk-insert raw task entries into one bot's store (startup split
+ *  migration). Runs the same in-file legacy normalization as a disk read;
+ *  an id already present in the destination wins (the per-bot store is newer
+ *  by definition) and the collision is logged. */
+export function importTasks(appId: string, entries: ReadonlyArray<[string, unknown]>): void {
+  if (entries.length === 0) return;
+  mutateTasks(working => {
+    let changed = false;
+    for (const [id, raw] of entries) {
+      const task = migrate(raw);
+      if (!task) continue;
+      if (working.has(id)) {
+        logger.warn(`[schedule-store] import: id ${id} already exists in ${appId}'s store — keeping existing entry`);
+        continue;
+      }
+      working.set(id, task);
+      changed = true;
+    }
+    return { result: undefined, changed };
+  }, appId);
+}
+
+/** Locate a task id across several bots' stores. First hit wins (ids are
+ *  UUID-derived; a cross-store collision is negligible and would only make an
+ *  id-addressed command pick the first store). */
+export function findTaskAcrossBots(
+  id: string,
+  appIds: readonly string[],
+): { task: ScheduledTask; appId: string } | undefined {
+  for (const appId of appIds) {
+    try {
+      const task = getTask(id, appId);
+      if (task) return { task, appId };
+    } catch { /* unreadable → skip */ }
+  }
+  return undefined;
 }
 
 /** Ensure per-task output dir exists and return path to today's run log. */
@@ -385,10 +677,10 @@ export function appendOutputLog(taskId: string, content: string): string {
  * schedule add` running outside the daemon) and emit dashboard events for
  * the diff. Idempotent — calling twice is a no-op.
  *
- * The existing `load()` already reloads when the on-disk mtime differs from
- * `cachedMtime`, so this watcher just snapshots the in-memory map, calls
+ * The existing `load()` already reloads when the on-disk file identity differs
+ * from `cachedFileVersion`, so this watcher snapshots the in-memory map, calls
  * `load()` to refresh, then diffs and publishes. fs.watch can fire multiple
- * events for one logical write — the mtime guard inside `load()` makes
+ * events for one logical write — the identity guard inside `load()` makes
  * redundant fires no-ops, and an unchanged diff produces no events anyway.
  */
 let watcherStarted = false;
@@ -396,31 +688,38 @@ export function startExternalWriteWatcher(): void {
   if (watcherStarted) return;
   watcherStarted = true;
 
-  // Make sure the data dir + file exist before we try to watch — fs.watch on
-  // a non-existent path throws ENOENT.
-  ensureDir(dirname(getFilePath()));
+  // Watch this daemon's OWN bot store (the only one it executes/serves). Make
+  // sure the BOT_HOME + file exist before we try to watch — fs.watch on a
+  // non-existent path throws ENOENT.
   const fp = getFilePath();
+  ensureDir(dirname(fp));
   if (!existsSync(fp)) {
-    try { writeFileSync(fp, '{}', 'utf-8'); } catch { /* best effort */ }
+    try {
+      mutateTasks(working => ({ result: undefined, changed: !existsSync(fp) && working.size === 0 }));
+    } catch { /* best effort */ }
   }
-  // Prime cachedMtime so the first watcher fire is comparable.
+  // Prime the cached file identity so the first watcher fire is comparable.
   load();
+  const state = stateFor(fp);
 
   try {
-    watch(fp, { persistent: false }, () => {
+    // Watch the directory, not the file inode: every commit atomically replaces
+    // schedules.json, so a file-level watcher would remain attached to the old
+    // inode after the first external write.
+    watch(dirname(fp), { persistent: false }, (_eventType, filename) => {
       try {
+        if (filename && filename.toString() !== basename(fp)) return;
         if (!existsSync(fp)) return;
-        const stat = statSync(fp);
-        if (stat.mtimeMs <= cachedMtime) return; // no real change since last reload
+        if (fileVersion(fp) === state.version) return;
 
         // Snapshot in-memory state, then let load() refresh from disk.
-        // load() compares mtime internally and updates cachedMtime.
+        // load() compares file identity internally and updates the cache.
         const before = new Map<string, ScheduledTask>();
-        for (const [k, v] of tasks) before.set(k, v);
+        for (const [k, v] of state.tasks) before.set(k, v);
         load();
 
         // Diff and publish.
-        for (const [id, t] of tasks) {
+        for (const [id, t] of state.tasks) {
           const prev = before.get(id);
           if (!prev) {
             dashboardEventBus.publish({ type: 'schedule.created', body: { schedule: t } });
@@ -429,7 +728,7 @@ export function startExternalWriteWatcher(): void {
           }
         }
         for (const id of before.keys()) {
-          if (!tasks.has(id)) {
+          if (!state.tasks.has(id)) {
             dashboardEventBus.publish({ type: 'schedule.deleted', body: { id } });
           }
         }

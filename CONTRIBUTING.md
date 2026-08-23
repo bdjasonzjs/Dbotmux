@@ -123,7 +123,7 @@ teach the agent when/how to use them.
 
 | Subcommand | Description |
 |------------|-------------|
-| `botmux send [content]` | Send message to current thread (stdin / heredoc / `--content-file`; `--images` / `--files` / `--mention` flags) |
+| `botmux send [content]` | Send message to current thread (stdin / heredoc / `--content-file`; `--images` / `--files` / `--videos` / `--mention` flags) |
 | `botmux bots list` | List bots in current chat with their `open_id`s |
 | `botmux thread messages [--limit N]` | Fetch thread message history (JSON) |
 | `botmux schedule add <schedule> <prompt>` | Create scheduled task bound to current thread |
@@ -141,6 +141,9 @@ spawn child processes — no extra protocol support required from the CLI.
 3. Add a case to the switch in `src/adapters/cli/registry.ts`
 4. Set `"cliId": "<new-id>"` in `bots.json` to use it
 
+> Full checklist — display names, setup choices, README updates:
+> see [`src/adapters/cli/CLAUDE.md`](src/adapters/cli/CLAUDE.md).
+
 The `CliAdapter` interface requires:
 
 | Method / Property | Description |
@@ -154,11 +157,46 @@ The `CliAdapter` interface requires:
 | `readyPattern` | Regex to detect when the CLI is ready for input (optional) |
 | `systemHints` | System-level hints injected into the CLI (optional) |
 | `altScreen` | Whether the CLI uses alternate screen mode |
+| `modelChoices` | Curated model candidates surfaced in `botmux setup` (optional). Set when the CLI accepts a model flag (consumed in `buildArgs` via the `model` opt); omit when the CLI has no `--model` concept — setup then skips the model prompt for that CLI |
 
 ## Tests
 
+Tests are split into two Vitest projects with different execution profiles
+(see `vitest.config.ts`):
+
+- **`unit`** (`*.test.ts`) — pure, filesystem-mocked or temp-dir-isolated.
+  Runs with **file parallelism on** (one process per file). This is what
+  `pnpm test` runs, so the default is fast (~10s) and needs no real CLI binary
+  or browser.
+- **`e2e`** (`*.e2e.ts`) — spawns real CLIs / drives the Feishu web UI through a
+  shared daemon, so files run **sequentially**. Opt-in only.
+
 ```bash
-pnpm test                # Run all tests (unit + E2E)
+pnpm test                # Unit tests only — parallel, ~10s (default)
+pnpm test:all            # Unit + E2E (needs real CLIs / browser session)
+pnpm test:e2e            # All *.e2e.ts (sequential)
 pnpm test:codex          # Codex input E2E
 pnpm test:gemini         # Gemini CLI input E2E
+pnpm test:bench          # Benchmark the unit suite (see docs/test-benchmark.md)
+pnpm test:bench --compare   # serial vs parallel vs parallel+time-scale table
 ```
+
+> **Speed knob:** adapter `writeInput()` waits real wall-clock time to confirm a
+> submit (poll the CLI history/transcript). `BOTMUX_TIME_SCALE` (read by
+> `src/utils/timing.ts`, default `1` = unchanged in production) multiplies every
+> such delay. Filesystem-mocked unit tests set it small to collapse those waits.
+> See [`docs/test-benchmark.md`](docs/test-benchmark.md).
+
+### Timing-Sensitive Test Contract
+
+- Treat a test fixture's `ready` handshake as a happens-before barrier, not a
+  progress log: publish it only after every handler, listener, resource, and
+  durable state needed by the parent's next action is installed.
+- Establish preconditions and postconditions through the exact observable event
+  or state under assertion. Do not infer sibling or downstream telemetry from a
+  lifecycle event unless its contract explicitly orders them. Fixed sleeps may
+  model intentional timing or bound a hang, but must not stand in for readiness.
+- Make scheduler-sensitive ordering deterministic in the fixture. Widen a
+  timeout only for proven slow-but-progressing work, and never use retries to
+  mask a missing barrier or known race.
+- Keep every wait bounded and make timeout errors identify the unmet condition.

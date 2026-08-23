@@ -4,12 +4,140 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing GitHub Release tag to refresh (for example, v3.3.0)
+        required: true
+        type: string
 
 jobs:
+  desktop:
+    if: github.actor == 'deepcoldy' && github.triggering_actor == 'deepcoldy'
+    runs-on: macos-14
+    environment: macos-signing
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v6
+        # Build from the EXACT released commit in both trigger paths:
+        #   - push: use github.sha (the immutable commit the tag pointed at when
+        #     the event fired), NOT github.ref. Passing the ref name would make
+        #     checkout re-resolve the tag at checkout time — and desktop runs
+        #     behind a manual approval that can lag up to 30 days, during which
+        #     the tag could be moved (repo ruleset excludes canary/beta/rc from
+        #     tag-update protection). If tag moves A→B after `release` already
+        #     published npm from A, a ref-name checkout would sign B → assets
+        #     diverge from the npm tarball. A pinned SHA cannot move.
+        #   - workflow_dispatch: no event SHA for the tag, so resolve the tag ref
+        #     explicitly (default checkout would be the dispatch ref = master).
+        # The Verify step below then fail-closes if the tag no longer points at
+        # the commit we built (tag moved), so mismatched assets never attach.
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.release_tag) || github.sha }}
+
+      - name: Verify HEAD is the tagged commit
+        # Prove the built commit still equals what the tag points at. On push,
+        # HEAD is github.sha; if the tag was moved during the approval wait, the
+        # current tag commit won't match HEAD → fail-closed (never attach assets
+        # built from a commit the tag no longer names). On workflow_dispatch this
+        # also catches a mis-resolved ref (e.g. accidental master checkout).
+        run: |
+          git fetch origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}" --force --quiet 2>/dev/null || true
+          TAG_SHA=$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")
+          HEAD_SHA=$(git rev-parse HEAD)
+          echo "tag ${RELEASE_TAG} → $TAG_SHA ; HEAD (built) → $HEAD_SHA"
+          if [ "$TAG_SHA" != "$HEAD_SHA" ]; then
+            echo "REFUSING: built commit $HEAD_SHA is not what tag ${RELEASE_TAG} now points at ($TAG_SHA)."
+            echo "The tag was likely moved after npm was published from the original commit."
+            echo "Signed assets must match the released commit; aborting to avoid attaching mismatched assets."
+            exit 1
+          fi
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - run: npm install -g pnpm@9.5.0
+      - run: pnpm install --frozen-lockfile
+
+      - name: Sync version from git tag to package.json
+        run: npm version "${RELEASE_TAG#v}" --no-git-tag-version --allow-same-version
+
+      - name: Validate existing release for manual refresh
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
+
+      - run: pnpm build
+      - run: pnpm desktop:bundle
+      - run: pnpm desktop:runtime
+
+      - name: Decode App Store Connect API key
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          printf '%s' "$APPLE_API_KEY_P8" | /usr/bin/base64 -D > "$RUNNER_TEMP/AuthKey.p8"
+          chmod 600 "$RUNNER_TEMP/AuthKey.p8"
+
+      - name: Build, sign, and notarize macOS app
+        env:
+          CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_API_KEY: ${{ runner.temp }}/AuthKey.p8
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          pnpm exec electron-builder --mac dmg zip --universal --publish never \
+            --config electron-builder.yml \
+            -c.forceCodeSigning=true \
+            -c.mac.notarize=true \
+            -c.mac.entitlements=build/entitlements.mac.release.plist \
+            -c.mac.entitlementsInherit=build/entitlements.mac.release.plist
+
+      - name: Verify macOS signature and notarization
+        run: |
+          APP_PATH="$(find dist -maxdepth 2 -type d -name 'Botmux.app' -print -quit)"
+          test -n "$APP_PATH"
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          spctl --assess --verbose --type exec "$APP_PATH"
+          xcrun stapler validate "$APP_PATH"
+          test -n "$(find dist -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+          test -n "$(find dist -maxdepth 1 -type f -name '*.zip' -print -quit)"
+
+      - name: Upload macOS release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: botmux-macos
+          path: |
+            dist/*.dmg
+            dist/*.zip
+          if-no-files-found: error
+          retention-days: 7
+
   release:
+    # npm-first: no longer `needs: desktop`. npm publish + GitHub Release run
+    # immediately on the tag push, WITHOUT waiting for the manually-gated
+    # (macos-signing environment) macOS build. The signed desktop assets are
+    # attached asynchronously afterwards by `attach-desktop-assets`. This keeps
+    # `npm i -g botmux` unblocked when macOS signing is slow / awaiting approval.
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # pull-requests: write —— 发版后给本版本包含的 PR 逐条留「Released in vX.Y.Z」
+      # 评论(见下方 Comment "Released in" 步骤)。GitHub 原生那个侧栏 released 徽标
+      # 判定用的是 PR 分支的原始 head commit,squash 合并会把它变成孤儿 commit → 徽标
+      # 永远不显示(即便 squash 出的新 commit 能从 tag 到达也不行)。此权限用于发一条
+      # 可见的时间线评论作为 squash 兼容的替代。
+      pull-requests: write
+      # id-token: write —— npm Trusted Publishing (OIDC) 要求 GitHub 能为本 job 签发
+      # OIDC token，npm CLI 用它向 registry 证明「确实是从已授权的 workflow 发布」，
+      # 无需存储长期 npm token。发布前须在 npmjs.com 上为两个包配置 Trusted Publisher。
+      id-token: write
     steps:
       - uses: actions/checkout@v6
         with:
@@ -20,11 +148,21 @@ jobs:
           node-version: 22
           registry-url: https://registry.npmjs.org
 
-      - run: npm install -g pnpm
+      - run: npm install -g pnpm@9.5.0
       - run: pnpm install --frozen-lockfile
+
+      - name: Upgrade npm for Trusted Publishing
+        # npm Trusted Publishing (OIDC) 要求 npm CLI >= 11.5.1（需 Node >= 22.14.0）。
+        # Node 22 自带的 npm 可能不够新，这里升级到固定的 11.19.0（2026-07-28 的最新
+        # 11.x）。不用 npm@latest —— floating latest 可能跳到 npm 12 并在 tag-push 发版
+        # 时引入破坏性改动；固定版本确保发版流程可预测。
+        run: npm install -g npm@11.19.0
 
       - name: Sync version from git tag to package.json
         run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version
+
+      - name: Sync workflow core version from git tag
+        run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version --prefix packages/workflow-core
 
       - name: Resolve npm dist-tag + prerelease flag
         id: dist_tag
@@ -41,6 +179,20 @@ jobs:
           echo "tag=$NPM_TAG"           >> "$GITHUB_OUTPUT"
           echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
           echo "Publishing $VERSION → npm dist-tag=$NPM_TAG, prerelease=$PRERELEASE"
+
+      - name: Require deepcoldy authority for stable (latest) releases
+        # npm-first removed the transitive authority gate that used to come via
+        # `needs: desktop` (desktop only runs for deepcoldy; the old "Require
+        # signed macOS assets" step then failed non-deepcoldy stable tags). With
+        # release decoupled from desktop, re-assert it explicitly: only deepcoldy
+        # may publish the `latest` dist-tag that every `npm i botmux` user gets.
+        # canary/beta/rc/next go to side dist-tags and stay open for branch
+        # gray-release by anyone.
+        if: steps.dist_tag.outputs.tag == 'latest' && (github.actor != 'deepcoldy' || github.triggering_actor != 'deepcoldy')
+        run: |
+          echo "REFUSING: stable (latest) releases may only be published by deepcoldy."
+          echo "actor=${{ github.actor }} triggering_actor=${{ github.triggering_actor }}"
+          exit 1
 
       - name: Guard against downgrading npm latest
         # 防止把比 npm 当前 latest 还小的版本号发到 latest dist-tag（曾发生
@@ -66,12 +218,47 @@ jobs:
             exit 1
           fi
 
+      - name: Guard — stable release must contain the latest master
+        # 正式版（latest）只能从「包含最新 master 的 commit」上发：被打 tag 的 commit
+        # 必须把 origin/master 当作祖先——即直接在 master 上打 tag，或在已 rebase 到最新
+        # master 的子分支上打 tag。否则拒绝，防止从落后/分叉的个人分支打出正式版（曾发生
+        # v2.47.0 从落后 master 175 个 commit 的分支发到 latest，丢了一大批 master 改动）。
+        # canary/beta/rc/next 走旁路 dist-tag、用于分支灰度，不受此约束。
+        #
+        # 为什么保持 fail-closed、不放宽（codex review 结论）：commit graph 无法区分两种
+        # 形状完全相同的场景——「打完 tag 后 master 才前进」（无害竞态）与「B 已在 master 上
+        # 之后再把 tag 指向历史 A」（真丢改动）。二者的 tag/master/ancestry/版本号全一致，只有
+        # 「tag 创建 vs B 落 master」的墙钟先后能区分，而这不可信地存在于 graph 里。因此在没有
+        # 「tag 创建时 master tip」的可信证明前，放宽这道闸必然引入「把旧 commit 发成 latest」
+        # 的洞。竞态的正确解法是「fetch 最新 master 后在新 HEAD 上重打 tag」（下面的 Fix 提示），
+        # 而 #593 那次真正漏的是 changelog（下一步已把 changelog 锚到「上一个已发布 Release」，
+        # 使失败/无 Release 的 tag 不再截断下一版 changelog）——发版闸本身当时拒得没错。
+        # 注意竞态：若打完 tag 后、本 job fetch 前 master 又前进了，这里会判定 tag 落后而
+        # fail（fail-closed，安全方向）——重新 fetch master 后在新 HEAD 上重打 tag 即可。
+        if: steps.dist_tag.outputs.tag == 'latest'
+        run: |
+          git fetch origin master --quiet
+          if ! git merge-base --is-ancestor origin/master HEAD; then
+            echo "REFUSING: tagged commit $(git rev-parse --short HEAD) does not contain the latest origin/master ($(git rev-parse --short origin/master))."
+            echo "Stable (latest) releases must be tagged on master, or on a branch rebased onto the latest master."
+            echo "Fix: rebase/merge onto origin/master then re-tag — or use a -canary/-beta/-rc suffix to publish off-master for testing."
+            exit 1
+          fi
+          echo "OK: tagged commit contains origin/master ($(git rev-parse --short origin/master))."
+
       - run: pnpm build
 
-      - name: Publish to npm
-        run: npm publish --tag "${{ steps.dist_tag.outputs.tag }}"
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_ACCESS_TOKEN }}
+      - run: pnpm workflow-core:test
+
+      - name: Publish workflow core to npm
+        # npm Trusted Publishing (OIDC) 流程:actions/setup-node 已配置 registry-url,
+        # npm CLI 检测到 id-token 权限后会自动向 GitHub OIDC Provider 请求 token 并用
+        # 它向 registry 认证,无需 NODE_AUTH_TOKEN。不传 NODE_AUTH_TOKEN 环境变量是
+        # 必需的 —— 若该变量存在,npm 会优先用它做传统认证而跳过 OIDC 流程。
+        run: node scripts/publish-npm-if-missing.mjs ./packages/workflow-core "${{ steps.dist_tag.outputs.tag }}"
+
+      - name: Publish botmux to npm
+        run: node scripts/publish-npm-if-missing.mjs . "${{ steps.dist_tag.outputs.tag }}"
 
       - name: Generate changelog
         id: changelog
@@ -80,29 +267,224 @@ jobs:
         run: |
           # actions/checkout 默认把 tag 存成轻量指针，需重新 fetch 才能拿到 annotated tag object
           git fetch origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}" --force
-          # 上一个 tag: stable 只跟 stable 比 (词法排序会把 canary 排到 stable 前面,
-          # 不过滤的话 v2.24.4 的 compare 会指向 v2.24.4-canary.X 而不是 v2.24.3)
+          # 上一版锚点：
+          # - prerelease（canary/beta/rc/next）：仍按 v:refname 排序取上一个 tag（灰度链条只关心
+          #   相邻 tag，且 prerelease 常不发 GitHub Release）。stable 只跟 stable 比（词法排序会把
+          #   canary 排到 stable 前面，不过滤的话 v2.24.4 的 compare 会指向 v2.24.4-canary.X）。
+          # - stable（latest）：锚到「上一个**已发布** stable GitHub Release」的 tag，而不是
+          #   git tag 排序的第一个。原因：若某个 stable tag 因签名/npm/权限/guard 失败而**只打了
+          #   tag、没发 Release**（如 v3.5.1），旧逻辑会把它当 PREV_TAG，导致下一版 changelog 从
+          #   那个「隐身版本」起算、漏掉它本该带上的 PR（#593 就是这么漏的）。锚到最近已发布
+          #   Release 后，任何中途没发成的 tag 都不会截断 changelog——它们引入的 PR 会被下一版
+          #   一并带上，保证「覆盖上次发布以来的所有 PR」。取不到已发布 Release 时回退到 tag 排序。
           if [[ "$GITHUB_REF_NAME" == *"-"* ]]; then
             PREV_TAG=$(git tag --sort=-v:refname | grep -Fxv "$GITHUB_REF_NAME" | head -1)
           else
-            PREV_TAG=$(git tag --sort=-v:refname | grep -Fxv "$GITHUB_REF_NAME" | grep -v -e '-' | head -1)
+            PREV_TAG=$(gh release list --limit 40 \
+              --json tagName,isPrerelease,isDraft,publishedAt \
+              --jq '[.[] | select(.isPrerelease==false and .isDraft==false and .tagName!="'"$GITHUB_REF_NAME"'")]
+                    | sort_by(.publishedAt) | reverse | .[0].tagName // ""' 2>/dev/null || echo "")
+            # 回退：无已发布 Release，或该 tag 在本地取不到 commit（异常）→ 用 tag 排序兜底。
+            if [ -z "$PREV_TAG" ] || ! git rev-parse -q --verify "refs/tags/${PREV_TAG}^{commit}" >/dev/null; then
+              PREV_TAG=$(git tag --sort=-v:refname | grep -Fxv "$GITHUB_REF_NAME" | grep -v -e '-' | head -1)
+            fi
           fi
+          echo "changelog range: ${PREV_TAG}..${GITHUB_REF_NAME}"
           TAG_MSG=$(git tag -l --format='%(contents)' "$GITHUB_REF_NAME")
-          # cliff.toml 渲染'本次合并' + '新贡献者'两段，GitHub PR 元数据由 GITHUB_TOKEN 拉取。
-          # 用显式区间 PREV_TAG..本 tag，别用 --current：--current 在 HEAD 落在 tag 上时
-          # 会把范围撑到好几个历史 release，导致'本次合并'重复堆叠多段。PREV_TAG 上面已算好。
-          CLIFF=$(npx --yes git-cliff "${PREV_TAG}..${GITHUB_REF_NAME}")
+
+          # 区间内每个非 merge commit → 反查所属 PR（gh api，有界：约等于区间 commit 数，
+          # 不翻全仓、不触发 git-cliff 那种二级限流 401）。squash 与 merge-commit 两种合并
+          # 都覆盖：squash 时区间含该 commit；merge-commit（"Merge pull request #N"）时区间
+          # 含其子 commit，子 commit 的 /pulls 仍指向同一 PR——靠 PR number 在 node 侧去重。
+          # （旧逻辑只 grep "(#N)" squash subject，merge-commit 的 PR 整条隐身，是真 bug。）
+          # 无关联 PR 的直推 commit 回退用自身 subject。结果 TSV 交给 changelog-sections.mjs
+          # 按约定式 `type(scope):` 前缀分桶成 ✨新功能/🐛修复/… 段落 + 去重的贡献者名单。
+          # 单次遍历同时兼顾 PR 列表与致谢，gh 调用量与旧版致谢循环持平。
+          RAW=$(mktemp)
+          for sha in $(git rev-list --no-merges --reverse "${PREV_TAG}..${GITHUB_REF_NAME}"); do
+            PULLS=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${sha}/pulls" \
+              --jq '.[] | [.number, .title, .user.login] | @tsv' 2>/dev/null || true)
+            if [ -n "$PULLS" ]; then
+              printf '%s\n' "$PULLS" | while IFS=$'\t' read -r num title login; do
+                printf 'pr\t%s\t%s\t%s\n' "$num" "$title" "$login"
+              done >> "$RAW"
+            else
+              printf 'commit\t%s\t%s\t\n' "${sha:0:7}" "$(git log -1 --pretty=%s "$sha")" >> "$RAW"
+            fi
+          done
+          SECTIONS=$(node .github/scripts/changelog-sections.mjs < "$RAW")
+
+          # 复用上面已算好的 PR 列表(不再多打一次 API),抽出本版本包含的**去重** PR
+          # 号,持久化到 $RUNNER_TEMP,交给后面的「Comment "Released in"」步骤逐个留言。
+          # 从 $RAW 里 type=='pr' 的行取第 2 列(PR number),排序去重。可能为空(纯直推
+          # commit、无关联 PR)——那样评论步骤自然什么都不做。
+          awk -F'\t' '$1=="pr"{print $2}' "$RAW" | sort -un > "$RUNNER_TEMP/released_prs.txt"
+          echo "PRs in this release: $(paste -sd' ' "$RUNNER_TEMP/released_prs.txt")"
+
           {
             echo 'body<<CHANGELOG_EOF'
-            [ -n "$TAG_MSG" ] && echo "$TAG_MSG"
-            echo "$CLIFF"
+            # TAG_MSG 后必须空一行再接自动段落：分隔线 '---' 紧贴正文末行会被 markdown
+            # 当成 setext 标题（末行变 H2），空行后才渲染成分隔线。
+            if [ -n "$TAG_MSG" ]; then echo "$TAG_MSG"; echo ""; fi
+            if [ -n "$SECTIONS" ]; then echo "---"; echo ""; echo "$SECTIONS"; fi
             echo ""
-            echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${GITHUB_REF_NAME}"
+            echo "**Full Changelog**: https://github.com/${GITHUB_REPOSITORY}/compare/${PREV_TAG}...${GITHUB_REF_NAME}"
             echo 'CHANGELOG_EOF'
           } >> "$GITHUB_OUTPUT"
 
-      - name: Create GitHub Release
+      - name: Create GitHub Release (desktop assets attached asynchronously)
+        # npm-first: the Release is created right after npm publish, WITHOUT the
+        # macOS assets — those are uploaded later by `attach-desktop-assets` once
+        # signing/notarization finishes. So the Release exists with npm already
+        # live but no .dmg/.zip yet. Normally the desktop bundle lands within the
+        # same run (a few minutes) once macOS signing completes — but signing is
+        # behind a human approval gate that can wait up to 30 days, or be
+        # rejected / fail / be cancelled; in those cases the Release stays
+        # npm-only until the manual recovery re-run (see attach-desktop-assets).
+        # softprops keeps the release editable so the later --clobber upload just
+        # adds the files.
         uses: softprops/action-gh-release@v3
         with:
           body: ${{ steps.changelog.outputs.body }}
           prerelease: ${{ steps.dist_tag.outputs.prerelease == 'true' }}
+
+      - name: Comment "Released in" on included PRs
+        # squash 兼容的「已发布」标记:GitHub 原生侧栏 released 徽标只认 PR 分支的原始
+        # head commit,squash 会把它变成孤儿 commit → 徽标永不显示。这里改为在本版本
+        # 包含的每个 PR 上留一条**可见、可点**的时间线评论作为等效替代。PR 列表来自上面
+        # changelog 步骤已算好的 released_prs.txt(不额外打 API 拉取)。
+        #
+        # 只在 stable(latest)发版时评论:canary/beta/rc/next 是分支灰度,常不从 master
+        # 出、也不是用户装到的正式版;若也评论,PR 会先被刷「Released in v3.7.0-canary.0」
+        # 再来一条「v3.7.0」,既噪又易误导。对齐原生徽标只关心正式 Release 的语义。
+        if: steps.dist_tag.outputs.tag == 'latest'
+        # 设计要点:
+        # - fail-soft:npm + Release 此时已经发布,评论失败绝不能让本 job 失败 →
+        #   continue-on-error + 每个 PR 内部 || true,单个 PR 评论失败不影响其它。
+        # - 幂等:workflow 重跑(如签名恢复 re-run)时不重复刷评论——先查该 PR 是否已
+        #   有带本版本隐藏标记 `<!-- released-in:vX.Y.Z -->` 的评论,有就跳过。
+        # - 只在有 PR 时动作;纯直推(released_prs.txt 为空)自然 no-op。
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          PR_FILE="$RUNNER_TEMP/released_prs.txt"
+          if [ ! -s "$PR_FILE" ]; then
+            echo "No PRs associated with this release; nothing to comment."
+            exit 0
+          fi
+          RELEASE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${RELEASE_TAG}"
+          MARKER="<!-- released-in:${RELEASE_TAG} -->"
+          # 从 FD 3 读 PR 列表(而非 stdin),避免循环体内的 gh 子进程吃掉 stdin 里剩余的
+          # PR 行导致漏评论。
+          while read -r pr <&3; do
+            [ -n "$pr" ] || continue
+            # 幂等检查:该 PR 是否已有本版本的「已发布」评论
+            if gh api "repos/${GITHUB_REPOSITORY}/issues/${pr}/comments" \
+                 --jq '.[].body' 2>/dev/null | grep -qF "$MARKER"; then
+              echo "PR #${pr}: already has released-in ${RELEASE_TAG} comment, skipping."
+              continue
+            fi
+            BODY="${MARKER}
+          🚀 Released in [**${RELEASE_TAG}**](${RELEASE_URL})"
+            if gh pr comment "$pr" --repo "$GITHUB_REPOSITORY" --body "$BODY" 2>/dev/null; then
+              echo "PR #${pr}: commented released-in ${RELEASE_TAG}."
+            else
+              echo "PR #${pr}: comment failed (non-fatal), continuing." >&2
+            fi
+          done 3< "$PR_FILE"
+
+      - name: Note — desktop assets pending
+        # Make the npm-first window visible in the run log: npm + Release are
+        # live now; the macOS .dmg/.zip attach in the parallel attach-desktop-assets
+        # job after signing. If signing is rejected/fails/cancelled, recover by
+        # re-running this workflow via workflow_dispatch with this release_tag.
+        run: |
+          echo "npm ${GITHUB_REF_NAME#v} published and GitHub Release ${GITHUB_REF_NAME} created."
+          echo "macOS desktop assets (.dmg/.zip) attach asynchronously in attach-desktop-assets after signing."
+          echo "If signing is rejected/fails/cancelled, re-run this workflow via workflow_dispatch with release_tag=${GITHUB_REF_NAME} to rebuild+sign and attach."
+  attach-desktop-assets:
+    # npm-first tail: once the parallel `desktop` job has signed+notarized the
+    # macOS build AND the `release` job has created the GitHub Release, upload
+    # the .dmg/.zip onto that Release. Runs on the tag-push path (the
+    # workflow_dispatch refresh path is handled by `refresh-desktop-assets`).
+    # `needs: [desktop, release]` both must succeed: desktop for the artifact,
+    # release so the GitHub Release exists to upload onto.
+    #
+    # FAILURE MODE (accepted trade-off of npm-first): the `desktop` job sits
+    # behind the macos-signing environment approval, which can wait up to 30
+    # days and may be rejected / the build may fail / the run may be cancelled.
+    # In any of those cases npm + the GitHub Release are already live but this
+    # job never runs, so the Release keeps npm-only (no .dmg/.zip). There is no
+    # auto-retry here on purpose — signing needs a human approval, so retrying
+    # would just re-block. Recovery is manual and idempotent: re-run this
+    # workflow via workflow_dispatch with release_tag=vX.Y.Z; that rebuilds+signs
+    # macOS (fresh artifact, so the 7-day retention is irrelevant) and
+    # `refresh-desktop-assets` --clobber-attaches to the existing Release.
+    if: github.event_name == 'push' && needs.desktop.result == 'success' && needs.release.result == 'success'
+    needs: [desktop, release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - name: Download macOS build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: botmux-macos
+          path: release-assets
+
+      - name: Attach macOS assets to the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$RELEASE_TAG" release-assets/* --clobber --repo "$GITHUB_REPOSITORY"
+
+      - name: Verify uploaded release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir downloaded-assets
+          gh release download "$RELEASE_TAG" \
+            --pattern 'Botmux-*.dmg' \
+            --pattern 'Botmux-*.zip' \
+            --dir downloaded-assets \
+            --repo "$GITHUB_REPOSITORY"
+          for file in release-assets/*; do
+            cmp "$file" "downloaded-assets/$(basename "$file")"
+          done
+
+  refresh-desktop-assets:
+    if: github.event_name == 'workflow_dispatch'
+    needs: desktop
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+    steps:
+      - name: Download macOS build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: botmux-macos
+          path: release-assets
+
+      - name: Replace macOS assets on existing GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$RELEASE_TAG" release-assets/* --clobber --repo "$GITHUB_REPOSITORY"
+
+      - name: Verify uploaded release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir downloaded-assets
+          gh release download "$RELEASE_TAG" \
+            --pattern 'Botmux-*.dmg' \
+            --pattern 'Botmux-*.zip' \
+            --dir downloaded-assets \
+            --repo "$GITHUB_REPOSITORY"
+          for file in release-assets/*; do
+            cmp "$file" "downloaded-assets/$(basename "$file")"
+          done

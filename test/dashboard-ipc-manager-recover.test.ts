@@ -35,9 +35,13 @@ const oldDs = {
   ownerOpenId: 'ou_owner',
 };
 
-const forceDestroySessionRuntime = vi.fn();
 const forkWorker = vi.fn();
-const closeSession = vi.fn(async () => ({ ok: true, alreadyClosed: false }));
+const closeSession = vi.fn(async () => ({
+  ok: true,
+  outcome: 'closed' as const,
+  alreadyClosed: false,
+  known: true,
+}));
 const createSession = vi.fn();
 const updateSession = vi.fn();
 const closeStoredSession = vi.fn();
@@ -47,7 +51,6 @@ vi.mock('../src/core/worker-pool.js', () => ({
   findActiveBySessionId: (sessionId: string) => sessionId === 'old_session' ? oldDs : undefined,
   closeSession,
   getActiveSessionsRegistry: () => registry,
-  forceDestroySessionRuntime,
   forkWorker,
 }));
 
@@ -71,10 +74,19 @@ vi.mock('../src/services/chat-first-seen-store.js', () => ({}));
 vi.mock('../src/services/message-queue.js', () => ({ ensureQueue: vi.fn() }));
 vi.mock('../src/im/lark/client.js', () => ({
   getChatMode: vi.fn(),
+  listCurrentChatBotMembers: vi.fn(async () => []),
+  resolveCurrentChatBotOpenIdsByLarkAppIds: vi.fn(async () => ({ mappings: [], unresolvedLarkAppIds: [] })),
   replyMessage: vi.fn(),
   sendMessage: vi.fn(),
 }));
 vi.mock('../src/bot-registry.js', () => ({
+  getOwnerOpenId: () => 'ou_owner',
+  getBotOpenId: () => 'ou_mgr_bot',
+  getBotBrand: () => undefined,
+  loadBotConfigs: vi.fn(),
+  readBotSkillPolicy: () => undefined,
+  getBotTuiSlashAllow: () => [],
+  MAX_TURN_TIMEOUT_MS: 24 * 60 * 60 * 1000,
   getBot: () => ({
     botName: '经理 bot',
     botOpenId: 'ou_mgr_bot',
@@ -90,7 +102,7 @@ describe('POST /api/sessions/:sessionId/manager-recover', () => {
     vi.clearAllMocks();
   });
 
-  it('force kills old session, closes it, creates clean session, preserves workingDir, and forks worker', async () => {
+  it('lifecycle-closes the old session, creates a clean session, preserves workingDir, and forks worker', async () => {
     registry.set('om_root::app_mgr', oldDs);
     createSession.mockReturnValue({
       sessionId: 'new_session',
@@ -112,9 +124,8 @@ describe('POST /api/sessions/:sessionId/manager-recover', () => {
 
     expect(res.status).toBe(200);
     await expect(res.json()).resolves.toMatchObject({ ok: true, oldSessionId: 'old_session', newSessionId: 'new_session' });
-    expect(forceDestroySessionRuntime).toHaveBeenCalledWith(oldDs);
+    expect(closeSession).toHaveBeenCalledWith('old_session');
     expect(registry.has('om_root::app_mgr')).toBe(true);
-    expect(closeStoredSession).toHaveBeenCalledWith('old_session');
     expect(createSession).toHaveBeenCalledWith('oc_mgr', 'om_root', 'AutoRecover: 经理任务', 'group');
     const cleanSession = updateSession.mock.calls[0][0];
     expect(cleanSession.workingDir).toBe('/repo/mgr');
@@ -124,5 +135,34 @@ describe('POST /api/sessions/:sessionId/manager-recover', () => {
     expect(forkedDs.session.sessionId).toBe('new_session');
     expect(forkedDs.workingDir).toBe('/repo/mgr');
     expect(forkWorker.mock.calls[0][1]).toContain('recover prompt');
+  });
+
+  it('fails closed instead of spawning a replacement when close leaves a residual', async () => {
+    registry.set('om_root::app_mgr', oldDs);
+    closeSession.mockResolvedValueOnce({
+      ok: true,
+      outcome: 'closed_with_residual',
+      residual: { reason: 'mojo_lineage_quarantined', taskId: 'remote-task-1' },
+      alreadyClosed: false,
+      known: true,
+    } as any);
+    const mod = await import('../src/core/dashboard-ipc-server.js');
+    handle = await mod.startIpcServer({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/old_session/manager-recover`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ prompt: 'recover prompt' }),
+    });
+
+    expect(res.status).toBe(409);
+    await expect(res.json()).resolves.toMatchObject({
+      ok: false,
+      error: 'close_residual',
+      detail: { outcome: 'closed_with_residual', residual: { taskId: 'remote-task-1' } },
+    });
+    expect(createSession).not.toHaveBeenCalled();
+    expect(updateSession).not.toHaveBeenCalled();
+    expect(forkWorker).not.toHaveBeenCalled();
   });
 });
