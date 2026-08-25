@@ -15,6 +15,7 @@ import { resolveUserToken } from '../../utils/user-token.js';
 import { listObservedBots } from '../../services/observed-bots-store.js';
 import { getBotCapability } from '../../services/bot-profile-store.js';
 import { resolveTeamRoleFile } from '../../core/role-resolver.js';
+import { setChatExternal } from './chat-external-cache.js';
 import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.js';
 import { canonicalMobileKey, isMobileEntry, normalizeMobileEntry } from '../../setup/bot-config-editor.js';
 import { stampBotmuxCallbackMarkers } from './callback-button-marker.js';
@@ -711,6 +712,8 @@ export async function getChatContext(larkAppId: string, chatId: string): Promise
       return unavailable;
     }
 
+    // 外部群标记与 chat_mode 同源；单独记到 chat-external-cache 供会话卡渲染判定。
+    if (typeof res.data?.external === 'boolean') setChatExternal(larkAppId, chatId, res.data.external);
     const rawMode = String(res.data?.chat_mode ?? '').toLowerCase();
     const rawGmt = String(res.data?.group_message_type ?? '').toLowerCase();
     let mode: ChatMode | 'unknown';
@@ -838,6 +841,8 @@ export async function getChatModeStrict(larkAppId: string, chatId: string): Prom
     // 'p2p' (single chat) lives in chat_mode, NOT chat_type. chat_type is the
     // group's visibility (public/private) and is undefined for p2p — checking it
     // for 'p2p' never matches, so a DM would fall through to 'group'.
+    // 外部群标记与 chat_mode 同源；单独记到 chat-external-cache 供会话卡渲染判定。
+    if (typeof res.data?.external === 'boolean') setChatExternal(larkAppId, chatId, res.data.external);
     const rawMode = String(res.data?.chat_mode ?? '').toLowerCase();
     // group_message_type is the actual "is this a 话题群" signal. The Lark
     // client UI lets users flip a chat between flat mode and topic mode at any

@@ -403,6 +403,8 @@ describe('restoreUsageLimitRuntimeState', () => {
       undefined,
       // 19th arg: Codex Fast tier badge — undefined for this non-Codex fixture.
       undefined,
+      // 20th arg: externalChat — this fixture's chat is not a known 外部群.
+      false,
     );
     expect(updateMessageMock).toHaveBeenCalledWith(APP_ID, 'om_live_limit', '{}');
   });

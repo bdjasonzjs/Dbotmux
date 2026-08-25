@@ -399,6 +399,7 @@ function localCliButton(
  * Build a Feishu interactive card with terminal button + action buttons.
  * @param showManageButtons - When true, include restart & close buttons (used in the private write-link card — delivered as a "visible-to-you" ephemeral card in plain groups, or DM'd as fallback).
  * @param adoptMode - When true, the danger button reads "⏏ 断开" with action `disconnect` (only tears down botmux's bridge worker, leaves the user's tmux pane / Claude process alone). Mutually exclusive with `showManageButtons` (DM management isn't surfaced for adopt sessions). Without this flag the card uses the original "❌ 关闭会话" button which closes the underlying CLI — wrong for adopt where we never owned the CLI in the first place.
+ * @param externalChat - When true (the session lives in an external / cross-tenant 外部群), the whole control row (terminal / local CLI / write link / restart / close) is omitted — external members get a header-only status card and no operating surface.
  */
 export function buildSessionCard(
   sessionId: string,
@@ -411,11 +412,23 @@ export function buildSessionCard(
   locale?: Locale,
   localCliReady = false,
   runtimeDisplayName?: string,
+  externalChat = false,
 ): string {
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(cliId ?? 'claude-code');
   const effectiveCliId = cliId ?? 'claude-code';
   const actionBase = { root_id: rootId, session_id: sessionId, cli_id: effectiveCliId };
   const actions: any[] = [];
+  if (externalChat) {
+    // 外部群：不渲染任何操作按钮（打开终端 / 获取操作链接 / 关闭会话 …）。
+    return JSON.stringify({
+      config: { wide_screen_mode: true },
+      header: {
+        title: { tag: 'plain_text', content: `🖥️ ${cliName} · ${plainTitle(title)}` },
+        template: 'blue',
+      },
+      elements: [],
+    });
+  }
   if (terminalUrl) {
     actions.push({
       tag: 'button',
@@ -910,6 +923,12 @@ function pushStreamBody(
  *
  * Quick-action buttons (Esc, ^C, Tab, Space, Enter, ←↑↓→, ½屏 ↑/↓) appear
  * whenever displayMode !== 'hidden'.
+ *
+ * `externalChat` (session lives in an external / cross-tenant 外部群): the main
+ * control row (显示输出 / 打开终端 / 获取操作链接 / 关闭会话 and friends) and the
+ * quick-action key rows are omitted entirely — external members see only the
+ * header + body, no operating surface. The opt-in group-visible writable link
+ * (`writableTerminalUrl`) is a separate explicit bot setting and is left alone.
  */
 export function buildStreamingCard(
   sessionId: string,
@@ -931,6 +950,7 @@ export function buildStreamingCard(
   usage?: CardUsageSnapshot,
   runtimeDisplayName?: string,
   serviceTierBadge?: string,
+  externalChat = false,
 ): string {
   const effectiveCliId = cliId ?? 'claude-code';
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(effectiveCliId);
@@ -945,13 +965,13 @@ export function buildStreamingCard(
   // ── Main control row: display toggle, mode toggle, terminal, manage ─────
   const headerActions: any[] = [];
 
-  headerActions.push({
+  if (!externalChat) headerActions.push({
     tag: 'button',
     text: { tag: 'plain_text', content: t(displayMode === 'hidden' ? 'card.btn.show_output' : 'card.btn.hide_output', undefined, locale) },
     type: 'default' as const,
     value: { action: 'toggle_display', ...actionBase },
   });
-  if (displayMode !== 'hidden') {
+  if (!externalChat && displayMode !== 'hidden') {
     headerActions.push({
       tag: 'button',
       text: { tag: 'plain_text', content: t('card.btn.export_text', undefined, locale) },
@@ -959,7 +979,7 @@ export function buildStreamingCard(
       value: { action: 'export_text', ...actionBase },
     });
   }
-  if (displayMode === 'screenshot') {
+  if (!externalChat && displayMode === 'screenshot') {
     headerActions.push({
       tag: 'button',
       text: { tag: 'plain_text', content: t('card.btn.refresh', undefined, locale) },
@@ -967,7 +987,7 @@ export function buildStreamingCard(
       value: { action: 'refresh_screenshot', ...actionBase },
     });
   }
-  if (terminalUrl) {
+  if (!externalChat && terminalUrl) {
     headerActions.push({
       tag: 'button',
       text: { tag: 'plain_text', content: t('card.btn.open_terminal', undefined, locale) },
@@ -975,9 +995,9 @@ export function buildStreamingCard(
       multi_url: terminalMultiUrl(terminalUrl),
     });
   }
-  const localBtn = cliId ? localCliButton(effectiveCliId, actionBase, locale, localCliReady, runtimeDisplayName) : undefined;
+  const localBtn = cliId && !externalChat ? localCliButton(effectiveCliId, actionBase, locale, localCliReady, runtimeDisplayName) : undefined;
   if (localBtn) headerActions.push(localBtn);
-  if (status === 'limited' && usageLimit?.retryReady) {
+  if (!externalChat && status === 'limited' && usageLimit?.retryReady) {
     headerActions.push({
       tag: 'button',
       text: { tag: 'plain_text', content: t('card.btn.retry_last_task', undefined, locale) },
@@ -985,7 +1005,7 @@ export function buildStreamingCard(
       value: { action: 'retry_last_task', ...actionBase },
     });
   }
-  if (terminalUrl) {
+  if (!externalChat && terminalUrl) {
     headerActions.push({
       tag: 'button',
       text: { tag: 'plain_text', content: t('card.btn.get_write_link', undefined, locale) },
@@ -993,7 +1013,9 @@ export function buildStreamingCard(
       value: { action: 'get_write_link', ...actionBase },
     });
   }
-  if (adoptMode) {
+  if (externalChat) {
+    // 外部群：整排操作按钮不渲染（下方快捷键排同样跳过）。
+  } else if (adoptMode) {
     if (showTakeover) {
       headerActions.push({
         tag: 'button',
@@ -1016,7 +1038,7 @@ export function buildStreamingCard(
       value: { action: 'close', ...actionBase },
     });
   }
-  elements.push({ tag: 'action', actions: headerActions });
+  if (headerActions.length > 0) elements.push({ tag: 'action', actions: headerActions });
 
   // ── Writable terminal link (opt-in) ─────────────────────────────────────
   // When the bot enables `writableTerminalLinkInCard`, embed the token-bearing
@@ -1036,7 +1058,7 @@ export function buildStreamingCard(
   // 用 isRemoteCliId 而非硬编码单个 id：这一处原本只排除了 riff，于是新增 mojo
   // 后卡片照旧渲染 11 个按钮、点击全部静默无效；改走 REMOTE_CLI_IDS 单一事实源，
   // 以后再加远端 CLI 不会重复漏改。
-  if (displayMode === 'screenshot' && !isRemoteCliId(cliId)) {
+  if (!externalChat && displayMode === 'screenshot' && !isRemoteCliId(cliId)) {
     const mkKey = (label: string, key: string) => ({
       tag: 'button',
       text: { tag: 'plain_text', content: label },

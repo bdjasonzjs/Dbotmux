@@ -439,6 +439,7 @@ import { normalizeBrand } from './im/lark/lark-hosts.js';
 import { buildDocCommentTurnInput, buildDocWatchWarmupTurnInput } from './core/doc-comment-prompt.js';
 import { advanceDocCommentCursor, docCommentRepliesAfterCursor, latestDocCommentPollCursor } from './core/doc-comment-poller.js';
 import { renderBufferedSenderBlock } from './core/session-manager.js';
+import { isExternalChatSession } from './core/external-chat.js';
 import { shutdownBackendDisposition } from './core/persistent-backend.js';
 import {
   abortRemoteShutdownFleet,
@@ -4622,6 +4623,7 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
       getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId, { fresh: true }),
       runtimeDisplayName,
       previousCodexTierBadge,
+      isExternalChatSession(ds),
     );
     scheduleCardPatch(ds, frozenCard);
 
@@ -22939,10 +22941,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       }
       routerTickInFlight = true;
       try {
-        const { runRouterTick } = await import('./services/scout-inbox-router.js');
+        const { runRouterTick, DEFAULT_POLICY } = await import('./services/scout-inbox-router.js');
         const { makeProductionExecutors } = await import('./services/scout-inbox-router-executors.js');
+        // 2026-08-17 本地补丁回源（此前只手改在线上 dist/daemon.js）：松松 08-13「我们都在做离职
+        // 准备了，你还管他们干嘛」+ 08-15「周末圈我的直接忽略」——外部群/催办一律不再推给他。
+        // maxPingsPerDay=0 让路径 A 恒命中 quota 分支，item 留 pending 由克劳德手动处置。
+        // 要恢复：删掉 policy 这一行即可。另有 crontab 每小时把 quota 打满做兜底。
         const stats = await runRouterTick({
           executors: makeProductionExecutors({ larkAppId: cfg.larkAppId }),
+          policy: { ...DEFAULT_POLICY, maxPingsPerDay: 0 },
         });
         // 只在真有 action 时 log; 全 wait/0 stat 静默防刷屏
         if (stats.routedA + stats.routedB + stats.routedC + stats.errors + stats.quotaSkipsA + stats.quotaSkipsB > 0) {
@@ -22995,7 +23002,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // 即可（重启重置 acceptable，重启本身就是 fresh start）。>=3 时
     // publish alert 到主话题；成功一次清零 + dismiss alert。
     let tillyConsecutiveFails = 0;
-    const TILLY_ALERT_THRESHOLD = 3;
+    // 2026-08-25 克劳德上调 3 → 8：连续一周的日志显示 3-fail 告警**全部是假警报**，
+    // 每次都在 1~3 次失败后自愈（`recovered after N consecutive fails`，N 最大 3），
+    // 从未真正停摆；而每条告警都会 @ 唤醒 CEO 一整轮，纯浪费。tick 间隔 900s，
+    // 8 次 ≈ 2 小时没有任何一次成功才告警。真停摆另有下面的 stale 健康线兜底。
+    const TILLY_ALERT_THRESHOLD = 8;
     // 2026-08-05 (共性根治·静默失败告警): scout 健康独立健康线。记录上次"有实质
     // 进展"的时刻（fetch 成功——含无新消息、或高水位推进）。若超阈值没有任何成功
     // tick → 主动发**会冒泡的文本告警** @CEO 到主话题（不靠更新那张 Lark 不上浮

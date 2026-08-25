@@ -26,6 +26,7 @@ import {
   markMessageListenerRunPreviewRunning,
 } from '../services/message-listener-run-preview-store.js';
 import { persistStreamCardState, rememberLastCliInput } from './session-manager.js';
+import { isExternalChatSession } from './external-chat.js';
 import { resolveSessionLaunchModel } from './session-model.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, rehomeReplyTargetState, replyTargetKey } from './reply-target.js';
 import { updateMessage, deleteMessage, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, MessageWithdrawnError } from '../im/lark/client.js';
@@ -902,6 +903,7 @@ function scheduleLocalCliOpenReadinessPatch(ds: DaemonSession): void {
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+    isExternalChatSession(ds),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -955,6 +957,7 @@ function scheduleActiveRuntimePatch(ds: DaemonSession): void {
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+    isExternalChatSession(ds),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1007,6 +1010,7 @@ function scheduleCodexServiceTierPatch(ds: DaemonSession): void {
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+    isExternalChatSession(ds),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1085,6 +1089,7 @@ export function refreshStreamingCardUsage(ds: DaemonSession): void {
     // path fires every 12s while a turn works, so omitting it would drop the
     // ⚡ badge until the next status-edge PATCH.
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+    isExternalChatSession(ds),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1167,6 +1172,7 @@ export function scheduleRiffAccessUrlPatch(ds: DaemonSession): void {
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+    isExternalChatSession(ds),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1708,9 +1714,12 @@ function daemonCardFooterRecipientOpenId(ds: DaemonSession, effectiveCliId?: str
       // dispatcher bot here too.
       return isRunnerDeliveryCli(effectiveCliId) ? owner : undefined;
     }
-    return owner;
+    // 本机既定行为（松松 2026-08-24 再次下令）：daemon 自动发的回复卡片
+    // **不得 @ 真人 owner**。他的原话：「把这个小尾巴去掉。然后艾特我，我也不会去处理」。
+    // 只有 bot↔bot 接力才需要真实 <at> 来唤醒对方（上面两条分支），真人 owner 一律不 @。
+    return undefined;
   } catch {
-    return owner;
+    return undefined;
   }
 }
 
@@ -1759,6 +1768,7 @@ function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, bot.config),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+    isExternalChatSession(ds),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -2009,6 +2019,7 @@ function reconcilePostedStartingCard(ds: DaemonSession, turnId: string | undefin
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId, { fresh: status === 'idle' }),
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+    isExternalChatSession(ds),
   );
   scheduleCardPatch(ds, cardJson, turnId);
 }
@@ -2073,6 +2084,7 @@ export async function postTurnStartingCard(
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+    isExternalChatSession(ds),
   );
 
   ds.streamCardNonce = nonce;
@@ -2205,6 +2217,7 @@ export async function postFreshStreamingCard(
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+    isExternalChatSession(ds),
   );
   ds.streamCardId = CARD_POSTING_SENTINEL;
   try {
@@ -2384,7 +2397,7 @@ export function buildWritableTerminalCard(ds: DaemonSession): string | null {
       localeForBot(ds.larkAppId),
       false,
       sessionRuntimeDisplayName(ds, botCfg),
-    );
+      );
   }
   const port = ds.workerPort ?? ds.session.webPort;
   if (!port || !ds.workerToken) return null;
@@ -5323,6 +5336,7 @@ export function buildStreamingCardJson(ds: DaemonSession, status?: StreamStatus)
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+    isExternalChatSession(ds),
   );
 }
 
@@ -10308,6 +10322,7 @@ function setupWorkerHandlers(
               getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
               sessionRuntimeDisplayName(ds, botCfg),
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+              isExternalChatSession(ds),
             );
             await updateMessage(ds.larkAppId, restoredCardId, streamCardJson);
             if (!ownsLifecycleMutation()) break;
@@ -10388,6 +10403,7 @@ function setupWorkerHandlers(
             getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
             sessionRuntimeDisplayName(ds, botCfg),
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+            isExternalChatSession(ds),
           );
           const postedCardId = await scopedReply(
             streamCardJson, 'interactive', cardReplyTarget.turnId,
@@ -10457,6 +10473,7 @@ function setupWorkerHandlers(
               loc,
               localCliReadyAtBuild,
               sessionRuntimeDisplayName(ds, botCfg),
+              isExternalChatSession(ds),
             );
             const fallbackCardId = await scopedReply(cardJson, 'interactive', msg.turnId);
             if (!ownsLifecycleMutation()) {
@@ -10476,6 +10493,7 @@ function setupWorkerHandlers(
                 loc,
                 true,
                 sessionRuntimeDisplayName(ds, botCfg),
+                isExternalChatSession(ds),
               );
               try {
                 await updateMessage(ds.larkAppId, fallbackCardId, readyCardJson);
@@ -10604,6 +10622,7 @@ function setupWorkerHandlers(
             getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
             sessionRuntimeDisplayName(ds, botCfg),
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+            isExternalChatSession(ds),
           );
           scheduleCardPatch(ds, cardJson);
         }
@@ -10848,6 +10867,7 @@ function setupWorkerHandlers(
             getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
             sessionRuntimeDisplayName(ds, botCfg),
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+            isExternalChatSession(ds),
           );
           // Mark POST in-flight so subsequent screen_updates are dropped,
           // not POSTed as duplicate cards.
@@ -10930,6 +10950,7 @@ function setupWorkerHandlers(
             }),
             sessionRuntimeDisplayName(ds, botCfg),
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+            isExternalChatSession(ds),
           );
           scheduleCardPatch(ds, cardJson, msg.turnId);
           // Keep the live usage climbing during a long working phase; stop once
@@ -11004,6 +11025,7 @@ function setupWorkerHandlers(
           getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId, { fresh: ds.lastScreenStatus === 'idle' }),
           sessionRuntimeDisplayName(ds, botCfg),
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+          isExternalChatSession(ds),
         );
         scheduleCardPatch(ds, cardJson);
         break;
@@ -11413,6 +11435,7 @@ function setupWorkerHandlers(
               getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId, { fresh: true }),
               sessionRuntimeDisplayName(ds, botCfg),
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+              isExternalChatSession(ds),
             );
             scheduleCardPatch(ds, frozenCard);
           }
@@ -11484,6 +11507,7 @@ function setupWorkerHandlers(
               getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId, { fresh: true }),
               sessionRuntimeDisplayName(ds, botCfg),
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+              isExternalChatSession(ds),
             );
             scheduleCardPatch(ds, frozenCard);
           }

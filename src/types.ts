@@ -177,6 +177,13 @@ export interface Session {
   runnerBuildId?: string;
   chatId: string;
   chatType?: 'group' | 'p2p';
+  /** Whether `chatId` is an external (cross-tenant, 外部群) chat per Lark
+   *  chat.get — session cards rendered there carry no control buttons. Filled
+   *  lazily from the in-memory chat-external cache (im/lark/chat-external-cache)
+   *  the first time a card is rendered, and persisted so cards rebuilt after a
+   *  daemon restart (before any message refreshes that cache) keep the same
+   *  surface. Undefined = not yet known → treated as internal. */
+  externalChat?: boolean;
   /** Thread-scope: an actual root message id under which all replies thread.
    *  Chat-scope: the message id of the first message that started the
    *  session — kept for traceability, NOT used as the routing anchor. */
