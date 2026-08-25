@@ -1,7 +1,8 @@
 /**
- * 外部群（Lark chat.get `external: true`）里的会话卡不渲染任何操作按钮：
+ * 外部群（Lark chat.get `external: true`）里的会话卡不渲染操作按钮：
  * 显示输出 / 打开终端 / 获取操作链接 / 关闭会话（以及同排的导出/刷新/本地 CLI/
- * 重启/断开 和快捷键排）全部省略；内部群 / p2p 保持原样。
+ * 重启/断开 和快捷键排）全部省略，流式卡上**只保留一个 Esc**（term_action/esc，
+ * 由 card-handler 限定只有 bot owner 能按）；内部群 / p2p 保持原样。
  *
  * Run:  pnpm vitest run test/external-chat-card-surface.test.ts
  */
@@ -87,33 +88,52 @@ describe('buildStreamingCard · externalChat', () => {
     expect(l.some(x => x.includes('关闭会话'))).toBe(true);
   });
 
-  it('external hidden mode: header + body only, no action rows at all', () => {
+  const onlyEsc = (card: any) => {
+    const btns = allButtons(card);
+    expect(btns).toHaveLength(1);
+    expect(btns[0].text.content).toBe('Esc');
+    expect(btns[0].value.action).toBe('term_action');
+    expect(btns[0].value.key).toBe('esc');
+    expect(btns[0].value.session_id).toBe(SID);
+    expect(btns[0].value.root_id).toBe(ROOT);
+  };
+
+  it('external hidden mode: header + body + exactly one Esc (no 显示输出 toggle needed)', () => {
     const card = parse(buildStreamingCard(
       SID, ROOT, URL, TITLE, CONTENT, 'working', 'claude-code', 'hidden',
       'nonce', undefined, false, false, undefined, undefined, undefined, true, undefined, undefined, undefined,
       /* externalChat */ true,
     ));
     expect(card.header.title.content).toContain(TITLE);
-    expect(card.elements.filter((e: any) => e.tag === 'action')).toHaveLength(0);
-    expect(allButtons(card)).toHaveLength(0);
+    expect(card.elements.filter((e: any) => e.tag === 'action')).toHaveLength(1);
+    onlyEsc(card);
     expect(JSON.stringify(card)).not.toContain(URL);
   });
 
-  it('external screenshot mode: no toggle/export/refresh and no quick-key rows', () => {
+  it('external screenshot mode: still exactly one Esc — no toggle/export/refresh, no other quick keys', () => {
     const card = parse(buildStreamingCard(
       SID, ROOT, URL, TITLE, CONTENT, 'working', 'claude-code', 'screenshot',
       'nonce', 'img_key_1', false, false, undefined, undefined, undefined, false, undefined, undefined, undefined,
       true,
     ));
-    expect(card.elements.filter((e: any) => e.tag === 'action')).toHaveLength(0);
+    onlyEsc(card);
     // Body (screenshot) still renders.
     expect(JSON.stringify(card)).toContain('img_key_1');
   });
 
-  it('external adopt session: no 接管 / 断开 either', () => {
+  it('external adopt session: no 接管 / 断开 either — only Esc', () => {
     const card = parse(buildStreamingCard(
       SID, ROOT, URL, TITLE, CONTENT, 'working', 'claude-code', 'hidden',
       'nonce', undefined, /* adoptMode */ true, /* showTakeover */ true, undefined, undefined, undefined, false, undefined, undefined, undefined,
+      true,
+    ));
+    onlyEsc(card);
+  });
+
+  it('external remote CLI (riff): no PTY to drive → not even Esc', () => {
+    const card = parse(buildStreamingCard(
+      SID, ROOT, URL, TITLE, CONTENT, 'working', 'riff', 'screenshot',
+      'nonce', 'img_key_1', false, false, undefined, undefined, undefined, false, undefined, undefined, undefined,
       true,
     ));
     expect(allButtons(card)).toHaveLength(0);
@@ -125,7 +145,7 @@ describe('buildStreamingCard · externalChat', () => {
       'nonce', undefined, false, false, undefined, undefined, 'https://example.com/write?t=x', false, undefined, undefined, undefined,
       true,
     ));
-    expect(allButtons(card)).toHaveLength(0);
+    onlyEsc(card);
     expect(JSON.stringify(card)).toContain('https://example.com/write?t=x');
   });
 });

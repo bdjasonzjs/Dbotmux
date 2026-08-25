@@ -3430,6 +3430,23 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       }
       const key = value?.key as TermActionKey | undefined;
       if (!key) return;
+      // 外部群（跨租户）硬闸门：卡片上只渲染一个 Esc，且**只有 bot owner**
+      // （bots.json allowedUsers 首个 open_id，与 getOwnerOpenId 同口径）能按。
+      // canOperate 上游已挡掉非白名单用户，但 chat-granted / allowedChatGroups
+      // 也能过 canOperate——外部群里这些人同样不许碰终端，所以这里再按 owner
+      // 精确匹配一次。旧卡残留的其它 key（^C / Enter / 方向键…）同样拒绝。
+      if (isExternalChatSession(ds)) {
+        const owner = getOwnerOpenId(ds.larkAppId);
+        const loc = localeForBot(ds.larkAppId);
+        if (!owner || !operatorOpenId || operatorOpenId !== owner) {
+          logger.info(`[${tag(ds)}] term_action ${key} blocked in external chat for non-owner: ${operatorOpenId}`);
+          return { toast: { type: 'error', content: t('card.action.external_esc_owner_only', undefined, loc) } };
+        }
+        if (key !== 'esc') {
+          logger.info(`[${tag(ds)}] term_action ${key} rejected in external chat (only esc is allowed)`);
+          return { toast: { type: 'warning', content: t('card.action.external_only_esc', undefined, loc) } };
+        }
+      }
       if (ds.worker) {
         sendWorkerSessionInput(ds, { type: 'term_action', key });
         logger.info(`[${tag(ds)}] term_action: ${key}`);

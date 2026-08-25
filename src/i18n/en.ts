@@ -833,6 +833,8 @@ export const messages: Record<string, string> = {
   'card.action.local_cli_failed': '⚠️ Could not open the local CLI: {reason}',
   'card.action.write_link_sent': '🔑 The action link has been sent to you privately — please check your messages.',
   'card.action.write_link_no_permission': '🔒 You do not have operate permission, so you cannot get the action link.',
+  'card.action.external_esc_owner_only': '🔒 Only the bot owner can press Esc in an external chat.',
+  'card.action.external_only_esc': 'Only Esc is allowed in an external chat.',
   'card.action.session_gone': '⚠️ This session is no longer active; the action was not completed.',
   'card.action.close_refused': 'Could not close the session because remote cancellation was not proven ({error}). The session was kept for retry and the remote may still be running. Retry later.',
   'card.action.close_refused_with_task': 'Could not close the session because remote cancellation was not proven ({error}). The session was kept for retry. Remote session id: {taskId}. The remote may still be running; retry later.',

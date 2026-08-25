@@ -926,8 +926,11 @@ function pushStreamBody(
  *
  * `externalChat` (session lives in an external / cross-tenant 外部群): the main
  * control row (显示输出 / 打开终端 / 获取操作链接 / 关闭会话 and friends) and the
- * quick-action key rows are omitted entirely — external members see only the
- * header + body, no operating surface. The opt-in group-visible writable link
+ * quick-action key rows are omitted; the ONLY button rendered is a single
+ * `Esc` (term_action/esc) so the bot owner can interrupt the CLI from the
+ * external group — the card handler restricts that button to the bot owner
+ * (see card-handler `term_action` external gate). External members see
+ * header + body + Esc, nothing else. The opt-in group-visible writable link
  * (`writableTerminalUrl`) is a separate explicit bot setting and is left alone.
  */
 export function buildStreamingCard(
@@ -1085,6 +1088,21 @@ export function buildStreamingCard(
         mkKey(t('card.btn.half_page_up', undefined, locale), 'half_page_up'),
         mkKey(t('card.btn.half_page_down', undefined, locale), 'half_page_down'),
       ],
+    });
+  }
+  // 外部群：唯一保留的按钮是 Esc（松松 2026-08-25：「就要一个 ESC 就行了，而且只有我
+  // 这个号能按」）。不看 displayMode——外部群没有「显示输出」开关，Esc 永远可见；
+  // 只有 bot owner 能按的闸门在 card-handler 的 term_action 分支里。远端 CLI 没有
+  // PTY 可驱动，同上排一起跳过。
+  if (externalChat && !isRemoteCliId(cliId)) {
+    elements.push({
+      tag: 'action',
+      actions: [{
+        tag: 'button',
+        text: { tag: 'plain_text', content: 'Esc' },
+        type: 'default' as const,
+        value: { action: 'term_action', ...actionBase, key: 'esc' },
+      }],
     });
   }
 

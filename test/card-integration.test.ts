@@ -106,6 +106,7 @@ vi.mock('../src/bot-registry.js', () => ({
   getAllBots: vi.fn(() => []),
   getBotClient: vi.fn(),
   getBotBrand: vi.fn(() => 'feishu'),
+  getOwnerOpenId: vi.fn(() => 'ou_owner'),
 }));
 
 vi.mock('../src/config.js', () => ({
@@ -1378,6 +1379,59 @@ describe('Card integration: full event flow', () => {
       // term_action returns the freshly rebuilt card body — must carry adoptMode.
       expect(result).toBeDefined();
       expect((result as any).adoptMode).toBe(true);
+    });
+
+    it('term_action in an EXTERNAL chat: only the bot owner may press, and only Esc', async () => {
+      const mkEvent = (key: string, operator: string) => ({
+        token: 'tok',
+        action: { tag: 'button', value: { action: 'term_action', root_id: ROOT_ID, session_id: 'x', key } },
+        operator: { open_id: operator },
+        host: 'im_message_card_action',
+      }) as any;
+      const mkExternal = () => {
+        const ds = makeAdoptSession({ displayMode: 'screenshot' });
+        ds.session.externalChat = true;
+        const sessions = new Map<string, DaemonSession>();
+        sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
+        return { ds, deps: makeDeps(sessions) };
+      };
+      // (ds.worker is undefined in this harness, so nothing is forwarded either way;
+      //  the gate is observed through the toast / rebuilt-card return value.)
+      {
+        // Non-owner (even one who passes canOperate) → error toast, nothing forwarded.
+        {
+          const { ds, deps } = mkExternal();
+          const ev = mkEvent('esc', 'ou_user'); ev.action.value.session_id = ds.session.sessionId;
+          const res = await handleCardAction(ev, deps, APP_ID);
+          expect(res?.toast?.type).toBe('error');
+        }
+        // Owner pressing a non-Esc key (stale internal card) → warning toast, nothing forwarded.
+        {
+          const { ds, deps } = mkExternal();
+          const ev = mkEvent('enter', 'ou_owner'); ev.action.value.session_id = ds.session.sessionId;
+          const res = await handleCardAction(ev, deps, APP_ID);
+          expect(res?.toast?.type).toBe('warning');
+        }
+        // Owner + Esc → forwarded to the worker, card rebuilt.
+        {
+          const { ds, deps } = mkExternal();
+          const ev = mkEvent('esc', 'ou_owner'); ev.action.value.session_id = ds.session.sessionId;
+          const res = await handleCardAction(ev, deps, APP_ID);
+          expect(res?.toast).toBeUndefined();
+          expect((res as any).adoptMode).toBe(true);
+        }
+        // Internal chat: unchanged — 'ou_user' + Enter still goes through.
+        {
+          const ds = makeAdoptSession({ displayMode: 'screenshot' });
+          ds.session.externalChat = false;
+          const sessions = new Map<string, DaemonSession>();
+          sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
+          const ev = mkEvent('enter', 'ou_user'); ev.action.value.session_id = ds.session.sessionId;
+          const res = await handleCardAction(ev, makeDeps(sessions), APP_ID);
+          expect(res?.toast).toBeUndefined();
+          expect((res as any).adoptMode).toBe(true);
+        }
+      }
     });
 
     it('refresh_screenshot on adopt session returns a card with adoptMode=true', async () => {

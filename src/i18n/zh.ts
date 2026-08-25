@@ -834,6 +834,8 @@ export const messages: Record<string, string> = {
   'card.action.local_cli_failed': '⚠️ 无法打开本机 CLI：{reason}',
   'card.action.write_link_sent': '🔑 操作链接已私密发送，请查收',
   'card.action.write_link_no_permission': '🔒 没有操作权限，无法获取操作链接',
+  'card.action.external_esc_owner_only': '🔒 外部群里只有机器人所有者可以按 Esc',
+  'card.action.external_only_esc': '外部群里只允许 Esc',
   'card.action.session_gone': '⚠️ 会话已不在线，操作未完成',
   'card.action.close_refused': '会话关闭失败：远端会话未能确认取消（{error}），已保留会话以便重试。远端可能仍在运行，请稍后重试。',
   'card.action.close_refused_with_task': '会话关闭失败：远端会话未能确认取消（{error}），已保留会话以便重试。远端会话 id：{taskId}。远端可能仍在运行，请稍后重试。',
