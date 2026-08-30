@@ -23012,7 +23012,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // tick → 主动发**会冒泡的文本告警** @CEO 到主话题（不靠更新那张 Lark 不上浮
     // 的卡）。独立于 consecutiveFails：后者是内存计数、重启清零、且只数硬失败；
     // 健康线直接盯"多久没成功过"，连"cap-hit 假成功但水位不动"这类静默退化也兜住。
-    const TILLY_STALENESS_ALERT_MS = 45 * 60 * 1000;  // ≈ 3 个 tick 没成功
+    // 2026-08-25 克劳德上调 45min → 120min：上次只调了 consecutiveFails 阈值(3→8)，
+    // 但告警实际是从**这条 stale 线**冒出来的（`||` 关系，两条任一命中都发），
+    // 所以噪音没根治。现与 8 次 tick(≈2h) 对齐；真停摆仍报得出来。
+    const TILLY_STALENESS_ALERT_MS = 120 * 60 * 1000;  // ≈ 8 个 tick 没成功
     let lastTillyProgressAt = Date.now();
     const tillyHandle = setInterval(async () => {
       if (tillyTickInFlight) {
