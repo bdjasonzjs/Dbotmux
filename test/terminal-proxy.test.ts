@@ -159,6 +159,46 @@ describe('terminal proxy — WebSocket', () => {
     expect(messages[1]).toBe('echo:ping');
   });
 
+  it('survives a client RST while the worker port is still being resolved (daemon restart loop 2026-08-30)', async () => {
+    const workerPort = await startFakeWorker();
+    let releaseWake: (port: number) => void = () => {};
+    const wake = new Promise<number>((resolve) => { releaseWake = resolve; });
+    proxy = await startTerminalProxy({
+      port: 0,
+      host: '127.0.0.1',
+      resolvePort: () => undefined,
+      ensureWorkerPort: () => wake,
+    });
+
+    // Raw upgrade request, then reset the TCP connection before the wake resolves.
+    const sock = connect(proxy.port, '127.0.0.1');
+    await new Promise<void>((resolve) => sock.on('connect', resolve));
+    sock.write([
+      'GET /s/sess1/ HTTP/1.1',
+      `Host: 127.0.0.1:${proxy.port}`,
+      'Connection: Upgrade',
+      'Upgrade: websocket',
+      'Sec-WebSocket-Version: 13',
+      'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==',
+      '', '',
+    ].join('\r\n'));
+    await new Promise((r) => setTimeout(r, 50));
+    sock.resetAndDestroy();
+    await new Promise((r) => setTimeout(r, 50));
+    releaseWake(workerPort);
+    await new Promise((r) => setTimeout(r, 50));
+
+    // Proxy (and the process) must still be alive and serving.
+    const ws = new WebSocket(`ws://127.0.0.1:${proxy.port}/s/sess1/?viewToken=abc`);
+    const first = await new Promise<string>((resolve, reject) => {
+      ws.on('message', (data) => resolve(data.toString()));
+      ws.on('error', reject);
+      setTimeout(() => reject(new Error('ws timeout')), 3000);
+    });
+    ws.close();
+    expect(first).toBe('hello-path:/?viewToken=abc');
+  });
+
   it('relays a non-101 upstream response and closes (framing headers stripped)', async () => {
     upstream = createServer((_req, res) => { res.writeHead(200); res.end('ok'); });
     upstream.on('upgrade', (_req, sock) => {

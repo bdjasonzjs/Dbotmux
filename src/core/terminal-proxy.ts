@@ -101,10 +101,20 @@ export function startTerminalProxy(opts: TerminalProxyOptions): Promise<Terminal
   });
 
   server.on('upgrade', (req: IncomingMessage, clientSocket: Duplex, head: Buffer) => {
+    // The upgraded socket is detached from the HTTP parser, so an 'error' with
+    // no listener is an uncaught exception that kills the daemon (no
+    // uncaughtException trap). Guard it BEFORE the async port resolution: after
+    // a daemon restart the worker may take seconds to (re)fork, and a browser
+    // terminal tab that gives up and resets during that window used to crash
+    // the daemon with `read ECONNRESET` — which restarted it, which made the
+    // tab reconnect, which crashed it again (2026-08-30 restart loop, ↺9).
+    clientSocket.on('error', () => clientSocket.destroy());
     const parsed = parseTarget(req.url ?? '');
     if (!parsed) return clientSocket.destroy();
     resolvePortMaybeWake(parsed.sessionId).then((port) => {
-    if (!port) return clientSocket.destroy();
+    // The client may have gone away during the wake; opening an upstream for a
+    // dead socket would leak a worker-side WS connection.
+    if (!port || clientSocket.destroyed) return clientSocket.destroy();
 
     const upstream = requestLiteralLoopback({ host: '127.0.0.1', port }, {
       method: req.method,
