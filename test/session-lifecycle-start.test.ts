@@ -545,6 +545,57 @@ describe('ordinary Claude semantic recovery', () => {
         && message?.turnId?.startsWith('bmx-recovery-'))).toHaveLength(2);
   });
 
+  it('auto-continues a scheduler-fired turn (schedule:<task>:<uuid>) injected into a live worker', async () => {
+    // 2026-08-30: 08:00/09:00 scheduled jobs died on a retryable
+    // provider_server_error with no continuation because recovery bookkeeping
+    // only began for `om_` turn ids.
+    vi.useFakeTimers();
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+    const sessionReply = vi.fn(async () => 'om_warning');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'original task', 'om_original');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_original' });
+    worker.emit('message', {
+      type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_original', status: 'completed',
+    });
+    await Promise.resolve();
+
+    const scheduledTurnId = 'schedule:task-1:11111111-2222-3333-4444-555555555555';
+    expect(sendWorkerInput(ds, 'scheduled job prompt', scheduledTurnId)).toBe(true);
+    worker.emit('message', { type: 'turn_input_received', turnId: scheduledTurnId });
+    expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({
+      logicalTurnId: scheduledTurnId,
+      currentTurnId: scheduledTurnId,
+      status: 'running',
+    }));
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: scheduledTurnId,
+      status: 'failed',
+      errorCode: 'provider_server_error',
+      retryable: true,
+    });
+    await vi.advanceTimersByTimeAsync(2_000);
+    const recoveries = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message'
+        && message?.turnId?.startsWith('bmx-recovery-'));
+    expect(recoveries).toHaveLength(1);
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({
+      logicalTurnId: scheduledTurnId,
+      continuationsStarted: 1,
+    }));
+  });
+
   it.each([
     ['codex', {}],
     ['claude-code', { adoptedFrom: { sessionId: 'external' } }],

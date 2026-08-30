@@ -7981,6 +7981,16 @@ function rollbackWorkerForkPreInit(
  * input). The user turn is already accepted at this point, so persistence
  * failures here are logged without making the caller retry and risk a duplicate
  * execution. */
+/** Turn ids whose transient provider failures the ordinary-turn recovery
+ * coordinator may auto-continue: real IM turns (`om_…`) and scheduler-fired
+ * turns (`schedule:<taskId>:<uuid>`, see session-manager). 2026-08-30: two
+ * scheduled jobs died on a retryable `provider_server_error` with no
+ * continuation because only `om_` turns ever began recovery bookkeeping, so the
+ * terminal fell through to the "未启动自动续跑" warning. */
+function ordinaryRecoveryTurnId(turnId: string | undefined): turnId is string {
+  return !!turnId && (turnId.startsWith('om_') || turnId.startsWith('schedule:'));
+}
+
 function recordAdmittedOrdinaryUserTurn(
   ds: DaemonSession,
   turnId: string,
@@ -8116,7 +8126,7 @@ export function sendWorkerInput(
       logger.info(
         `[${tag(ds)}] Staged turn ${queuedTurnId} behind queued activation ACK`,
       );
-      if (turnId?.startsWith('om_')) {
+      if (ordinaryRecoveryTurnId(turnId)) {
         recordAdmittedOrdinaryUserTurn(ds, turnId, { beginRecovery: false });
       }
       return true;
@@ -8214,7 +8224,7 @@ export function sendWorkerInput(
     );
     return false;
   }
-  if (turnId?.startsWith('om_')) {
+  if (ordinaryRecoveryTurnId(turnId)) {
     recordAdmittedOrdinaryUserTurn(ds, turnId, { beginRecovery: true });
   }
   return true;
@@ -8559,7 +8569,7 @@ export function promoteQueuedActivationTail(
       queuedActivationToken: token,
       ...(vcMeetingImTurnOrigin ? { vcMeetingImTurnOrigin } : {}),
     } as DaemonToWorker);
-    if (head.turnId.startsWith('om_')) {
+    if (ordinaryRecoveryTurnId(head.turnId)) {
       recordAdmittedOrdinaryUserTurn(ds, head.turnId, { beginRecovery: true });
     }
   } catch (err) {
@@ -9659,7 +9669,7 @@ export function forkWorker(
   } else {
     worker.send(initMsg);
   }
-  if (prompt.length > 0 && initAttributionTurnId?.startsWith('om_')) {
+  if (prompt.length > 0 && ordinaryRecoveryTurnId(initAttributionTurnId)) {
     recordAdmittedOrdinaryUserTurn(ds, initAttributionTurnId, { beginRecovery: true });
   }
   ds.spawnedAt = Date.now();
