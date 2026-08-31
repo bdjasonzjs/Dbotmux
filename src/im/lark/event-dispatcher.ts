@@ -18,6 +18,7 @@ import { parseForceTopicInvocation } from '../../core/command-handler.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
 import { resolveNonsupportMessage, stripLeadingMentions, mentionOpenId, mentionAppId, extractMentionIdentities, messageMentionsBot, RESOLVED_TEXT_KEY, type MentionIdentity } from './message-parser.js';
 import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
+import { noteInstantObserverMessage } from '../../services/instant-observer.js';
 import { isTeamBot, recordTeamBot } from '../../services/team-bots-store.js';
 import { isTeamGroupChat } from '../../services/team-groups-store.js';
 import { isPlatformTeamBot, isPlatformHallChat, isPlatformTeamMember } from '../../services/platform-team-store.js';
@@ -3171,6 +3172,22 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           } catch (err) {
             logger.debug(`[main-bot/L1] auto-unarchive failed: ${err}`);
           }
+        }
+        // instant-observer：配置了即时唤醒的群，非 observer 自身的新消息
+        // → 防抖合并 → 复用一次性 schedule 触发一轮幂等对账。
+        // 发送者身份分 open_id / app_id 两个域传入（不混装）——app_id-only 的
+        // bot 回声也要能被识别为自我消息（review P1-1，防自激循环）。
+        // fire-and-forget + try/catch，绝不阻塞/影响消息路由。
+        try {
+          noteInstantObserverMessage({
+            larkAppId,
+            chatId,
+            senderOpenId: sender?.sender_id?.open_id,
+            senderAppId: sender?.sender_id?.app_id,
+            botOpenId: getBot(larkAppId).botOpenId,
+          });
+        } catch (err) {
+          logger.warn(`[instant-observer] note failed (routing unaffected): ${err}`);
         }
       }
 

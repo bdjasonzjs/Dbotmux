@@ -1,5 +1,6 @@
 import { Cron } from 'croner';
 import * as scheduleStore from '../services/schedule-store.js';
+import { isInstantObserverTask, instantTaskStillWanted } from '../services/instant-observer.js';
 import { scheduleTimeZone, zonedTomorrowAt } from '../utils/timezone.js';
 import { emitHookEvent } from '../services/hook-runner.js';
 import { logger } from '../utils/logger.js';
@@ -404,6 +405,15 @@ function computeGraceSeconds(parsed: ParsedSchedule): number {
 
 // ─── Tick loop ──────────────────────────────────────────────────────────────
 
+/** instant-observer 任务且策略已不再想要（off/removed/换 app/读取失败）→
+ *  应当在执行前丢弃。鉴别用完整内部 shape（稳定 id 自校验 + once/silent/repeat=1），
+ *  同名同前缀的用户任务不受影响、恒 false。导出供单测直接断言 tick 守卫语义。 */
+export function shouldDropStaleInstantTask(
+  task: Pick<ScheduledTask, 'id' | 'name' | 'chatId' | 'larkAppId' | 'parsed' | 'silent' | 'repeat'>,
+): boolean {
+  return isInstantObserverTask(task) && !instantTaskStillWanted(task);
+}
+
 async function tick(): Promise<void> {
   const tasks = scheduleStore.listTasks();
   const now = Date.now();
@@ -435,6 +445,15 @@ async function tick(): Promise<void> {
     const nextMs = new Date(nextRunAt).getTime();
     if (nextMs > now) continue;
 
+    // instant-observer 内部一次性任务：真正执行前 fail-closed 复核当前群策略。
+    // `--instant off` / `watch remove` / 切 observer app 之后，pending 唤醒
+    // 一律作废并删除，绝不再执行（review P1-2）。
+    if (shouldDropStaleInstantTask(task)) {
+      logger.info(`[scheduler] instant-observer task "${task.name}" (${task.id}) stale (policy off/changed) — dropped without firing`);
+      scheduleStore.removeTask(task.id);
+      continue;
+    }
+
     // Recurring: fast-forward if stale beyond grace window
     if (task.parsed.kind !== 'once') {
       const grace = computeGraceSeconds(task.parsed);
@@ -460,9 +479,13 @@ async function tick(): Promise<void> {
 
     if (executeCallback) {
       const taskId = task.id;
+      // Generation CAS：回写只允许命中「本次触发的这一行」。稳定 id 的任务
+      // （instant-observer）可能在回调在途时被删除重建（同 id 新行），旧回调
+      // 的 markRun 绝不能误记/误删新行（ABA 竞态，review T6R r2 P1）。
+      const firedGeneration = task.createdAt;
       executeCallback(task)
         .then(() => {
-          scheduleStore.markRun(taskId, true);
+          scheduleStore.markRun(taskId, true, undefined, undefined, { expectedCreatedAt: firedGeneration });
           dashboardEventBus.publish({
             type: 'schedule.fired',
             body: { id: taskId, runAt: Date.now(), status: 'ok' },
@@ -471,7 +494,7 @@ async function tick(): Promise<void> {
         })
         .catch(err => {
           logger.error(`[scheduler] Task "${task.name}" failed: ${err.message}`);
-          scheduleStore.markRun(taskId, false, err.message);
+          scheduleStore.markRun(taskId, false, err.message, undefined, { expectedCreatedAt: firedGeneration });
           dashboardEventBus.publish({
             type: 'schedule.fired',
             body: {
@@ -561,6 +584,9 @@ export function stopScheduler(): void {
 }
 
 export function addTask(params: {
+  /** 可选稳定 id（如 instant-observer 的 chat+app 派生 id）；缺省随机。
+   *  同 id 已存在且输入不同时 schedule-store 抛 IdempotencyConflictError。 */
+  id?: string;
   name: string;
   schedule: string;
   prompt: string;
@@ -594,6 +620,7 @@ export function addTask(params: {
   const topicTitle = normalizeTopicTitle(params.topicTitle);
   const scope: 'thread' | 'chat' = executionPosition === 'topic' ? 'thread' : 'chat';
   const task = scheduleStore.createTask({
+    id: params.id,
     name: params.name,
     schedule: params.schedule,
     parsed,
@@ -701,9 +728,10 @@ export function runNow(id: string): { ok: boolean; error?: string } {
   // Don't block the caller — fire on next tick. `Promise.resolve().then`
   // coerces a synchronous throw from executeCallback into a rejection so the
   // error path always runs and we don't leak a 500 to the IPC client.
+  const firedGeneration = task.createdAt; // 同 tick 路径：回写只命中本次触发的行
   void Promise.resolve().then(() => executeCallback!(task)).then(
     () => {
-      scheduleStore.markRun(task.id, true);
+      scheduleStore.markRun(task.id, true, undefined, undefined, { expectedCreatedAt: firedGeneration });
       dashboardEventBus.publish({
         type: 'schedule.fired',
         body: { id, runAt: Date.now(), status: 'ok' },
@@ -712,7 +740,7 @@ export function runNow(id: string): { ok: boolean; error?: string } {
     },
     err => {
       const msg = err instanceof Error ? err.message : String(err);
-      scheduleStore.markRun(task.id, false, msg);
+      scheduleStore.markRun(task.id, false, msg, undefined, { expectedCreatedAt: firedGeneration });
       dashboardEventBus.publish({
         type: 'schedule.fired',
         body: { id, runAt: Date.now(), status: 'error', error: msg },

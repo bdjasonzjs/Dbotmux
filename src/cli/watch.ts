@@ -17,8 +17,13 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import {
-  setPolicy, listPolicies, getPolicy, removePolicy, type ChatPolicy,
+  setPolicy, listPolicies, getPolicy, removePolicy,
+  type ChatPolicy, type InstantObserverPolicy,
 } from '../services/chat-policy-store.js';
+import {
+  MIN_DEBOUNCE_SECONDS, MAX_DEBOUNCE_SECONDS, DEFAULT_DEBOUNCE_SECONDS, clampDebounceSeconds,
+  cancelPendingInstantTasks,
+} from '../services/instant-observer.js';
 import {
   listOpen, listOpenByTarget, closeIncident, type WatchIncident,
 } from '../services/watch-inbox-store.js';
@@ -60,7 +65,11 @@ const defaultReachProber: ReachProber = async (targetChatId) => {
 function fmtPolicy(p: ChatPolicy): string {
   const target = p.driveTargetSummonName ? `，唤醒：${p.driveTargetSummonName}` : '';
   const drive = p.driveOn ? `on（目标：${p.driveGoal ?? '（未设，无效）'}${target}）` : 'off';
-  return `${p.chatId}\n   推动: ${drive} | 汇报: ${p.reportTargetChatId ?? 'off'} | 扫读: ${p.scoutMode}\n   更新: ${p.updatedAt}`;
+  const io = p.instantObserver;
+  const instant = io?.enabled
+    ? `on（observer: ${io.larkAppId}，防抖 ${clampDebounceSeconds(io.debounceSeconds)}s${io.prompt?.trim() ? '，自定义 prompt' : ''}）`
+    : 'off';
+  return `${p.chatId}\n   推动: ${drive} | 汇报: ${p.reportTargetChatId ?? 'off'} | 扫读: ${p.scoutMode} | 即时唤醒: ${instant}\n   更新: ${p.updatedAt}`;
 }
 
 export async function cmdWatch(
@@ -75,13 +84,16 @@ export async function cmdWatch(
 
 用法:
   botmux watch set --chat oc_xxx [--push "<目标>"|off] [--summon 克劳德] [--report oc_target|off] [--scout watch|mute] [--skip-verify]
+  botmux watch set --chat oc_xxx --instant on --instant-app cli_xxx [--instant-debounce 60~120] [--instant-prompt "<对账指令>"]
+  botmux watch set --chat oc_xxx --instant off
   botmux watch list
   botmux watch show --chat oc_xxx
   botmux watch remove --chat oc_xxx
   botmux watch incidents [--target oc_xxx]
   botmux watch close <incidentId> [--by 名字]
 
-每个群三个独立开关: 推动(drive, --push 设目标后按目标急急如律令唤醒目标 bot) / 汇报(report, off 或目标群) / 扫读(scout, watch|mute)。
+每个群独立开关: 推动(drive, --push 设目标后按目标急急如律令唤醒目标 bot) / 汇报(report, off 或目标群) / 扫读(scout, watch|mute)
+/ 即时唤醒(instant, 群内新消息防抖 60~120s 后触发 observer bot 一轮幂等对账；--instant-app 指定 observer bot 的 larkAppId)。
 主话题默认扫读静音(fail-closed)。`);
     return;
   }
@@ -145,9 +157,53 @@ export async function cmdWatch(
       }
     }
 
-    if (Object.keys(patch).length === 0) { console.error('❌ set 至少要带一个 --push/--report/--scout/--drive'); process.exitCode = 2; return; }
+    // 即时唤醒：--instant on|off（on 必须能定位 observer bot 的 larkAppId）。
+    // off / 切 app 时要撤销旧 app+chat 的 pending 唤醒任务（策略写完后执行；
+    // scheduler 执行前的 fail-closed 预检兜底竞态窗口）。
+    const cancelAfterSet: string[] = []; // 待撤销 pending 的旧 observer appId
+    const instant = argValue(rest, '--instant');
+    if (instant !== undefined) {
+      if (instant !== 'on' && instant !== 'off') { console.error('❌ --instant 只能是 on|off'); process.exitCode = 2; return; }
+      const prev = getPolicy(chat)?.instantObserver ?? null;
+      if (instant === 'off') {
+        patch.instantObserver = null;
+        if (prev?.larkAppId) cancelAfterSet.push(prev.larkAppId);
+      } else {
+        const app = argValue(rest, '--instant-app') ?? prev?.larkAppId;
+        if (!app || !app.startsWith('cli_')) {
+          console.error('❌ --instant on 需要 --instant-app cli_xxx（observer bot 的 larkAppId）'); process.exitCode = 2; return;
+        }
+        const debounceRaw = argValue(rest, '--instant-debounce');
+        let debounceSeconds = prev?.debounceSeconds ?? null;
+        if (debounceRaw !== undefined) {
+          const n = Number(debounceRaw);
+          if (!Number.isFinite(n) || n < MIN_DEBOUNCE_SECONDS || n > MAX_DEBOUNCE_SECONDS) {
+            console.error(`❌ --instant-debounce 取值 ${MIN_DEBOUNCE_SECONDS}~${MAX_DEBOUNCE_SECONDS}（秒），缺省 ${DEFAULT_DEBOUNCE_SECONDS}`); process.exitCode = 2; return;
+          }
+          debounceSeconds = Math.round(n);
+        }
+        const promptRaw = argValue(rest, '--instant-prompt');
+        const io: InstantObserverPolicy = {
+          enabled: true,
+          larkAppId: app,
+          debounceSeconds,
+          prompt: promptRaw !== undefined ? (promptRaw === 'off' ? null : promptRaw) : (prev?.prompt ?? null),
+        };
+        patch.instantObserver = io;
+        // 切 observer app：旧 app 名下的 pending 唤醒必须撤销，否则旧 bot 仍会被唤醒。
+        if (prev?.larkAppId && prev.larkAppId !== app) cancelAfterSet.push(prev.larkAppId);
+      }
+    } else if (argValue(rest, '--instant-app') !== undefined || argValue(rest, '--instant-debounce') !== undefined || argValue(rest, '--instant-prompt') !== undefined) {
+      console.error('❌ --instant-app/--instant-debounce/--instant-prompt 必须与 --instant on 一起使用'); process.exitCode = 2; return;
+    }
+
+    if (Object.keys(patch).length === 0) { console.error('❌ set 至少要带一个 --push/--report/--scout/--drive/--instant'); process.exitCode = 2; return; }
     const p = setPolicy(chat, patch);
     console.log(`✅ 已更新群策略\n   ${fmtPolicy(p)}`);
+    for (const appId of cancelAfterSet) {
+      const n = cancelPendingInstantTasks(chat, appId);
+      if (n > 0) console.log(`   已撤销 ${n} 条 pending 即时唤醒任务（app ${appId}）`);
+    }
     return;
   }
 
@@ -170,7 +226,12 @@ export async function cmdWatch(
   if (sub === 'remove' || sub === 'rm') {
     const chat = argValue(rest, '--chat', '--chat-id');
     if (!chat) { console.error('❌ 缺 --chat oc_xxx'); process.exitCode = 2; return; }
+    const prevInstantApp = getPolicy(chat)?.instantObserver?.larkAppId;
     console.log(removePolicy(chat) ? `✅ 已移除 ${chat} 的策略` : `⚠️ 没找到 ${chat} 的策略`);
+    if (prevInstantApp) {
+      const n = cancelPendingInstantTasks(chat, prevInstantApp);
+      if (n > 0) console.log(`   已撤销 ${n} 条 pending 即时唤醒任务（app ${prevInstantApp}）`);
+    }
     return;
   }
 

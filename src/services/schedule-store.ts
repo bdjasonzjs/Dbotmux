@@ -572,11 +572,29 @@ export function updateTask(
 /**
  * Record a run outcome and auto-manage repeat counter.  If the task has a
  * finite repeat count and we've hit it, the task is removed.
+ *
+ * `opts.expectedCreatedAt` — generation CAS（防稳定 id 的 ABA 竞态）：
+ * 调用方传入它**当时触发的那一行**的 createdAt；行若已被删除重建（同 id 新行，
+ * createdAt 必然不同），本次回写整体跳过（不动 lastRun/repeat、不误删新行）。
+ * 不传则维持旧语义（按 id 直接回写）。
  */
-export function markRun(id: string, success: boolean, error?: string, deliveryError?: string): void {
+export function markRun(
+  id: string,
+  success: boolean,
+  error?: string,
+  deliveryError?: string,
+  opts?: { expectedCreatedAt?: string },
+): void {
   const completedRepeat = mutateTasks(working => {
     const task = working.get(id);
     if (!task) return { result: undefined, changed: false };
+    if (opts?.expectedCreatedAt !== undefined && task.createdAt !== opts.expectedCreatedAt) {
+      logger.info(
+        `[schedule-store] markRun ${id} skipped: row was recreated `
+        + `(expected createdAt ${opts.expectedCreatedAt}, found ${task.createdAt ?? 'none'})`,
+      );
+      return { result: undefined, changed: false };
+    }
 
     const now = new Date().toISOString();
     task.lastRunAt = now;

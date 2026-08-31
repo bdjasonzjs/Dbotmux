@@ -35,6 +35,22 @@ export const DEFAULT_MUTED_CHAT_IDS: readonly string[] = [MAIN_TOPIC_CHAT_ID];
 
 export type ScoutMode = 'watch' | 'mute';
 
+/**
+ * instant-observer（群内新消息 → 即时唤醒 observer）群级配置。
+ * 按群隔离（挂在各自 ChatPolicy 上）；larkAppId 指明哪个 bot 是该群 observer，
+ * 只有该 bot 的 daemon 响应（同群其它 bot 的 daemon 忽略）。
+ * 消费方：src/services/instant-observer.ts。
+ */
+export interface InstantObserverPolicy {
+  enabled: boolean;
+  /** observer bot 的 larkAppId（cli_xxx）——按 bot 隔离的锚。 */
+  larkAppId: string;
+  /** 防抖窗口秒数，运行时收敛到 [60,120]，缺省 90。 */
+  debounceSeconds?: number | null;
+  /** 唤醒轮注入的 prompt；空/缺省用内置默认（幂等对账措辞）。 */
+  prompt?: string | null;
+}
+
 export interface ChatPolicy {
   chatId: string;
   /** 推动开关。一期只存不实现（推动逻辑放二期）。 */
@@ -47,6 +63,8 @@ export interface ChatPolicy {
   driveGoal?: string | null;
   /** 推动唤醒的急急如律令目标名（botName/displayName），例如“克劳德”。 */
   driveTargetSummonName?: string | null;
+  /** 群内新消息即时唤醒 observer；null/缺省 = 未配置。 */
+  instantObserver?: InstantObserverPolicy | null;
   updatedAt: string;
 }
 
@@ -155,6 +173,8 @@ export interface ChatPolicyPatch {
   scoutMode?: ScoutMode;
   driveGoal?: string | null;
   driveTargetSummonName?: string | null;
+  /** 整体替换语义：给对象 = 设置；给 null = 清掉；undefined = 不动。 */
+  instantObserver?: InstantObserverPolicy | null;
 }
 
 /** 推动配置（drive=on 且有目标才算真正开启推动）。 */
@@ -177,12 +197,13 @@ export function setPolicy(chatId: string, patch: ChatPolicyPatch): ChatPolicy {
     ...(patch.scoutMode !== undefined ? { scoutMode: patch.scoutMode } : {}),
     ...(patch.driveGoal !== undefined ? { driveGoal: patch.driveGoal } : {}),
     ...(patch.driveTargetSummonName !== undefined ? { driveTargetSummonName: patch.driveTargetSummonName } : {}),
+    ...(patch.instantObserver !== undefined ? { instantObserver: patch.instantObserver } : {}),
     updatedAt: now,
   };
   if (idx >= 0) store.policies[idx] = next;
   else store.policies.push(next);
   write(store);
-  logger.info(`[chat-policy-store] set chat=${chatId.slice(0, 12)} drive=${next.driveOn} report=${next.reportTargetChatId ?? 'off'} scout=${next.scoutMode}`);
+  logger.info(`[chat-policy-store] set chat=${chatId.slice(0, 12)} drive=${next.driveOn} report=${next.reportTargetChatId ?? 'off'} scout=${next.scoutMode} instant=${next.instantObserver?.enabled ? `on(${next.instantObserver.larkAppId})` : 'off'}`);
   return next;
 }
 
