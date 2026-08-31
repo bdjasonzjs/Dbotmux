@@ -55,6 +55,7 @@ import {
 } from './session-create.js';
 import { validateZellijAdoptTarget } from './zellij-adopt-discovery.js';
 import { buildContextBlocks } from './context-providers.js';
+import { sealUntrustedUserBody } from './untrusted-body-seal.js';
 import { recordMention, getRecentMentions, MAX_RECENT_MENTIONS } from '../services/mention-history-store.js';
 import type { BackendType, SessionProbe } from '../adapters/backend/types.js';
 import { backendSupportsWebTerminal } from '../adapters/backend/capabilities.js';
@@ -1201,7 +1202,7 @@ export function buildNewTopicPrompt(
   const mergedMessage = followUps && followUps.length > 0
     ? [userMessage, ...followUps].join('\n\n')
     : userMessage;
-  const userBlock = `<user_message>\n${mergedMessage}\n</user_message>`;
+  const userBlock = `<user_message>\n${sealUntrustedUserBody(mergedMessage)}\n</user_message>`;
   const parts: string[] = [];
 
   // Put stable, instruction-like context before the user's first turn. This
@@ -1446,7 +1447,7 @@ function buildFollowUpBlocks(
   }
   if (whiteboardBlock) blocks.push({ key: 'whiteboard', text: whiteboardBlock });
 
-  blocks.push({ key: 'userMessage', text: `<user_message>\n${content}\n</user_message>` });
+  blocks.push({ key: 'userMessage', text: `<user_message>\n${sealUntrustedUserBody(content)}\n</user_message>` });
 
   const senderBlock = renderSenderTag(opts?.sender);
   if (senderBlock) blocks.push({ key: 'sender', text: senderBlock });
