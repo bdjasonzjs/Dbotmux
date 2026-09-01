@@ -23,6 +23,8 @@ beforeEach(() => {
   dataDir = join(fakeHome, '.botmux', 'data');
   registryDir = join(dataDir, 'dashboard-daemons');
   mkdirSync(registryDir, { recursive: true });
+  // CLI 现在必须签 trusted-host HMAC 三头 → 需要 host secret 文件（0600，秘密路径同产线）
+  writeFileSync(join(fakeHome, '.botmux', '.dashboard-secret'), 'dGVzdC1zZWNyZXQ', { mode: 0o600 });
   process.env.SESSION_DATA_DIR = dataDir; // 空 → 无 marker → 隔离进程树 marker 解析
   exitCode.value = 0;
   vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
@@ -100,8 +102,36 @@ describe('cli subtask-orch', () => {
 
     expect(exitCode.value).toBe(0);
     expect(fetchSpy.mock.calls[0][0]).toBe('http://127.0.0.1:9102/api/subtask-orch-create');
-    const body = JSON.parse((fetchSpy.mock.calls[0][1] as RequestInit).body as string);
+    const init = fetchSpy.mock.calls[0][1] as RequestInit;
+    const body = JSON.parse(init.body as string);
     expect(body.bots).toEqual(['k:main', 'c:collab', 't:observer', '蔻黛克斯（初号机）:collab']);
+    // trusted-host HMAC 三头必须在场（daemon 外层门先于路由，缺头=401 missing_headers）
+    const headers = new Headers(init.headers);
+    expect(headers.get('x-botmux-cli-ts')).toBeTruthy();
+    expect(headers.get('x-botmux-cli-nonce')).toBeTruthy();
+    expect(headers.get('x-botmux-cli-auth')).toBeTruthy();
+    expect(headers.get('content-type')).toBe('application/json');
+  });
+
+  it('fails fast with a clear error when the host IPC secret is unreadable', async () => {
+    writeDaemon('app_codex', '蔻黛克斯', 9102);
+    writeSession('app_codex', {
+      sessionId: 'sid_codex',
+      chatId: 'oc_codex_root',
+      rootMessageId: 'om_root',
+      larkAppId: 'app_codex',
+    });
+    rmSync(join(fakeHome, '.botmux', '.dashboard-secret'));
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    const errSpy = vi.spyOn(console, 'error');
+
+    await runCmd('start', ['--session-id', 'sid_codex', '--goal', 'x']);
+
+    expect(exitCode.value).toBe(1);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(String(errSpy.mock.calls.at(-1)?.[0])).toContain('daemon IPC secret');
   });
 
   it('passes --dry-run to subtask-start and renders the pre-create preview', async () => {

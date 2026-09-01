@@ -9,6 +9,7 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { resolveSessionIdWithSource, type SessionIdSource } from './session-marker.js';
+import { fetchDaemonIpc, loadDaemonIpcSecret } from '../core/daemon-ipc-auth.js';
 
 const REGISTRY_DIR = join(homedir(), '.botmux', 'data', 'dashboard-daemons');
 const DATA_DIR = join(homedir(), '.botmux', 'data');
@@ -17,7 +18,8 @@ const CLAUDE_BOT_NAME_ZH = '克劳德';
 interface DaemonInfoFile { larkAppId?: string; botName: string; ipcPort: number; lastHeartbeat: number; }
 type DaemonSelection = { port: number; diagnostic?: string } | { error: string; diagnostic?: string };
 
-const VERB_ROUTE: Record<string, string> = {
+// exported: test/subtask-orch-routes.test.ts 锚定「CLI 的每个路径在 daemon 侧都有注册」
+export const VERB_ROUTE: Record<string, string> = {
   start: '/api/subtask-orch-create',
   report: '/api/subtask-orch-report',
   query: '/api/subtask-orch-query',
@@ -224,13 +226,22 @@ export async function cmdSubtaskOrch(verb: string, argv: string[]): Promise<void
     process.exit(1);
   }
 
+  // daemon 的 /api/subtask-orch-* 走 trusted-host HMAC（loopback 不是身份）：
+  // 必须签 X-Botmux-Cli-{Ts,Nonce,Auth} 三头，否则被外层门拦成 401 missing_headers。
+  // secret 是 host-only 文件，读隔离/沙箱会话读不到 → 直接明错，不发注定 401 的请求。
+  let secret: string;
+  try { secret = loadDaemonIpcSecret(); }
+  catch (err: any) {
+    console.error(`❌ 读不到 daemon IPC secret（${err.message}）；subtask 编排命令只能在能读 ~/.botmux 的受信 host 会话里用`);
+    process.exit(1);
+  }
   let res: Response;
   try {
-    res = await fetch(`http://127.0.0.1:${selected.port}${route}`, {
+    res = await fetchDaemonIpc(selected.port, route, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(parsed.body),
-    });
+    }, secret);
   } catch (err: any) { console.error(`❌ 连不上 daemon (port ${selected.port}): ${err.message}`); process.exit(1); }
 
   const json = await res.json().catch(() => ({ ok: false, error: 'invalid_json_response' }));

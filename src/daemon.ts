@@ -79,6 +79,7 @@ import {
   type VcMeetingConsumerProfileConfig,
 } from './bot-registry.js';
 import { setDisplayNameRefresher, findConfigField, applyConfigField } from './services/bot-config-store.js';
+import { registerSubtaskOrchRoutes } from './services/subtask-orch-routes.js';
 import { getSkillFeedbackStore } from './services/skill-feedback-store.js';
 import { enqueueTurnTerminal, drainTurnTerminalQueue } from './services/turn-completion-events.js';
 import { FeedbackWebhookSecretStore, startFeedbackWebhookDispatcher } from './services/feedback-webhook-dispatcher.js';
@@ -6489,6 +6490,11 @@ ipcRoute('POST', '/api/hooks/emit', async (req, res) => {
   emitHookEventLocal(event as HookEvent, boundPayload);
   return jsonRes(res, 202, { ok: true });
 });
+
+// ─── 子任务编排 v2 · /api/subtask-orch-* ─────────────────────────────────────
+// 路由表与 handler 在 services/subtask-orch-routes.ts（曾内联于此，upstream 合并时
+// 整块被丢过一次——见该模块头注释；CLI↔daemon 路径对齐由测试锚定）。
+registerSubtaskOrchRoutes();
 
 // ─── adopt-session 查询端点 ───────────────────────────────────────────────────
 // CLI side（botmux hook）通过祖先 PID 匹配 adopt 会话，路由 askUserQuestion。
