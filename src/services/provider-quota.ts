@@ -515,12 +515,16 @@ async function refreshEntry(larkAppId: string, entry: CacheEntry, spec: SourceSp
     return;
   }
   if (!isLive(larkAppId, live)) return;
-  // Claude reports utilisation in response headers on every answer — including
-  // a 429 at the limit — so a header hit is a success regardless of status.
-  if (spec.provider === 'claude-oauth') {
+  // Claude reports utilisation in response headers. Only a served answer (200)
+  // or a rate-limit answer (429) is trusted: an auth/server failure that
+  // happens to carry a plausible header is still a failure. On 429 the value
+  // is real (the account is at its limit) and is shown, but the next probe
+  // must also respect the server's Retry-After, not just our TTL.
+  if (spec.provider === 'claude-oauth' && (res.status === 200 || res.status === 429)) {
     const fromHeaders = parseClaudeRateLimitHeaders(res.headers);
     if (fromHeaders) {
-      commitQuota(live, fromHeaders);
+      const retryAfterMs = res.status === 429 ? parseRetryAfterMs(res.headers['retry-after']) ?? 0 : 0;
+      commitQuota(live, fromHeaders, Math.max(PROVIDER_QUOTA_TTL_MS, retryAfterMs));
       return;
     }
   }
@@ -550,11 +554,11 @@ async function refreshEntry(larkAppId: string, entry: CacheEntry, spec: SourceSp
   commitQuota(live, quota);
 }
 
-function commitQuota(entry: CacheEntry, quota: ProviderQuota): void {
+function commitQuota(entry: CacheEntry, quota: ProviderQuota, holdMs: number = PROVIDER_QUOTA_TTL_MS): void {
   const now = clock();
   entry.quota = quota;
   entry.fetchedAt = now;
-  entry.nextAttemptAt = now + PROVIDER_QUOTA_TTL_MS;
+  entry.nextAttemptAt = now + Math.max(PROVIDER_QUOTA_TTL_MS, holdMs);
   // The loader just fingerprinted the credential; start the rotation-probe
   // cadence from here rather than probing again on the very next peek.
   entry.lastProbeAt = now;
@@ -650,21 +654,41 @@ function parseDeepSeekBalance(body: Record<string, unknown>): ProviderQuota | nu
   return { kind: 'balance', currency: pick.currency, amount: pick.amount };
 }
 
+/** Strict decimal fixed-point parser for HTTP header values: optional
+ *  surrounding ASCII spaces, then `digits[.digits]` only — no sign, exponent,
+ *  hex/binary/octal prefix, leading/trailing dot, or embedded whitespace. The
+ *  loose `Number()` rules used for JSON bodies are deliberately not reused here
+ *  (`0x1`, `1e-1`, `+0.1` would all sneak through them). */
+export function parseHeaderDecimal(
+  value: string | undefined,
+  opts: { maxIntegerDigits: number; maxFractionDigits: number },
+): number | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.replace(/^ +| +$/g, '');
+  const m = /^(\d+)(?:\.(\d+))?$/.exec(trimmed);
+  if (!m) return undefined;
+  const [, intPart, fracPart] = m;
+  if (intPart!.length > opts.maxIntegerDigits) return undefined;
+  if (fracPart !== undefined && (fracPart.length === 0 || fracPart.length > opts.maxFractionDigits)) return undefined;
+  const n = Number(trimmed);
+  return Number.isFinite(n) ? n : undefined;
+}
+
 /** `anthropic-ratelimit-unified-7d-utilization` is the used share of the 7-day
- *  window as a fraction 0–1; `…-7d-reset` is an epoch-second timestamp. Present
- *  on every Messages response for a claude.ai login (including 429s). Exported
- *  for unit tests. */
+ *  window as a decimal fraction 0–1; `…-7d-reset` is a decimal epoch-second
+ *  timestamp. Anything outside that exact grammar or range is hidden — never
+ *  coerced. A malformed reset drops only the timestamp. Exported for unit tests. */
 export function parseClaudeRateLimitHeaders(
   headers: Record<string, string | undefined>,
 ): ProviderQuota | null {
-  const used = finiteNumber(headers[CLAUDE_7D_UTILIZATION_HEADER]);
+  const used = parseHeaderDecimal(headers[CLAUDE_7D_UTILIZATION_HEADER], { maxIntegerDigits: 1, maxFractionDigits: 6 });
   if (used === undefined || used < 0 || used > 1) return null;
-  const reset = finiteNumber(headers[CLAUDE_7D_RESET_HEADER]);
+  const reset = parseHeaderDecimal(headers[CLAUDE_7D_RESET_HEADER], { maxIntegerDigits: 12, maxFractionDigits: 0 });
   return {
     kind: 'window',
     window: 'weekly',
     remainingPercent: Math.round((100 - used * 100) * 100) / 100,
-    ...(reset !== undefined && reset >= 0 ? { resetsAt: reset * 1000 } : {}),
+    ...(reset !== undefined && Number.isInteger(reset) ? { resetsAt: reset * 1000 } : {}),
   };
 }
 

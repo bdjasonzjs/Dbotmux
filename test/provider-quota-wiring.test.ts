@@ -90,6 +90,16 @@ describe('provider-quota wiring (source lock)', () => {
     expect(probe).toContain('source.identity !== entry.sourceIdentity');
   });
 
+  it('Claude headers are trusted only on 200/429, parsed by the strict header parser, and 429 keeps Retry-After', () => {
+    const src = read('src/services/provider-quota.ts');
+    const body = functionBody(src, 'async function refreshEntry(');
+    expect(body).toContain("spec.provider === 'claude-oauth' && (res.status === 200 || res.status === 429)");
+    expect(body).toContain('Math.max(PROVIDER_QUOTA_TTL_MS, retryAfterMs)');
+    const parser = functionBody(src, 'export function parseClaudeRateLimitHeaders(');
+    expect(parser).toContain('parseHeaderDecimal(');
+    expect(parser).not.toContain('finiteNumber(');
+  });
+
   it('the CLI send path normalizes the IPC quota instead of trusting it', () => {
     const cli = read('src/cli.ts');
     const body = functionBody(cli, 'function normalizeCardUsageSnapshot(value: unknown): CardUsageSnapshot | null {');

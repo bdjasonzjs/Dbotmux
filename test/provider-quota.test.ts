@@ -23,6 +23,7 @@ import {
   __setProviderQuotaTransportForTests,
   describeProviderQuotaSource,
   parseClaudeRateLimitHeaders,
+  parseHeaderDecimal,
   parseProviderQuota,
   peekProviderQuota,
   refreshProviderQuota,
@@ -175,10 +176,28 @@ describe('provider-quota parsers', () => {
         rate_limit: { primary_window: { used_percent: bad, limit_window_seconds: 604800, reset_at: 1 } },
       }), `codex ${String(bad)}`).toBeNull();
     }
-    // Claude's header is a fraction: anything outside [0, 1] is malformed.
-    for (const bad of ['-0.01', '1.01', '40', 'NaN', 'Infinity', '', 'allowed']) {
-      expect(parseClaudeRateLimitHeaders({ 'anthropic-ratelimit-unified-7d-utilization': bad }), `claude ${bad}`).toBeNull();
+    // Claude's header is a strict decimal fraction: anything outside the exact
+    // grammar or [0, 1] is malformed — JS numeric extensions included.
+    const badUtil = [
+      '-0.01', '1.01', '40', 'NaN', 'Infinity', '', 'allowed',
+      '0x1', '0b1', '0o1', '1e-1', '1E-1', '+0.1', '-0', '.1', '1.', '00.1', '0.1.0',
+      '0.1abc', '0.1\t', '\u00a00.1', '0. 1', '0.1\n', '1_0', '0,1', '０.１',
+      '0.1234567', '10', '01',
+    ];
+    for (const bad of badUtil) {
+      expect(parseClaudeRateLimitHeaders({ 'anthropic-ratelimit-unified-7d-utilization': bad }), `claude ${JSON.stringify(bad)}`).toBeNull();
     }
+    for (const good of [['0', 100], ['1', 0], ['0.1', 90], ['0.632', 36.8], ['1.0', 0], ['0.000000', 100], [' 0.25 ', 75]] as const) {
+      expect(parseClaudeRateLimitHeaders({ 'anthropic-ratelimit-unified-7d-utilization': good[0] }), `claude ${JSON.stringify(good[0])}`)
+        .toEqual({ kind: 'window', window: 'weekly', remainingPercent: good[1] });
+    }
+    // reset: decimal epoch seconds only; malformed → timestamp dropped, value kept.
+    for (const badReset of ['1.7e9', '+5', '0x10', '1788537600.5', '-1', 'soon', '1'.repeat(13)]) {
+      expect(parseClaudeRateLimitHeaders({ 'anthropic-ratelimit-unified-7d-utilization': '0.1', 'anthropic-ratelimit-unified-7d-reset': badReset }), badReset)
+        .toEqual({ kind: 'window', window: 'weekly', remainingPercent: 90 });
+    }
+    expect(parseHeaderDecimal('0x1', { maxIntegerDigits: 1, maxFractionDigits: 6 })).toBeUndefined();
+    expect(parseHeaderDecimal('0.5', { maxIntegerDigits: 1, maxFractionDigits: 6 })).toBe(0.5);
     // A malformed reset timestamp drops only the timestamp, never the percentage.
     expect(parseClaudeRateLimitHeaders({ 'anthropic-ratelimit-unified-7d-utilization': '0.1', 'anthropic-ratelimit-unified-7d-reset': 'soon' }))
       .toEqual({ kind: 'window', window: 'weekly', remainingPercent: 90 });
@@ -308,17 +327,83 @@ describe('provider-quota cache / refresh policy', () => {
     expect(peekProviderQuota('app-c', CLAUDE_CFG)).toMatchObject({ kind: 'window', remainingPercent: 36.8 });
   });
 
-  it('Claude: a 429 that still carries the unified headers is a value (0% left), not a failure', async () => {
+  it('Claude: a 429 that still carries the unified headers is a value (0% left), and Retry-After beyond the TTL is respected', async () => {
     const calls = installTransport(() => ({
       status: 429,
-      headers: { ...CLAUDE_HEADERS, 'anthropic-ratelimit-unified-7d-utilization': '1', 'retry-after': '600' },
+      headers: { ...CLAUDE_HEADERS, 'anthropic-ratelimit-unified-7d-utilization': '1', 'retry-after': '3600' },
       body: '{"error":{"type":"rate_limit_error"}}',
     }));
     expect(await refreshProviderQuota('app-c', CLAUDE_CFG)).toMatchObject({ kind: 'window', remainingPercent: 0 });
-    now += PROVIDER_QUOTA_TTL_MS - 1;
+    now += PROVIDER_QUOTA_TTL_MS + 1;
+    for (let i = 0; i < 5; i++) { peekProviderQuota('app-c', CLAUDE_CFG); await refreshProviderQuota('app-c', CLAUDE_CFG); }
+    await flush();
+    expect(calls).toHaveLength(1); // still inside Retry-After: no second probe
+    now = 1_000_000_000 + 3600_000 - 1;
     peekProviderQuota('app-c', CLAUDE_CFG);
     await flush();
-    expect(calls).toHaveLength(1); // normal TTL, not Retry-After driven
+    expect(calls).toHaveLength(1);
+    now += 2;
+    peekProviderQuota('app-c', CLAUDE_CFG);
+    await flush();
+    expect(calls).toHaveLength(2);
+  });
+
+  it('Claude: a 429 with headers but a short Retry-After still waits the full TTL', async () => {
+    const calls = installTransport(() => ({
+      status: 429,
+      headers: { ...CLAUDE_HEADERS, 'retry-after': '60' },
+      body: '',
+    }));
+    expect(await refreshProviderQuota('app-c', CLAUDE_CFG)).toMatchObject({ remainingPercent: 36.8 });
+    now += 61_000;
+    peekProviderQuota('app-c', CLAUDE_CFG);
+    await flush();
+    expect(calls).toHaveLength(1);
+    now += PROVIDER_QUOTA_TTL_MS;
+    peekProviderQuota('app-c', CLAUDE_CFG);
+    await flush();
+    expect(calls).toHaveLength(2);
+  });
+
+  it('Claude: 401 / 403 / 500 / 529 carrying a plausible utilization header are failures, not values', async () => {
+    for (const status of [401, 403, 500, 529, 400, 503]) {
+      __resetProviderQuotaForTests();
+      __setProviderQuotaClockForTests(() => now);
+      const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+      const calls = installTransport(() => ({
+        status,
+        headers: { ...CLAUDE_HEADERS, 'anthropic-ratelimit-unified-7d-utilization': '0.2', 'retry-after': '30' },
+        body: '{"error":{"type":"authentication_error","message":"dummy-secret-marker"}}',
+      }));
+      expect(await refreshProviderQuota('app-c', CLAUDE_CFG), `status ${status}`).toBeNull();
+      expect(peekProviderQuota('app-c', CLAUDE_CFG), `status ${status}`).toBeNull();
+      now += PROVIDER_QUOTA_FAILURE_BACKOFF_MS - 1;
+      peekProviderQuota('app-c', CLAUDE_CFG);
+      await flush();
+      expect(calls, `status ${status}`).toHaveLength(1); // backoff, not a value
+      const all = warn.mock.calls.flat().map(String).join('\n');
+      expect(all).toContain(`HTTP ${status}, retry after 30s`);
+      expect(all).not.toContain('dummy-secret-marker');
+      expect(all).not.toContain('0.2');
+      warn.mockRestore();
+    }
+  });
+
+  it('Claude: 429 without usable headers stays hidden and honors Retry-After', async () => {
+    const calls = installTransport(() => ({
+      status: 429,
+      headers: { 'anthropic-ratelimit-unified-7d-utilization': '0x1', 'retry-after': '1800' },
+      body: '',
+    }));
+    expect(await refreshProviderQuota('app-c', CLAUDE_CFG)).toBeNull();
+    now += 1800_000 - 1;
+    peekProviderQuota('app-c', CLAUDE_CFG);
+    await flush();
+    expect(calls).toHaveLength(1);
+    now += 2;
+    peekProviderQuota('app-c', CLAUDE_CFG);
+    await flush();
+    expect(calls).toHaveLength(2);
   });
 
   it('Claude: a 200 without the unified headers is "no usable quota" → hidden + backoff', async () => {
