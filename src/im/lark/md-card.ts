@@ -32,6 +32,7 @@ import {
 } from './reply-card-footer-signature.js';
 import { buildFeedbackElement } from './skill-feedback-card.js';
 import type { FeedbackPolicy } from '../../services/feedback-policy.js';
+import type { ProviderQuota } from '../../services/provider-quota.js';
 
 export { REPLY_CARD_FOOTER_MARKER } from './reply-card-footer-signature.js';
 
@@ -64,6 +65,65 @@ export interface CardUsageSnapshot {
   model?: string;
   /** Latest executor-reported reasoning effort. */
   reasoningEffort?: string;
+  /** Account-level quota for the bot's credential (DeepSeek balance /
+   *  subscription weekly window). Read from an in-memory cache, never
+   *  estimated; absent or null renders nothing. */
+  quota?: ProviderQuota | null;
+}
+
+/** Currency symbols for the balance segment; anything else renders as
+ *  `amount CODE`. */
+const QUOTA_CURRENCY_SYMBOLS: Readonly<Record<string, string>> = {
+  CNY: '¥',
+  USD: '$',
+};
+
+/** Format the account quota as one compact segment (`余额 ¥472.34` /
+ *  `周额度剩 92%`). Returns null for a missing or malformed quota so the caller
+ *  omits it like any other missing metric. */
+export function cardQuotaSegment(
+  quota: ProviderQuota | null | undefined,
+  locale?: Locale,
+): string | null {
+  if (!quota || typeof quota !== 'object') return null;
+  if (quota.kind === 'balance') {
+    if (typeof quota.amount !== 'number' || !Number.isFinite(quota.amount)) return null;
+    const code = typeof quota.currency === 'string' ? quota.currency.trim().toUpperCase() : '';
+    if (!code) return null;
+    const amount = quota.amount.toFixed(2);
+    const symbol = QUOTA_CURRENCY_SYMBOLS[code];
+    const money = symbol ? `${symbol}${amount}` : `${amount}\u00a0${code}`;
+    return `${t('card.usage.balance', undefined, locale)} ${money}`;
+  }
+  if (quota.kind === 'window' && quota.window === 'weekly' && isNonNegativeFinite(quota.remainingPercent)) {
+    const pct = Math.round(Math.min(100, quota.remainingPercent));
+    return `${t('card.usage.weekly_left', undefined, locale)} ${pct}%`;
+  }
+  return null;
+}
+
+/** Validate an untrusted (IPC / JSON) quota value into a {@link ProviderQuota}
+ *  or null. Shared by the CLI send path so a daemon of a different version
+ *  can never inject an unrenderable shape. */
+export function normalizeProviderQuota(value: unknown): ProviderQuota | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  if (raw.kind === 'balance') {
+    if (typeof raw.currency !== 'string' || !raw.currency.trim()) return null;
+    if (typeof raw.amount !== 'number' || !Number.isFinite(raw.amount)) return null;
+    return { kind: 'balance', currency: raw.currency.trim().toUpperCase(), amount: raw.amount };
+  }
+  if (raw.kind === 'window') {
+    if (raw.window !== 'weekly') return null;
+    if (!isNonNegativeFinite(raw.remainingPercent)) return null;
+    return {
+      kind: 'window',
+      window: 'weekly',
+      remainingPercent: Math.min(100, raw.remainingPercent),
+      ...(isNonNegativeFinite(raw.resetsAt) ? { resetsAt: raw.resetsAt } : {}),
+    };
+  }
+  return null;
 }
 
 export interface ReplyCardFooter {
@@ -367,8 +427,11 @@ export function cardUsageFooterSegment(
     parts.push(`${t('card.usage.context', undefined, locale)} ${used}${suffix}`);
   }
   // Footer variant is context-only (keeps the cramped reply-card footer clean);
-  // the token breakdown below is streaming-only.
+  // the token breakdown below is streaming-only. The account quota segment is
+  // short and rendered in both variants.
   if (variant !== 'streaming') {
+    const quotaSeg = cardQuotaSegment(usage.quota, locale);
+    if (quotaSeg) parts.push(quotaSeg);
     return parts.length > 0 ? parts.join(' · ') : null;
   }
   // Per-turn delta (streaming only): small ↑↓ for the latest turn, labelled 本轮.
@@ -395,6 +458,10 @@ export function cardUsageFooterSegment(
       + `↑${compactTokenCount(usage.tokens.in)} ↓${compactTokenCount(usage.tokens.out)}`,
     );
   }
+  // Account quota (balance / weekly window) sits after the token metrics and
+  // before the runtime tail. Missing or unparseable → omitted, never estimated.
+  const quotaSeg = cardQuotaSegment(usage.quota, locale);
+  if (quotaSeg) parts.push(quotaSeg);
   // Runtime identity is formatted separately by cardUsageRuntimeSegment, then
   // the streaming card appends it to this metric string with ` · ` in one
   // continuous markdown paragraph. Keep this function metric-only so reply-card

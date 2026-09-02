@@ -19,8 +19,10 @@ import {
   buildContextualReplyCard,
   buildReplyCardFooter,
   brandFooterSegment,
+  cardQuotaSegment,
   cardUsageFooterSegment,
   cardUsageRuntimeSegment,
+  normalizeProviderQuota,
   DEFAULT_BRAND_LABEL,
   hasMarkdown,
   normalizeLocalHomeLinks,
@@ -753,6 +755,68 @@ describe('buildMarkdownCard', () => {
     );
     expect(seg).toBe('上下文 80.7K/258.4K (31%) · 累计 ↑1.4M ↓7.8K');
     expect(seg).not.toContain('GPT-5.6-Sol');
+  });
+
+  it('streaming variant appends the account balance after the token metrics', () => {
+    const seg = cardUsageFooterSegment(
+      {
+        context: { usedTokens: 80_700, windowTokens: 258_400, percentUsed: 31 },
+        tokens: { in: 1_400_000, out: 7_800 },
+        quota: { kind: 'balance', currency: 'CNY', amount: 472.34 },
+      },
+      'zh',
+      'streaming',
+    );
+    expect(seg).toBe('上下文 80.7K/258.4K (31%) · 累计 ↑1.4M ↓7.8K · 余额 ¥472.34');
+  });
+
+  it('streaming variant appends the weekly window remaining (rounded)', () => {
+    const seg = cardUsageFooterSegment(
+      {
+        context: { usedTokens: 10_000, windowTokens: 200_000, percentUsed: 5 },
+        tokens: { in: 100, out: 50 },
+        quota: { kind: 'window', window: 'weekly', remainingPercent: 36.8, resetsAt: 1 },
+      },
+      'en',
+      'streaming',
+    );
+    expect(seg).toBe('Context 10K/200K (5%) · Total ↑100 ↓50 · Weekly left 37%');
+  });
+
+  it('quota alone still renders (no native metrics yet) and USD / unknown currencies format sanely', () => {
+    expect(cardUsageFooterSegment(
+      { context: null, tokens: null, quota: { kind: 'window', window: 'weekly', remainingPercent: 92 } },
+      'zh',
+      'streaming',
+    )).toBe('周额度剩 92%');
+    expect(cardQuotaSegment({ kind: 'balance', currency: 'USD', amount: 3 }, 'zh')).toBe('余额 $3.00');
+    expect(cardQuotaSegment({ kind: 'balance', currency: 'EUR', amount: 3.456 }, 'en')).toBe('Balance 3.46\u00a0EUR');
+  });
+
+  it('reply-card footer variant carries the quota too, and hides malformed quota values', () => {
+    expect(cardUsageFooterSegment(
+      {
+        context: { usedTokens: 12_345, windowTokens: 100_000 },
+        tokens: null,
+        quota: { kind: 'balance', currency: 'CNY', amount: 5 },
+      },
+      'zh',
+    )).toBe('上下文 12.3K/100K · 余额 ¥5.00');
+    expect(cardQuotaSegment(null)).toBeNull();
+    expect(cardQuotaSegment({ kind: 'balance', currency: 'CNY', amount: Number.NaN })).toBeNull();
+    expect(cardQuotaSegment({ kind: 'window', window: 'weekly', remainingPercent: Number.POSITIVE_INFINITY })).toBeNull();
+    expect(cardQuotaSegment({ kind: 'window', window: 'weekly', remainingPercent: -3 })).toBeNull();
+  });
+
+  it('normalizeProviderQuota accepts only a well-formed IPC quota', () => {
+    expect(normalizeProviderQuota({ kind: 'balance', currency: 'cny', amount: 1.5 }))
+      .toEqual({ kind: 'balance', currency: 'CNY', amount: 1.5 });
+    expect(normalizeProviderQuota({ kind: 'window', window: 'weekly', remainingPercent: 140, resetsAt: 5 }))
+      .toEqual({ kind: 'window', window: 'weekly', remainingPercent: 100, resetsAt: 5 });
+    expect(normalizeProviderQuota({ kind: 'window', window: '5h', remainingPercent: 1 })).toBeNull();
+    expect(normalizeProviderQuota({ kind: 'balance', currency: '', amount: 1 })).toBeNull();
+    expect(normalizeProviderQuota('余额 ¥1')).toBeNull();
+    expect(normalizeProviderQuota(null)).toBeNull();
   });
 
   it('cardUsageRuntimeSegment renders a compact model (bold) + effort tail', () => {

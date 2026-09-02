@@ -6670,7 +6670,8 @@ function normalizeCardUsageSnapshot(value: unknown): CardUsageSnapshot | null {
     }
   }
 
-  return { context, tokens };
+  const quota = normalizeProviderQuota(raw.quota);
+  return { context, tokens, ...(quota ? { quota } : {}) };
 }
 
 /** Prefer the resident daemon's incremental transcript cache. Older/offline
@@ -8418,6 +8419,7 @@ import {
   buildReplyCardFooter,
   prepareCardMarkdown,
   type CardUsageSnapshot,
+  normalizeProviderQuota,
   type LocalHomeLinkMode,
 } from './im/lark/md-card.js';
 import { buildFeedbackElement } from './im/lark/skill-feedback-card.js';

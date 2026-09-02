@@ -1262,6 +1262,8 @@ export const messages: Record<string, string> = {
   'card.usage.tokens': 'Token',
   'card.usage.turn': '本轮',
   'card.usage.total': '累计',
+  'card.usage.balance': '余额',
+  'card.usage.weekly_left': '周额度剩',
 
   // Adopt preamble card title
   'card.adopt_last_round': '📜 /adopt 前最后一轮',

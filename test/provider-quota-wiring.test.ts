@@ -1,0 +1,64 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { describe, expect, it } from 'vitest';
+
+/**
+ * Source-lock for the provider-quota → card wiring.
+ *
+ * The behavioral tests (provider-quota.test.ts, md-card.test.ts) cover the
+ * fetch/cache policy and the segment formatter. What they cannot exercise is
+ * the daemon glue: the two snapshot readers in worker-pool must attach the
+ * cached quota, and they must do so through the non-blocking peek (never an
+ * awaited fetch on the card render path). The CLI send path must pass the
+ * quota through its IPC normalizer. Each check is anchored to a unique line so
+ * reverting the wiring makes the assertion fail.
+ */
+function read(rel: string): string {
+  return readFileSync(resolve(rel), 'utf8');
+}
+
+function functionBody(source: string, signature: string): string {
+  const start = source.indexOf(signature);
+  if (start === -1) throw new Error(`signature not found: ${signature}`);
+  const end = source.indexOf('\n}', start);
+  return source.slice(start, end === -1 ? undefined : end + 2);
+}
+
+describe('provider-quota wiring (source lock)', () => {
+  const workerPool = read('src/core/worker-pool.ts');
+
+  it('streaming-card snapshot attaches the cached quota via the non-blocking peek', () => {
+    const body = functionBody(workerPool, 'export function getDaemonStreamingCardUsageSnapshot(');
+    expect(body).toContain('peekProviderQuotaForSession(ds)');
+    expect(body).toContain('...(quota ? { quota } : {})');
+    expect(body).not.toContain('await');
+  });
+
+  it('reply-card (footer mode) snapshot attaches the cached quota too', () => {
+    const body = functionBody(workerPool, 'export function getDaemonReplyCardUsageSnapshot(');
+    expect(body).toContain('peekProviderQuotaForSession(ds)');
+    expect(body).toContain('...(quota ? { quota } : {})');
+  });
+
+  it('the peek helper reads the bot config at call time and swallows failures', () => {
+    const body = functionBody(workerPool, 'function peekProviderQuotaForSession(ds: DaemonSession): ProviderQuota | null {');
+    expect(body).toContain('peekProviderQuota(ds.larkAppId, getBot(ds.larkAppId).config)');
+    expect(body).toContain('return null');
+  });
+
+  it('the streaming card renders the quota segment between token metrics and the runtime tail', () => {
+    const mdCard = read('src/im/lark/md-card.ts');
+    const body = functionBody(mdCard, 'export function cardUsageFooterSegment(');
+    const quotaAt = body.indexOf('cardQuotaSegment(usage.quota, locale)');
+    const totalAt = body.indexOf("t('card.usage.total'");
+    expect(quotaAt).toBeGreaterThan(-1);
+    expect(totalAt).toBeGreaterThan(-1);
+    expect(body.lastIndexOf('cardQuotaSegment(usage.quota, locale)')).toBeGreaterThan(totalAt);
+  });
+
+  it('the CLI send path normalizes the IPC quota instead of trusting it', () => {
+    const cli = read('src/cli.ts');
+    const body = functionBody(cli, 'function normalizeCardUsageSnapshot(value: unknown): CardUsageSnapshot | null {');
+    expect(body).toContain('normalizeProviderQuota(raw.quota)');
+  });
+});

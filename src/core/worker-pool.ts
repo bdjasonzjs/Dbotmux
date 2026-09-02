@@ -309,7 +309,19 @@ export function getDaemonReplyCardUsageSnapshot(
     // Missing runtime config → default 'streaming' → no footer usage.
     return { context: null, tokens: null };
   }
-  return getDaemonSessionUsageSnapshot(ds, effectiveCliId);
+  const quota = peekProviderQuotaForSession(ds);
+  return { ...getDaemonSessionUsageSnapshot(ds, effectiveCliId), ...(quota ? { quota } : {}) };
+}
+
+/** Account quota (DeepSeek balance / subscription weekly window) for the bot
+ *  that owns this session. Non-blocking: served from the provider-quota cache,
+ *  which refreshes itself in the background; any failure → null (hidden). */
+function peekProviderQuotaForSession(ds: DaemonSession): ProviderQuota | null {
+  try {
+    return peekProviderQuota(ds.larkAppId, getBot(ds.larkAppId).config);
+  } catch {
+    return null;
+  }
 }
 
 /** Streaming-card usage. Only the `'streaming'` display mode (the default)
@@ -354,10 +366,12 @@ export function getDaemonStreamingCardUsageSnapshot(
   // routing code for Relay-family CLIs (e.g. `ark/relay-code`).
   const grokModel = effectiveCliId === 'grok' ? snapshot.model?.trim() : undefined;
   const grokReasoningEffort = effectiveCliId === 'grok' ? snapshot.reasoningEffort?.trim() : undefined;
+  const quota = peekProviderQuotaForSession(ds);
   return {
     ...snapshot,
     ...(runtimeModel ? { model: runtimeModel } : grokModel ? { model: grokModel } : {}),
     ...(reasoningEffort ? { reasoningEffort } : grokReasoningEffort ? { reasoningEffort: grokReasoningEffort } : {}),
+    ...(quota ? { quota } : {}),
   };
 }
 
@@ -382,6 +396,7 @@ import {
 import { knownBotOpenIdsFromCrossRef, type BotMentionEntry } from '../utils/bot-routing.js';
 import { emitSessionLifecycleHook, emitSessionStateTransitionHook } from '../services/session-lifecycle-hooks.js';
 import { anchorUsageForDaemonSession, recordOwnershipForDaemonSession, recordUsageForDaemonSession, reconcileUsageForDaemonSession } from '../services/usage-ledger.js';
+import { peekProviderQuota, type ProviderQuota } from '../services/provider-quota.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { isStructuredBridgeAdoptCli } from '../services/structured-bridge-clis.js';
 import { resolveEffectivePluginIds } from './plugins/effective.js';
