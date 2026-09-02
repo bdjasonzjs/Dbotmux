@@ -3,7 +3,10 @@
  *
  * Three account-level facts, one per credential kind:
  *   - DeepSeek (pay-as-you-go API key)       → account balance (¥ / $)
- *   - Claude Code (claude.ai OAuth login)    → 7-day window remaining %
+ *   - Claude Code (claude.ai OAuth login)    → 7-day window remaining %, read
+ *     from the `anthropic-ratelimit-unified-7d-*` response headers of one
+ *     minimal (max_tokens=1) Messages call — the dedicated usage endpoint is
+ *     account-rate-limited by the CLI's own polling and answers 429 for hours.
  *   - Codex (ChatGPT login)                  → 7-day window remaining %
  *
  * Invariants (each one is guarded by a test in test/provider-quota.test.ts):
@@ -80,9 +83,16 @@ export interface ProviderQuotaTransportLimits {
   maxBodyBytes: number;
 }
 
+/** One outbound request. `headers` carries the credential — never log it. */
+export interface ProviderQuotaRequest {
+  url: string;
+  method: 'GET' | 'POST';
+  headers: Record<string, string>;
+  body?: string;
+}
+
 export type ProviderQuotaTransport = (
-  url: string,
-  headers: Record<string, string>,
+  request: ProviderQuotaRequest,
   limits: ProviderQuotaTransportLimits,
 ) => Promise<ProviderQuotaTransportResponse>;
 
@@ -107,7 +117,18 @@ export const PROVIDER_QUOTA_REQUEST_DEADLINE_MS = 15_000;
 export const PROVIDER_QUOTA_MAX_BODY_BYTES = 64 * 1024;
 
 const DEEPSEEK_BALANCE_URL = 'https://api.deepseek.com/user/balance';
-const CLAUDE_OAUTH_USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
+/** Minimal Messages call whose response headers carry the unified rate-limit
+ *  utilisation for the account (fractions 0–1 + epoch-second resets). ~10
+ *  tokens per probe, one probe per TTL. */
+const CLAUDE_USAGE_PROBE_URL = 'https://api.anthropic.com/v1/messages';
+const CLAUDE_USAGE_PROBE_MODEL = 'claude-haiku-4-5-20251001';
+const CLAUDE_USAGE_PROBE_BODY = JSON.stringify({
+  model: CLAUDE_USAGE_PROBE_MODEL,
+  max_tokens: 1,
+  messages: [{ role: 'user', content: 'hi' }],
+});
+const CLAUDE_7D_UTILIZATION_HEADER = 'anthropic-ratelimit-unified-7d-utilization';
+const CLAUDE_7D_RESET_HEADER = 'anthropic-ratelimit-unified-7d-reset';
 const CODEX_USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage';
 const WEEK_SECONDS = 7 * 24 * 3600;
 
@@ -122,6 +143,8 @@ const FINGERPRINT_SALT = randomBytes(32);
 interface SourceSpec {
   provider: ProviderQuotaProvider;
   url: string;
+  method: 'GET' | 'POST';
+  body?: string;
   configIdentity: string;
   credential:
     | { kind: 'inline'; headers: Record<string, string> }
@@ -133,6 +156,8 @@ interface SourceSpec {
 interface ResolvedSource {
   provider: ProviderQuotaProvider;
   url: string;
+  method: 'GET' | 'POST';
+  body?: string;
   headers: Record<string, string>;
   /** provider + salted fingerprint of the credential material. */
   identity: string;
@@ -331,6 +356,7 @@ function resolveSourceSpec(config: ProviderQuotaBotConfig | undefined): SourceSp
     return {
       provider: 'deepseek',
       url: DEEPSEEK_BALANCE_URL,
+      method: 'GET',
       configIdentity: `deepseek:${fingerprint(deepseekKey)}`,
       credential: { kind: 'inline', headers: { Authorization: `Bearer ${deepseekKey}` } },
     };
@@ -343,7 +369,9 @@ function resolveSourceSpec(config: ProviderQuotaBotConfig | undefined): SourceSp
     if (token) {
       return {
         provider: 'claude-oauth',
-        url: CLAUDE_OAUTH_USAGE_URL,
+        url: CLAUDE_USAGE_PROBE_URL,
+        method: 'POST',
+        body: CLAUDE_USAGE_PROBE_BODY,
         configIdentity: `claude-oauth:${fingerprint(token)}`,
         credential: { kind: 'inline', headers: claudeHeaders(token) },
       };
@@ -354,7 +382,9 @@ function resolveSourceSpec(config: ProviderQuotaBotConfig | undefined): SourceSp
     const path = join(configDir, '.credentials.json');
     return {
       provider: 'claude-oauth',
-      url: CLAUDE_OAUTH_USAGE_URL,
+      url: CLAUDE_USAGE_PROBE_URL,
+      method: 'POST',
+      body: CLAUDE_USAGE_PROBE_BODY,
       configIdentity: `claude-oauth:file:${path}`,
       credential: { kind: 'file', path },
     };
@@ -367,6 +397,7 @@ function resolveSourceSpec(config: ProviderQuotaBotConfig | undefined): SourceSp
     return {
       provider: 'codex-chatgpt',
       url: CODEX_USAGE_URL,
+      method: 'GET',
       configIdentity: `codex-chatgpt:file:${path}`,
       credential: { kind: 'file', path },
     };
@@ -378,6 +409,8 @@ function claudeHeaders(token: string): Record<string, string> {
   return {
     Authorization: `Bearer ${token}`,
     'anthropic-beta': 'oauth-2025-04-20',
+    'anthropic-version': '2023-06-01',
+    'content-type': 'application/json',
     Accept: 'application/json',
   };
 }
@@ -389,6 +422,8 @@ async function loadSource(spec: SourceSpec): Promise<ResolvedSource | null> {
     return {
       provider: spec.provider,
       url: spec.url,
+      method: spec.method,
+      ...(spec.body !== undefined ? { body: spec.body } : {}),
       headers: spec.credential.headers,
       identity: spec.configIdentity,
     };
@@ -408,6 +443,8 @@ async function loadSource(spec: SourceSpec): Promise<ResolvedSource | null> {
     return {
       provider: spec.provider,
       url: spec.url,
+      method: spec.method,
+      ...(spec.body !== undefined ? { body: spec.body } : {}),
       headers: claudeHeaders(token),
       identity: `claude-oauth:${fingerprint(token)}`,
     };
@@ -424,6 +461,7 @@ async function loadSource(spec: SourceSpec): Promise<ResolvedSource | null> {
   return {
     provider: spec.provider,
     url: spec.url,
+    method: spec.method,
     headers: {
       Authorization: `Bearer ${accessToken}`,
       'ChatGPT-Account-Id': accountId,
@@ -460,7 +498,12 @@ async function refreshEntry(larkAppId: string, entry: CacheEntry, spec: SourceSp
 
   let res: ProviderQuotaTransportResponse;
   try {
-    res = await transport(source.url, source.headers, {
+    res = await transport({
+      url: source.url,
+      method: source.method,
+      headers: source.headers,
+      ...(source.body !== undefined ? { body: source.body } : {}),
+    }, {
       timeoutMs: PROVIDER_QUOTA_REQUEST_TIMEOUT_MS,
       deadlineMs: PROVIDER_QUOTA_REQUEST_DEADLINE_MS,
       maxBodyBytes: PROVIDER_QUOTA_MAX_BODY_BYTES,
@@ -472,6 +515,15 @@ async function refreshEntry(larkAppId: string, entry: CacheEntry, spec: SourceSp
     return;
   }
   if (!isLive(larkAppId, live)) return;
+  // Claude reports utilisation in response headers on every answer — including
+  // a 429 at the limit — so a header hit is a success regardless of status.
+  if (spec.provider === 'claude-oauth') {
+    const fromHeaders = parseClaudeRateLimitHeaders(res.headers);
+    if (fromHeaders) {
+      commitQuota(live, fromHeaders);
+      return;
+    }
+  }
   if (res.status !== 200) {
     const retryAfterMs = parseRetryAfterMs(res.headers['retry-after']);
     live.nextAttemptAt = clock() + Math.max(PROVIDER_QUOTA_FAILURE_BACKOFF_MS, retryAfterMs ?? 0);
@@ -495,13 +547,17 @@ async function refreshEntry(larkAppId: string, entry: CacheEntry, spec: SourceSp
     logger.warn(`${tag} response had no usable quota field`);
     return;
   }
+  commitQuota(live, quota);
+}
+
+function commitQuota(entry: CacheEntry, quota: ProviderQuota): void {
   const now = clock();
-  live.quota = quota;
-  live.fetchedAt = now;
-  live.nextAttemptAt = now + PROVIDER_QUOTA_TTL_MS;
+  entry.quota = quota;
+  entry.fetchedAt = now;
+  entry.nextAttemptAt = now + PROVIDER_QUOTA_TTL_MS;
   // The loader just fingerprinted the credential; start the rotation-probe
   // cadence from here rather than probing again on the very next peek.
-  live.lastProbeAt = now;
+  entry.lastProbeAt = now;
 }
 
 /** Error class names that may appear in a log line. Anything else — including
@@ -571,7 +627,8 @@ export function parseProviderQuota(
   if (!body || typeof body !== 'object') return null;
   switch (provider) {
     case 'deepseek': return parseDeepSeekBalance(body as Record<string, unknown>);
-    case 'claude-oauth': return parseClaudeOauthUsage(body as Record<string, unknown>);
+    // Claude's quota lives in response headers, never in a body.
+    case 'claude-oauth': return null;
     case 'codex-chatgpt': return parseCodexUsage(body as Record<string, unknown>);
     default: return null;
   }
@@ -593,22 +650,21 @@ function parseDeepSeekBalance(body: Record<string, unknown>): ProviderQuota | nu
   return { kind: 'balance', currency: pick.currency, amount: pick.amount };
 }
 
-/** `GET /api/oauth/usage` → `{ five_hour: {utilization, resets_at}, seven_day: {…}, … }`
- *  (`utilization` is the used share in percent). Only the 7-day window is rendered. */
-function parseClaudeOauthUsage(body: Record<string, unknown>): ProviderQuota | null {
-  const week = body.seven_day;
-  if (!week || typeof week !== 'object') return null;
-  const w = week as Record<string, unknown>;
-  const used = percentInRange(w.utilization);
-  if (used === undefined) return null;
-  const resetsAt = typeof w.resets_at === 'string' ? Date.parse(w.resets_at)
-    : typeof w.resets_at === 'number' ? w.resets_at * 1000
-    : Number.NaN;
+/** `anthropic-ratelimit-unified-7d-utilization` is the used share of the 7-day
+ *  window as a fraction 0–1; `…-7d-reset` is an epoch-second timestamp. Present
+ *  on every Messages response for a claude.ai login (including 429s). Exported
+ *  for unit tests. */
+export function parseClaudeRateLimitHeaders(
+  headers: Record<string, string | undefined>,
+): ProviderQuota | null {
+  const used = finiteNumber(headers[CLAUDE_7D_UTILIZATION_HEADER]);
+  if (used === undefined || used < 0 || used > 1) return null;
+  const reset = finiteNumber(headers[CLAUDE_7D_RESET_HEADER]);
   return {
     kind: 'window',
     window: 'weekly',
-    remainingPercent: 100 - used,
-    ...(Number.isFinite(resetsAt) && resetsAt >= 0 ? { resetsAt } : {}),
+    remainingPercent: Math.round((100 - used * 100) * 100) / 100,
+    ...(reset !== undefined && reset >= 0 ? { resetsAt: reset * 1000 } : {}),
   };
 }
 
@@ -661,19 +717,24 @@ class TransportError extends Error {
 }
 
 function defaultTransport(
-  url: string,
-  headers: Record<string, string>,
+  request: ProviderQuotaRequest,
   limits: ProviderQuotaTransportLimits,
 ): Promise<ProviderQuotaTransportResponse> {
   return new Promise((resolve, reject) => {
-    const target = new URL(url);
+    const target = new URL(request.url);
+    const { headers } = request;
+    const body = request.body !== undefined ? Buffer.from(request.body, 'utf8') : undefined;
     const isHttps = target.protocol === 'https:';
     const doRequest = isHttps ? httpsRequest : httpRequest;
     let settled = false;
     const finish = (fn: () => void) => { if (!settled) { settled = true; fn(); } };
     const req = doRequest(target, {
-      method: 'GET',
-      headers: { 'User-Agent': 'botmux-provider-quota', ...headers },
+      method: request.method,
+      headers: {
+        'User-Agent': 'botmux-provider-quota',
+        ...(body ? { 'content-length': String(body.length) } : {}),
+        ...headers,
+      },
       agent: isHttps ? outboundAgent() : undefined,
       timeout: limits.timeoutMs,
     }, (res: IncomingMessage) => {
@@ -701,6 +762,7 @@ function defaultTransport(
     req.on('timeout', () => { req.destroy(new TransportError('ERR_SOCKET_TIMEOUT')); });
     req.on('error', error => finish(() => reject(error)));
     req.on('close', () => { clearTimeout(deadline); });
+    if (body) req.write(body);
     req.end();
   });
 }

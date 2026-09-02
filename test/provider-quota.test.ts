@@ -22,6 +22,7 @@ import {
   __setProviderQuotaFileReaderForTests,
   __setProviderQuotaTransportForTests,
   describeProviderQuotaSource,
+  parseClaudeRateLimitHeaders,
   parseProviderQuota,
   peekProviderQuota,
   refreshProviderQuota,
@@ -48,11 +49,18 @@ const CODEX_BODY = JSON.stringify({
   },
 });
 
-const CLAUDE_BODY = JSON.stringify({
-  five_hour: { utilization: 37.5, resets_at: '2026-09-02T04:00:00Z' },
-  seven_day: { utilization: 63.2, resets_at: '2026-09-05T12:00:00Z' },
-  seven_day_opus: { utilization: 10, resets_at: '2026-09-05T12:00:00Z' },
-});
+/** Real header shape observed 2026-09-02 on a max_tokens=1 Messages call. */
+const CLAUDE_HEADERS: Record<string, string> = {
+  'anthropic-ratelimit-unified-status': 'allowed',
+  'anthropic-ratelimit-unified-5h-utilization': '0.4',
+  'anthropic-ratelimit-unified-5h-reset': '1788322800',
+  'anthropic-ratelimit-unified-7d-status': 'allowed',
+  'anthropic-ratelimit-unified-7d-utilization': '0.632',
+  'anthropic-ratelimit-unified-7d-reset': '1788537600',
+  'request-id': 'req_test',
+};
+const CLAUDE_BODY = '{"id":"msg_test","type":"message","content":[{"type":"text","text":"Hello"}],"stop_reason":"max_tokens"}';
+const CLAUDE_QUOTA = { kind: 'window', window: 'weekly', remainingPercent: 36.8, resetsAt: 1788537600_000 };
 
 const DEEPSEEK_QUOTA = { kind: 'balance', currency: 'CNY', amount: 472.34 };
 const CODEX_QUOTA = { kind: 'window', window: 'weekly', remainingPercent: 92, resetsAt: 1788803049_000 };
@@ -68,14 +76,14 @@ function ok(body: string, headers: Record<string, string> = {}): ProviderQuotaTr
   return { status: 200, headers, body };
 }
 
-interface Call { url: string; headers: Record<string, string> }
+interface Call { url: string; method: string; headers: Record<string, string>; body?: string }
 
 function installTransport(
   respond: (call: Call) => ProviderQuotaTransportResponse | Promise<ProviderQuotaTransportResponse>,
 ): Call[] {
   const calls: Call[] = [];
-  __setProviderQuotaTransportForTests(async (url, headers) => {
-    const call = { url, headers };
+  __setProviderQuotaTransportForTests(async request => {
+    const call: Call = { url: request.url, method: request.method, headers: request.headers, ...(request.body !== undefined ? { body: request.body } : {}) };
     calls.push(call);
     return respond(call);
   });
@@ -146,25 +154,33 @@ describe('provider-quota parsers', () => {
     expect(parseProviderQuota('codex-chatgpt', { rate_limit: null })).toBeNull();
   });
 
-  it('Claude OAuth: renders the seven_day window only', () => {
-    expect(parseProviderQuota('claude-oauth', JSON.parse(CLAUDE_BODY)))
-      .toEqual({ kind: 'window', window: 'weekly', remainingPercent: 36.8, resetsAt: Date.parse('2026-09-05T12:00:00Z') });
-    expect(parseProviderQuota('claude-oauth', { seven_day: { utilization: 0 } }))
+  it('Claude: the 7-day window comes from the unified rate-limit response headers (fraction → remaining %)', () => {
+    expect(parseClaudeRateLimitHeaders(CLAUDE_HEADERS)).toEqual(CLAUDE_QUOTA);
+    expect(parseClaudeRateLimitHeaders({ 'anthropic-ratelimit-unified-7d-utilization': '0' }))
       .toEqual({ kind: 'window', window: 'weekly', remainingPercent: 100 });
-    expect(parseProviderQuota('claude-oauth', { seven_day: { utilization: 100 } }))
-      .toEqual({ kind: 'window', window: 'weekly', remainingPercent: 0 });
-    expect(parseProviderQuota('claude-oauth', { five_hour: { utilization: 1 } })).toBeNull();
+    expect(parseClaudeRateLimitHeaders({ 'anthropic-ratelimit-unified-7d-utilization': '1', 'anthropic-ratelimit-unified-7d-reset': '5' }))
+      .toEqual({ kind: 'window', window: 'weekly', remainingPercent: 0, resetsAt: 5000 });
+    expect(parseClaudeRateLimitHeaders({ 'anthropic-ratelimit-unified-7d-utilization': '0.1' }))
+      .toEqual({ kind: 'window', window: 'weekly', remainingPercent: 90 });
+    // Only the 5h header, or no headers at all → nothing to show.
+    expect(parseClaudeRateLimitHeaders({ 'anthropic-ratelimit-unified-5h-utilization': '0.4' })).toBeNull();
+    expect(parseClaudeRateLimitHeaders({})).toBeNull();
+    // A body is never a Claude quota source.
+    expect(parseProviderQuota('claude-oauth', { seven_day: { utilization: 10 } })).toBeNull();
   });
 
   it('out-of-range or non-finite used percentages are rejected, never clamped', () => {
     for (const bad of [-20, 130, 100.01, -0.01, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 'NaN', 'Infinity', '-5', '', null, true]) {
-      expect(parseProviderQuota('claude-oauth', { seven_day: { utilization: bad } }), `claude ${String(bad)}`).toBeNull();
       expect(parseProviderQuota('codex-chatgpt', {
         rate_limit: { primary_window: { used_percent: bad, limit_window_seconds: 604800, reset_at: 1 } },
       }), `codex ${String(bad)}`).toBeNull();
     }
+    // Claude's header is a fraction: anything outside [0, 1] is malformed.
+    for (const bad of ['-0.01', '1.01', '40', 'NaN', 'Infinity', '', 'allowed']) {
+      expect(parseClaudeRateLimitHeaders({ 'anthropic-ratelimit-unified-7d-utilization': bad }), `claude ${bad}`).toBeNull();
+    }
     // A malformed reset timestamp drops only the timestamp, never the percentage.
-    expect(parseProviderQuota('claude-oauth', { seven_day: { utilization: 10, resets_at: 'soon' } }))
+    expect(parseClaudeRateLimitHeaders({ 'anthropic-ratelimit-unified-7d-utilization': '0.1', 'anthropic-ratelimit-unified-7d-reset': 'soon' }))
       .toEqual({ kind: 'window', window: 'weekly', remainingPercent: 90 });
   });
 });
@@ -268,6 +284,9 @@ describe('provider-quota cache / refresh policy', () => {
     expect(await refreshProviderQuota('app-c', CLAUDE_CFG)).toBeNull();
     expect(calls).toHaveLength(1);
     expect(calls[0]!.headers['anthropic-beta']).toBe('oauth-2025-04-20');
+    expect(calls[0]!.method).toBe('POST');
+    expect(calls[0]!.url).toBe('https://api.anthropic.com/v1/messages');
+    expect(JSON.parse(calls[0]!.body!)).toEqual({ model: 'claude-haiku-4-5-20251001', max_tokens: 1, messages: [{ role: 'user', content: 'hi' }] });
     now += 3565_000 - 1;
     peekProviderQuota('app-c', CLAUDE_CFG);
     await flush();
@@ -281,12 +300,34 @@ describe('provider-quota cache / refresh policy', () => {
   it('clamps an absurd Retry-After to the maximum', async () => {
     installTransport(() => ({ status: 429, headers: { 'retry-after': String(30 * 24 * 3600) }, body: '' }));
     await refreshProviderQuota('app-c', CLAUDE_CFG);
-    const calls = installTransport(() => ok(CLAUDE_BODY));
+    const calls = installTransport(() => ok(CLAUDE_BODY, CLAUDE_HEADERS));
     now += PROVIDER_QUOTA_MAX_RETRY_AFTER_MS + 1;
     peekProviderQuota('app-c', CLAUDE_CFG);
     await flush();
     expect(calls).toHaveLength(1);
     expect(peekProviderQuota('app-c', CLAUDE_CFG)).toMatchObject({ kind: 'window', remainingPercent: 36.8 });
+  });
+
+  it('Claude: a 429 that still carries the unified headers is a value (0% left), not a failure', async () => {
+    const calls = installTransport(() => ({
+      status: 429,
+      headers: { ...CLAUDE_HEADERS, 'anthropic-ratelimit-unified-7d-utilization': '1', 'retry-after': '600' },
+      body: '{"error":{"type":"rate_limit_error"}}',
+    }));
+    expect(await refreshProviderQuota('app-c', CLAUDE_CFG)).toMatchObject({ kind: 'window', remainingPercent: 0 });
+    now += PROVIDER_QUOTA_TTL_MS - 1;
+    peekProviderQuota('app-c', CLAUDE_CFG);
+    await flush();
+    expect(calls).toHaveLength(1); // normal TTL, not Retry-After driven
+  });
+
+  it('Claude: a 200 without the unified headers is "no usable quota" → hidden + backoff', async () => {
+    const calls = installTransport(() => ok(CLAUDE_BODY, { 'request-id': 'req_x' }));
+    expect(await refreshProviderQuota('app-c', CLAUDE_CFG)).toBeNull();
+    now += PROVIDER_QUOTA_FAILURE_BACKOFF_MS - 1;
+    peekProviderQuota('app-c', CLAUDE_CFG);
+    await flush();
+    expect(calls).toHaveLength(1);
   });
 
   it('transport exceptions and non-JSON bodies degrade to null with backoff', async () => {
@@ -303,10 +344,10 @@ describe('provider-quota cache / refresh policy', () => {
   });
 
   it('an out-of-range upstream percentage is a failure (hidden + backoff), not a clamped value', async () => {
-    let used = 140;
-    const calls = installTransport(() => ok(JSON.stringify({ seven_day: { utilization: used } })));
+    let used = '1.4';
+    const calls = installTransport(() => ok(CLAUDE_BODY, { ...CLAUDE_HEADERS, 'anthropic-ratelimit-unified-7d-utilization': used }));
     expect(await refreshProviderQuota('app-c', CLAUDE_CFG)).toBeNull();
-    used = -3;
+    used = '-0.03';
     now += PROVIDER_QUOTA_FAILURE_BACKOFF_MS - 1;
     peekProviderQuota('app-c', CLAUDE_CFG);
     await flush();
@@ -331,13 +372,13 @@ describe('provider-quota cache / refresh policy', () => {
 
 describe('provider-quota source identity (no cross-account leakage)', () => {
   it('provider A → B on the same bot: old quota is dropped, null until B answers, B is fetched', async () => {
-    const calls = installTransport(call => (call.url.includes('deepseek') ? ok(DEEPSEEK_BODY) : ok(CLAUDE_BODY)));
+    const calls = installTransport(call => (call.url.includes('deepseek') ? ok(DEEPSEEK_BODY) : ok(CLAUDE_BODY, CLAUDE_HEADERS)));
     await refreshProviderQuota('same-app', DS_CFG);
     expect(peekProviderQuota('same-app', DS_CFG)).toEqual(DEEPSEEK_QUOTA);
     // Config switches to Claude (well inside the DeepSeek TTL / grace).
     expect(peekProviderQuota('same-app', CLAUDE_CFG)).toBeNull();
     await flush();
-    expect(calls.map(c => c.url)).toEqual(['https://api.deepseek.com/user/balance', 'https://api.anthropic.com/api/oauth/usage']);
+    expect(calls.map(c => c.url)).toEqual(['https://api.deepseek.com/user/balance', 'https://api.anthropic.com/v1/messages']);
     expect(peekProviderQuota('same-app', CLAUDE_CFG)).toMatchObject({ kind: 'window', remainingPercent: 36.8 });
     // And back: the DeepSeek entry was discarded, so it is fetched again rather than replayed.
     expect(peekProviderQuota('same-app', DS_CFG)).toBeNull();
@@ -472,7 +513,7 @@ describe('provider-quota source identity (no cross-account leakage)', () => {
     const oldGate = new Promise<void>(r => { releaseOld = r; });
     const calls = installTransport(async call => {
       if (call.headers.Authorization === 'Bearer sk-test') { await oldGate; return ok(DEEPSEEK_BODY); }
-      return ok(CLAUDE_BODY);
+      return ok(CLAUDE_BODY, CLAUDE_HEADERS);
     });
     expect(peekProviderQuota('same-app', DS_CFG)).toBeNull(); // old request in flight
     await flush();
@@ -626,10 +667,30 @@ describe('provider-quota bounded default transport', () => {
       res.statusCode = 429;
       res.end(JSON.stringify({ seen: req.headers.authorization }));
     });
-    const res = await __defaultProviderQuotaTransportForTests(`${base}/x`, { Authorization: 'Bearer t' }, { timeoutMs: 2000, deadlineMs: 4000, maxBodyBytes: 65536 });
+    const res = await __defaultProviderQuotaTransportForTests({ url: `${base}/x`, method: 'GET', headers: { Authorization: 'Bearer t' } }, { timeoutMs: 2000, deadlineMs: 4000, maxBodyBytes: 65536 });
     expect(res.status).toBe(429);
     expect(res.headers['retry-after']).toBe('7');
     expect(JSON.parse(res.body)).toEqual({ seen: 'Bearer t' });
+  });
+
+  it('sends a POST body with content-length and returns the response headers', async () => {
+    let seen: { method?: string; body?: string; len?: string } = {};
+    const base = await listen((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on('data', c => chunks.push(c));
+      req.on('end', () => {
+        seen = { method: req.method, body: Buffer.concat(chunks).toString(), len: String(req.headers['content-length']) };
+        res.setHeader('anthropic-ratelimit-unified-7d-utilization', '0.1');
+        res.statusCode = 200;
+        res.end('{}');
+      });
+    });
+    const res = await __defaultProviderQuotaTransportForTests(
+      { url: `${base}/v1/messages`, method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"max_tokens":1}' },
+      { timeoutMs: 2000, deadlineMs: 4000, maxBodyBytes: 65536 },
+    );
+    expect(seen).toEqual({ method: 'POST', body: '{"max_tokens":1}', len: '16' });
+    expect(res.headers['anthropic-ratelimit-unified-7d-utilization']).toBe('0.1');
   });
 
   it('aborts a response larger than the body cap', async () => {
@@ -639,7 +700,7 @@ describe('provider-quota bounded default transport', () => {
       res.write(Buffer.alloc(40_000, 0x62));
       res.end();
     });
-    await expect(__defaultProviderQuotaTransportForTests(`${base}/big`, {}, { timeoutMs: 2000, deadlineMs: 4000, maxBodyBytes: 65536 }))
+    await expect(__defaultProviderQuotaTransportForTests({ url: `${base}/big`, method: 'GET', headers: {} }, { timeoutMs: 2000, deadlineMs: 4000, maxBodyBytes: 65536 }))
       .rejects.toMatchObject({ code: 'ERR_BODY_TOO_LARGE' });
   });
 
@@ -650,7 +711,7 @@ describe('provider-quota bounded default transport', () => {
       res.on('close', () => clearInterval(timer));
     });
     const started = Date.now();
-    await expect(__defaultProviderQuotaTransportForTests(`${base}/slow`, {}, { timeoutMs: 5000, deadlineMs: 300, maxBodyBytes: 65536 }))
+    await expect(__defaultProviderQuotaTransportForTests({ url: `${base}/slow`, method: 'GET', headers: {} }, { timeoutMs: 5000, deadlineMs: 300, maxBodyBytes: 65536 }))
       .rejects.toMatchObject({ code: 'ERR_DEADLINE' });
     expect(Date.now() - started).toBeLessThan(3000);
   });
