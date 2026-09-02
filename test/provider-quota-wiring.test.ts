@@ -70,6 +70,26 @@ describe('provider-quota wiring (source lock)', () => {
     }
   });
 
+  it('the log label is built from fixed value sets, not from format regexes over name/code', () => {
+    const src = read('src/services/provider-quota.ts');
+    const body = functionBody(src, 'export function safeErrorLabel(error: unknown): string {');
+    expect(body).toContain('LOG_SAFE_ERROR_NAMES.has(error.name)');
+    expect(body).toContain('LOG_SAFE_ERROR_CODES.has(code)');
+    expect(body).not.toMatch(/\.test\(/);
+    expect(src).toMatch(/const LOG_SAFE_ERROR_CODES: ReadonlySet<string> = new Set\(\[/);
+    expect(src).toMatch(/const LOG_SAFE_ERROR_NAMES: ReadonlySet<string> = new Set\(\[/);
+  });
+
+  it('file-backed credential identity is content-only: one read per load, no metadata consulted', () => {
+    const src = read('src/services/provider-quota.ts');
+    expect(src).not.toMatch(/\bstat\b|mtimeMs|\bino\b/);
+    const loader = functionBody(src, 'async function loadSource(spec: SourceSpec): Promise<ResolvedSource | null> {');
+    expect(loader.match(/readCredentialFile\(/g)).toHaveLength(1);
+    const probe = functionBody(src, 'async function probeCredentialFile(');
+    expect(probe).toContain('await loadSource(spec)');
+    expect(probe).toContain('source.identity !== entry.sourceIdentity');
+  });
+
   it('the CLI send path normalizes the IPC quota instead of trusting it', () => {
     const cli = read('src/cli.ts');
     const body = functionBody(cli, 'function normalizeCardUsageSnapshot(value: unknown): CardUsageSnapshot | null {');

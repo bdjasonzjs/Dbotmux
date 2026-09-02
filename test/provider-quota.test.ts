@@ -82,23 +82,17 @@ function installTransport(
   return calls;
 }
 
-/** Virtual credential files: `files` is mutable so tests can rotate them. */
-function installFiles(files: Record<string, { body: string; mtime: number }>): { reads: string[]; stats: string[] } {
+/** Virtual credential files: `files` is mutable so tests can rotate them.
+ *  `mtime` is carried only to document that the implementation must ignore it. */
+function installFiles(files: Record<string, { body: string; mtime: number }>): { reads: string[] } {
   const reads: string[] = [];
-  const stats: string[] = [];
-  __setProviderQuotaFileReaderForTests(
-    async path => {
-      reads.push(path);
-      const f = files[path];
-      if (!f) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
-      return f.body;
-    },
-    async path => {
-      stats.push(path);
-      return files[path]?.mtime ?? null;
-    },
-  );
-  return { reads, stats };
+  __setProviderQuotaFileReaderForTests(async path => {
+    reads.push(path);
+    const f = files[path];
+    if (!f) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    return f.body;
+  });
+  return { reads };
 }
 
 async function flush(): Promise<void> {
@@ -200,7 +194,6 @@ describe('provider-quota source resolution (memory-only)', () => {
     expect(describeProviderQuotaSource(CODEX_CFG)).toBe('codex-chatgpt');
     expect(describeProviderQuotaSource({ cliId: 'codex-app', env: { CODEX_HOME: '/virtual/codex' } })).toBe('codex-chatgpt');
     expect(files.reads).toEqual([]);
-    expect(files.stats).toEqual([]);
   });
 
   it('other CLIs have no quota source', () => {
@@ -370,26 +363,60 @@ describe('provider-quota source identity (no cross-account leakage)', () => {
     expect(peekProviderQuota('app-a', rotated)).toEqual(DEEPSEEK_QUOTA);
   });
 
-  it('same provider, file-backed account rotation: mtime probe drops the old account\'s value', async () => {
+  const ACC2_BODY = JSON.stringify({ rate_limit: { primary_window: { used_percent: 50, limit_window_seconds: 604800, reset_at: 9 } } });
+  const byAccount = (call: Call) => ok(call.headers['ChatGPT-Account-Id'] === 'acc-1' ? CODEX_BODY : ACC2_BODY);
+
+  it('same provider, file-backed account rotation: the content-fingerprint probe drops the old account\'s value', async () => {
     const files: Record<string, { body: string; mtime: number }> = {
       '/virtual/codex/auth.json': { body: CODEX_AUTH('at-1', 'acc-1'), mtime: 1 },
     };
     const io = installFiles(files);
-    const calls = installTransport(call => ok(call.headers['ChatGPT-Account-Id'] === 'acc-1'
-      ? CODEX_BODY
-      : JSON.stringify({ rate_limit: { primary_window: { used_percent: 50, limit_window_seconds: 604800, reset_at: 9 } } })));
+    const calls = installTransport(byAccount);
     await refreshProviderQuota('app-b', CODEX_CFG);
-    const statsAfterFetch = io.stats.length;
+    const readsAfterFetch = io.reads.length;
     expect(peekProviderQuota('app-b', CODEX_CFG)).toMatchObject({ remainingPercent: 92 });
     await flush();
-    expect(io.stats.length).toBe(statsAfterFetch); // no probe right after a fetch
-    // Rotate the login on disk.
-    files['/virtual/codex/auth.json'] = { body: CODEX_AUTH('at-2', 'acc-2'), mtime: 2 };
+    expect(io.reads.length).toBe(readsAfterFetch); // no probe right after a fetch
+    // Rotate the login on disk — metadata deliberately unchanged (same "mtime").
+    files['/virtual/codex/auth.json'] = { body: CODEX_AUTH('at-2', 'acc-2'), mtime: 1 };
     now += PROVIDER_QUOTA_CREDENTIAL_PROBE_MS + 1;
     expect(peekProviderQuota('app-b', CODEX_CFG)).toMatchObject({ remainingPercent: 92 }); // probe kicked off, async
     await flush();
-    expect(io.stats.length).toBeGreaterThanOrEqual(statsAfterFetch + 1); // the probe's stat (+ the follow-up loader's)
     await flush();
+    expect(calls).toHaveLength(2);
+    expect(calls[1]!.headers['ChatGPT-Account-Id']).toBe('acc-2');
+    expect(peekProviderQuota('app-b', CODEX_CFG)).toMatchObject({ remainingPercent: 50 });
+  });
+
+  it('cross-rotation during a refresh: the cached value stays bound to the content that was read, and the next probe replaces it', async () => {
+    // The file is replaced *while* the first refresh is in flight (after the
+    // loader read the old content, before the response landed). Identity is a
+    // fingerprint of exactly the bytes read, so the 92% is bound to acc-1 —
+    // never to "the current file" — and the 30s probe re-reads and evicts it.
+    const files: Record<string, { body: string; mtime: number }> = {
+      '/virtual/codex/auth.json': { body: CODEX_AUTH('at-1', 'acc-1'), mtime: 1 },
+    };
+    const io = installFiles(files);
+    let release!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    const calls = installTransport(async call => {
+      if (call.headers['ChatGPT-Account-Id'] === 'acc-1') await gate;
+      return byAccount(call);
+    });
+    peekProviderQuota('app-b', CODEX_CFG);
+    await flush();
+    expect(io.reads).toHaveLength(1);
+    expect(calls).toHaveLength(1);
+    // Atomic replacement lands now, with a newer mtime the implementation must not consult.
+    files['/virtual/codex/auth.json'] = { body: CODEX_AUTH('at-2', 'acc-2'), mtime: 2 };
+    release();
+    await flush();
+    expect(peekProviderQuota('app-b', CODEX_CFG)).toMatchObject({ remainingPercent: 92 }); // acc-1's value, bound to acc-1
+    now += PROVIDER_QUOTA_CREDENTIAL_PROBE_MS + 1;
+    peekProviderQuota('app-b', CODEX_CFG);
+    await flush();
+    await flush();
+    expect(io.reads).toHaveLength(3); // loader + probe + loader for the new identity
     expect(calls).toHaveLength(2);
     expect(calls[1]!.headers['ChatGPT-Account-Id']).toBe('acc-2');
     expect(peekProviderQuota('app-b', CODEX_CFG)).toMatchObject({ remainingPercent: 50 });
@@ -404,12 +431,10 @@ describe('provider-quota source identity (no cross-account leakage)', () => {
     const gate = new Promise<void>(r => { release = r; });
     const calls = installTransport(async call => {
       if (call.headers['ChatGPT-Account-Id'] === 'acc-2') await gate;
-      return ok(call.headers['ChatGPT-Account-Id'] === 'acc-1'
-        ? CODEX_BODY
-        : JSON.stringify({ rate_limit: { primary_window: { used_percent: 50, limit_window_seconds: 604800, reset_at: 9 } } }));
+      return byAccount(call);
     });
     await refreshProviderQuota('app-b', CODEX_CFG);
-    files['/virtual/codex/auth.json'] = { body: CODEX_AUTH('at-2', 'acc-2'), mtime: 1 }; // same mtime: probe blind
+    files['/virtual/codex/auth.json'] = { body: CODEX_AUTH('at-2', 'acc-2'), mtime: 1 };
     now += PROVIDER_QUOTA_TTL_MS + 1;
     peekProviderQuota('app-b', CODEX_CFG); // schedules refresh
     await flush();
@@ -420,6 +445,26 @@ describe('provider-quota source identity (no cross-account leakage)', () => {
     release();
     await flush();
     expect(peekProviderQuota('app-b', CODEX_CFG)).toMatchObject({ remainingPercent: 50 });
+  });
+
+  it('credential file becomes unusable while a value is cached: probe hides the value and backs off', async () => {
+    const files: Record<string, { body: string; mtime: number }> = {
+      '/virtual/codex/auth.json': { body: CODEX_AUTH('at-1', 'acc-1'), mtime: 1 },
+    };
+    installFiles(files);
+    const calls = installTransport(byAccount);
+    await refreshProviderQuota('app-b', CODEX_CFG);
+    files['/virtual/codex/auth.json'] = { body: JSON.stringify({ auth_mode: 'apikey' }), mtime: 1 };
+    now += PROVIDER_QUOTA_CREDENTIAL_PROBE_MS + 1;
+    peekProviderQuota('app-b', CODEX_CFG);
+    await flush();
+    await flush();
+    expect(peekProviderQuota('app-b', CODEX_CFG)).toBeNull();
+    expect(calls).toHaveLength(1);
+    now += PROVIDER_QUOTA_FAILURE_BACKOFF_MS - 1;
+    peekProviderQuota('app-b', CODEX_CFG);
+    await flush();
+    expect(calls).toHaveLength(1); // still backing off, no request with a dead credential
   });
 
   it('a late completion of an old in-flight request never surfaces after the source changed', async () => {
@@ -465,12 +510,11 @@ describe('provider-quota hot path does no file I/O', () => {
     release();
     await flush();
 
-    // Cache fresh: many peeks, zero reads, zero stats.
-    const reads = io.reads.length; const stats = io.stats.length;
+    // Cache fresh: many peeks, zero reads.
+    const reads = io.reads.length;
     for (let i = 0; i < 50; i++) expect(peekProviderQuota('app-b', CODEX_CFG)).toMatchObject({ remainingPercent: 92 });
     await flush();
     expect(io.reads.length).toBe(reads);
-    expect(io.stats.length).toBe(stats);
 
     // Backoff: force a failure, then peeks inside the backoff window read nothing.
     fail = true;
@@ -482,19 +526,30 @@ describe('provider-quota hot path does no file I/O', () => {
     now += 1000;
     for (let i = 0; i < 50; i++) peekProviderQuota('app-b', CODEX_CFG);
     await flush();
-    expect(io.reads.length).toBe(readsAfterFailure);
+    // The peeks themselves read nothing; at most ONE throttled background
+    // rotation probe may run (the stale value is still on display, so a
+    // rotated credential must still be detectable during backoff).
+    expect(io.reads.length - readsAfterFailure).toBeLessThanOrEqual(1);
+    const readsAfterProbe = io.reads.length;
+    for (let i = 0; i < 50; i++) peekProviderQuota('app-b', CODEX_CFG);
+    await flush();
+    expect(io.reads.length).toBe(readsAfterProbe);
   });
 
-  it('the credential rotation probe is a stat (no content read), throttled, and only while a value is cached', async () => {
+  it('the credential rotation probe is one background content read, throttled, and only while a value is cached', async () => {
     const io = installFiles({ '/virtual/codex/auth.json': { body: CODEX_AUTH('at-1'), mtime: 1 } });
-    installTransport(() => ok(CODEX_BODY));
+    const calls = installTransport(() => ok(CODEX_BODY));
     await refreshProviderQuota('app-b', CODEX_CFG);
-    const reads = io.reads.length; const stats = io.stats.length;
+    const reads = io.reads.length;
     now += PROVIDER_QUOTA_CREDENTIAL_PROBE_MS + 1;
-    for (let i = 0; i < 10; i++) peekProviderQuota('app-b', CODEX_CFG);
+    for (let i = 0; i < 10; i++) peekProviderQuota('app-b', CODEX_CFG); // all synchronous, none blocks
     await flush();
-    expect(io.stats.length).toBe(stats + 1);
-    expect(io.reads.length).toBe(reads);
+    expect(io.reads.length).toBe(reads + 1);
+    expect(calls).toHaveLength(1); // unchanged identity → no refresh
+    now += PROVIDER_QUOTA_CREDENTIAL_PROBE_MS - 1;
+    peekProviderQuota('app-b', CODEX_CFG);
+    await flush();
+    expect(io.reads.length).toBe(reads + 1); // throttled
   });
 });
 
@@ -513,6 +568,19 @@ describe('provider-quota logging never leaks error text', () => {
     expect(all).toContain('fetch failed: Error/ECONNRESET');
   });
 
+  it('a well-formed but unknown error name/code (secret shaped like a constant) is never logged', async () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    const error = vi.spyOn(logger, 'error').mockImplementation(() => undefined);
+    const info = vi.spyOn(logger, 'info').mockImplementation(() => undefined);
+    const err = Object.assign(new Error('x'), { name: 'DUMMYSECRETMARKER', code: 'TOKENABC123' });
+    installTransport(() => { throw err; });
+    await refreshProviderQuota('app-a', DS_CFG);
+    const all = [...warn.mock.calls, ...error.mock.calls, ...info.mock.calls].flat().map(String).join('\n');
+    expect(all).not.toContain('DUMMYSECRETMARKER');
+    expect(all).not.toContain('TOKENABC123');
+    expect(all).toContain('fetch failed: Error/UNKNOWN');
+  });
+
   it('HTTP failures log only the status and a numeric Retry-After', async () => {
     const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
     installTransport(() => ({ status: 429, headers: { 'retry-after': '120', 'x-secret': 'dummy-secret-marker' }, body: '{"token":"dummy-secret-marker"}' }));
@@ -522,12 +590,20 @@ describe('provider-quota logging never leaks error text', () => {
     expect(all).toContain('HTTP 429, retry after 120s');
   });
 
-  it('safeErrorLabel allow-lists name and code and never returns message text', () => {
-    expect(safeErrorLabel(new Error('secret'))).toBe('Error');
+  it('safeErrorLabel is a fixed value allow-list: unknown names → Error, unknown codes → UNKNOWN', () => {
+    expect(safeErrorLabel(new Error('secret'))).toBe('Error/UNKNOWN');
     expect(safeErrorLabel(Object.assign(new TypeError('secret'), { code: 'ERR_INVALID_URL' }))).toBe('TypeError/ERR_INVALID_URL');
-    expect(safeErrorLabel(Object.assign(new Error('secret'), { code: 'sk-live-secret' }))).toBe('Error');
-    expect(safeErrorLabel(Object.assign(new Error('secret'), { name: 'Bad name with secret' }))).toBe('Error');
+    expect(safeErrorLabel(Object.assign(new Error('secret'), { code: 'ECONNRESET' }))).toBe('Error/ECONNRESET');
+    for (const code of ['sk-live-secret', 'TOKENABC123', 'ERR_SECRET_VALUE', 'E_' + 'A'.repeat(30), '', 42, null]) {
+      expect(safeErrorLabel(Object.assign(new Error('secret'), { code })), String(code)).toBe('Error/UNKNOWN');
+    }
+    for (const name of ['DUMMYSECRETMARKER', 'Bad name with secret', 'SyntaxErrorX', 'Error ', '']) {
+      expect(safeErrorLabel(Object.assign(new Error('secret'), { name })), name).toBe('Error/UNKNOWN');
+    }
+    expect(safeErrorLabel(Object.assign(new Error('secret'), { name: 'ProviderQuotaTransportError', code: 'ERR_DEADLINE' })))
+      .toBe('ProviderQuotaTransportError/ERR_DEADLINE');
     expect(safeErrorLabel('secret string')).toBe('UnknownError');
+    expect(safeErrorLabel({ name: 'DUMMYSECRETMARKER', code: 'TOKENABC123' })).toBe('UnknownError');
   });
 });
 

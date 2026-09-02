@@ -21,10 +21,13 @@
  *     grace period, then dropped. Out-of-range or malformed upstream numbers
  *     are rejected, never clamped or estimated.
  *   - Credentials live only in request headers built inside this module. Logs
- *     carry status codes, error names and allow-listed error codes — never a
- *     raw error message, URL, header or fingerprint.
+ *     carry status codes plus error names / codes drawn from a fixed value
+ *     allow-list — never a raw error message, URL, header or fingerprint.
+ *   - File-backed credentials are identified by a fingerprint of the file
+ *     *contents* (the same fingerprint the loader computes), never by file
+ *     metadata, so a rotation can never be mistaken for "unchanged".
  */
-import { readFile, stat } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { createHmac, randomBytes } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -95,9 +98,9 @@ export const PROVIDER_QUOTA_FAILURE_BACKOFF_MS = 5 * 60_000;
 export const PROVIDER_QUOTA_MAX_RETRY_AFTER_MS = 6 * 60 * 60_000;
 /** A stale value keeps rendering for this long past its fetch time, then hides. */
 export const PROVIDER_QUOTA_STALE_GRACE_MS = 60 * 60_000;
-/** File-backed credentials are re-checked (mtime) at most this often while a
- *  value is cached, so a rotated login stops showing the old account's quota
- *  well before the next scheduled refresh. */
+/** File-backed credentials are re-read and re-fingerprinted at most this often
+ *  while a value is cached, so a rotated login stops showing the old account's
+ *  quota well before the next scheduled refresh. */
 export const PROVIDER_QUOTA_CREDENTIAL_PROBE_MS = 30_000;
 export const PROVIDER_QUOTA_REQUEST_TIMEOUT_MS = 8_000;
 export const PROVIDER_QUOTA_REQUEST_DEADLINE_MS = 15_000;
@@ -133,8 +136,6 @@ interface ResolvedSource {
   headers: Record<string, string>;
   /** provider + salted fingerprint of the credential material. */
   identity: string;
-  /** mtime of the credential file (file-backed only), for rotation probes. */
-  fileMtimeMs?: number;
 }
 
 interface CacheEntry {
@@ -142,7 +143,6 @@ interface CacheEntry {
   /** Identity of the credential the cached quota belongs to (set once the
    *  async loader has resolved it). */
   sourceIdentity: string | null;
-  fileMtimeMs: number | null;
   quota: ProviderQuota | null;
   /** When `quota` was fetched successfully (ms). 0 = never. */
   fetchedAt: number;
@@ -157,13 +157,6 @@ interface CacheEntry {
 const cache = new Map<string, CacheEntry>();
 let transport: ProviderQuotaTransport = defaultTransport;
 let readCredentialFile: ProviderQuotaFileReader = path => readFile(path, 'utf8');
-let statCredentialFile: (path: string) => Promise<number | null> = async path => {
-  try {
-    return (await stat(path)).mtimeMs;
-  } catch {
-    return null;
-  }
-};
 let clock: () => number = () => Date.now();
 
 // ---------------------------------------------------------------------------
@@ -241,7 +234,6 @@ function newEntry(configIdentity: string): CacheEntry {
   return {
     configIdentity,
     sourceIdentity: null,
-    fileMtimeMs: null,
     quota: null,
     fetchedAt: 0,
     nextAttemptAt: 0,
@@ -296,17 +288,22 @@ function startCredentialProbe(larkAppId: string, entry: CacheEntry, spec: Source
     .finally(() => { entry.probing = null; });
 }
 
-/** Cheap rotation signal for file-backed credentials: if the file's mtime
- *  moved since the cached value was fetched, drop the cached quota now and
- *  refresh; the fingerprint check in the loader decides whether the account
- *  actually changed. */
+/** Rotation check for file-backed credentials: re-read the file and compare
+ *  the *content* fingerprint with the identity the cached quota belongs to.
+ *  A different (or no longer usable) credential means the cached value is
+ *  another account's: drop it now and refresh against the new identity. File
+ *  metadata is deliberately not consulted — a same-mtime or mid-read
+ *  replacement is caught by the next probe because only contents count. */
 async function probeCredentialFile(larkAppId: string, entry: CacheEntry, spec: SourceSpec): Promise<void> {
   if (spec.credential.kind !== 'file') return;
-  const mtime = await statCredentialFile(spec.credential.path);
-  if (!isLive(larkAppId, entry)) return;
-  if (entry.fileMtimeMs !== null && mtime !== entry.fileMtimeMs) {
-    const next = supersede(larkAppId, entry);
-    startRefresh(larkAppId, next, spec);
+  const source = await loadSource(spec);
+  if (!isLive(larkAppId, entry) || entry.sourceIdentity === null) return;
+  if (source === null) {
+    supersede(larkAppId, entry).nextAttemptAt = clock() + PROVIDER_QUOTA_FAILURE_BACKOFF_MS;
+    return;
+  }
+  if (source.identity !== entry.sourceIdentity) {
+    startRefresh(larkAppId, supersede(larkAppId, entry), spec);
   }
 }
 
@@ -404,7 +401,6 @@ async function loadSource(spec: SourceSpec): Promise<ResolvedSource | null> {
     return null;
   }
   if (!raw || typeof raw !== 'object') return null;
-  const mtime = await statCredentialFile(path);
   if (spec.provider === 'claude-oauth') {
     const oauth = (raw as { claudeAiOauth?: { accessToken?: unknown } }).claudeAiOauth;
     const token = typeof oauth?.accessToken === 'string' ? oauth.accessToken.trim() : '';
@@ -414,7 +410,6 @@ async function loadSource(spec: SourceSpec): Promise<ResolvedSource | null> {
       url: spec.url,
       headers: claudeHeaders(token),
       identity: `claude-oauth:${fingerprint(token)}`,
-      ...(mtime !== null ? { fileMtimeMs: mtime } : {}),
     };
   }
   const auth = raw as {
@@ -435,7 +430,6 @@ async function loadSource(spec: SourceSpec): Promise<ResolvedSource | null> {
       Accept: 'application/json',
     },
     identity: `codex-chatgpt:${fingerprint(accountId, accessToken)}`,
-    ...(mtime !== null ? { fileMtimeMs: mtime } : {}),
   };
 }
 
@@ -463,7 +457,6 @@ async function refreshEntry(larkAppId: string, entry: CacheEntry, spec: SourceSp
     live.inflight = entry.inflight;
   }
   live.sourceIdentity = source.identity;
-  live.fileMtimeMs = source.fileMtimeMs ?? null;
 
   let res: ProviderQuotaTransportResponse;
   try {
@@ -506,20 +499,38 @@ async function refreshEntry(larkAppId: string, entry: CacheEntry, spec: SourceSp
   live.quota = quota;
   live.fetchedAt = now;
   live.nextAttemptAt = now + PROVIDER_QUOTA_TTL_MS;
-  // The loader just stat'ed the credential file; start the rotation-probe
+  // The loader just fingerprinted the credential; start the rotation-probe
   // cadence from here rather than probing again on the very next peek.
   live.lastProbeAt = now;
 }
 
-/** Log-safe error label: the error's class name plus an allow-listed `code`
- *  (e.g. `ECONNRESET`, `ERR_BODY_TOO_LARGE`). Never the message — a transport
- *  or proxy layer may embed URLs, userinfo or headers in it. */
+/** Error class names that may appear in a log line. Anything else — including
+ *  a well-formed name planted by a dependency — is reported as `Error`. */
+const LOG_SAFE_ERROR_NAMES: ReadonlySet<string> = new Set([
+  'Error', 'TypeError', 'RangeError', 'AbortError', 'ProviderQuotaTransportError',
+]);
+
+/** Error codes that may appear in a log line: this module's own codes plus the
+ *  Node network / TLS constants a failed outbound request can produce. A code
+ *  outside this fixed set is reported as `UNKNOWN`, whatever it looks like. */
+const LOG_SAFE_ERROR_CODES: ReadonlySet<string> = new Set([
+  'ERR_BODY_TOO_LARGE', 'ERR_DEADLINE', 'ERR_SOCKET_TIMEOUT',
+  'ECONNRESET', 'ECONNREFUSED', 'ECONNABORTED', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN',
+  'EHOSTUNREACH', 'ENETUNREACH', 'EPIPE', 'ERR_INVALID_URL', 'ERR_STREAM_PREMATURE_CLOSE',
+  'ERR_TLS_CERT_ALTNAME_INVALID', 'CERT_HAS_EXPIRED', 'DEPTH_ZERO_SELF_SIGNED_CERT',
+  'SELF_SIGNED_CERT_IN_CHAIN', 'UNABLE_TO_VERIFY_LEAF_SIGNATURE', 'UNABLE_TO_GET_ISSUER_CERT_LOCALLY',
+]);
+
+/** Log-safe error label built only from fixed value sets (`Error/ECONNRESET`,
+ *  `ProviderQuotaTransportError/ERR_DEADLINE`, `Error/UNKNOWN`). Never the
+ *  message, and never an arbitrary name/code — a transport, proxy or
+ *  dependency may put URLs, userinfo, headers or tokens in any of them. */
 export function safeErrorLabel(error: unknown): string {
   if (!(error instanceof Error)) return 'UnknownError';
-  const name = /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(error.name) ? error.name : 'Error';
+  const name = LOG_SAFE_ERROR_NAMES.has(error.name) ? error.name : 'Error';
   const code = (error as { code?: unknown }).code;
-  const safeCode = typeof code === 'string' && /^[A-Z][A-Z0-9_]{0,39}$/.test(code) ? code : undefined;
-  return safeCode ? `${name}/${safeCode}` : name;
+  const safeCode = typeof code === 'string' && LOG_SAFE_ERROR_CODES.has(code) ? code : 'UNKNOWN';
+  return `${name}/${safeCode}`;
 }
 
 function parseRetryAfterMs(value: string | undefined): number | undefined {
@@ -702,16 +713,8 @@ export function __setProviderQuotaTransportForTests(next: ProviderQuotaTransport
   transport = next ?? defaultTransport;
 }
 
-export function __setProviderQuotaFileReaderForTests(
-  reader: ProviderQuotaFileReader | null,
-  statter?: ((path: string) => Promise<number | null>) | null,
-): void {
+export function __setProviderQuotaFileReaderForTests(reader: ProviderQuotaFileReader | null): void {
   readCredentialFile = reader ?? (path => readFile(path, 'utf8'));
-  if (statter !== undefined) {
-    statCredentialFile = statter ?? (async path => {
-      try { return (await stat(path)).mtimeMs; } catch { return null; }
-    });
-  }
 }
 
 export function __setProviderQuotaClockForTests(next: (() => number) | null): void {
@@ -725,8 +728,5 @@ export function __resetProviderQuotaForTests(): void {
   cache.clear();
   transport = defaultTransport;
   readCredentialFile = path => readFile(path, 'utf8');
-  statCredentialFile = async path => {
-    try { return (await stat(path)).mtimeMs; } catch { return null; }
-  };
   clock = () => Date.now();
 }
