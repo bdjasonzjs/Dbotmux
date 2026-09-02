@@ -811,8 +811,16 @@ describe('buildMarkdownCard', () => {
   it('normalizeProviderQuota accepts only a well-formed IPC quota', () => {
     expect(normalizeProviderQuota({ kind: 'balance', currency: 'cny', amount: 1.5 }))
       .toEqual({ kind: 'balance', currency: 'CNY', amount: 1.5 });
-    expect(normalizeProviderQuota({ kind: 'window', window: 'weekly', remainingPercent: 140, resetsAt: 5 }))
-      .toEqual({ kind: 'window', window: 'weekly', remainingPercent: 100, resetsAt: 5 });
+    expect(normalizeProviderQuota({ kind: 'window', window: 'weekly', remainingPercent: 36.8, resetsAt: 5 }))
+      .toEqual({ kind: 'window', window: 'weekly', remainingPercent: 36.8, resetsAt: 5 });
+    // Out-of-range percentages are malformed, not clampable: hidden, never rewritten.
+    expect(normalizeProviderQuota({ kind: 'window', window: 'weekly', remainingPercent: 140 })).toBeNull();
+    expect(normalizeProviderQuota({ kind: 'window', window: 'weekly', remainingPercent: -1 })).toBeNull();
+    expect(normalizeProviderQuota({ kind: 'window', window: 'weekly', remainingPercent: Number.NaN })).toBeNull();
+    expect(normalizeProviderQuota({ kind: 'window', window: 'weekly', remainingPercent: Number.POSITIVE_INFINITY })).toBeNull();
+    expect(normalizeProviderQuota({ kind: 'window', window: 'weekly', remainingPercent: 100 }))
+      .toEqual({ kind: 'window', window: 'weekly', remainingPercent: 100 });
+    expect(cardQuotaSegment({ kind: 'window', window: 'weekly', remainingPercent: 100.5 })).toBeNull();
     expect(normalizeProviderQuota({ kind: 'window', window: '5h', remainingPercent: 1 })).toBeNull();
     expect(normalizeProviderQuota({ kind: 'balance', currency: '', amount: 1 })).toBeNull();
     expect(normalizeProviderQuota('余额 ¥1')).toBeNull();

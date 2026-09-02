@@ -95,8 +95,9 @@ export function cardQuotaSegment(
     const money = symbol ? `${symbol}${amount}` : `${amount}\u00a0${code}`;
     return `${t('card.usage.balance', undefined, locale)} ${money}`;
   }
-  if (quota.kind === 'window' && quota.window === 'weekly' && isNonNegativeFinite(quota.remainingPercent)) {
-    const pct = Math.round(Math.min(100, quota.remainingPercent));
+  if (quota.kind === 'window' && quota.window === 'weekly'
+    && isNonNegativeFinite(quota.remainingPercent) && quota.remainingPercent <= 100) {
+    const pct = Math.round(quota.remainingPercent);
     return `${t('card.usage.weekly_left', undefined, locale)} ${pct}%`;
   }
   return null;
@@ -115,11 +116,13 @@ export function normalizeProviderQuota(value: unknown): ProviderQuota | null {
   }
   if (raw.kind === 'window') {
     if (raw.window !== 'weekly') return null;
-    if (!isNonNegativeFinite(raw.remainingPercent)) return null;
+    // A percentage outside [0, 100] is malformed data, not a value to clamp:
+    // hide it rather than render a number nobody reported.
+    if (!isNonNegativeFinite(raw.remainingPercent) || raw.remainingPercent > 100) return null;
     return {
       kind: 'window',
       window: 'weekly',
-      remainingPercent: Math.min(100, raw.remainingPercent),
+      remainingPercent: raw.remainingPercent,
       ...(isNonNegativeFinite(raw.resetsAt) ? { resetsAt: raw.resetsAt } : {}),
     };
   }

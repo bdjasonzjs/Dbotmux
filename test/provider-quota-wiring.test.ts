@@ -56,6 +56,20 @@ describe('provider-quota wiring (source lock)', () => {
     expect(body.lastIndexOf('cardQuotaSegment(usage.quota, locale)')).toBeGreaterThan(totalAt);
   });
 
+  it('the quota module has no synchronous file I/O and never logs raw error text', () => {
+    const src = read('src/services/provider-quota.ts');
+    expect(src).not.toMatch(/readFileSync|statSync|existsSync/);
+    expect(src).not.toMatch(/error\.message|String\(error\)/);
+    // Every warn starts with the fixed tag and carries only fixed literals,
+    // the allow-listed error label, an integer status or a Retry-After second count.
+    const warns = src.match(/logger\.warn\([^;]*?\);/gs) ?? [];
+    expect(warns.length).toBeGreaterThanOrEqual(4);
+    for (const w of warns) {
+      expect(w).toMatch(/logger\.warn\(\s*`\$\{tag\}/);
+      expect(w).not.toMatch(/error\.message|String\(error\)|res\.body|headers\[/);
+    }
+  });
+
   it('the CLI send path normalizes the IPC quota instead of trusting it', () => {
     const cli = read('src/cli.ts');
     const body = functionBody(cli, 'function normalizeCardUsageSnapshot(value: unknown): CardUsageSnapshot | null {');
