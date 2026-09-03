@@ -132,6 +132,7 @@ import {
 } from './session-wake-deadline.js';
 import {
   protectedSessionMutationReasons,
+  hasProtectedSessionMutationOwnership,
 } from './session-mutation-guard.js';
 import { listPendingAsks, submitAskFromDesktop } from './ask-broker.js';
 import { getMessageListenerConfig, sanitizeMessageListenerUpdate, updateMessageListenerConfig, validateMessageListenerUpdate } from '../services/message-listener-store.js';
@@ -1106,10 +1107,41 @@ ipcRoute('POST', '/api/sessions/:sessionId/close', async (req, res, params) => {
         ? { ok: true, outcome: 'closed_with_residual', residual, alreadyClosed: true }
         : { ok: true, outcome: 'closed', alreadyClosed: true });
     }
+    // Optional conditional close: the caller states what it observed when it
+    // decided this session was eligible, and we re-check INSIDE this same
+    // bot-level mutation gate — so "eligibility check" and "close" are one
+    // atomic step rather than two racing ones. Absent `expect` → legacy
+    // unconditional close (botmux delete / dashboard / manager-recover
+    // unchanged). Used by the external session-cap guard, which must never
+    // close a session that became active after its snapshot.
+    //
+    // Observed values come from composeRowFromActive so they are the SAME
+    // quantities a caller read from GET /api/sessions. Reading
+    // ds.lastMessageAt / ds.lastScreenStatus by hand would compare two
+    // different things: the row folds session activity over the runtime field,
+    // and row status folds worker residency + queued into 'dormant'/'idle'.
+    const expect = (body as { expect?: CloseExpect }).expect;
+    if (expect && typeof expect === 'object') {
+      const live = findActiveBySessionId(params.sessionId);
+      const row = live ? composeRowFromActive(live) : undefined;
+      const workerAlive = !!(live?.worker && !live.worker.killed);
+      const observed = { lastMessageAt: row?.lastMessageAt ?? null, status: row?.status ?? 'dormant', workerAlive };
+      const fails: string[] = [];
+      if (expect.noWorker && workerAlive) fails.push('worker_alive');
+      if (typeof expect.lastMessageAt === 'number' && observed.lastMessageAt !== expect.lastMessageAt) fails.push('lastMessageAt_changed');
+      if (Array.isArray(expect.statusIn) && !expect.statusIn.includes(observed.status)) fails.push('status_not_allowed');
+      if (live && hasProtectedSessionMutationOwnership(live)) fails.push('protected_mutation');
+      if (live && isSessionTransferring(live)) fails.push('session_transferring');
+      if (fails.length) return jsonRes(res, 409, { ok: false, error: 'precondition_failed', fails, observed });
+    }
     const r = await closeSession(params.sessionId);
     jsonRes(res, r.ok ? 200 : 502, r);
   });
 });
+/** Preconditions a conditional `/close` may state; re-checked inside the bot
+ * mutation gate. `statusIn`/`lastMessageAt` are compared against the same
+ * SessionRow shape `GET /api/sessions` publishes. */
+interface CloseExpect { noWorker?: boolean; lastMessageAt?: number; statusIn?: string[] }
 
 ipcRoute('POST', '/api/sessions/:sessionId/manager-recover', async (req, res, params) => {
   const reg = getActiveSessionsRegistry();

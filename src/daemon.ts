@@ -3925,6 +3925,8 @@ interface DaemonDescriptor {
   bootInstanceId: string;
   /** Full-envelope Workflow mutation protocol supported by this process. */
   workflowIpcProtocol: 'v1';
+  /** `/api/sessions/:id/close` accepts `body.expect` (conditional close) — capability flag for external tools. */
+  closeExpect?: 'v1';
   /** Exact supervisor protocol this in-memory daemon will execute on signal.
    * Absent until the SIGTERM/SIGINT handlers and all captured state are ready. */
   supervisorShutdownProtocol?: SupervisorShutdownProtocol;
@@ -21436,6 +21438,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     startedAt: Date.now(),
     bootInstanceId: generateWorkflowDaemonBootInstanceId(),
     workflowIpcProtocol: 'v1',
+    closeExpect: 'v1',
     lastHeartbeat: Date.now(),
     // Dashboard create-group only consumes app-scoped open_ids — publish ONLY
     // ou_ entries. Before the resolution below runs, the list may still hold raw
