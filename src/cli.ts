@@ -27,7 +27,7 @@
  */
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
 import { readProcessStartIdentity } from './core/session-marker.js';
-import type { LaunchAttestation } from './utils/launch-attestation.js';
+import { describeCardIdentity, isAttestableCliId, type CardIdentity, type LaunchAttestation } from './utils/launch-attestation.js';
 import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, symlinkSync, appendFileSync, statSync, unlinkSync, rmSync, realpathSync, chmodSync } from 'node:fs';
 import { underReadIsolation, sendCredFilePath } from './adapters/cli/read-isolation.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
@@ -6680,6 +6680,7 @@ function normalizeCardUsageSnapshot(value: unknown): CardUsageSnapshot | null {
   // Runtime identity rides along with usage over the daemon IPC. It is not a
   // metric and has no display gate, so pass it through verbatim (strings only)
   // instead of dropping it the way the pre-identity parser did.
+  const identity = normalizeCardIdentity(raw.identity);
   const model = typeof raw.model === 'string' && raw.model ? raw.model : undefined;
   const reasoningEffort = typeof raw.reasoningEffort === 'string' && raw.reasoningEffort
     ? raw.reasoningEffort
@@ -6690,7 +6691,24 @@ function normalizeCardUsageSnapshot(value: unknown): CardUsageSnapshot | null {
     ...(quota ? { quota } : {}),
     ...(model ? { model } : {}),
     ...(reasoningEffort ? { reasoningEffort } : {}),
+    ...(identity ? { identity } : {}),
   };
+}
+
+/** Shape-check the daemon-supplied identity; anything malformed is dropped
+ *  (rendering nothing) rather than coerced into a state it never claimed. */
+function normalizeCardIdentity(value: unknown): CardIdentity | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const v = value as Record<string, unknown>;
+  const prov = v.effortProvenance;
+  const provOk = prov === 'explicit' || prov === 'default' || prov === 'unknown';
+  const effort = typeof v.effort === 'string' ? v.effort : null;
+  if (v.state === 'unknown') return { state: 'unknown' };
+  if (v.state === 'cli-default' && provOk) return { state: 'cli-default', effort, effortProvenance: prov };
+  if (v.state === 'verified' && provOk && typeof v.model === 'string' && v.model) {
+    return { state: 'verified', model: v.model, effort, effortProvenance: prov };
+  }
+  return undefined;
 }
 
 /** Prefer the resident daemon's incremental transcript cache. Older/offline
@@ -6759,17 +6777,10 @@ async function readCardUsageSnapshotForSend(
  *  hand. Mirrors the daemon rule: a committed attestation counts only while the
  *  exact process it describes is still alive (pid + kernel start identity), so a
  *  recycled pid or a dead CLI degrades to "unknown" instead of a stale claim. */
-function localLaunchIdentity(session: SessionData): { model?: string; reasoningEffort?: string } {
-  const att = session.launchAttestation;
-  if (!att) return {};
-  const now = readProcessStartIdentity(att.cliPid);
-  if (!now || now !== att.cliProcStart) return {};
-  return {
-    ...(att.model ? { model: att.model } : {}),
-    ...(att.effort
-      ? { reasoningEffort: `${att.effort}${att.effortProvenance === 'default' ? '(默认)' : ''}` }
-      : {}),
-  };
+function localLaunchIdentity(session: SessionData): { identity?: CardIdentity } {
+  const cliId = session.cliId ?? session.adoptedFrom?.cliId;
+  if (!isAttestableCliId(cliId)) return {};
+  return { identity: describeCardIdentity(session.launchAttestation, readProcessStartIdentity) };
 }
 
 /**

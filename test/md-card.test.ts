@@ -1391,3 +1391,33 @@ describe('buildContextualReplyCard footer brand', () => {
     expect(JSON.stringify(els)).not.toContain('botmux');
   });
 });
+
+describe('reply-card footer identity 三态（S3 review P1-2，逐字断言）', () => {
+  const base = { context: null, tokens: null } as const;
+  it('verified → **model** effort，且不依赖 usage metrics（默认 streaming 无数字也显示）', () => {
+    const footer = buildReplyCardFooter({
+      brand: '',
+      usage: { ...base, identity: { state: 'verified', model: 'claude-fable-5-1[1m]', effort: 'high', effortProvenance: 'default' } },
+    });
+    // 方括号在 footer 里被转义（\[1m\]）以免被当成链接；断言容忍两种形态
+    expect(footer?.content).toMatch(/\*\*claude-fable-5-1\\?\[1m\\?\]\*\*/);
+    expect(footer?.content).toContain('high(默认)');
+  });
+  it('有效 attestation 但 model=null → 逐字显示「模型：CLI 默认，具体模型未知」', () => {
+    const footer = buildReplyCardFooter({
+      brand: '',
+      usage: { ...base, identity: { state: 'cli-default', effort: 'high', effortProvenance: 'default' } },
+    });
+    expect(footer?.content).toContain('模型：CLI 默认，具体模型未知');
+    expect(footer?.content).not.toContain('claude-');
+  });
+  it('无 attestation / 失效 pid → 逐字显示「模型：未知（重生后核验）」，绝不回退配置', () => {
+    const footer = buildReplyCardFooter({ brand: '', usage: { ...base, identity: { state: 'unknown' } } });
+    expect(footer?.content).toContain('模型：未知（重生后核验）');
+    expect(footer?.content).not.toContain('claude-');
+  });
+  it('没有 identity 字段（旧 daemon 载荷）→ 不渲染任何模型文字，不冒充 unknown', () => {
+    const footer = buildReplyCardFooter({ brand: '', usage: { ...base } });
+    expect(footer?.content ?? '').not.toContain('模型：');
+  });
+});

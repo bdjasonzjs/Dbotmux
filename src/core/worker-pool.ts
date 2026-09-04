@@ -6,6 +6,9 @@ import { execSync, fork, type ChildProcess, type ForkOptions } from 'node:child_
 import { readProcessStartIdentity } from './session-marker.js';
 import {
   decideLaunchAttestationCas,
+  describeCardIdentity,
+  isAttestableCliId,
+  type CardIdentity,
   type LaunchAttestation,
 } from '../utils/launch-attestation.js';
 import { join, dirname } from 'node:path';
@@ -307,24 +310,9 @@ export function getDaemonSessionUsageSnapshot(
  *  attestation (never committed, or invalidated) → no fields, which the card
  *  renders as "unknown". The live bot config is deliberately NOT consulted:
  *  it describes the next spawn, not the process that is answering. */
-function daemonReplyCardIdentity(ds: DaemonSession): { model?: string; reasoningEffort?: string } {
-  const att = ds.session.launchAttestation;
-  if (!att) return {};
-  if (!isLaunchAttestationLive(ds, att)) return {};
-  return {
-    ...(att.model ? { model: att.model } : {}),
-    ...(att.effort ? { reasoningEffort: `${att.effort}${att.effortProvenance === 'default' ? '(默认)' : ''}` } : {}),
-  };
-}
-
-/** An attestation describes one CLI process. It stops being current the moment
- *  that process is gone or its pid was recycled — checked by re-reading the
- *  kernel start identity, which cannot repeat for a reused pid. */
-function isLaunchAttestationLive(ds: DaemonSession, att: LaunchAttestation): boolean {
-  // A suspended session had its CLI killed, so the identity read below already
-  // fails — no separate suspend flag needed.
-  const now = readProcessStartIdentity(att.cliPid);
-  return !!now && now === att.cliProcStart;
+function daemonReplyCardIdentity(ds: DaemonSession): { identity?: CardIdentity } {
+  if (!isAttestableCliId(ds.session.cliId)) return {};
+  return { identity: describeCardIdentity(ds.session.launchAttestation, readProcessStartIdentity) };
 }
 
 export function getDaemonReplyCardUsageSnapshot(

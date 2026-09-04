@@ -57,10 +57,12 @@ import { rawCommandWriteOptionsFor } from './core/raw-command-write-options.js';
 import { publishCliSessionIdToDaemon } from './core/cli-session-id-publisher.js';
 import { readProcessStartIdentity } from './core/session-marker.js';
 import {
+  firstPidMayBeLeaf,
   readLeafArgv,
   resolveLaunchEffort,
   verifyLeafArgv,
   type ExpectedLeafLaunch,
+  type LaunchContract,
 } from './utils/launch-attestation.js';
 import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, type TranscriptEvent } from './services/claude-transcript.js';
@@ -14991,24 +14993,34 @@ async function spawnCli(
   // this worker and carry entirely different argv, so it must never produce a
   // new attestation. Everything below is frozen BEFORE any wrapper/sandbox
   // rewrite of spawnBin/spawnArgs, because the real leaf is the *base* CLI.
-  pendingLaunchAttestation = actuallyReattachedPersistent ? undefined : {
-    expected: {
-      bin: reproduceBaseBin,
-      args: reproduceBaseArgs,
-      // Factual, not predictive: the launch is wrapped iff the final spawn tuple
-      // no longer equals the pre-wrapper base captured above.
-      wrapped: spawnBin !== reproduceBaseBin
-        || spawnArgs.length !== reproduceBaseArgs.length
-        || spawnArgs.some((a, i) => a !== reproduceBaseArgs[i]),
-    },
-    frozenConfigRoot: claudeDataDir,
-    redirected: !!isolationBotHome,
-    // A wrapper hides the real CLI behind a launcher pid; the first pid we see
-    // is then NOT the leaf and must not be committed (the real-pid resolver
-    // calls back later with it).
-    awaitLeafResolver: !!(cfg.wrapperCli && cfg.wrapperCli.trim()) && !sandboxRequested && !!claudeDataDir,
-    committed: false,
-  };
+  {
+    // Factual, not predictive: the launch is wrapped iff the final spawn tuple
+    // no longer equals the pre-wrapper base captured above. Then name the
+    // wrapper so the contract is discriminated rather than a bare boolean.
+    const tupleRewritten = spawnBin !== reproduceBaseBin
+      || spawnArgs.length !== reproduceBaseArgs.length
+      || spawnArgs.some((a, i) => a !== reproduceBaseArgs[i]);
+    const contract: LaunchContract = !tupleRewritten
+      ? { kind: 'direct' }
+      : (cfg.wrapperCli && cfg.wrapperCli.trim())
+        ? { kind: 'wrapped', via: 'wrapper-cli' }
+        : (sandboxRequested && process.platform === 'darwin')
+          ? { kind: 'wrapped', via: 'seatbelt' }
+          : (sandboxRequested || credentialOnlyBwrap)
+            ? { kind: 'wrapped', via: 'bwrap' }
+            : { kind: 'wrapped', via: 'unknown' };
+    pendingLaunchAttestation = actuallyReattachedPersistent ? undefined : {
+      expected: { bin: reproduceBaseBin, args: reproduceBaseArgs, contract },
+      frozenConfigRoot: claudeDataDir,
+      redirected: !!isolationBotHome,
+      // Under ANY wrapped contract the pid the backend reports is the launcher /
+      // sandbox supervisor, never the CLI: it must not be committed. The real
+      // leaf is resolved as a descendant (startAttestationLeafResolve) and only
+      // that pid, with its own argv equal to the base tuple, may commit.
+      awaitLeafResolver: !firstPidMayBeLeaf(contract),
+      committed: false,
+    };
+  }
   // ── Generational-race commit/teardown for the read-isolation provenance proof ──
   // We wrote a PENDING proof before spawn (pendingProvenanceCommit). Now that spawn
   // has returned we know whether a FRESH generation was actually established.
@@ -15214,6 +15226,24 @@ async function spawnCli(
       schedule: (fn, ms) => { setTimeout(fn, ms); },
     });
   };
+  // Attestation-only leaf resolver for EVERY wrapped launch (wrapperCli,
+  // Seatbelt, bwrap — any CLI, not just traex). Walks descendants of the
+  // launcher until a process whose comm matches this cliId appears, then offers
+  // that pid to tryCommitLaunchAttestation, which still insists the pid's own
+  // argv equals the frozen base tuple. Rewires nothing: session discovery and
+  // bridge pid-follow keep their own, unchanged resolvers.
+  const startAttestationLeafResolve = (launcherPid: number): void => {
+    const pending = pendingLaunchAttestation;
+    if (!pending || pending.committed || !pending.awaitLeafResolver) return;
+    scheduleWrapperRealCliPid(launcherPid, {
+      findRealPid: (lp) => findLaunchedCliPid(lp, cfg.cliId as CliId),
+      getBackend: () => backend,
+      getChildPid: () => backend?.getChildPid?.(),
+      applyRealPid: (realPid) => { tryCommitLaunchAttestation(realPid, true); },
+      schedule: (fn, ms) => { setTimeout(fn, ms); },
+    });
+  };
+  if (cliPid) startAttestationLeafResolve(cliPid);
   if (cliPid) startWrapperRealPidResolve(cliPid);
   if (cliPid) observeCursorCliSessionId(cliPid);
 
@@ -15293,6 +15323,7 @@ async function spawnCli(
       if (pid) {
         publishLocalProcessAttestation(pid);
         tryCommitLaunchAttestation(pid, false);
+        startAttestationLeafResolve(pid);
         if (process.env.SESSION_DATA_DIR && !cliPidMarker) {
           try {
             const markersDir = join(process.env.SESSION_DATA_DIR, '.botmux-cli-pids');

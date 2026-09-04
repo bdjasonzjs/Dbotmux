@@ -20,6 +20,7 @@
  */
 
 import { homedir } from 'node:os';
+import { cardEffortLabel, type CardIdentity } from '../../utils/launch-attestation.js';
 import { existsSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { resolve } from 'node:path';
@@ -61,6 +62,9 @@ export interface CardUsageSnapshot {
     in: number;
     out: number;
   } | null;
+  /** Verified launch identity for the reply-card footer (three explicit
+   *  states; see describeCardIdentity). Independent of usage metrics. */
+  identity?: CardIdentity;
   /** Latest executor-reported model. Rendered by session-status cards only. */
   model?: string;
   /** Latest executor-reported reasoning effort. */
@@ -493,18 +497,30 @@ export function cardUsageRuntimeSegment(
   return `**${model}**${reasoningEffort ? `\u00a0${reasoningEffort}` : ''}`;
 }
 
-/** Runtime identity for the reply-card footer: which model answered, and under
- *  which effort. Deliberately independent of `hasMetrics` (unlike
- *  cardUsageRuntimeSegment, which suppresses a metrics-less runtime row on the
- *  streaming card): identity is the point of this segment, so it must render
- *  under the default 'streaming' usageDisplay where the footer carries no usage
- *  numbers at all. Absent model → nothing, so an unverified session shows no
- *  claim rather than a guessed one. */
+/** Runtime identity for the reply-card footer, in the three states the S2
+ *  contract requires. Deliberately independent of `hasMetrics`: identity is the
+ *  point of this segment, so it renders under the default 'streaming'
+ *  usageDisplay where the footer carries no usage numbers at all.
+ *
+ *  - verified    → `**model** effort`
+ *  - cli-default → the CLI verifiably received no --model; say so, never guess
+ *  - unknown     → no live attestation; say so, never fall back to config
+ *
+ *  A snapshot without `identity` at all (pre-identity daemon, older payload)
+ *  renders nothing rather than a false "unknown". */
+export const CARD_IDENTITY_CLI_DEFAULT = '模型：CLI 默认，具体模型未知';
+export const CARD_IDENTITY_UNKNOWN = '模型：未知（重生后核验）';
+
 export function cardIdentitySegment(usage: CardUsageSnapshot | undefined): string | null {
-  if (!usage) return null;
-  const model = compactRuntimeLabel(stripModelProviderPrefix(usage.model), 24);
-  if (!model) return null;
-  const effort = compactRuntimeLabel(usage.reasoningEffort, 12);
+  const id = usage?.identity;
+  if (!id) return null;
+  if (id.state === 'unknown') return CARD_IDENTITY_UNKNOWN;
+  const effort = compactRuntimeLabel(cardEffortLabel(id.effort, id.effortProvenance) ?? undefined, 12);
+  if (id.state === 'cli-default') {
+    return `${CARD_IDENTITY_CLI_DEFAULT}${effort ? `\u00a0${effort}` : ''}`;
+  }
+  const model = compactRuntimeLabel(stripModelProviderPrefix(id.model), 24);
+  if (!model) return CARD_IDENTITY_UNKNOWN;
   return `**${model}**${effort ? `\u00a0${effort}` : ''}`;
 }
 

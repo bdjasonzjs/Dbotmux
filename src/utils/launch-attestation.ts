@@ -33,9 +33,11 @@ export type EnvKeyRead =
   | { kind: 'absent' }
   | { kind: 'unreadable' };
 
-/** Reads exactly ONE target key out of a process environment. The rest of the
- *  environ is never parsed, returned, logged or persisted — it holds provider
- *  credentials. */
+/** Reads exactly ONE target key out of a process environment.
+ *
+ *  The environ block holds provider credentials, so the rest of it is never
+ *  decoded: we scan the raw Buffer for a NUL-delimited `KEY=` boundary and
+ *  UTF-8 decode only the bytes of the matching value. */
 export function readLeafEnvKey(pid: number, key: string): EnvKeyRead {
   if (!Number.isInteger(pid) || pid <= 1) return { kind: 'unreadable' };
   if (process.platform !== 'linux') return { kind: 'unreadable' };
@@ -45,9 +47,23 @@ export function readLeafEnvKey(pid: number, key: string): EnvKeyRead {
   } catch {
     return { kind: 'unreadable' };
   }
-  const prefix = `${key}=`;
-  for (const entry of raw.toString('utf8').split('\0')) {
-    if (entry.startsWith(prefix)) return { kind: 'present', value: entry.slice(prefix.length) };
+  return findEnvKeyInBuffer(raw, key);
+}
+
+/** Pure Buffer scan, exported for tests. Matches only at an entry boundary
+ *  (offset 0 or right after a NUL) so `XCLAUDE_EFFORT=` never matches. */
+export function findEnvKeyInBuffer(raw: Buffer, key: string): EnvKeyRead {
+  const needle = Buffer.from(`${key}=`, 'utf8');
+  let from = 0;
+  while (from <= raw.length - needle.length) {
+    const at = raw.indexOf(needle, from);
+    if (at < 0) break;
+    if (at === 0 || raw[at - 1] === 0) {
+      let end = raw.indexOf(0, at + needle.length);
+      if (end < 0) end = raw.length;
+      return { kind: 'present', value: raw.subarray(at + needle.length, end).toString('utf8') };
+    }
+    from = at + 1;
   }
   return { kind: 'absent' };
 }
@@ -69,6 +85,22 @@ function canonical(p: string): string {
   try { return realpathSync(p); } catch { return p; }
 }
 
+/** How the base CLI tuple was launched. This is a *discriminated* contract:
+ *  each kind states where the real leaf lives relative to the pid the backend
+ *  hands us, so the worker knows whether that first pid may be trusted.
+ *
+ *  - direct  : the pane child IS the CLI; its argv must equal the base tuple.
+ *  - wrapped : a launcher / sandbox supervisor sits above the CLI (wrapperCli,
+ *              Seatbelt `sandbox-exec`, bwrap). The pane child is the launcher,
+ *              NEVER the leaf: the real CLI must be resolved as a descendant
+ *              process and its own argv must still equal the base tuple. A
+ *              wrapper that rewrites the CLI's arguments (ttadk gateway, an
+ *              unknown wrapper script) therefore never verifies — which is the
+ *              intended fail-closed outcome, not a gap to paper over. */
+export type LaunchContract =
+  | { kind: 'direct' }
+  | { kind: 'wrapped'; via: 'wrapper-cli' | 'seatbelt' | 'bwrap' | 'unknown' };
+
 /** Expected leaf launch tuple, frozen BEFORE any wrapper/sandbox rewrite.
  *  `spawnBin`/`spawnArgs` are overwritten by buildWrappedLaunch and again by
  *  the Seatbelt / bwrap wrappers, so comparing a real leaf against them would
@@ -76,47 +108,40 @@ function canonical(p: string): string {
 export interface ExpectedLeafLaunch {
   bin: string;
   args: readonly string[];
-  /** True when the launch goes through a wrapper/sandbox that rewrites argv. */
-  wrapped: boolean;
+  contract: LaunchContract;
 }
 
 export type ArgvVerdict =
   | { ok: true; model: string | null; argv: string[] }
   | { ok: false; reason: string };
 
-/** Verifies the real leaf argv against the frozen expected tuple.
+/** Verifies a process argv against the frozen base tuple.
  *
- *  Unwrapped launches must match exactly (bin canonicalised). Wrapped launches
- *  are accepted only when the expected tuple appears as a contiguous *suffix*
- *  of the leaf argv — i.e. the wrapper prefixed its own argv and left the CLI
- *  invocation intact. A wrapper that rewrites the CLI's own arguments has no
- *  verifiable contract here and must fail closed rather than be guessed at. */
+ *  Exact match only, for every contract kind: the leaf is the CLI process
+ *  itself, whose argv is the base tuple regardless of how many launchers sit
+ *  above it. No prefix stripping, no suffix acceptance — accepting "anything +
+ *  expected tail" would let a supervisor (`bwrap … claude …`) or an untrusted
+ *  launcher (`node wrapper.js claude …`) pass as the leaf. Only the binary may
+ *  differ by path form (realpath). */
 export function verifyLeafArgv(expected: ExpectedLeafLaunch, argv: readonly string[] | null): ArgvVerdict {
   if (!argv || argv.length === 0) return { ok: false, reason: 'leaf-argv-unreadable' };
   const want = [expected.bin, ...expected.args];
-  const sameFrom = (start: number): boolean => {
-    if (argv.length - start !== want.length) return false;
-    for (let i = 0; i < want.length; i++) {
-      const a = argv[start + i];
-      const b = want[i];
-      if (a === b) continue;
-      // Only the binary itself may differ by path form.
-      if (i === 0 && canonical(a) === canonical(b)) continue;
-      return false;
-    }
-    return true;
-  };
-  let matchedAt = -1;
-  if (sameFrom(0)) matchedAt = 0;
-  else if (expected.wrapped) {
-    const start = argv.length - want.length;
-    if (start > 0 && sameFrom(start)) matchedAt = start;
+  if (argv.length !== want.length) return { ok: false, reason: 'leaf-argv-mismatch' };
+  for (let i = 0; i < want.length; i++) {
+    if (argv[i] === want[i]) continue;
+    if (i === 0 && canonical(argv[0]) === canonical(want[0])) continue;
+    return { ok: false, reason: 'leaf-argv-mismatch' };
   }
-  if (matchedAt < 0) return { ok: false, reason: 'leaf-argv-mismatch' };
-  const rest = argv.slice(matchedAt + 1);
-  const at = rest.indexOf('--model');
-  const model = at >= 0 && at + 1 < rest.length ? rest[at + 1] : null;
+  const at = expected.args.indexOf('--model');
+  const model = at >= 0 && at + 1 < expected.args.length ? expected.args[at + 1] : null;
   return { ok: true, model, argv: [...argv] };
+}
+
+/** Whether the pid the backend reports may be treated as the leaf. Under a
+ *  wrapped contract it is the launcher/supervisor and must be skipped until a
+ *  descendant resolver hands back the real CLI pid. */
+export function firstPidMayBeLeaf(contract: LaunchContract): boolean {
+  return contract.kind === 'direct';
 }
 
 export type EffortProvenance = 'explicit' | 'default' | 'unknown';
@@ -250,4 +275,48 @@ export function decideLaunchAttestationCas(
   const comparable = Number.isFinite(Number(incoming.cliProcStart)) && Number.isFinite(Number(current.cliProcStart));
   if (comparable && !newerStart) return 'discard';
   return 'replace';
+}
+
+/** Card-facing identity, ONE shape for the daemon and the CLI/offline path.
+ *
+ *  verified    : a live attestation with a concrete model
+ *  cli-default : a live attestation that verifiably passed no --model (the CLI
+ *                chose its own default; we do not know which)
+ *  unknown     : no attestation, or the attested process is gone / recycled
+ *
+ *  The card must render all three; collapsing the last two to "nothing" would
+ *  quietly turn fail-closed into "no claim shown", which readers cannot tell
+ *  apart from "feature not deployed". */
+export type CardIdentity =
+  | { state: 'verified'; model: string; effort: string | null; effortProvenance: EffortProvenance }
+  | { state: 'cli-default'; effort: string | null; effortProvenance: EffortProvenance }
+  | { state: 'unknown' };
+
+export function describeCardIdentity(
+  att: LaunchAttestation | undefined,
+  readStartIdentity: (pid: number) => string | undefined,
+): CardIdentity {
+  if (!att) return { state: 'unknown' };
+  const now = readStartIdentity(att.cliPid);
+  if (!now || now !== att.cliProcStart) return { state: 'unknown' };
+  if (att.model) {
+    return { state: 'verified', model: att.model, effort: att.effort, effortProvenance: att.effortProvenance };
+  }
+  return { state: 'cli-default', effort: att.effort, effortProvenance: att.effortProvenance };
+}
+
+/** Effort label for the card: value plus a marker when it came from a settings
+ *  default rather than an explicit injection. Null when unknown. */
+export function cardEffortLabel(effort: string | null, provenance: EffortProvenance): string | null {
+  if (!effort) return null;
+  return provenance === 'default' ? `${effort}(默认)` : effort;
+}
+
+/** CLIs the attestation mechanism is implemented for: the Claude family (the
+ *  adapters that define `claudeDataDir`; keep in sync with them). For any other
+ *  CLI the card shows NO identity segment at all — "not applicable" is a
+ *  different, honest statement from "unknown", which would wrongly tell a codex
+ *  reader that respawning will fix it. */
+export function isAttestableCliId(cliId: string | undefined): boolean {
+  return cliId === 'claude-code' || cliId === 'seed' || cliId === 'genius';
 }
