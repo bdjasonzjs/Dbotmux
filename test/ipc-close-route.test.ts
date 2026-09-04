@@ -26,6 +26,7 @@ async function postClose(sessionId: string, opts: {
   auth?: 'capability' | 'signed' | 'none';
   authRequired?: boolean;
   capability?: string;
+  expect?: { noWorker?: boolean; lastMessageAt?: number; statusIn?: string[] };
 } = {}): Promise<Response> {
   if (!handle) {
     if (opts.authRequired) setIpcAuthSecret(HOST_SECRET);
@@ -39,6 +40,7 @@ async function postClose(sessionId: string, opts: {
   const path = `/api/sessions/${sessionId}/close`;
   const body: Record<string, unknown> = {};
   if (auth === 'capability') body.originCapability = opts.capability ?? CAP;
+  if (opts.expect) body.expect = opts.expect;
   const headers: HeadersInit = auth === 'signed'
     ? daemonIpcAuthHeaders({
       secret: HOST_SECRET,
@@ -169,5 +171,97 @@ describe('POST /api/sessions/:sessionId/close', () => {
     expect(res.status).toBe(403);
     expect(await res.json()).toMatchObject({ ok: false, error: 'managed_action_required' });
     expect(closeSpy).not.toHaveBeenCalled();
+  });
+});
+
+// Conditional close (`body.expect`): the eligibility re-check runs inside the
+// same bot mutation gate as the close itself, so an external reaper cannot
+// close a session that became active after its snapshot.
+describe('POST /api/sessions/:sessionId/close with expect preconditions', () => {
+  const liveDs = (over: Record<string, unknown> = {}) => ({
+    session: { sessionId: 's-expect', lastMessageAt: '2026-09-03T10:00:00.000Z', chatId: 'oc_1' },
+    managedTurnOrigin: { capability: CAP },
+    larkAppId: 'app-1',
+    chatId: 'oc_1',
+    lastScreenStatus: 'idle',
+    worker: null,
+    ...over,
+  }) as any;
+  const AT = Date.parse('2026-09-03T10:00:00.000Z');
+
+  it('closes when every stated precondition still holds', async () => {
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(liveDs());
+    const closeSpy = vi.spyOn(workerPool, 'closeSession')
+      .mockResolvedValue({ ok: true, outcome: 'closed', alreadyClosed: false });
+
+    const res = await postClose('s-expect', {
+      authRequired: true,
+      expect: { noWorker: true, lastMessageAt: AT, statusIn: ['idle', 'dormant'] },
+    });
+
+    expect(res.status).toBe(200);
+    expect(closeSpy).toHaveBeenCalledWith('s-expect');
+  });
+
+  it('refuses with 409 when a new message arrived after the caller snapshot', async () => {
+    vi.spyOn(workerPool, 'findActiveBySessionId')
+      .mockReturnValue(liveDs({ session: { sessionId: 's-expect', lastMessageAt: '2026-09-03T10:05:00.000Z', chatId: 'oc_1' } }));
+    const closeSpy = vi.spyOn(workerPool, 'closeSession');
+
+    const res = await postClose('s-expect', {
+      authRequired: true,
+      expect: { noWorker: true, lastMessageAt: AT, statusIn: ['idle', 'dormant'] },
+    });
+
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body).toMatchObject({ ok: false, error: 'precondition_failed' });
+    expect(body.fails).toContain('lastMessageAt_changed');
+    expect(body.observed.lastMessageAt).toBe(Date.parse('2026-09-03T10:05:00.000Z'));
+    expect(closeSpy).not.toHaveBeenCalled();
+  });
+
+  it('refuses when a live worker reappeared, and reports the row status it saw', async () => {
+    vi.spyOn(workerPool, 'findActiveBySessionId')
+      .mockReturnValue(liveDs({ worker: { killed: false }, lastScreenStatus: 'working' }));
+    const closeSpy = vi.spyOn(workerPool, 'closeSession');
+
+    const res = await postClose('s-expect', {
+      authRequired: true,
+      expect: { noWorker: true, lastMessageAt: AT, statusIn: ['idle', 'dormant'] },
+    });
+
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.fails).toEqual(expect.arrayContaining(['worker_alive', 'status_not_allowed']));
+    expect(body.observed).toMatchObject({ status: 'working', workerAlive: true });
+    expect(closeSpy).not.toHaveBeenCalled();
+  });
+
+  it('refuses while a protected mutation ownership is outstanding', async () => {
+    vi.spyOn(workerPool, 'findActiveBySessionId')
+      .mockReturnValue(liveDs({ session: { sessionId: 's-expect', lastMessageAt: '2026-09-03T10:00:00.000Z', chatId: 'oc_1', queuedActivationPending: true } }));
+    const closeSpy = vi.spyOn(workerPool, 'closeSession');
+
+    const res = await postClose('s-expect', {
+      authRequired: true,
+      expect: { noWorker: true, lastMessageAt: AT, statusIn: ['idle', 'dormant'] },
+    });
+
+    expect(res.status).toBe(409);
+    expect((await res.json()).fails).toContain('protected_mutation');
+    expect(closeSpy).not.toHaveBeenCalled();
+  });
+
+  it('keeps an unconditional close unconditional (no expect → legacy behavior)', async () => {
+    vi.spyOn(workerPool, 'findActiveBySessionId')
+      .mockReturnValue(liveDs({ worker: { killed: false }, lastScreenStatus: 'working' }));
+    const closeSpy = vi.spyOn(workerPool, 'closeSession')
+      .mockResolvedValue({ ok: true, outcome: 'closed', alreadyClosed: false });
+
+    const res = await postClose('s-expect', { authRequired: true });
+
+    expect(res.status).toBe(200);
+    expect(closeSpy).toHaveBeenCalledWith('s-expect');
   });
 });
