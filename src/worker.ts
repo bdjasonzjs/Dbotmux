@@ -56,6 +56,12 @@ import {
 import { rawCommandWriteOptionsFor } from './core/raw-command-write-options.js';
 import { publishCliSessionIdToDaemon } from './core/cli-session-id-publisher.js';
 import { readProcessStartIdentity } from './core/session-marker.js';
+import {
+  readLeafArgv,
+  resolveLaunchEffort,
+  verifyLeafArgv,
+  type ExpectedLeafLaunch,
+} from './utils/launch-attestation.js';
 import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
@@ -14980,6 +14986,29 @@ async function spawnCli(
   }
   const actuallyReattachedPersistent = 'isReattach' in backend
     && backend.isReattach === true;
+  // ── Launch attestation arming (see utils/launch-attestation.ts) ──
+  // A re-attach did NOT create a CLI generation: the running leaf may predate
+  // this worker and carry entirely different argv, so it must never produce a
+  // new attestation. Everything below is frozen BEFORE any wrapper/sandbox
+  // rewrite of spawnBin/spawnArgs, because the real leaf is the *base* CLI.
+  pendingLaunchAttestation = actuallyReattachedPersistent ? undefined : {
+    expected: {
+      bin: reproduceBaseBin,
+      args: reproduceBaseArgs,
+      // Factual, not predictive: the launch is wrapped iff the final spawn tuple
+      // no longer equals the pre-wrapper base captured above.
+      wrapped: spawnBin !== reproduceBaseBin
+        || spawnArgs.length !== reproduceBaseArgs.length
+        || spawnArgs.some((a, i) => a !== reproduceBaseArgs[i]),
+    },
+    frozenConfigRoot: claudeDataDir,
+    redirected: !!isolationBotHome,
+    // A wrapper hides the real CLI behind a launcher pid; the first pid we see
+    // is then NOT the leaf and must not be committed (the real-pid resolver
+    // calls back later with it).
+    awaitLeafResolver: !!(cfg.wrapperCli && cfg.wrapperCli.trim()) && !sandboxRequested && !!claudeDataDir,
+    committed: false,
+  };
   // ── Generational-race commit/teardown for the read-isolation provenance proof ──
   // We wrote a PENDING proof before spawn (pendingProvenanceCommit). Now that spawn
   // has returned we know whether a FRESH generation was actually established.
@@ -15137,6 +15166,7 @@ async function spawnCli(
     (backend as PtyHandle).expectedCodexSessionId = cfg.cliSessionId;
   }
   publishLocalProcessAttestation(cliPid ?? undefined);
+  tryCommitLaunchAttestation(cliPid ?? undefined, false);
   if (cliPid && process.env.SESSION_DATA_DIR) {
     const markersDir = join(process.env.SESSION_DATA_DIR, '.botmux-cli-pids');
     try {
@@ -15179,6 +15209,7 @@ async function spawnCli(
         // module-level bridgeCliPid and re-points to the real CLI's jsonl.
         bridgeCliPid = realPid;
         publishLocalProcessAttestation(realPid);
+        tryCommitLaunchAttestation(realPid, true);
       },
       schedule: (fn, ms) => { setTimeout(fn, ms); },
     });
@@ -15212,6 +15243,7 @@ async function spawnCli(
         (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
         codexAdoptPendingPid = realPid;
         publishLocalProcessAttestation(realPid);
+        tryCommitLaunchAttestation(realPid, true);
       },
       schedule: (fn, ms) => { setTimeout(fn, ms); },
     });
@@ -15260,6 +15292,7 @@ async function spawnCli(
       const pid = backend.getChildPid?.();
       if (pid) {
         publishLocalProcessAttestation(pid);
+        tryCommitLaunchAttestation(pid, false);
         if (process.env.SESSION_DATA_DIR && !cliPidMarker) {
           try {
             const markersDir = join(process.env.SESSION_DATA_DIR, '.botmux-cli-pids');
@@ -17814,6 +17847,57 @@ function receiveOrdinaryImTurn(turnId: string): 'new' | 'inflight' | 'committed'
 function rejectOrdinaryImTurn(turnId: string, reason: string): void {
   ordinaryImTurnDedupe.release(turnId);
   send({ type: 'turn_input_rejected', turnId, reason });
+}
+
+/** Armed at spawn (non-reattach only), disarmed after the single commit.
+ *  Holds the pre-wrapper expected leaf tuple and the config root THIS launch
+ *  resolved — never re-derived later from ambient config. */
+let pendingLaunchAttestation: {
+  expected: ExpectedLeafLaunch;
+  frozenConfigRoot: string | undefined;
+  redirected: boolean;
+  awaitLeafResolver: boolean;
+  committed: boolean;
+} | undefined;
+
+/** The ONE place a launch attestation is produced. Called wherever a pid
+ *  becomes known; commits at most once, and only for a pid that verifiably IS
+ *  the CLI leaf this worker launched. Any failed check leaves the session with
+ *  no attestation, which renders as "unknown" — never as a plausible guess. */
+function tryCommitLaunchAttestation(pid: number | undefined, isResolvedLeaf: boolean): void {
+  const pending = pendingLaunchAttestation;
+  if (!pending || pending.committed || !pid) return;
+  // A wrapper hides the leaf: ignore the launcher pid, wait for the resolver.
+  if (pending.awaitLeafResolver && !isResolvedLeaf) return;
+  const verdict = verifyLeafArgv(pending.expected, readLeafArgv(pid));
+  if (!verdict.ok) {
+    log(`launch attestation: not committed (${verdict.reason}, pid=${pid})`);
+    return;
+  }
+  const cliProcStart = readProcessStartIdentity(pid);
+  if (!cliProcStart) {
+    log(`launch attestation: not committed (proc-start unreadable, pid=${pid})`);
+    return;
+  }
+  const effort = resolveLaunchEffort({
+    leafPid: pid,
+    frozenConfigRoot: pending.frozenConfigRoot,
+    redirected: pending.redirected,
+  });
+  pending.committed = true;
+  send({
+    type: 'launch_attestation',
+    fact: {
+      model: verdict.model,
+      effort: effort.effort,
+      effortProvenance: effort.provenance,
+      effortConfigRoot: effort.configRoot,
+      effortSourcePath: effort.sourcePath,
+      cliPid: pid,
+      cliProcStart,
+      leafArgvDigest: createHash('sha256').update(verdict.argv.join('\0')).digest('hex'),
+    },
+  });
 }
 
 function publishLocalProcessAttestation(cliPid?: number): void {

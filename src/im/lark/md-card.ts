@@ -493,6 +493,21 @@ export function cardUsageRuntimeSegment(
   return `**${model}**${reasoningEffort ? `\u00a0${reasoningEffort}` : ''}`;
 }
 
+/** Runtime identity for the reply-card footer: which model answered, and under
+ *  which effort. Deliberately independent of `hasMetrics` (unlike
+ *  cardUsageRuntimeSegment, which suppresses a metrics-less runtime row on the
+ *  streaming card): identity is the point of this segment, so it must render
+ *  under the default 'streaming' usageDisplay where the footer carries no usage
+ *  numbers at all. Absent model → nothing, so an unverified session shows no
+ *  claim rather than a guessed one. */
+export function cardIdentitySegment(usage: CardUsageSnapshot | undefined): string | null {
+  if (!usage) return null;
+  const model = compactRuntimeLabel(stripModelProviderPrefix(usage.model), 24);
+  if (!model) return null;
+  const effort = compactRuntimeLabel(usage.reasoningEffort, 12);
+  return `**${model}**${effort ? `\u00a0${effort}` : ''}`;
+}
+
 /** Build the one canonical footer shared by all Bot Session reply cards.
  * Ordering, i18n, the parser marker, grey styling, and recipient rendering live
  * here so direct sends and daemon fallbacks cannot drift apart. */
@@ -506,6 +521,8 @@ export function buildReplyCardFooter(opts: {
   const brandSeg = brandFooterSegment(opts.brand);
   if (brandSeg) parts.push(brandSeg);
   let hasUsage = false;
+  const identitySeg = cardIdentitySegment(opts.usage);
+  if (identitySeg) { parts.push(identitySeg); hasUsage = true; }
   if (opts.usage) {
     const usageSeg = cardUsageFooterSegment(opts.usage, opts.locale);
     if (usageSeg) { parts.push(usageSeg); hasUsage = true; }

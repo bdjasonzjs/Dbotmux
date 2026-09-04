@@ -7,6 +7,7 @@ import type { BotSkillPolicy } from './core/skills/types.js';
 import type { MojoConfig, MojoLivePatch, MojoSessionIdentity } from './adapters/backend/mojo-types.js';
 import type { RiffBackendConfig } from './adapters/backend/riff-backend.js';
 import type { CliUsageLimitState } from './utils/cli-usage-limit.js';
+import type { LaunchAttestation, LaunchAttestationFact } from './utils/launch-attestation.js';
 import type { VcMeetingActivityType } from './vc-agent/types.js';
 import type { CodexServiceTierSnapshot } from './services/codex-service-tier.js';
 import type { PendingInputMetadata } from './services/codex-input-batch.js';
@@ -601,6 +602,12 @@ export interface Session {
    * live config applies, which is what keeps a config change effective.
    */
   model?: string;
+  /** The VERIFIED launch fact of the CLI generation currently backing this
+   *  session: what the real leaf process was actually started with, committed
+   *  once per generation after cmdline/pid/proc-start verification. Unlike
+   *  `model` above (a next-spawn plan), this is safe to display as "current".
+   *  Absent = no verified generation (never fall back to config to fill it). */
+  launchAttestation?: LaunchAttestation;
   /** Optional codex reasoning effort frozen at creation (per-turn API override).
    *  Only meaningful for codex/codex-app; injected as model_reasoning_effort at spawn. */
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
@@ -1179,6 +1186,14 @@ export type WorkerToDaemon =
       credentialIsolated: boolean;
       cliPid?: number;
       cliProcStart?: string;
+    }
+  /** One-shot, post-verification launch fact for the CLI generation this worker
+   *  just created. Sent only after the real leaf is resolved and its cmdline
+   *  matches the pre-wrapper expected tuple; the daemon applies compare-and-set
+   *  so late launcher/late-PID callbacks cannot form a second "current" value. */
+  | {
+      type: 'launch_attestation';
+      fact: LaunchAttestationFact;
     }
   | {
       type: 'queued_activation_submitted';

@@ -3,6 +3,11 @@
  * Extracted from daemon.ts for modularity.
  */
 import { execSync, fork, type ChildProcess, type ForkOptions } from 'node:child_process';
+import { readProcessStartIdentity } from './session-marker.js';
+import {
+  decideLaunchAttestationCas,
+  type LaunchAttestation,
+} from '../utils/launch-attestation.js';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { readFileSync, readdirSync, mkdirSync, existsSync, realpathSync, unlinkSync } from 'node:fs';
@@ -297,20 +302,54 @@ export function getDaemonSessionUsageSnapshot(
  * reader leaves accounting and dashboard consumers intact; the concrete empty
  * snapshot (rather than undefined) also freezes "hidden" over final-output
  * retries. */
+/** Card-facing runtime identity, sourced ONLY from the verified launch
+ *  attestation of the CLI generation currently backing the session. No
+ *  attestation (never committed, or invalidated) → no fields, which the card
+ *  renders as "unknown". The live bot config is deliberately NOT consulted:
+ *  it describes the next spawn, not the process that is answering. */
+function daemonReplyCardIdentity(ds: DaemonSession): { model?: string; reasoningEffort?: string } {
+  const att = ds.session.launchAttestation;
+  if (!att) return {};
+  if (!isLaunchAttestationLive(ds, att)) return {};
+  return {
+    ...(att.model ? { model: att.model } : {}),
+    ...(att.effort ? { reasoningEffort: `${att.effort}${att.effortProvenance === 'default' ? '(默认)' : ''}` } : {}),
+  };
+}
+
+/** An attestation describes one CLI process. It stops being current the moment
+ *  that process is gone or its pid was recycled — checked by re-reading the
+ *  kernel start identity, which cannot repeat for a reused pid. */
+function isLaunchAttestationLive(ds: DaemonSession, att: LaunchAttestation): boolean {
+  // A suspended session had its CLI killed, so the identity read below already
+  // fails — no separate suspend flag needed.
+  const now = readProcessStartIdentity(att.cliPid);
+  return !!now && now === att.cliProcStart;
+}
+
 export function getDaemonReplyCardUsageSnapshot(
   ds: DaemonSession,
   effectiveCliId?: CliId,
 ): CardUsageSnapshot {
+  // Runtime identity (model + effort) is NOT usage: it identifies who answered
+  // and must show under every usageDisplay mode, including the 'streaming'
+  // default where the footer carries no metrics at all. Only the metric half
+  // stays behind the display gate below.
+  const identity = daemonReplyCardIdentity(ds);
   try {
     if (resolveUsageDisplay(ds.larkAppId) !== 'footer') {
-      return { context: null, tokens: null };
+      return { context: null, tokens: null, ...identity };
     }
   } catch {
     // Missing runtime config → default 'streaming' → no footer usage.
-    return { context: null, tokens: null };
+    return { context: null, tokens: null, ...identity };
   }
   const quota = peekProviderQuotaForSession(ds);
-  return { ...getDaemonSessionUsageSnapshot(ds, effectiveCliId), ...(quota ? { quota } : {}) };
+  return {
+    ...getDaemonSessionUsageSnapshot(ds, effectiveCliId),
+    ...(quota ? { quota } : {}),
+    ...identity,
+  };
 }
 
 /** Account quota (DeepSeek balance / subscription weekly window) for the bot
@@ -10125,6 +10164,38 @@ function setupWorkerHandlers(
             ? { workerGeneration: ds.workerGeneration }
             : {}),
         };
+        break;
+      }
+      case 'launch_attestation': {
+        // Compare-and-set on the ONE current value. Late launcher / late-PID
+        // callbacks and replaced workers all funnel here, so the decision table
+        // (accept / noop / reject / replace / discard) is what keeps a committed
+        // generation immutable — a same-identity payload change is a bug signal,
+        // not an update.
+        if (ds.worker !== worker) {
+          logger.warn(`[${t}] Ignored launch_attestation from stale worker`);
+          break;
+        }
+        const generation = ds.workerGeneration ?? 0;
+        const incoming: LaunchAttestation = {
+          ...msg.fact,
+          workerGeneration: generation,
+          committedAt: new Date().toISOString(),
+        };
+        const decision = decideLaunchAttestationCas(ds.session.launchAttestation, incoming, generation);
+        if (decision === 'accept' || decision === 'replace') {
+          ds.session.launchAttestation = incoming;
+          sessionStore.updateSession(ds.session);
+          logger.info(
+            `[${t}] launch attestation ${decision}: model=${incoming.model ?? '<cli-default>'} `
+            + `effort=${incoming.effort ?? 'unknown'}(${incoming.effortProvenance}) pid=${incoming.cliPid}`,
+          );
+        } else if (decision === 'reject') {
+          logger.warn(
+            `[${t}] Rejected launch_attestation: same CLI identity (pid=${incoming.cliPid}) with a `
+            + 'different payload; keeping the first committed value',
+          );
+        }
         break;
       }
       case 'queued_activation_submitted': {

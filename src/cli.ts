@@ -26,6 +26,8 @@
  *   botmux whiteboard status|enable|disable|current|list|read|update|write — local project whiteboard
  */
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
+import { readProcessStartIdentity } from './core/session-marker.js';
+import type { LaunchAttestation } from './utils/launch-attestation.js';
 import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, symlinkSync, appendFileSync, statSync, unlinkSync, rmSync, realpathSync, chmodSync } from 'node:fs';
 import { underReadIsolation, sendCredFilePath } from './adapters/cli/read-isolation.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
@@ -4679,6 +4681,10 @@ interface AdoptedFromData {
 
 interface SessionData {
   sessionId: string;
+  /** Verified launch fact of the CLI generation backing this session (written
+   *  by the daemon). Present on disk since the launch-attestation change; the
+   *  local send path reads it for the reply-card identity. */
+  launchAttestation?: LaunchAttestation;
   chatId: string;
   chatType?: 'group' | 'p2p';
   rootMessageId: string;
@@ -6671,7 +6677,20 @@ function normalizeCardUsageSnapshot(value: unknown): CardUsageSnapshot | null {
   }
 
   const quota = normalizeProviderQuota(raw.quota);
-  return { context, tokens, ...(quota ? { quota } : {}) };
+  // Runtime identity rides along with usage over the daemon IPC. It is not a
+  // metric and has no display gate, so pass it through verbatim (strings only)
+  // instead of dropping it the way the pre-identity parser did.
+  const model = typeof raw.model === 'string' && raw.model ? raw.model : undefined;
+  const reasoningEffort = typeof raw.reasoningEffort === 'string' && raw.reasoningEffort
+    ? raw.reasoningEffort
+    : undefined;
+  return {
+    context,
+    tokens,
+    ...(quota ? { quota } : {}),
+    ...(model ? { model } : {}),
+    ...(reasoningEffort ? { reasoningEffort } : {}),
+  };
 }
 
 /** Prefer the resident daemon's incremental transcript cache. Older/offline
@@ -6712,12 +6731,16 @@ async function readCardUsageSnapshotForSend(
   // This send path renders into the reply-card FOOTER, so only the 'footer'
   // display mode surfaces usage here; 'streaming' shows it on the daemon's live
   // card (absent on this offline fallback) and 'off' shows nothing.
+  // Identity comes from the session record this function already holds — no
+  // second read of sessions-<appId>.json (which read-isolated panes may not even
+  // be able to open). Only committed, still-live attestations qualify.
+  const identity = localLaunchIdentity(session);
   if (resolveUsageDisplay(larkAppId) !== 'footer') {
-    return { context: null, tokens: null };
+    return { context: null, tokens: null, ...identity };
   }
 
   try {
-    return getSessionUsageSnapshot({
+    return { ...getSessionUsageSnapshot({
       cliId: (session.cliId ?? session.adoptedFrom?.cliId ?? 'unknown') as CliId | 'unknown',
       sessionId: session.sessionId,
       cliSessionId: session.cliSessionId ?? session.adoptedFrom?.sessionId,
@@ -6726,10 +6749,27 @@ async function readCardUsageSnapshotForSend(
       // (parity with the daemon reader and the ledger/dashboard consumers).
       larkAppId: larkAppId ?? session.larkAppId,
       fresh: true,
-    });
+    }), ...identity };
   } catch {
-    return { context: null, tokens: null };
+    return { context: null, tokens: null, ...identity };
   }
+}
+
+/** Identity for the offline/CLI send path, read from the session record in
+ *  hand. Mirrors the daemon rule: a committed attestation counts only while the
+ *  exact process it describes is still alive (pid + kernel start identity), so a
+ *  recycled pid or a dead CLI degrades to "unknown" instead of a stale claim. */
+function localLaunchIdentity(session: SessionData): { model?: string; reasoningEffort?: string } {
+  const att = session.launchAttestation;
+  if (!att) return {};
+  const now = readProcessStartIdentity(att.cliPid);
+  if (!now || now !== att.cliProcStart) return {};
+  return {
+    ...(att.model ? { model: att.model } : {}),
+    ...(att.effort
+      ? { reasoningEffort: `${att.effort}${att.effortProvenance === 'default' ? '(默认)' : ''}` }
+      : {}),
+  };
 }
 
 /**
