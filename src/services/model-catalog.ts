@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 /**
  * model-catalog.ts
  *
@@ -32,8 +33,26 @@ export interface DetectModelsOptions {
   /** 适配器工厂注入，默认 createCliAdapterSync。 */
   readonly adapterFactory?: (cliId: CliId) => CliAdapter;
   /** 透传给 adapter.detectModels 的 per-bot env（如 pi 需要 provider key 才能列模型）。
-   *  不参与缓存键：同一 key 的候选被认为与 env 无关，调用方需按 bot 分别取 key。 */
+   *  参与缓存/in-flight 作用域：缓存键 = key + env 的摘要（只存 sha256 前缀，不存 env 值），
+   *  不同 bot 的 provider key 不同 → 候选互不串。 */
   readonly env?: Readonly<Record<string, string>>;
+  /** 显式的 per-bot/session 作用域（与 env 一起进缓存键；两者都缺省 = 全局）。 */
+  readonly scope?: string;
+  /** 强制探测：跳过 TTL 内的旧缓存（仍与同 key 的 in-flight 探测去重），
+   *  成功后以**真实完成时刻**写缓存，供随后的普通查询命中。 */
+  readonly force?: boolean;
+}
+
+/** 缓存键：selection key + 作用域摘要。env 只贡献 sha256 前缀，绝不落值。 */
+export function detectCacheKey(key: string, opts?: Pick<DetectModelsOptions, 'env' | 'scope'>): string {
+  const parts: string[] = [];
+  if (opts?.scope) parts.push(`s=${opts.scope}`);
+  if (opts?.env && Object.keys(opts.env).length > 0) {
+    const h = createHash('sha256');
+    for (const k of Object.keys(opts.env).sort()) h.update(`${k}=${opts.env[k]}\n`);
+    parts.push(`e=${h.digest('hex').slice(0, 16)}`);
+  }
+  return parts.length ? `${key}::${parts.join(';')}` : key;
 }
 
 // ─── 静态候选 ────────────────────────────────────────────────────────────────
@@ -88,13 +107,15 @@ async function detectModelsWith(
     if (!opt || isTtadkWrapper(opt.wrapperCli)) return null;
 
     // TTL 内的成功缓存直接复用。
-    const cached = cache.get(opt.key);
+    const cacheKey = detectCacheKey(opt.key, opts);
+    const cached = opts?.force ? undefined : cache.get(cacheKey);
     if (cached && now() - cached.at < MODEL_DETECT_TTL_MS) {
       return cached.models;
     }
 
-    // 同一 key 并发调用复用 in-flight Promise（去重）。
-    const pending = inFlight.get(opt.key);
+    // 同一 (key, scope) 并发调用复用 in-flight Promise（去重）；force 也复用
+    // 正在进行的探测（它本身就是新鲜的）。
+    const pending = inFlight.get(cacheKey);
     if (pending) return pending;
 
     const promise = (async (): Promise<readonly string[] | null> => {
@@ -104,17 +125,17 @@ async function detectModelsWith(
         const models = adapter.detectModels ? await adapter.detectModels(opts?.env ? { env: opts.env } : undefined) : null;
         // 只缓存非空成功结果；失败（null/空数组/异常）不缓存，下次调用重试。
         if (models && models.length > 0) {
-          cache.set(opt.key, { at: now(), models: [...models] });
+          cache.set(cacheKey, { at: now(), models: [...models] });
         }
         return models;
       } catch {
         return null;
       } finally {
-        inFlight.delete(opt.key);
+        inFlight.delete(cacheKey);
       }
     })();
 
-    inFlight.set(opt.key, promise);
+    inFlight.set(cacheKey, promise);
     return promise;
   } catch {
     return null;

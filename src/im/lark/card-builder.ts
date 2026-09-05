@@ -414,6 +414,9 @@ export function buildSessionCard(
   localCliReady = false,
   runtimeDisplayName?: string,
   externalChat = false,
+  /** Caller-proven surface verdict (core/model-switch-surface.ts). Default
+   *  false = never render the model button unless the call site proved it. */
+  modelSwitchAllowed = false,
 ): string {
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(cliId ?? 'claude-code');
   const effectiveCliId = cliId ?? 'claude-code';
@@ -464,7 +467,7 @@ export function buildSessionCard(
       value: { action: 'restart', ...actionBase },
     });
   }
-  const modelBtn = modelSwitchButton(effectiveCliId, !!adoptMode, actionBase, locale);
+  const modelBtn = modelSwitchAllowed ? modelSwitchButton(effectiveCliId, !!adoptMode, actionBase, locale) : undefined;
   if (showManageButtons && modelBtn) actions.push(modelBtn);
   if (adoptMode) {
     actions.push({
@@ -957,6 +960,9 @@ export function buildStreamingCard(
   runtimeDisplayName?: string,
   serviceTierBadge?: string,
   externalChat = false,
+  /** Caller-proven surface verdict (core/model-switch-surface.ts); default
+   *  false = never render the model button unless the call site proved it. */
+  modelSwitchAllowed = false,
 ): string {
   const effectiveCliId = cliId ?? 'claude-code';
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(effectiveCliId);
@@ -1019,7 +1025,7 @@ export function buildStreamingCard(
       value: { action: 'get_write_link', ...actionBase },
     });
   }
-  const modelSwitchBtn = externalChat ? undefined : modelSwitchButton(effectiveCliId, !!adoptMode, actionBase, locale);
+  const modelSwitchBtn = (externalChat || !modelSwitchAllowed) ? undefined : modelSwitchButton(effectiveCliId, !!adoptMode, actionBase, locale);
   if (modelSwitchBtn) headerActions.push(modelSwitchBtn);
   if (externalChat) {
     // 外部群：整排操作按钮不渲染（下方快捷键排同样跳过）。
@@ -2742,10 +2748,10 @@ export function buildCodexAppThreadSelectCard(threads: CodexAppThreadSummary[], 
 
 // ─── Card-driven model switch (design card-model-switch-s1 rev16, v1) ────────
 
-/** 「⚙ 模型」 button for the session / streaming cards. Only for CLIs that can
- *  actually take a model on respawn (MODEL_SWITCH_CAPABILITY spawn|fresh-only),
- *  never for adopt sessions or remote backends (their restart is refused). The
- *  click handler re-checks everything (proven-internal chat, canOperate, txn). */
+/** 「⚙ 模型」 button for the session / streaming cards. Rendered only when the
+ *  call site passed `modelSwitchAllowed=true` (proven-internal chat +
+ *  wrapper-first capability, see core/model-switch-surface.ts); this helper
+ *  keeps the adopt / remote / bare-CLI defence for legacy callers. */
 export function modelSwitchButton(
   cliId: CliId,
   adoptMode: boolean,
@@ -2876,6 +2882,7 @@ export function buildModelPickConfirmCard(
   d: Pick<ModelMenuCardData, 'sessionId' | 'rootId' | 'cliId' | 'cliName' | 'menuId'>,
   target: { model?: string; effort?: string },
   locale?: Locale,
+  reason: 'busy' | 'fresh' = 'busy',
 ): string {
   const actionBase = { root_id: d.rootId, session_id: d.sessionId, cli_id: d.cliId, menu_id: d.menuId };
   const label = `${target.model ?? t('card.model.cli_default', undefined, locale)}${target.effort ? ` · ${target.effort}` : ''}`;
@@ -2883,9 +2890,9 @@ export function buildModelPickConfirmCard(
     config: { wide_screen_mode: true },
     header: { template: 'orange', title: { tag: 'plain_text', content: t('card.model.confirm_title', { cliName: d.cliName }, locale) } },
     elements: [
-      { tag: 'div', text: { tag: 'lark_md', content: t('card.model.confirm_busy', { target: escapeMd(label) }, locale) } },
+      { tag: 'div', text: { tag: 'lark_md', content: t(reason === 'fresh' ? 'card.model.confirm_fresh' : 'card.model.confirm_busy', { cliName: d.cliName, target: escapeMd(label) }, locale) } },
       { tag: 'action', actions: [
-        { tag: 'button', text: { tag: 'plain_text', content: t('card.model.btn_confirm_switch', undefined, locale) }, type: 'primary', value: { action: 'model_pick_confirm', ...(target.model !== undefined ? { model: target.model } : {}), ...(target.effort !== undefined ? { effort: target.effort } : {}), ...actionBase } },
+        { tag: 'button', text: { tag: 'plain_text', content: t(reason === 'fresh' ? 'card.model.btn_confirm_fresh' : 'card.model.btn_confirm_switch', undefined, locale) }, type: 'primary', value: { action: 'model_pick_confirm', ...(target.model !== undefined ? { model: target.model } : {}), ...(target.effort !== undefined ? { effort: target.effort } : {}), ...actionBase } },
       ] },
     ],
   });

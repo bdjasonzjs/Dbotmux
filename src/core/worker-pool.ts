@@ -35,8 +35,9 @@ import {
 } from '../services/message-listener-run-preview-store.js';
 import { persistStreamCardState, rememberLastCliInput } from './session-manager.js';
 import { isExternalChatSession } from './external-chat.js';
+import { modelSwitchAllowedForSession } from './model-switch-surface.js';
 import { resolveSessionLaunchModel } from './session-model.js';
-import { prepareModelSwitch, settleModelSwitch, applyRollbackInMemory, type PrepareRefusal, type ModelSwitchTxn, type SettleOutcome } from './model-switch.js';
+import { prepareModelSwitch, settleModelSwitch, applyRollbackInMemory, beginForceRollback, type PrepareRefusal, type ModelSwitchTxn, type SettleOutcome } from './model-switch.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, rehomeReplyTargetState, replyTargetKey } from './reply-target.js';
 import { updateMessage, deleteMessage, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, MessageWithdrawnError } from '../im/lark/client.js';
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, getCliDisplayName } from '../im/lark/card-builder.js';
@@ -947,6 +948,7 @@ function scheduleLocalCliOpenReadinessPatch(ds: DaemonSession): void {
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     isExternalChatSession(ds),
+    modelSwitchAllowedForSession(ds),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1001,6 +1003,7 @@ function scheduleActiveRuntimePatch(ds: DaemonSession): void {
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     isExternalChatSession(ds),
+    modelSwitchAllowedForSession(ds),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1054,6 +1057,7 @@ function scheduleCodexServiceTierPatch(ds: DaemonSession): void {
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     isExternalChatSession(ds),
+    modelSwitchAllowedForSession(ds),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1133,6 +1137,7 @@ export function refreshStreamingCardUsage(ds: DaemonSession): void {
     // ⚡ badge until the next status-edge PATCH.
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     isExternalChatSession(ds),
+    modelSwitchAllowedForSession(ds),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1216,6 +1221,7 @@ export function scheduleRiffAccessUrlPatch(ds: DaemonSession): void {
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     isExternalChatSession(ds),
+    modelSwitchAllowedForSession(ds),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1829,6 +1835,7 @@ function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
     sessionRuntimeDisplayName(ds, bot.config),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     isExternalChatSession(ds),
+    modelSwitchAllowedForSession(ds),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -2080,6 +2087,7 @@ function reconcilePostedStartingCard(ds: DaemonSession, turnId: string | undefin
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     isExternalChatSession(ds),
+    modelSwitchAllowedForSession(ds),
   );
   scheduleCardPatch(ds, cardJson, turnId);
 }
@@ -2145,6 +2153,7 @@ export async function postTurnStartingCard(
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     isExternalChatSession(ds),
+    modelSwitchAllowedForSession(ds),
   );
 
   ds.streamCardNonce = nonce;
@@ -2278,6 +2287,7 @@ export async function postFreshStreamingCard(
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     isExternalChatSession(ds),
+    modelSwitchAllowedForSession(ds),
   );
   ds.streamCardId = CARD_POSTING_SENTINEL;
   try {
@@ -2457,6 +2467,8 @@ export function buildWritableTerminalCard(ds: DaemonSession): string | null {
       localeForBot(ds.larkAppId),
       false,
       sessionRuntimeDisplayName(ds, botCfg),
+      isExternalChatSession(ds),
+      modelSwitchAllowedForSession(ds, effectiveCliId),
       );
   }
   const port = ds.workerPort ?? ds.session.webPort;
@@ -2474,6 +2486,8 @@ export function buildWritableTerminalCard(ds: DaemonSession): string | null {
     localeForBot(ds.larkAppId),
     isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
     sessionRuntimeDisplayName(ds, botCfg),
+    isExternalChatSession(ds),
+    modelSwitchAllowedForSession(ds, effectiveCliId),
   );
 }
 
@@ -2563,6 +2577,8 @@ function buildSubstituteControlCard(ds: DaemonSession): string | null {
     localeForBot(ds.larkAppId),
     isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
     sessionRuntimeDisplayName(ds, botCfg),
+    isExternalChatSession(ds),
+    modelSwitchAllowedForSession(ds, effectiveCliId),
   );
 }
 
@@ -3529,11 +3545,90 @@ export type ModelSwitchRefusal =
   | 'restart_in_flight'
   | 'transferring'
   | 'remote'
-  | 'adopt';
+  | 'adopt'
+  /** No live worker and the persistent pane is still alive / indeterminate:
+   *  a fork would REATTACH the old CLI and `succeeded` would be untruthful. */
+  | 'pane_alive'
+  | 'pane_unknown';
+
+/**
+ * A model switch must be a genuine relaunch. With no live worker the fork path
+ * may reattach a surviving persistent pane (see destroyLivePaneBeforeRestart,
+ * which deliberately tolerates that for plain restarts). For a switch that is
+ * unacceptable — the reattached CLI runs the OLD model yet reports succeeded —
+ * so kill first and only proceed when the pane is PROVEN gone.
+ */
+export function ensureFreshSpawnForSwitch(ds: DaemonSession): 'ok' | 'pane_alive' | 'pane_unknown' {
+  if (ds.worker && !ds.worker.killed) return 'ok';
+  if (!shouldDestroyPaneBeforeRestart(ds)) return 'ok';
+  const target = persistentBackendTargetForSession(ds);
+  if (!target) return 'ok';
+  const kill = (): void => {
+    try { killPersistentBackendTarget(target, ds.session.sessionId); } catch { /* probe decides */ }
+  };
+  kill();
+  let probe = probePersistentBackendTarget(target);
+  if (probe === 'exists') { kill(); probe = probePersistentBackendTarget(target); }
+  if (probe === 'missing') return 'ok';
+  return probe === 'exists' ? 'pane_alive' : 'pane_unknown';
+}
 
 export type ModelSwitchRequestResult =
   | { ok: true; attemptId: string; txn: ModelSwitchTxn }
   | { ok: false; reason: ModelSwitchRefusal };
+
+export type ForceRollbackResult =
+  | { ok: true; attemptId: string; txn: ModelSwitchTxn }
+  | { ok: false; reason: 'no_txn' | 'restart_in_flight' | 'transferring' | 'pane_alive' | 'pane_unknown' };
+
+/**
+ * Force-rollback an `ambiguous` switch. The record is restored ONLY once the
+ * convergence restart has been accepted by the coordinator, and the
+ * transaction stays (state `rolling_back`) until that attempt reports
+ * `succeeded`; a refusal leaves record and transaction exactly as they were.
+ */
+export function requestModelSwitchForceRollback(
+  ds: DaemonSession,
+  observer: RestartObserver & { onSettled?: (outcome: SettleOutcome, txn: ModelSwitchTxn) => void | Promise<void> },
+): ForceRollbackResult {
+  const txn = ds.session.modelSwitchTxn;
+  if (!txn || txn.state !== 'ambiguous') return { ok: false, reason: 'no_txn' };
+  if (isSessionTransferring(ds)) return { ok: false, reason: 'transferring' };
+  if (restartCoordinator.activeAttemptId(ds.session.sessionId)) return { ok: false, reason: 'restart_in_flight' };
+  const fresh = ensureFreshSpawnForSwitch(ds);
+  if (fresh !== 'ok') return { ok: false, reason: fresh };
+  const attemptId = randomBytes(12).toString('hex');
+  // Preconditions are all synchronous and just verified, so the request below
+  // is accepted under our id; restore the record first so the restart IPC
+  // carries the restored model/effort.
+  const snapshot = { model: ds.session.model, reasoningEffort: ds.session.reasoningEffort, pin: ds.session.modelPin, state: txn.state, attemptId: txn.attemptId };
+  beginForceRollback(ds.session, attemptId);
+  const settle = (status: 'succeeded' | 'failed' | 'timed_out'): void | Promise<void> => {
+    const outcome = settleModelSwitch(ds.session, attemptId, status);
+    if (outcome === 'ignored') return;
+    sessionStore.updateSession(ds.session);
+    logger.info(`[${tag(ds)}] model switch ${txn.txnId} force-rollback ${outcome} (restart ${status})`);
+    return observer.onSettled?.(outcome, txn);
+  };
+  const result = requestSessionRestart(ds, {
+    source: observer.source,
+    notify: async status => {
+      if (status === 'succeeded' || status === 'failed' || status === 'timed_out') await settle(status);
+      await observer.notify(status);
+    },
+  }, { attemptId, strict: true, freshThread: txn.freshThread });
+  if (!result || result.joined || result.attemptId !== attemptId) {
+    // Not issued under our id: undo the in-memory restore, keep ambiguous.
+    ds.session.model = snapshot.model;
+    ds.session.reasoningEffort = snapshot.reasoningEffort;
+    ds.session.modelPin = snapshot.pin;
+    txn.state = 'ambiguous';
+    txn.attemptId = snapshot.attemptId;
+    return { ok: false, reason: !result ? 'transferring' : 'restart_in_flight' };
+  }
+  sessionStore.updateSession(ds.session);
+  return { ok: true, attemptId, txn };
+}
 
 /**
  * Card-driven model switch (design rev16 §7, v1 subset): pin the target on the
@@ -3551,6 +3646,11 @@ export function requestModelSwitchRestart(
   if (isRemoteBackendSession(ds)) return { ok: false, reason: 'remote' };
   if (isSessionTransferring(ds)) return { ok: false, reason: 'transferring' };
   if (restartCoordinator.activeAttemptId(ds.session.sessionId)) return { ok: false, reason: 'restart_in_flight' };
+  const fresh = ensureFreshSpawnForSwitch(ds);
+  if (fresh !== 'ok') {
+    logger.warn(`[${tag(ds)}] model switch refused: persistent pane ${fresh === 'pane_alive' ? 'still alive' : 'indeterminate'} with no live worker`);
+    return { ok: false, reason: fresh };
+  }
   const attemptId = randomBytes(12).toString('hex');
   const prepared = prepareModelSwitch(ds.session, { ...target, attemptId });
   if (!prepared.ok) return prepared;
@@ -5495,6 +5595,7 @@ export function buildStreamingCardJson(ds: DaemonSession, status?: StreamStatus)
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     isExternalChatSession(ds),
+    modelSwitchAllowedForSession(ds),
   );
 }
 
@@ -10525,6 +10626,7 @@ function setupWorkerHandlers(
               sessionRuntimeDisplayName(ds, botCfg),
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
               isExternalChatSession(ds),
+              modelSwitchAllowedForSession(ds),
             );
             await updateMessage(ds.larkAppId, restoredCardId, streamCardJson);
             if (!ownsLifecycleMutation()) break;
@@ -10606,6 +10708,7 @@ function setupWorkerHandlers(
             sessionRuntimeDisplayName(ds, botCfg),
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
             isExternalChatSession(ds),
+            modelSwitchAllowedForSession(ds),
           );
           const postedCardId = await scopedReply(
             streamCardJson, 'interactive', cardReplyTarget.turnId,
@@ -10676,6 +10779,7 @@ function setupWorkerHandlers(
               localCliReadyAtBuild,
               sessionRuntimeDisplayName(ds, botCfg),
               isExternalChatSession(ds),
+              modelSwitchAllowedForSession(ds),
             );
             const fallbackCardId = await scopedReply(cardJson, 'interactive', msg.turnId);
             if (!ownsLifecycleMutation()) {
@@ -10696,6 +10800,7 @@ function setupWorkerHandlers(
                 true,
                 sessionRuntimeDisplayName(ds, botCfg),
                 isExternalChatSession(ds),
+                modelSwitchAllowedForSession(ds),
               );
               try {
                 await updateMessage(ds.larkAppId, fallbackCardId, readyCardJson);
@@ -10825,6 +10930,7 @@ function setupWorkerHandlers(
             sessionRuntimeDisplayName(ds, botCfg),
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
             isExternalChatSession(ds),
+            modelSwitchAllowedForSession(ds),
           );
           scheduleCardPatch(ds, cardJson);
         }
@@ -11070,6 +11176,7 @@ function setupWorkerHandlers(
             sessionRuntimeDisplayName(ds, botCfg),
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
             isExternalChatSession(ds),
+            modelSwitchAllowedForSession(ds),
           );
           // Mark POST in-flight so subsequent screen_updates are dropped,
           // not POSTed as duplicate cards.
@@ -11153,6 +11260,7 @@ function setupWorkerHandlers(
             sessionRuntimeDisplayName(ds, botCfg),
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
             isExternalChatSession(ds),
+            modelSwitchAllowedForSession(ds),
           );
           scheduleCardPatch(ds, cardJson, msg.turnId);
           // Keep the live usage climbing during a long working phase; stop once
@@ -11228,6 +11336,7 @@ function setupWorkerHandlers(
           sessionRuntimeDisplayName(ds, botCfg),
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
           isExternalChatSession(ds),
+          modelSwitchAllowedForSession(ds),
         );
         scheduleCardPatch(ds, cardJson);
         break;
@@ -11638,6 +11747,7 @@ function setupWorkerHandlers(
               sessionRuntimeDisplayName(ds, botCfg),
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
               isExternalChatSession(ds),
+              modelSwitchAllowedForSession(ds),
             );
             scheduleCardPatch(ds, frozenCard);
           }
@@ -11710,6 +11820,7 @@ function setupWorkerHandlers(
               sessionRuntimeDisplayName(ds, botCfg),
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
               isExternalChatSession(ds),
+              modelSwitchAllowedForSession(ds),
             );
             scheduleCardPatch(ds, frozenCard);
           }

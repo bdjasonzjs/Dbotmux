@@ -24,16 +24,27 @@ vi.mock('../src/services/session-store.js', async (importOriginal) => ({
   updateSession: (...args: unknown[]) => updateSessionMock(...args),
 }));
 
+const probeMock = vi.fn();
+const killMock = vi.fn();
+vi.mock('../src/core/persistent-backend.js', async (importOriginal) => ({
+  ...(await importOriginal() as object),
+  probePersistentBackendTarget: (...a: unknown[]) => probeMock(...a),
+  killPersistentBackendTarget: (...a: unknown[]) => killMock(...a),
+}));
+
 import { readFileSync } from 'node:fs';
 import {
-  MODEL_SWITCH_CAPABILITY, cliSupportsModelSwitch, prepareModelSwitch, settleModelSwitch,
-  recheckModelSwitch, forceRollbackModelSwitch, applyRollbackInMemory,
+  MODEL_SWITCH_CAPABILITY, cliSupportsModelSwitch, sessionSupportsModelSwitch, capabilityForSession,
+  prepareModelSwitch, settleModelSwitch, recheckModelSwitch, forceRollbackModelSwitch, applyRollbackInMemory,
+  beginForceRollback,
 } from '../src/core/model-switch.js';
+import { modelSwitchAllowedForSession } from '../src/core/model-switch-surface.js';
+import { setChatExternal, _resetChatExternalCacheForTests } from '../src/im/lark/chat-external-cache.js';
 import { resolveSessionLaunchModel } from '../src/core/session-model.js';
 import { RestartCoordinator } from '../src/core/restart-coordinator.js';
 import {
-  requestSessionRestart, requestModelSwitchRestart, latestEffortForRespawn, convergeSessionEffort,
-  __testOnly_resetRestartCoordinator,
+  requestSessionRestart, requestModelSwitchRestart, requestModelSwitchForceRollback, ensureFreshSpawnForSwitch,
+  latestEffortForRespawn, convergeSessionEffort, __testOnly_resetRestartCoordinator, __testOnly_resolveRestart,
 } from '../src/core/worker-pool.js';
 import { parsePiListModels } from '../src/adapters/cli/pi.js';
 import { buildSessionCard, buildStreamingCard, buildModelMenuCard, buildModelCustomCard } from '../src/im/lark/card-builder.js';
@@ -43,8 +54,10 @@ const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 
 const cardHandlerSource = readFileSync(new URL('../src/im/lark/card-handler.ts', import.meta.url), 'utf8');
 const dispatcherSource = readFileSync(new URL('../src/im/lark/event-dispatcher.ts', import.meta.url), 'utf8');
 
-beforeEach(() => { getBotMock.mockReset(); updateSessionMock.mockReset(); __testOnly_resetRestartCoordinator(); });
+beforeEach(() => { getBotMock.mockReset(); updateSessionMock.mockReset(); probeMock.mockReset(); killMock.mockReset(); _resetChatExternalCacheForTests(); __testOnly_resetRestartCoordinator(); });
 afterEach(() => { __testOnly_resetRestartCoordinator(); });
+
+import { activeSessionRestartAttemptId as __testOnly_activeAttempt } from '../src/core/worker-pool.js';
 
 let n = 0;
 function makeDs(session: Record<string, unknown> = {}, extra: Record<string, unknown> = {}) {
@@ -57,22 +70,70 @@ function makeDs(session: Record<string, unknown> = {}, extra: Record<string, unk
   return { ds, send };
 }
 
-// ─── 1. capability table (independent oracle) ─────────────────────────────
+// ─── 1. capability table (independent oracle: 28 literal rows, 17/1/8/2) ────
 describe('MODEL_SWITCH_CAPABILITY', () => {
-  const EXPECTED: Record<string, string> = {
-    'claude-code': 'spawn', codex: 'spawn', 'codex-app': 'fresh-only', pi: 'spawn', grok: 'spawn',
-    coco: 'unsupported', opencode2: 'unsupported', riff: 'remote', mojo: 'remote', relay: 'unsupported',
+  const EXPECTED: Record<string, 'spawn' | 'fresh-only' | 'unsupported' | 'remote'> = {
+    'claude-code': 'spawn', seed: 'spawn', relay: 'spawn', aiden: 'unsupported', coco: 'spawn',
+    codex: 'spawn', 'codex-app': 'fresh-only', cursor: 'spawn', gemini: 'spawn', genius: 'spawn',
+    opencode: 'spawn', opencode2: 'unsupported', antigravity: 'unsupported', mtr: 'unsupported',
+    hermes: 'unsupported', mira: 'unsupported', mir: 'unsupported', traex: 'spawn', pi: 'spawn',
+    copilot: 'spawn', 'oh-my-pi': 'spawn', kimi: 'spawn', grok: 'spawn', 'kiro-cli': 'unsupported',
+    riff: 'remote', reasonix: 'spawn', dsh: 'spawn', mojo: 'remote',
   };
-  for (const [cli, cap] of Object.entries(EXPECTED)) {
-    it(`${cli} → ${cap}`, () => expect(MODEL_SWITCH_CAPABILITY[cli as keyof typeof MODEL_SWITCH_CAPABILITY]).toBe(cap));
-  }
-  it('covers all 28 CliIds', () => expect(Object.keys(MODEL_SWITCH_CAPABILITY)).toHaveLength(28));
-  it('button predicate: spawn/fresh-only yes, unsupported/remote/undefined no', () => {
+  it('has exactly the 28 expected rows with the expected values (17/1/8/2)', () => {
+    expect(Object.keys(MODEL_SWITCH_CAPABILITY).sort()).toEqual(Object.keys(EXPECTED).sort());
+    for (const [cli, cap] of Object.entries(EXPECTED)) {
+      expect(MODEL_SWITCH_CAPABILITY[cli as keyof typeof MODEL_SWITCH_CAPABILITY], cli).toBe(cap);
+    }
+    const counts = Object.values(MODEL_SWITCH_CAPABILITY).reduce<Record<string, number>>((m, c) => ({ ...m, [c]: (m[c] ?? 0) + 1 }), {});
+    expect(counts).toEqual({ spawn: 17, 'fresh-only': 1, unsupported: 8, remote: 2 });
+  });
+  it('bare predicate: spawn/fresh-only yes, unsupported/remote/undefined no', () => {
     expect(cliSupportsModelSwitch('claude-code')).toBe(true);
     expect(cliSupportsModelSwitch('codex-app')).toBe(true);
-    expect(cliSupportsModelSwitch('coco')).toBe(false);
+    expect(cliSupportsModelSwitch('relay')).toBe(true);
+    expect(cliSupportsModelSwitch('coco')).toBe(true);
+    expect(cliSupportsModelSwitch('opencode2')).toBe(false);
     expect(cliSupportsModelSwitch('riff')).toBe(false);
     expect(cliSupportsModelSwitch(undefined)).toBe(false);
+  });
+  it('wrapper-first: standalone coco = spawn, ttadk-coco = unsupported, ttadk-claude = spawn', () => {
+    expect(capabilityForSession('coco', undefined)).toBe('spawn');
+    expect(capabilityForSession('coco', 'ttadk coco')).toBe('unsupported');
+    expect(capabilityForSession('claude-code', 'ttadk claude')).toBe('spawn');
+    // the wrapper verdict wins even when the bare CLI would be unsupported
+    expect(capabilityForSession('opencode2', 'ttadk claude')).toBe('spawn');
+    expect(sessionSupportsModelSwitch('coco', 'ttadk coco')).toBe(false);
+    expect(sessionSupportsModelSwitch('coco', undefined)).toBe(true);
+  });
+  it('prepareModelSwitch refuses a ttadk-coco session even though bare coco is switchable', () => {
+    expect(prepareModelSwitch({ cliId: 'coco', wrapperCli: 'ttadk coco' } as any, { model: 'x', setBy: 'x', attemptId: 'A' })).toEqual({ ok: false, reason: 'unsupported' });
+    expect(prepareModelSwitch({ cliId: 'coco' } as any, { model: 'x', setBy: 'x', attemptId: 'A' }).ok).toBe(true);
+  });
+});
+
+// ─── 1b. render surface (real chain: session → cache → verdict) ───────────
+describe('modelSwitchAllowedForSession', () => {
+  const base = (over: Record<string, unknown> = {}) => ({
+    session: { sessionId: 's', cliId: 'claude-code', backendType: 'pty' }, larkAppId: 'app', chatId: 'oc_1', chatType: 'group', ...over,
+  }) as any;
+  it('p2p → allowed', () => expect(modelSwitchAllowedForSession(base({ chatType: 'p2p' }))).toBe(true));
+  it('persisted internal → allowed; persisted external → not', () => {
+    expect(modelSwitchAllowedForSession(base({ session: { sessionId: 's', cliId: 'claude-code', externalChat: false } }))).toBe(true);
+    expect(modelSwitchAllowedForSession(base({ session: { sessionId: 's', cliId: 'claude-code', externalChat: true } }))).toBe(false);
+  });
+  it('cached internal → allowed; cached external → not; UNKNOWN → not (fail closed)', () => {
+    expect(modelSwitchAllowedForSession(base())).toBe(false); // unknown
+    setChatExternal('app', 'oc_1', false);
+    expect(modelSwitchAllowedForSession(base())).toBe(true);
+    _resetChatExternalCacheForTests();
+    setChatExternal('app', 'oc_1', true);
+    expect(modelSwitchAllowedForSession(base())).toBe(false);
+  });
+  it('capability / adopt gates apply before the chat verdict', () => {
+    expect(modelSwitchAllowedForSession(base({ chatType: 'p2p', session: { sessionId: 's', cliId: 'coco', wrapperCli: 'ttadk coco' } }))).toBe(false);
+    expect(modelSwitchAllowedForSession(base({ chatType: 'p2p', session: { sessionId: 's', cliId: 'riff' } }))).toBe(false);
+    expect(modelSwitchAllowedForSession(base({ chatType: 'p2p', initConfig: { adoptMode: true } }))).toBe(false);
   });
 });
 
@@ -114,7 +175,7 @@ describe('prepareModelSwitch / settleModelSwitch', () => {
     expect(prepareModelSwitch(s, { model: 'sonnet', setBy: 'x', attemptId: 'A3' })).toEqual({ ok: false, reason: 'ambiguous_frozen' });
   });
   it('refuses unsupported CLIs and unsupported / non-configurable effort', () => {
-    expect(prepareModelSwitch({ cliId: 'coco' } as any, { model: 'x', setBy: 'x', attemptId: 'A' })).toEqual({ ok: false, reason: 'unsupported' });
+    expect(prepareModelSwitch({ cliId: 'opencode2' } as any, { model: 'x', setBy: 'x', attemptId: 'A' })).toEqual({ ok: false, reason: 'unsupported' });
     expect(prepareModelSwitch({ cliId: 'claude-code' } as any, { model: 'opus', effort: 'high', setBy: 'x', attemptId: 'A' })).toEqual({ ok: false, reason: 'effort_not_configurable' });
     expect(prepareModelSwitch({ cliId: 'codex' } as any, { model: 'gpt-5.5', effort: 'ultra', setBy: 'x', attemptId: 'A' })).toEqual({ ok: false, reason: 'effort_not_supported' });
   });
@@ -155,18 +216,73 @@ describe('prepareModelSwitch / settleModelSwitch', () => {
     expect(s.modelSwitchTxn.state).toBe('ambiguous');
     expect(s.modelPin.model).toBe('opus');
   });
-  it('recheck: only a verified attestation of the CURRENT generation decides', () => {
+  it('recheck: only a verified attestation of the CURRENT generation decides; model AND effort', () => {
+    const att = (model: string | null, effort: string | null = null, gen = 3, prov: 'explicit' | 'default' | 'unknown' = effort ? 'explicit' : 'default') => ({ model, effort, effortProvenance: prov, workerGeneration: gen });
     const mk = () => { const s: any = { cliId: 'claude-code', model: 'fable' }; prepareModelSwitch(s, { model: 'opus', setBy: 'x', attemptId: 'A1' }); settleModelSwitch(s, 'A1', 'timed_out'); return s; };
     let s = mk();
     expect(recheckModelSwitch(s, undefined, 3)).toBe('ambiguous');
-    expect(recheckModelSwitch(s, { model: 'opus', workerGeneration: 2 }, 3)).toBe('ambiguous');
-    expect(recheckModelSwitch(s, { model: 'opus', workerGeneration: 3 }, 3)).toBe('committed');
+    expect(recheckModelSwitch(s, att('opus', null, 2), 3)).toBe('ambiguous');
+    expect(recheckModelSwitch(s, att('opus'), 3)).toBe('committed');
     expect(s.modelPin.model).toBe('opus');
     s = mk();
-    expect(recheckModelSwitch(s, { model: 'fable', workerGeneration: 3 }, 3)).toBe('rolled_back');
+    expect(recheckModelSwitch(s, att('fable'), 3)).toBe('rolled_back');
     expect(s.modelPin).toBeUndefined();
     s = mk();
-    expect(recheckModelSwitch(s, { model: 'sonnet', workerGeneration: 3 }, 3)).toBe('ambiguous');
+    expect(recheckModelSwitch(s, att('sonnet'), 3)).toBe('ambiguous');
+    // in_flight is never rechecked (only ambiguous)
+    const live: any = { cliId: 'claude-code' }; prepareModelSwitch(live, { model: 'opus', setBy: 'x', attemptId: 'A' });
+    expect(recheckModelSwitch(live, att('opus'), 3)).toBe('ignored');
+  });
+  it('recheck: an effort-only switch is NOT proven by an unchanged model (P1-7)', () => {
+    const s: any = { cliId: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high' };
+    prepareModelSwitch(s, { model: 'gpt-5.6-sol', effort: 'xhigh', setBy: 'x', attemptId: 'A1' });
+    settleModelSwitch(s, 'A1', 'timed_out');
+    // attestation still shows the OLD effort → this is the rollback fact, not a commit
+    expect(recheckModelSwitch(s, { model: 'gpt-5.6-sol', effort: 'high', effortProvenance: 'explicit', workerGeneration: 3 }, 3)).toBe('rolled_back');
+    expect(s.reasoningEffort).toBe('high');
+    const s2: any = { cliId: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high' };
+    prepareModelSwitch(s2, { model: 'gpt-5.6-sol', effort: 'xhigh', setBy: 'x', attemptId: 'A1' });
+    settleModelSwitch(s2, 'A1', 'timed_out');
+    expect(recheckModelSwitch(s2, { model: 'gpt-5.6-sol', effort: 'xhigh', effortProvenance: 'explicit', workerGeneration: 3 }, 3)).toBe('committed');
+    // a CLI-default effort with an unset target counts as "no explicit effort"
+    const s3: any = { cliId: 'codex', model: 'gpt-5.5' };
+    prepareModelSwitch(s3, { model: 'gpt-5.6-sol', setBy: 'x', attemptId: 'A1' });
+    settleModelSwitch(s3, 'A1', 'timed_out');
+    expect(recheckModelSwitch(s3, { model: 'gpt-5.6-sol', effort: 'medium', effortProvenance: 'default', workerGeneration: 3 }, 3)).toBe('committed');
+    // …but an EXPLICIT stray effort does not prove the unset target
+    const s4: any = { cliId: 'codex', model: 'gpt-5.5' };
+    prepareModelSwitch(s4, { model: 'gpt-5.6-sol', setBy: 'x', attemptId: 'A1' });
+    settleModelSwitch(s4, 'A1', 'timed_out');
+    expect(recheckModelSwitch(s4, { model: 'gpt-5.6-sol', effort: 'high', effortProvenance: 'explicit', workerGeneration: 3 }, 3)).toBe('ambiguous');
+  });
+  it('recheck: fresh-only additionally needs a NEW thread id', () => {
+    const mk = () => { const s: any = { cliId: 'codex-app', model: 'gpt-5.5', cliSessionId: 'thr-old' }; prepareModelSwitch(s, { model: 'gpt-5.6-sol', setBy: 'x', attemptId: 'A1' }); settleModelSwitch(s, 'A1', 'timed_out'); return s; };
+    const att = { model: 'gpt-5.6-sol', effort: null, effortProvenance: 'default' as const, workerGeneration: 3 };
+    let s = mk();
+    expect(recheckModelSwitch(s, att, 3)).toBe('ambiguous');           // same thread id → not proven
+    s.cliSessionId = 'thr-new';
+    expect(recheckModelSwitch(s, att, 3)).toBe('committed');
+    s = mk(); s.cliSessionId = undefined;
+    expect(recheckModelSwitch(s, att, 3)).toBe('ambiguous');
+  });
+  it('beginForceRollback restores the record but KEEPS the txn as rolling_back bound to the new attempt', () => {
+    const s: any = { cliId: 'claude-code', model: 'fable' };
+    prepareModelSwitch(s, { model: 'opus', setBy: 'x', attemptId: 'A1' });
+    expect(beginForceRollback(s, 'R1')).toBeUndefined(); // only from ambiguous
+    settleModelSwitch(s, 'A1', 'timed_out');
+    const txn = beginForceRollback(s, 'R1');
+    expect(txn).toMatchObject({ state: 'rolling_back', attemptId: 'R1', originalAttemptId: 'A1' });
+    expect(s.model).toBe('fable');
+    expect(s.modelPin).toBeUndefined();
+    expect(s.modelSwitchTxn).toBe(txn);
+    // a late result for the ORIGINAL attempt is ignored
+    expect(settleModelSwitch(s, 'A1', 'succeeded')).toBe('ignored');
+    // only succeeded on the convergence attempt clears it; failure keeps it recoverable
+    const s2: any = JSON.parse(JSON.stringify(s));
+    expect(settleModelSwitch(s2, 'R1', 'failed')).toBe('ambiguous');
+    expect(s2.modelSwitchTxn.state).toBe('ambiguous');
+    expect(settleModelSwitch(s, 'R1', 'succeeded')).toBe('rolled_back');
+    expect(s.modelSwitchTxn).toBeUndefined();
   });
   it('force rollback restores the snapshot from ambiguous', () => {
     const s: any = { cliId: 'claude-code', model: 'fable' };
@@ -214,12 +330,21 @@ describe('requestModelSwitchRestart', () => {
     expect(ds.session.modelSwitchTxn.attemptId).toBe(r.attemptId);
     expect(updateSessionMock).toHaveBeenCalled();
   });
-  it('codex-app switch requests a fresh thread on both branches', () => {
+  it('codex-app switch on the LIVE branch sends freshThread:true', () => {
     getBotMock.mockReturnValue({ config: { cliId: 'codex-app' } });
     const { ds, send } = makeDs({ cliId: 'codex-app' });
     const r = requestModelSwitchRestart(ds, { model: 'gpt-5.5', setBy: 'x' }, { source: 'card', notify: vi.fn() });
     expect(r.ok).toBe(true);
     expect(send.mock.calls[0][0].freshThread).toBe(true);
+    expect(ds.session.modelSwitchTxn.freshThread).toBe(true);
+  });
+  it('a plain restart never sends freshThread and the no-live branch resumes; a freshThread no-live restart does not resume', () => {
+    // Behavioural, via the coordinator seam: the fork options are what the
+    // no-live branch passes. We intercept forkWorker through the module seam.
+    getBotMock.mockReturnValue({ config: { cliId: 'codex-app' } });
+    const { ds, send } = makeDs({ cliId: 'codex-app' });
+    requestSessionRestart(ds, { source: 'slash', notify: vi.fn() });
+    expect(send.mock.calls[0][0].freshThread).toBeUndefined();
   });
   it('strict: refuses while another restart is in flight and leaves the record untouched', () => {
     getBotMock.mockReturnValue({ config: { cliId: 'claude-code', model: 'fable' } });
@@ -271,6 +396,98 @@ describe('requestModelSwitchRestart', () => {
   });
 });
 
+describe('no-live-worker switch must be a proven fresh spawn (P1-4)', () => {
+  const noLive = () => makeDs({ cliId: 'codex-app', backendType: 'tmux' }, { worker: undefined });
+  it('live worker → ok without probing', () => {
+    expect(ensureFreshSpawnForSwitch(makeDs().ds)).toBe('ok');
+    expect(probeMock).not.toHaveBeenCalled();
+  });
+  it('pane missing after kill → ok', () => {
+    probeMock.mockReturnValue('missing');
+    expect(ensureFreshSpawnForSwitch(noLive().ds)).toBe('ok');
+    expect(killMock).toHaveBeenCalledTimes(1);
+  });
+  it('pane still alive after two kills → pane_alive; indeterminate → pane_unknown', () => {
+    probeMock.mockReturnValue('exists');
+    expect(ensureFreshSpawnForSwitch(noLive().ds)).toBe('pane_alive');
+    expect(killMock).toHaveBeenCalledTimes(2);
+    killMock.mockReset(); probeMock.mockReturnValue('unknown');
+    expect(ensureFreshSpawnForSwitch(noLive().ds)).toBe('pane_unknown');
+    expect(killMock).toHaveBeenCalledTimes(1);
+  });
+  it('requestModelSwitchRestart refuses (zero mutation, zero fork) when the pane is alive / unknown', () => {
+    getBotMock.mockReturnValue({ config: { cliId: 'codex-app' } });
+    for (const [probe, reason] of [['exists', 'pane_alive'], ['unknown', 'pane_unknown']] as const) {
+      probeMock.mockReturnValue(probe);
+      const { ds } = noLive();
+      const r = requestModelSwitchRestart(ds, { model: 'gpt-5.5', setBy: 'x' }, { source: 'card', notify: vi.fn() });
+      expect(r).toEqual({ ok: false, reason });
+      expect(ds.session.modelPin).toBeUndefined();
+      expect(ds.session.modelSwitchTxn).toBeUndefined();
+      expect(updateSessionMock).not.toHaveBeenCalled();
+      expect(__testOnly_activeAttempt(ds)).toBeUndefined();
+    }
+  });
+});
+
+describe('requestModelSwitchForceRollback (P1-7)', () => {
+  const ambiguous = () => {
+    getBotMock.mockReturnValue({ config: { cliId: 'codex', model: 'gpt-5.5' } });
+    const { ds, send } = makeDs({ cliId: 'codex', model: 'gpt-5.5', reasoningEffort: 'high' });
+    const r = requestModelSwitchRestart(ds, { model: 'gpt-5.6-sol', effort: 'xhigh', setBy: 'x' }, { source: 'card', notify: vi.fn() });
+    if (!r.ok) throw new Error('refused');
+    __testOnly_resolveRestart(ds.session.sessionId, r.attemptId, 'timed_out');
+    return { ds, send, r };
+  };
+  it('refuses when nothing is ambiguous / a restart is in flight, leaving the record untouched', async () => {
+    const { ds } = makeDs();
+    expect(requestModelSwitchForceRollback(ds, { source: 'card', notify: vi.fn() })).toEqual({ ok: false, reason: 'no_txn' });
+    const a = ambiguous();
+    await new Promise(r => setTimeout(r, 0));
+    expect(a.ds.session.modelSwitchTxn.state).toBe('ambiguous');
+    requestSessionRestart(a.ds, { source: 'slash', notify: vi.fn() }); // someone else's restart
+    const snapshot = JSON.stringify(a.ds.session);
+    expect(requestModelSwitchForceRollback(a.ds, { source: 'card', notify: vi.fn() })).toEqual({ ok: false, reason: 'restart_in_flight' });
+    expect(JSON.stringify(a.ds.session)).toBe(snapshot);
+  });
+  it('accepted: record restored, restart IPC carries the OLD model/effort, txn stays until succeeded', async () => {
+    const a = ambiguous();
+    await new Promise(r => setTimeout(r, 0));
+    const onSettled = vi.fn();
+    const res = requestModelSwitchForceRollback(a.ds, { source: 'card', notify: vi.fn(), onSettled });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    const msg = a.send.mock.calls.at(-1)![0];
+    expect(msg).toMatchObject({ type: 'restart', attemptId: res.attemptId, model: 'gpt-5.5', reasoningEffort: 'high' });
+    expect(a.ds.session.modelPin).toBeUndefined();
+    expect(a.ds.session.modelSwitchTxn).toMatchObject({ state: 'rolling_back', attemptId: res.attemptId });
+    // a LATE result for the original attempt changes nothing
+    __testOnly_resolveRestart(a.ds.session.sessionId, a.r.attemptId, 'succeeded');
+    await new Promise(r => setTimeout(r, 0));
+    expect(a.ds.session.modelSwitchTxn.state).toBe('rolling_back');
+    expect(onSettled).not.toHaveBeenCalled();
+    __testOnly_resolveRestart(a.ds.session.sessionId, res.attemptId, 'succeeded');
+    await new Promise(r => setTimeout(r, 0));
+    expect(onSettled).toHaveBeenCalledWith('rolled_back', expect.anything());
+    expect(a.ds.session.modelSwitchTxn).toBeUndefined();
+  });
+  it('convergence failed / timed out → txn back to ambiguous (still recoverable), record stays restored', async () => {
+    for (const status of ['failed', 'timed_out'] as const) {
+      const a = ambiguous();
+      await new Promise(r => setTimeout(r, 0));
+      const onSettled = vi.fn();
+      const res = requestModelSwitchForceRollback(a.ds, { source: 'card', notify: vi.fn(), onSettled });
+      if (!res.ok) throw new Error('refused');
+      __testOnly_resolveRestart(a.ds.session.sessionId, res.attemptId, status);
+      await new Promise(r => setTimeout(r, 0));
+      expect(onSettled).toHaveBeenCalledWith('ambiguous', expect.anything());
+      expect(a.ds.session.modelSwitchTxn.state).toBe('ambiguous');
+      expect(a.ds.session.model).toBe('gpt-5.5');
+      expect(a.ds.session.reasoningEffort).toBe('high');
+    }
+  });
+});
+
 describe('effort convergence (single persistent point)', () => {
   it('convergeSessionEffort clears an incompatible effort and persists', () => {
     const { ds } = makeDs({ cliId: 'codex', reasoningEffort: 'ultra' });
@@ -312,23 +529,36 @@ describe('card layer', () => {
   it('dedupe key discriminates model / effort / menu_id', () => {
     expect(dispatcherSource).toMatch(/model: value\?\.model,\s*effort: value\?\.effort,\s*menuId: value\?\.menu_id,/);
   });
-  it('session card: ⚙ button only for switchable CLIs, never adopt / external / read-only', () => {
+  it('session card: ⚙ button ONLY when the caller proved modelSwitchAllowed; never adopt / external / read-only', () => {
     const has = (json: string) => json.includes('"action":"model_menu_open"');
-    expect(has(buildSessionCard('s', 'r', 'http://t', 'T', 'claude-code', true, false, 'zh'))).toBe(true);
-    expect(has(buildSessionCard('s', 'r', 'http://t', 'T', 'codex-app', true, false, 'zh'))).toBe(true);
-    expect(has(buildSessionCard('s', 'r', 'http://t', 'T', 'coco', true, false, 'zh'))).toBe(false);
-    expect(has(buildSessionCard('s', 'r', 'http://t', 'T', 'claude-code', true, true, 'zh'))).toBe(false);
-    expect(has(buildSessionCard('s', 'r', 'http://t', 'T', 'claude-code', false, false, 'zh'))).toBe(false);
-    expect(has(buildSessionCard('s', 'r', 'http://t', 'T', 'claude-code', true, false, 'zh', false, undefined, true))).toBe(false);
+    const build = (cli: any, o: { manage?: boolean; adopt?: boolean; external?: boolean; allowed?: boolean } = {}) =>
+      buildSessionCard('s', 'r', 'http://t', 'T', cli, o.manage ?? true, o.adopt ?? false, 'zh', false, undefined, o.external ?? false, o.allowed ?? false);
+    expect(has(build('claude-code'))).toBe(false);                       // default = not proven → no button
+    expect(has(build('claude-code', { allowed: true }))).toBe(true);
+    expect(has(build('codex-app', { allowed: true }))).toBe(true);
+    expect(has(build('opencode2', { allowed: true }))).toBe(false);      // bare-CLI defence stays
+    expect(has(build('claude-code', { allowed: true, adopt: true }))).toBe(false);
+    expect(has(build('claude-code', { allowed: true, manage: false }))).toBe(false);
+    expect(has(build('claude-code', { allowed: true, external: true }))).toBe(false);
   });
-  it('streaming card: ⚙ button present internally, absent externally / adopt / unsupported', () => {
+  it('streaming card: ⚙ button ONLY when proven; absent by default / externally / adopt / unsupported', () => {
     const has = (json: string) => json.includes('"action":"model_menu_open"');
-    const build = (cli: any, adopt = false, external = false) => buildStreamingCard('s', 'r', 'http://t', 'T', '', 'idle', cli, 'hidden', 'n', undefined, adopt, false, 'zh', undefined, undefined, false, undefined, undefined, undefined, external);
-    expect(has(build('claude-code'))).toBe(true);
-    expect(has(build('pi'))).toBe(true);
-    expect(has(build('coco'))).toBe(false);
-    expect(has(build('claude-code', true))).toBe(false);
-    expect(has(build('claude-code', false, true))).toBe(false);
+    const build = (cli: any, adopt = false, external = false, allowed = false) => buildStreamingCard('s', 'r', 'http://t', 'T', '', 'idle', cli, 'hidden', 'n', undefined, adopt, false, 'zh', undefined, undefined, false, undefined, undefined, undefined, external, allowed);
+    expect(has(build('claude-code'))).toBe(false);
+    expect(has(build('claude-code', false, false, true))).toBe(true);
+    expect(has(build('pi', false, false, true))).toBe(true);
+    expect(has(build('opencode2', false, false, true))).toBe(false);
+    expect(has(build('claude-code', true, false, true))).toBe(false);
+    expect(has(build('claude-code', false, true, true))).toBe(false);
+  });
+  it('every session/streaming card call site passes the proven surface verdict (no default-false leaks)', () => {
+    const wp = readFileSync(new URL('../src/core/worker-pool.ts', import.meta.url), 'utf8');
+    for (const [src, name] of [[wp, 'worker-pool'], [cardHandlerSource, 'card-handler']] as const) {
+      const calls = (src.match(/build(?:Streaming|Session)Card\(\s*\n/g) ?? []).length;
+      const verdicts = (src.match(/modelSwitchAllowedForSession\(ds/g) ?? []).length;
+      expect(calls, name).toBeGreaterThan(0);
+      expect(verdicts, `${name}: ${calls} card calls vs ${verdicts} verdicts`).toBe(calls);
+    }
   });
   it('menu card lists candidates as model_pick, efforts as effort_pick, and hides picks when ambiguous', () => {
     const base = { sessionId: 's', rootId: 'r', cliId: 'codex' as const, cliName: 'Codex', menuId: 'm1', verifiedModel: 'gpt-5.5', verifiedEffort: 'high', models: ['gpt-5.5', 'gpt-5.6-sol'], source: 'live' as const, efforts: ['low', 'medium', 'high', 'xhigh'], currentEffort: 'high', freshThreadNote: false };
