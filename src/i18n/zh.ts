@@ -68,6 +68,7 @@ export const messages: Record<string, string> = {
   'card.model.force_rollback_started': '↩ 记录已回滚到 {previous}，正在重启 {cliName} 收敛进程…（完成前事务仍保留）',
   'card.model.force_rollback_done': '✅ {cliName} 已回滚并运行在 {previous}。',
   'card.model.force_rollback_failed': '❌ {cliName} 回滚重启未成功，事务保持冻结，可再次「复核」或「强制回滚」。',
+  'card.model.refuse.no_pending_confirm': '这张确认卡已失效（没有对应的待确认切换，或已过期/已被使用）。请重新打开「⚙ 模型」发起。',
   'card.btn.restart_cli': '🔄 重启 {cliName}',
   'card.btn.disconnect': '⏏ 断开',
   'card.btn.close_session': '❌ 关闭会话',

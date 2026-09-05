@@ -2877,12 +2877,20 @@ export function buildModelCustomCard(d: Pick<ModelMenuCardData, 'sessionId' | 'r
   });
 }
 
-/** Confirmation card shown when a switch would interrupt a running turn. */
+/** Provenance of the model in a confirmation card — frozen into the button
+ *  value so the second hop keeps the FIRST hop's entry semantics: a curated
+ *  pick is re-validated against the live catalog, a custom entry against the
+ *  name grammar. Never inferred from the model string itself. */
+export type ModelConfirmSource = 'curated' | 'custom';
+
+/** Confirmation card shown when a switch would interrupt a running turn or
+ *  start a new thread. */
 export function buildModelPickConfirmCard(
   d: Pick<ModelMenuCardData, 'sessionId' | 'rootId' | 'cliId' | 'cliName' | 'menuId'>,
   target: { model?: string; effort?: string },
   locale?: Locale,
   reason: 'busy' | 'fresh' = 'busy',
+  source: ModelConfirmSource = 'curated',
 ): string {
   const actionBase = { root_id: d.rootId, session_id: d.sessionId, cli_id: d.cliId, menu_id: d.menuId };
   const label = `${target.model ?? t('card.model.cli_default', undefined, locale)}${target.effort ? ` · ${target.effort}` : ''}`;
@@ -2892,7 +2900,7 @@ export function buildModelPickConfirmCard(
     elements: [
       { tag: 'div', text: { tag: 'lark_md', content: t(reason === 'fresh' ? 'card.model.confirm_fresh' : 'card.model.confirm_busy', { cliName: d.cliName, target: escapeMd(label) }, locale) } },
       { tag: 'action', actions: [
-        { tag: 'button', text: { tag: 'plain_text', content: t(reason === 'fresh' ? 'card.model.btn_confirm_fresh' : 'card.model.btn_confirm_switch', undefined, locale) }, type: 'primary', value: { action: 'model_pick_confirm', ...(target.model !== undefined ? { model: target.model } : {}), ...(target.effort !== undefined ? { effort: target.effort } : {}), ...actionBase } },
+        { tag: 'button', text: { tag: 'plain_text', content: t(reason === 'fresh' ? 'card.model.btn_confirm_fresh' : 'card.model.btn_confirm_switch', undefined, locale) }, type: 'primary', value: { action: 'model_pick_confirm', source, ...(target.model !== undefined ? { model: target.model } : {}), ...(target.effort !== undefined ? { effort: target.effort } : {}), ...actionBase } },
       ] },
     ],
   });

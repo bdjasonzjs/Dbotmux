@@ -27,7 +27,7 @@ vi.mock('../src/core/worker-pool.js', async (importOriginal) => ({
   activeSessionRestartAttemptId: () => undefined,
 }));
 
-import { handleModelSwitchCardAction, MODEL_SWITCH_CARD_ACTIONS, type ModelSwitchCardContext } from '../src/im/lark/model-switch-card.js';
+import { handleModelSwitchCardAction, MODEL_SWITCH_CARD_ACTIONS, __testOnly_resetPendingConfirms, PENDING_CONFIRM_TTL_MS, type ModelSwitchCardContext } from '../src/im/lark/model-switch-card.js';
 import { setChatExternal, _resetChatExternalCacheForTests } from '../src/im/lark/chat-external-cache.js';
 
 const CANDIDATES = ['gpt-5.5', 'gpt-5.6-sol'];
@@ -71,6 +71,7 @@ beforeEach(() => {
   updateSessionMock.mockReset(); switchMock.mockReset(); forceRollbackMock.mockReset(); restartMock.mockReset();
   deliverMock.mockClear(); delivered.length = 0;
   _resetChatExternalCacheForTests(); setChatExternal('app', 'oc_1', false);
+  __testOnly_resetPendingConfirms(); vi.useRealTimers();
 });
 
 // ─── identity gate: every refusal class, every action, zero mutation ───────
@@ -146,7 +147,8 @@ describe('menu and candidate authority (P1-5 / P1-6)', () => {
     expectZeroMutation(c, before);
   });
   it('model_pick_confirm re-validates against the catalog too (the confirm card value is not authority)', async () => {
-    const c = ctx({ value: { action: 'model_pick_confirm', model: 'gpt-9-forged' } });
+    const c = ctx({ value: { action: 'model_pick_confirm', source: 'curated', model: 'gpt-9-forged' } });
+    // no server-side offer for a forged value → refused before any catalog work
     const before = snapshot(c);
     expect((await handleModelSwitchCardAction(c))?.toast.type).toBe('warning');
     expectZeroMutation(c, before);
@@ -188,6 +190,7 @@ describe('fresh-only (codex-app) always confirms first', () => {
     getBotMock.mockReturnValue({ config: { cliId: 'codex-app' } });
     return ctx({ session: { cliId: 'codex-app' }, value, ...extra });
   };
+  void app;
   it('idle codex-app model_pick → confirm card, ZERO mutation, no switch', async () => {
     const c = app({ action: 'model_pick', model: 'gpt-5.6-sol' });
     const before = snapshot(c);
@@ -210,9 +213,122 @@ describe('fresh-only (codex-app) always confirms first', () => {
       expect(JSON.stringify(JSON.parse(delivered[0].content))).toContain('"action":"model_pick_confirm"');
     }
   });
-  it('codex-app model_pick_confirm on a current candidate starts the switch', async () => {
+  it('REVIEWER: custom-save confirmation preserves free-form authority', async () => {
+    switchMock.mockReturnValue({ ok: true, attemptId: 'A1', txn: { target: { model: 'deepseek/deepseek-v4-pro' }, rollback: {} } });
+    const first = app(
+      { action: 'model_custom_save' },
+      { action: { form_value: { model: 'deepseek/deepseek-v4-pro' } } },
+    );
+    expect(await handleModelSwitchCardAction(first)).toBeUndefined();
+    expect(switchMock).not.toHaveBeenCalled();
+    const confirm = JSON.parse(delivered[0].content);
+    expect(JSON.stringify(confirm)).toContain('deepseek/deepseek-v4-pro');
+
+    const second = app({ action: 'model_pick_confirm', model: 'deepseek/deepseek-v4-pro' });
+    expect((await handleModelSwitchCardAction(second))?.toast.type).toBe('info');
+    expect(switchMock).toHaveBeenCalledTimes(1);
+    expect(switchMock.mock.calls[0][1]).toMatchObject({ model: 'deepseek/deepseek-v4-pro' });
+  });
+  it('custom-save → confirm → switch, replaying the REAL confirm-card button value (codex-app fresh-only)', async () => {
+    switchMock.mockReturnValue({ ok: true, attemptId: 'A1', txn: { target: { model: 'deepseek/deepseek-v4-pro' }, rollback: {} } });
+    const first = app({ action: 'model_custom_save' }, { action: { form_value: { model: 'deepseek/deepseek-v4-pro' } } });
+    expect(await handleModelSwitchCardAction(first)).toBeUndefined();
+    const btn = JSON.parse(delivered[0].content).elements.find((e: any) => e.tag === 'action').actions[0];
+    expect(btn.value).toMatchObject({ action: 'model_pick_confirm', source: 'custom', model: 'deepseek/deepseek-v4-pro' });
+    const second = app(btn.value);
+    expect((await handleModelSwitchCardAction(second))?.toast.type).toBe('info');
+    expect(switchMock).toHaveBeenCalledTimes(1);
+    expect(switchMock.mock.calls[0][1]).toMatchObject({ model: 'deepseek/deepseek-v4-pro' });
+  });
+  it('custom-save → confirm → switch on a BUSY plain CLI, replaying the real button value', async () => {
+    switchMock.mockReturnValue({ ok: true, attemptId: 'A1', txn: { target: { model: 'my-private-model' }, rollback: {} } });
+    const first = ctx({ value: { action: 'model_custom_save' }, action: { form_value: { model: 'my-private-model' } }, ds: { lastScreenStatus: 'working' } });
+    expect(await handleModelSwitchCardAction(first)).toBeUndefined();
+    expect(switchMock).not.toHaveBeenCalled();
+    const btn = JSON.parse(delivered[0].content).elements.find((e: any) => e.tag === 'action').actions[0];
+    expect(btn.value).toMatchObject({ action: 'model_pick_confirm', source: 'custom', model: 'my-private-model' });
+    const second = ctx({ value: btn.value, ds: { lastScreenStatus: 'working' } });
+    expect((await handleModelSwitchCardAction(second))?.toast.type).toBe('info');
+    expect(switchMock.mock.calls[0][1]).toMatchObject({ model: 'my-private-model' });
+  });
+  it('curated pick → confirm carries source=curated and is re-validated against the live catalog', async () => {
     switchMock.mockReturnValue({ ok: true, attemptId: 'A1', txn: { target: { model: 'gpt-5.6-sol' }, rollback: {} } });
-    const c = app({ action: 'model_pick_confirm', model: 'gpt-5.6-sol' });
+    const first = app({ action: 'model_pick', model: 'gpt-5.6-sol' });
+    expect(await handleModelSwitchCardAction(first)).toBeUndefined();
+    const btn = JSON.parse(delivered[0].content).elements.find((e: any) => e.tag === 'action').actions[0];
+    expect(btn.value).toMatchObject({ source: 'curated', model: 'gpt-5.6-sol' });
+    // catalog changed between the two hops → stale curated confirm is refused
+    const stale = app(btn.value, { catalog: async () => ({ models: ['gpt-5.5'], source: 'live' as const }) });
+    const before = snapshot(stale);
+    expect((await handleModelSwitchCardAction(stale))?.toast.type).toBe('warning');
+    expectZeroMutation(stale, before);
+    // the offer was consumed by the refused hop → a fresh pick is needed
+    delivered.length = 0;
+    expect(await handleModelSwitchCardAction(app({ action: 'model_pick', model: 'gpt-5.6-sol' }))).toBeUndefined();
+    const btn2 = JSON.parse(delivered[0].content).elements.find((e: any) => e.tag === 'action').actions[0];
+    expect((await handleModelSwitchCardAction(app(btn2.value)))?.toast.type).toBe('info');
+  });
+  it('a confirmation without a matching server-side offer is refused (forged / stale / replayed), zero mutation', async () => {
+    const offer = async (model = 'deepseek/deepseek-v4-pro') => {
+      delivered.length = 0;
+      await handleModelSwitchCardAction(app({ action: 'model_custom_save' }, { action: { form_value: { model } } }));
+      return JSON.parse(delivered[0].content).elements.find((e: any) => e.tag === 'action').actions[0].value;
+    };
+    const cases: Array<[string, () => Promise<Record<string, any>>, Partial<ModelSwitchCardContext>]> = [
+      ['no offer at all', async () => ({ action: 'model_pick_confirm', source: 'custom', model: 'deepseek/deepseek-v4-pro' }), {}],
+      ['card source says custom but the offer was for another model', async () => ({ ...(await offer('other/model')), model: 'deepseek/deepseek-v4-pro' }), {}],
+      ['offer exists but effort tampered', async () => ({ ...(await offer()), effort: 'high' }), {}],
+      ['offer made by a different operator', async () => offer(), { operatorOpenId: 'ou_other', identity: { resolveOperator: async () => ({ unionId: 'on_other' }), isBotUnionId: () => false, canOperate: () => true } }],
+      ['offer replayed twice (consumed on first use)', async () => { const v = await offer(); switchMock.mockReturnValue({ ok: true, attemptId: 'A', txn: { target: {}, rollback: {} } }); await handleModelSwitchCardAction(app(v)); switchMock.mockReset(); return v; }, {}],
+    ];
+    for (const [name, mk, extra] of cases) {
+      __testOnly_resetPendingConfirms();
+      const value = await mk();
+      const c = app(value, extra);
+      const before = snapshot(c);
+      const r = await handleModelSwitchCardAction(c);
+      expect(r?.toast.type, name).toBe('warning');
+      expectZeroMutation(c, before);
+    }
+  });
+  it('an expired offer is refused', async () => {
+    vi.useFakeTimers({ now: 1_000_000 });
+    delivered.length = 0;
+    await handleModelSwitchCardAction(app({ action: 'model_custom_save' }, { action: { form_value: { model: 'deepseek/deepseek-v4-pro' } } }));
+    const v = JSON.parse(delivered[0].content).elements.find((e: any) => e.tag === 'action').actions[0].value;
+    vi.setSystemTime(1_000_000 + PENDING_CONFIRM_TTL_MS + 1);
+    const c = app(v);
+    const before = snapshot(c);
+    expect((await handleModelSwitchCardAction(c))?.toast.type).toBe('warning');
+    expectZeroMutation(c, before);
+  });
+  it('a custom offer confirmed with an illegal name (tampered) is rejected; effort re-validated', async () => {
+    delivered.length = 0;
+    await handleModelSwitchCardAction(app({ action: 'model_custom_save' }, { action: { form_value: { model: 'ok-model' } } }));
+    let c = app({ action: 'model_pick_confirm', source: 'custom', model: 'x; rm -rf /' });
+    let before = snapshot(c);
+    expect((await handleModelSwitchCardAction(c))?.toast.type).toBe('warning'); // no matching offer for that name
+    expectZeroMutation(c, before);
+    // curated offer whose model dropped out of the catalog between hops → refused
+    __testOnly_resetPendingConfirms(); delivered.length = 0;
+    await handleModelSwitchCardAction(app({ action: 'model_pick', model: 'gpt-5.6-sol' }));
+    const v = JSON.parse(delivered[0].content).elements.find((e: any) => e.tag === 'action').actions[0].value;
+    c = app(v, { catalog: async () => ({ models: ['gpt-5.5'], source: 'live' as const }) });
+    before = snapshot(c);
+    expect((await handleModelSwitchCardAction(c))?.toast.type).toBe('warning');
+    expectZeroMutation(c, before);
+  });
+  it('the identity gate still guards the custom confirmation hop', async () => {
+    await handleModelSwitchCardAction(app({ action: 'model_custom_save' }, { action: { form_value: { model: 'deepseek/deepseek-v4-pro' } } }));
+    const c = app({ action: 'model_pick_confirm', source: 'custom', model: 'deepseek/deepseek-v4-pro' }, { identity: { resolveOperator: async () => ({ unionId: 'on_bot' }), isBotUnionId: (u: string) => u === 'on_bot', canOperate: () => true } });
+    const before = snapshot(c);
+    expect((await handleModelSwitchCardAction(c))?.toast.type).toBe('warning');
+    expectZeroMutation(c, before);
+  });
+  it('codex-app model_pick_confirm on a current candidate starts the switch (after the offer)', async () => {
+    switchMock.mockReturnValue({ ok: true, attemptId: 'A1', txn: { target: { model: 'gpt-5.6-sol' }, rollback: {} } });
+    expect(await handleModelSwitchCardAction(app({ action: 'model_pick', model: 'gpt-5.6-sol' }))).toBeUndefined();
+    const c = app({ action: 'model_pick_confirm', source: 'curated', model: 'gpt-5.6-sol' });
     expect((await handleModelSwitchCardAction(c))?.toast.type).toBe('info');
     expect(switchMock).toHaveBeenCalledTimes(1);
   });

@@ -37,7 +37,7 @@ import { persistStreamCardState, rememberLastCliInput } from './session-manager.
 import { isExternalChatSession } from './external-chat.js';
 import { modelSwitchAllowedForSession } from './model-switch-surface.js';
 import { resolveSessionLaunchModel } from './session-model.js';
-import { prepareModelSwitch, settleModelSwitch, applyRollbackInMemory, beginForceRollback, type PrepareRefusal, type ModelSwitchTxn, type SettleOutcome } from './model-switch.js';
+import { prepareModelSwitch, validateModelSwitch, settleModelSwitch, applyRollbackInMemory, beginForceRollback, type PrepareRefusal, type ModelSwitchTxn, type SettleOutcome } from './model-switch.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, rehomeReplyTargetState, replyTargetKey } from './reply-target.js';
 import { updateMessage, deleteMessage, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, MessageWithdrawnError } from '../im/lark/client.js';
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, getCliDisplayName } from '../im/lark/card-builder.js';
@@ -3646,6 +3646,11 @@ export function requestModelSwitchRestart(
   if (isRemoteBackendSession(ds)) return { ok: false, reason: 'remote' };
   if (isSessionTransferring(ds)) return { ok: false, reason: 'transferring' };
   if (restartCoordinator.activeAttemptId(ds.session.sessionId)) return { ok: false, reason: 'restart_in_flight' };
+  // Every NON-destructive refusal (state / capability / effort domain) comes
+  // BEFORE the persistent-pane teardown: a request that cannot enter a
+  // transaction must leave the external CLI pane untouched.
+  const valid = validateModelSwitch(ds.session, target);
+  if (!valid.ok) return valid;
   const fresh = ensureFreshSpawnForSwitch(ds);
   if (fresh !== 'ok') {
     logger.warn(`[${tag(ds)}] model switch refused: persistent pane ${fresh === 'pane_alive' ? 'still alive' : 'indeterminate'} with no live worker`);

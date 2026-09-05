@@ -862,6 +862,7 @@ function cardActionKey(larkAppId: string, data: any): string {
     model: value?.model,
     effort: value?.effort,
     menuId: value?.menu_id,
+    modelSource: value?.source,
   })}`;
 }
 

@@ -415,6 +415,61 @@ describe('no-live-worker switch must be a proven fresh spawn (P1-4)', () => {
     expect(ensureFreshSpawnForSwitch(noLive().ds)).toBe('pane_unknown');
     expect(killMock).toHaveBeenCalledTimes(1);
   });
+  it('REVIEWER: a state-level refusal must not destroy a persistent pane', () => {
+    getBotMock.mockReturnValue({ config: { cliId: 'codex-app' } });
+    probeMock.mockReturnValue('missing');
+    const { ds } = noLive();
+    ds.session.modelSwitchTxn = {
+      txnId: 'old', state: 'ambiguous', attemptId: 'old-attempt', cliId: 'codex-app',
+      target: { model: 'gpt-5.6-sol' }, rollback: {}, freshThread: true,
+    };
+    const before = JSON.stringify(ds.session);
+    const r = requestModelSwitchRestart(ds, { model: 'gpt-5.5', setBy: 'x' }, { source: 'card', notify: vi.fn() });
+    expect(r).toEqual({ ok: false, reason: 'ambiguous_frozen' });
+    expect(JSON.stringify(ds.session)).toBe(before);
+    expect(killMock).not.toHaveBeenCalled();
+    expect(probeMock).not.toHaveBeenCalled();
+    expect(updateSessionMock).not.toHaveBeenCalled();
+    expect(__testOnly_activeAttempt(ds)).toBeUndefined();
+  });
+  it('every non-destructive refusal comes BEFORE kill/probe on a no-live persistent backend (P1-2 r3)', () => {
+    getBotMock.mockReturnValue({ config: { cliId: 'codex' } });
+    probeMock.mockReturnValue('missing');
+    const cases: Array<[string, Record<string, unknown>, { model?: string; effort?: string }, string]> = [
+      ['ambiguous txn', { cliId: 'codex', backendType: 'tmux', modelSwitchTxn: { txnId: 't', seq: 1, state: 'ambiguous', attemptId: 'a', target: {}, rollback: {}, startedAt: 1, setBy: 'x' } }, { model: 'gpt-5.5' }, 'ambiguous_frozen'],
+      ['in_flight txn (stale)', { cliId: 'codex', backendType: 'tmux', modelSwitchTxn: { txnId: 't', seq: 1, state: 'in_flight', attemptId: 'a', target: {}, rollback: {}, startedAt: 1, setBy: 'x' } }, { model: 'gpt-5.5' }, 'switch_in_flight'],
+      ['rolling_back txn', { cliId: 'codex', backendType: 'tmux', modelSwitchTxn: { txnId: 't', seq: 1, state: 'rolling_back', attemptId: 'a', target: {}, rollback: {}, startedAt: 1, setBy: 'x' } }, { model: 'gpt-5.5' }, 'switch_in_flight'],
+      ['effort outside model domain', { cliId: 'codex', backendType: 'tmux' }, { model: 'gpt-5.5', effort: 'ultra' }, 'effort_not_supported'],
+      ['effort on a non-configurable CLI', { cliId: 'claude-code', backendType: 'tmux' }, { model: 'opus', effort: 'high' }, 'effort_not_configurable'],
+      ['unsupported (ttadk-coco)', { cliId: 'coco', wrapperCli: 'ttadk coco', backendType: 'tmux' }, { model: 'x' }, 'unsupported'],
+    ];
+    for (const [name, session, target, reason] of cases) {
+      killMock.mockClear(); probeMock.mockClear(); updateSessionMock.mockClear();
+      const { ds } = makeDs(session, { worker: undefined });
+      const before = JSON.stringify(ds.session);
+      const r = requestModelSwitchRestart(ds, { ...target, setBy: 'x' }, { source: 'card', notify: vi.fn() });
+      expect(r, name).toEqual({ ok: false, reason });
+      expect(JSON.stringify(ds.session), name).toBe(before);
+      expect(killMock, name).not.toHaveBeenCalled();
+      expect(probeMock, name).not.toHaveBeenCalled();
+      expect(updateSessionMock, name).not.toHaveBeenCalled();
+      expect(__testOnly_activeAttempt(ds), name).toBeUndefined();
+    }
+    // …and a VALID request on the same no-live backend does reach the teardown
+    const { ds } = makeDs({ cliId: 'codex', backendType: 'tmux' }, { worker: undefined });
+    probeMock.mockReturnValue('exists');
+    expect(requestModelSwitchRestart(ds, { model: 'gpt-5.5', setBy: 'x' }, { source: 'card', notify: vi.fn() })).toEqual({ ok: false, reason: 'pane_alive' });
+    expect(killMock).toHaveBeenCalled();
+  });
+  it('validateModelSwitch is pure (no mutation) and agrees with prepareModelSwitch', async () => {
+    const { validateModelSwitch } = await import('../src/core/model-switch.js');
+    const s: any = { cliId: 'codex', model: 'gpt-5.5', reasoningEffort: 'ultra' };
+    const before = JSON.stringify(s);
+    expect(validateModelSwitch(s, { model: 'gpt-5.6-sol' })).toEqual({ ok: true, model: 'gpt-5.6-sol', effort: 'ultra', capability: 'spawn' });
+    expect(validateModelSwitch(s, { model: 'gpt-5.5' })).toEqual({ ok: true, model: 'gpt-5.5', capability: 'spawn' }); // ultra cleared
+    expect(validateModelSwitch(s, { model: 'gpt-5.5', effort: 'ultra' })).toEqual({ ok: false, reason: 'effort_not_supported' });
+    expect(JSON.stringify(s)).toBe(before);
+  });
   it('requestModelSwitchRestart refuses (zero mutation, zero fork) when the pane is alive / unknown', () => {
     getBotMock.mockReturnValue({ config: { cliId: 'codex-app' } });
     for (const [probe, reason] of [['exists', 'pane_alive'], ['unknown', 'pane_unknown']] as const) {

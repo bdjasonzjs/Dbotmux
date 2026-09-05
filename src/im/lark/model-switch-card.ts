@@ -37,7 +37,7 @@ import {
   requestModelSwitchRestart, requestModelSwitchForceRollback, requestSessionRestart, deliverEphemeralOrReply,
   activeSessionRestartAttemptId, type ModelSwitchRefusal,
 } from '../../core/worker-pool.js';
-import { buildModelMenuCard, buildModelCustomCard, buildModelPickConfirmCard, getCliDisplayName, type ModelMenuCardData } from './card-builder.js';
+import { buildModelMenuCard, buildModelCustomCard, buildModelPickConfirmCard, getCliDisplayName, type ModelMenuCardData, type ModelConfirmSource } from './card-builder.js';
 
 export const MODEL_SWITCH_CARD_ACTIONS = [
   'effort_pick', 'model_custom_open', 'model_custom_save', 'model_menu_open', 'model_menu_refresh',
@@ -95,6 +95,40 @@ export interface ModelSwitchCardContext {
 }
 
 type Toast = { toast: { type: 'success' | 'info' | 'warning' | 'error'; content: string } };
+
+/**
+ * Server-side pending confirmations (P1-1 r3). The confirmation hop must keep
+ * the FIRST hop's entry semantics (curated vs custom) without trusting the
+ * card: the first hop records what it offered, keyed by bot+session; the
+ * confirmation is accepted only when it names exactly that offer, from the
+ * same operator, within the TTL, and is consumed on use. The `source` field
+ * in the button value is informational (dedupe / debugging), never authority.
+ */
+export interface PendingModelConfirm {
+  model?: string;
+  effort?: string;
+  source: ModelConfirmSource;
+  operatorOpenId: string;
+  createdAt: number;
+}
+export const PENDING_CONFIRM_TTL_MS = 10 * 60 * 1000;
+const pendingConfirms = new Map<string, PendingModelConfirm>();
+const pendingKey = (larkAppId: string, sessionId: string) => `${larkAppId}::${sessionId}`;
+export function __testOnly_resetPendingConfirms(): void { pendingConfirms.clear(); }
+function rememberPending(ctx: ModelSwitchCardContext, p: Omit<PendingModelConfirm, 'createdAt' | 'operatorOpenId'>): void {
+  pendingConfirms.set(pendingKey(ctx.larkAppId, ctx.ds.session.sessionId), { ...p, operatorOpenId: ctx.operatorOpenId ?? '', createdAt: Date.now() });
+}
+/** Take the pending offer if the confirmation matches it exactly; else undefined (and nothing is consumed). */
+function takePending(ctx: ModelSwitchCardContext, model: string | undefined, effort: string | undefined): PendingModelConfirm | undefined {
+  const key = pendingKey(ctx.larkAppId, ctx.ds.session.sessionId);
+  const p = pendingConfirms.get(key);
+  if (!p) return undefined;
+  if (Date.now() - p.createdAt > PENDING_CONFIRM_TTL_MS) { pendingConfirms.delete(key); return undefined; }
+  if (p.operatorOpenId !== (ctx.operatorOpenId ?? '')) return undefined;
+  if (p.model !== model || p.effort !== effort) return undefined;
+  pendingConfirms.delete(key);
+  return p;
+}
 const toast = (type: Toast['toast']['type'], content: string): Toast => ({ toast: { type, content } });
 
 function sessionCliId(ds: DaemonSession): CliId {
@@ -168,7 +202,7 @@ async function deliverCard(ctx: ModelSwitchCardContext, cardJson: string): Promi
   await deliverEphemeralOrReply(ctx.ds, ctx.operatorOpenId, cardJson, 'interactive', () => ctx.sessionReply(ctx.rootId, cardJson, 'interactive'));
 }
 
-type RefusalKey = ModelSwitchRefusal | 'external' | 'same' | 'no_txn' | 'identity' | 'not_candidate' | 'not_admin';
+type RefusalKey = ModelSwitchRefusal | 'external' | 'same' | 'no_txn' | 'identity' | 'not_candidate' | 'not_admin' | 'no_pending_confirm';
 function refusalToast(reason: RefusalKey, loc: Locale): Toast {
   return toast('warning', t(`card.model.refuse.${reason}`, undefined, loc));
 }
@@ -233,11 +267,12 @@ async function startSwitch(
   return toast('info', t('card.model.switch_started', { cliName: name, target: targetLabel }, loc));
 }
 
-async function confirmFirst(ctx: ModelSwitchCardContext, loc: Locale, target: { model?: string; effort?: string }, reason: 'busy' | 'fresh'): Promise<undefined> {
+async function confirmFirst(ctx: ModelSwitchCardContext, loc: Locale, target: { model?: string; effort?: string }, reason: 'busy' | 'fresh', source: ModelConfirmSource): Promise<undefined> {
   const { ds } = ctx;
+  rememberPending(ctx, { ...target, source });
   await deliverCard(ctx, buildModelPickConfirmCard({
     sessionId: ds.session.sessionId, rootId: ctx.rootId, cliId: sessionCliId(ds), cliName: cliName(ds), menuId: newMenuId(),
-  }, target, loc, reason));
+  }, target, loc, reason, source));
   return undefined;
 }
 
@@ -283,16 +318,32 @@ export async function handleModelSwitchCardAction(ctx: ModelSwitchCardContext): 
       if (actionType === 'model_custom_save') {
         const fv = ctx.action?.form_value ?? {};
         model = String(fv.model ?? ctx.action?.input_value ?? '').trim() || undefined;
-        if (model !== undefined && !MODEL_NAME_RE.test(model)) return toast('error', t('card.model.invalid_model', undefined, loc));
       } else {
         model = typeof value.model === 'string' ? value.model.trim() || undefined : undefined;
-        // P1-5: a pick (and its confirmation) is only ever a click on a CURRENT
-        // candidate. Recompute the authoritative set; the card value is a hint.
+      }
+      const effortRaw = typeof value.effort === 'string' && value.effort ? value.effort : undefined;
+      // Entry semantics: decided by the ACTION on the first hop; on the
+      // confirmation hop by the SERVER-SIDE pending offer this session made
+      // (never by the card value). No matching offer → refused.
+      let source: ModelConfirmSource;
+      if (actionType === 'model_custom_save') source = 'custom';
+      else if (actionType === 'model_pick') source = 'curated';
+      else {
+        const pending = takePending(ctx, model, effortRaw);
+        if (!pending) return refusalToast('no_pending_confirm', loc);
+        source = pending.source;
+      }
+      if (source === 'custom') {
+        // Free-form entry (first hop AND its confirmation): name grammar only.
+        if (model !== undefined && !MODEL_NAME_RE.test(model)) return toast('error', t('card.model.invalid_model', undefined, loc));
+      } else {
+        // P1-5: a curated pick (and its confirmation) is only ever a click on a
+        // CURRENT candidate. Recompute the authoritative set; the value is a hint.
         if (model === undefined) return refusalToast('not_candidate', loc);
         const { models } = await currentCandidates(ctx);
         if (!models.includes(model)) return refusalToast('not_candidate', loc);
       }
-      const effort = typeof value.effort === 'string' && value.effort ? value.effort : undefined;
+      const effort = effortRaw;
       if (effort !== undefined && !reasoningEffortsForCliModel(cliId, model).includes(effort as any)) return refusalToast('effort_not_supported', loc);
       const currentModel = ds.session.modelPin?.model ?? ds.session.launchAttestation?.model ?? undefined;
       if (actionType !== 'model_custom_save' && model === currentModel && (effort === undefined || effort === ds.session.reasoningEffort)
@@ -302,8 +353,8 @@ export async function handleModelSwitchCardAction(ctx: ModelSwitchCardContext): 
       const target = { ...(model !== undefined ? { model } : {}), ...(effort !== undefined ? { effort } : {}) };
       if (actionType !== 'model_pick_confirm') {
         // fresh-only (codex-app) ALWAYS confirms: the old thread is lost (P1-4).
-        if (freshOnly) return confirmFirst(ctx, loc, target, 'fresh');
-        if (sessionLooksBusy(ds)) return confirmFirst(ctx, loc, target, 'busy');
+        if (freshOnly) return confirmFirst(ctx, loc, target, 'fresh', source);
+        if (sessionLooksBusy(ds)) return confirmFirst(ctx, loc, target, 'busy', source);
       }
       return startSwitch(ctx, loc, target);
     }
@@ -313,8 +364,12 @@ export async function handleModelSwitchCardAction(ctx: ModelSwitchCardContext): 
       if (!effort || !reasoningEffortsForCliModel(cliId, model).includes(effort as any)) return refusalToast('effort_not_supported', loc);
       if (effort === ds.session.reasoningEffort && !ds.session.modelSwitchTxn) return refusalToast('same', loc);
       const target = { ...(model !== undefined ? { model } : {}), effort };
-      if (freshOnly) return confirmFirst(ctx, loc, target, 'fresh');
-      if (sessionLooksBusy(ds)) return confirmFirst(ctx, loc, target, 'busy');
+      // The effort row edits the CURRENT model (pin / attested), which need not
+      // be a catalog member (it may itself have been a custom entry) → 'custom'
+      // keeps the second hop on the grammar check rather than membership.
+      const src: ModelConfirmSource = model === undefined ? 'custom' : (await currentCandidates(ctx)).models.includes(model) ? 'curated' : 'custom';
+      if (freshOnly) return confirmFirst(ctx, loc, target, 'fresh', src);
+      if (sessionLooksBusy(ds)) return confirmFirst(ctx, loc, target, 'busy', src);
       return startSwitch(ctx, loc, target);
     }
     case 'model_txn_recheck': {

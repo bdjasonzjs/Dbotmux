@@ -65,6 +65,7 @@ export const messages: Record<string, string> = {
   'card.model.force_rollback_started': '↩ Record rolled back to {previous}; restarting {cliName} to converge… (the transaction stays until then)',
   'card.model.force_rollback_done': '✅ {cliName} rolled back and running on {previous}.',
   'card.model.force_rollback_failed': '❌ {cliName} rollback restart did not succeed; the transaction stays frozen — recheck or force-rollback again.',
+  'card.model.refuse.no_pending_confirm': 'This confirmation card is no longer valid (no matching pending switch, or it expired / was already used). Reopen "⚙ Model" to start again.',
   'card.btn.restart_cli': '🔄 Restart {cliName}',
   'card.btn.disconnect': '⏏ Disconnect',
   'card.btn.close_session': '❌ Close Session',

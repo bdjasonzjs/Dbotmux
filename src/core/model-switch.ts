@@ -143,12 +143,20 @@ export interface PrepareInput {
   txnId?: string;
 }
 
+export type ValidateResult =
+  | { ok: true; model?: string; effort?: string; capability: ModelSwitchCapability }
+  | { ok: false; reason: PrepareRefusal };
+
 /**
- * Apply a switch to the session record (memory only — caller persists).
- * The transaction is bound to `attemptId`; the caller must issue the restart
- * with the same id or roll back immediately.
+ * PURE validation of a switch request against the session's current state —
+ * capability, transaction state, effort domain. No side effects at all, so a
+ * caller can reject BEFORE any destructive step (persistent-pane teardown).
+ * `prepareModelSwitch` is exactly validate + apply.
  */
-export function prepareModelSwitch(session: ModelSwitchSession, input: PrepareInput): PrepareResult {
+export function validateModelSwitch(
+  session: Pick<ModelSwitchSession, 'cliId' | 'wrapperCli' | 'reasoningEffort' | 'modelSwitchTxn'>,
+  input: Pick<PrepareInput, 'model' | 'effort'>,
+): ValidateResult {
   const cliId = session.cliId;
   const capability = capabilityForSession(cliId, session.wrapperCli);
   if (!isSwitchable(capability)) return { ok: false, reason: 'unsupported' };
@@ -168,6 +176,19 @@ export function prepareModelSwitch(session: ModelSwitchSession, input: PrepareIn
   } else {
     effort = session.reasoningEffort;
   }
+  return { ok: true, ...(model !== undefined ? { model } : {}), ...(effort !== undefined ? { effort } : {}), capability };
+}
+
+/**
+ * Apply a switch to the session record (memory only — caller persists).
+ * The transaction is bound to `attemptId`; the caller must issue the restart
+ * with the same id or roll back immediately.
+ */
+export function prepareModelSwitch(session: ModelSwitchSession, input: PrepareInput): PrepareResult {
+  const v = validateModelSwitch(session, input);
+  if (!v.ok) return v;
+  const cliId = session.cliId;
+  const { model, effort, capability } = v;
   const now = input.now ?? Date.now();
   const seq = (session.modelSwitchSeq ?? 0) + 1;
   const txnId = input.txnId ?? `ms-${seq}-${input.attemptId}`;
