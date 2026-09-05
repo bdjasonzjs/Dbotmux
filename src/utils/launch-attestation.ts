@@ -320,3 +320,17 @@ export function cardEffortLabel(effort: string | null, provenance: EffortProvena
 export function isAttestableCliId(cliId: string | undefined): boolean {
   return cliId === 'claude-code' || cliId === 'seed' || cliId === 'genius';
 }
+
+/** Bounded re-verification policy for the exec-chain race. Only a *mismatch*
+ *  on a *direct* contract is worth re-reading: the pid is the CLI-to-be and its
+ *  argv will settle once the shell/env stages exec into it. An unreadable
+ *  cmdline (pid gone) or a wrapped contract (the launcher never becomes the
+ *  leaf; the descendant resolver handles it) is not retried here. */
+export const LEAF_VERIFY_MAX_RETRIES = 40; // × 150 ms ≈ 6 s, matches the wrapper resolver budget
+
+export function shouldRetryLeafVerdict(contract: LaunchContract, reason: string, retriesSoFar: number): boolean {
+  if (contract.kind !== 'direct') return false;
+  if (reason !== 'leaf-argv-mismatch') return false;
+  return retriesSoFar < LEAF_VERIFY_MAX_RETRIES;
+}
+

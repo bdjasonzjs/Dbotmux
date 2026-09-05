@@ -2189,3 +2189,25 @@ describe('remote backends get no PTY quick-action keys', () => {
     });
   }
 });
+
+describe('streaming card 运行时行：Claude 系用 verified identity，codex 保留 legacy 对（缺陷回修 2026-09-05）', () => {
+  const S = 'sess-identity'; const R = 'om_root'; const U = 'https://t/x'; const T = 'title'; const C = 'body';
+  const call = (usage: any, cliId: any = 'claude-code') =>
+    JSON.stringify(parse(buildStreamingCard(S, R, U, T, C, 'working', cliId, 'hidden', undefined, undefined, false, false, undefined, undefined, undefined, false, usage)));
+  it('verified identity + 无 usage 数字 → 行内仍显示 **model** effort(默认)', () => {
+    const json = call({ context: null, tokens: null, identity: { state: 'verified', model: 'claude-fable-5-1[1m]', effort: 'high', effortProvenance: 'default' } });
+    expect(json).toMatch(/claude-fable-5-1/);
+    expect(json).toContain('high(默认)');
+  });
+  it('identity=unknown（未 attested 的 Claude 会话）→ 显示未知，绝不显示 registry 计划值', () => {
+    const json = call({ context: null, tokens: null, identity: { state: 'unknown' }, model: 'claude-opus-5' });
+    expect(json).toContain('模型：未知（重生后核验）');
+    expect(json).not.toContain('claude-opus-5');
+  });
+  it('无 identity（codex）→ legacy **model** effort 照旧（仍只随 usage 数字一起出现，不新增独立行）', () => {
+    expect(call({ context: null, tokens: null, model: 'gpt-5.6-sol', reasoningEffort: 'xhigh' }, 'codex')).not.toContain('gpt-5.6-sol');
+    const json = call({ context: { usedTokens: 1200, windowTokens: 200000 }, tokens: null, model: 'gpt-5.6-sol', reasoningEffort: 'xhigh' }, 'codex');
+    expect(json).toContain('gpt-5.6-sol');
+    expect(json).toContain('xhigh');
+  });
+});

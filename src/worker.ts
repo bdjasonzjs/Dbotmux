@@ -60,6 +60,7 @@ import {
   firstPidMayBeLeaf,
   readLeafArgv,
   resolveLaunchEffort,
+  shouldRetryLeafVerdict,
   verifyLeafArgv,
   type ExpectedLeafLaunch,
   type LaunchContract,
@@ -17895,14 +17896,30 @@ let pendingLaunchAttestation: {
  *  becomes known; commits at most once, and only for a pid that verifiably IS
  *  the CLI leaf this worker launched. Any failed check leaves the session with
  *  no attestation, which renders as "unknown" — never as a plausible guess. */
-function tryCommitLaunchAttestation(pid: number | undefined, isResolvedLeaf: boolean): void {
+const LEAF_VERIFY_RETRY_MS = 150;
+
+function tryCommitLaunchAttestation(pid: number | undefined, isResolvedLeaf: boolean, retriesSoFar = 0): void {
   const pending = pendingLaunchAttestation;
   if (!pending || pending.committed || !pid) return;
   // A wrapper hides the leaf: ignore the launcher pid, wait for the resolver.
   if (pending.awaitLeafResolver && !isResolvedLeaf) return;
   const verdict = verifyLeafArgv(pending.expected, readLeafArgv(pid));
   if (!verdict.ok) {
-    log(`launch attestation: not committed (${verdict.reason}, pid=${pid})`);
+    // On a direct contract the pane pid is the CLI itself — but at spawn time
+    // it is still walking its exec chain (shell → /usr/bin/env → claude), so the
+    // same pid can briefly show the shell's or env's argv. Reading once and
+    // giving up leaves a legitimate session unattested forever (63add4b3,
+    // 2026-09-05 12:41: read at +88 ms → "mismatch"; the two sessions that
+    // verified were read at +112/+196 ms). Re-read the SAME pid a bounded
+    // number of times; the verdict is still exact-match, only the moment moves.
+    if (shouldRetryLeafVerdict(pending.expected.contract, verdict.reason, retriesSoFar)) {
+      setTimeout(() => {
+        if (pendingLaunchAttestation !== pending || pending.committed) return;
+        tryCommitLaunchAttestation(pid, isResolvedLeaf, retriesSoFar + 1);
+      }, LEAF_VERIFY_RETRY_MS);
+      return;
+    }
+    log(`launch attestation: not committed (${verdict.reason}, pid=${pid}, retries=${retriesSoFar})`);
     return;
   }
   const cliProcStart = readProcessStartIdentity(pid);

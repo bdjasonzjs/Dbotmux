@@ -366,14 +366,23 @@ export function getDaemonStreamingCardUsageSnapshot(
   // without reading the transcript. The disk read (getDaemonSessionUsageSnapshot)
   // is deferred until we know usage will actually render — a footer/off bot must
   // not pay a per-tick transcript parse just to throw the tokens away.
-  const runtimeModel = ds.activeModel?.trim() || ds.session.model?.trim();
-  const reasoningEffort = ds.activeReasoningEffort?.trim()
-    || ds.session.reasoningEffort?.trim();
+  // Claude-family sessions carry their identity ONLY through the verified
+  // launch attestation. `ds.session.model` is the next-spawn plan (re-stamped
+  // from the live registry) and `session.reasoningEffort` is codex-only, so for
+  // these sessions the legacy pair below would print the registry value as if
+  // it were running and never show an effort — the exact misreport the S2
+  // contract forbids (seen on 63add4b3, 2026-09-05 12:42). Other CLIs keep the
+  // executor-reported / frozen fields as before.
+  const identity = daemonReplyCardIdentity(ds).identity;
+  const runtimeModel = identity ? undefined : (ds.activeModel?.trim() || ds.session.model?.trim());
+  const reasoningEffort = identity ? undefined : (ds.activeReasoningEffort?.trim()
+    || ds.session.reasoningEffort?.trim());
   try {
     if (resolveUsageDisplay(ds.larkAppId) !== 'streaming') {
       return {
         context: null,
         tokens: null,
+        ...(identity ? { identity } : {}),
         ...(runtimeModel ? { model: runtimeModel } : {}),
         ...(reasoningEffort ? { reasoningEffort } : {}),
       };

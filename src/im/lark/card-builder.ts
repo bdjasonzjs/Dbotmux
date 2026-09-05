@@ -7,7 +7,7 @@ import type { CodexAppThreadSummary } from '../../services/codex-app-threads.js'
 import type { DisplayMode, StreamStatus } from '../../types.js';
 import type { CliUsageLimitState } from '../../utils/cli-usage-limit.js';
 import { t, type Locale } from '../../i18n/index.js';
-import { cardUsageFooterSegment, cardUsageRuntimeSegment, type CardUsageSnapshot } from './md-card.js';
+import { cardIdentitySegment, cardUsageFooterSegment, cardUsageRuntimeSegment, type CardUsageSnapshot } from './md-card.js';
 import { readGlobalConfig } from '../../global-config.js';
 import type { ConfigCardData } from '../../services/bot-config-store.js';
 import { isLocalCliOpenEnabled } from '../../services/local-cli-opener.js';
@@ -892,7 +892,12 @@ function pushStreamBody(
   // on the streaming card. Missing metrics are omitted independently by
   // cardUsageFooterSegment; a fully-empty snapshot renders nothing.
   const usageSeg = usage ? cardUsageFooterSegment(usage, locale, 'streaming') : null;
-  if (usageSeg) {
+  // Verified identity (Claude family) may stand alone: "which model answered"
+  // is required even when no usage numbers are available. The legacy runtime
+  // pair keeps its old rule (only alongside metrics) so non-Claude cards do not
+  // grow a standalone row they never had.
+  const identitySeg = cardIdentitySegment(usage);
+  if (usageSeg || identitySeg) {
     // Usage metrics + runtime identity render as ONE single-line text run in a
     // single markdown element, joined by ` · ` — not a two-column split. This
     // reads as "one row": when the content is short it's literally one line;
@@ -903,8 +908,10 @@ function pushStreamBody(
     // to the right edge — it simply follows the metrics in reading order. The
     // runtime self-truncates (model ≤20 chars) so the tail stays compact. No
     // runtime → the metrics render alone, unchanged.
-    const runtimeSeg = usage ? cardUsageRuntimeSegment(usage, true) : null;
-    const line = runtimeSeg ? `${usageSeg} · ${runtimeSeg}` : usageSeg;
+    // Verified identity (Claude family) wins over the legacy runtime pair: it
+    // renders the three explicit states, never a plan value.
+    const runtimeSeg = identitySeg ?? (usage && usageSeg ? cardUsageRuntimeSegment(usage, true) : null);
+    const line = usageSeg && runtimeSeg ? `${usageSeg} · ${runtimeSeg}` : (usageSeg ?? runtimeSeg ?? '');
     elements.push({
       tag: 'markdown',
       text_size: 'notation_small_v2',

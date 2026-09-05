@@ -74,3 +74,21 @@ describe('Codex active-runtime wiring (source lock)', () => {
     expect(fn).toContain('ds.activeModel?.trim() || ds.session.model?.trim()');
   });
 });
+
+describe('Claude-family streaming identity（缺陷回修 2026-09-05：卡片只显示 registry 计划值、无强度）', () => {
+  it('the streaming snapshot routes attestable sessions through the verified identity, not session.model', () => {
+    const fn = sliceBetween(
+      workerPool,
+      'export function getDaemonStreamingCardUsageSnapshot(',
+      'import { normalizeBrand }',
+    );
+    // identity is derived first, and the legacy plan-value pair is suppressed whenever it exists
+    expect(fn).toContain('const identity = daemonReplyCardIdentity(ds).identity;');
+    expect(fn).toContain('identity ? undefined : (ds.activeModel?.trim() || ds.session.model?.trim())');
+    expect(fn).toContain('...(identity ? { identity } : {}),');
+  });
+  it('the worker re-reads a direct-contract leaf on argv mismatch instead of giving up after one read', () => {
+    expect(worker).toContain('shouldRetryLeafVerdict(pending.expected.contract, verdict.reason, retriesSoFar)');
+    expect(worker).toContain('tryCommitLaunchAttestation(pid, isResolvedLeaf, retriesSoFar + 1);');
+  });
+});
