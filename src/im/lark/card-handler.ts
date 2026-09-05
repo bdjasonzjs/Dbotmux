@@ -93,6 +93,7 @@ import { resumeStartsFresh } from '../../services/resume-fresh-policy.js';
 import { forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, buildStreamingCardJson, type WorkerSessionReplyOptions } from '../../core/worker-pool.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { isExternalChatSession } from '../../core/external-chat.js';
+import { MODEL_SWITCH_CARD_ACTIONS, isModelSwitchCardAction, handleModelSwitchCardAction } from './model-switch-card.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
 import { publishAttentionPatch, publishClosedSessionPatch, announcePendingRepoSession } from '../../core/session-activity.js';
 import { fallbackTurnId, rehomeReplyTargetState } from '../../core/reply-target.js';
@@ -1962,7 +1963,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     );
   }
 
-  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'get_write_link', 'open_local_terminal', 'open_local_cli', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);
+  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'get_write_link', 'open_local_terminal', 'open_local_cli', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel', ...MODEL_SWITCH_CARD_ACTIONS].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     // activeSessions is keyed by sessionKey(anchor, larkAppId) — `${anchor}::${larkAppId}`
@@ -2484,6 +2485,20 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
             () => sessionReply(rootId, content),
           );
         },
+      });
+    }
+
+    // ── Card-driven model switch (9 actions, all in the sensitive gate above) ──
+    if (isModelSwitchCardAction(actionType)) {
+      if (!ds || !larkAppId) return;
+      return handleModelSwitchCardAction({
+        ds,
+        operatorOpenId,
+        rootId,
+        larkAppId,
+        value,
+        action: action as any,
+        sessionReply: (rid, content, msgType) => sessionReply(rid, content, msgType),
       });
     }
 

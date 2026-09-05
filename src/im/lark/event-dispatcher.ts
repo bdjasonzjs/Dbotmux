@@ -856,6 +856,12 @@ function cardActionKey(larkAppId: string, data: any): string {
     // bundleId so rapidly clicking Arc then Chrome isn't collapsed into one
     // in-flight dedupe key that drops the second click.
     bundleId: value?.bundleId,
+    // Model-switch menu buttons share action labels (model_pick / effort_pick)
+    // across candidates and across re-rendered menus; include the target and
+    // the per-render menu id so picking A then B is two distinct clicks.
+    model: value?.model,
+    effort: value?.effort,
+    menuId: value?.menu_id,
   })}`;
 }
 

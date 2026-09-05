@@ -16110,7 +16110,7 @@ function killCli(opts: {
 
 async function restartCliProcess(
   reason: string,
-  opts: { immediate?: boolean; preservePending?: boolean; skipRestartBudget?: boolean } = {},
+  opts: { immediate?: boolean; preservePending?: boolean; skipRestartBudget?: boolean; freshThread?: boolean } = {},
 ): Promise<void> {
   if (lastInitConfig?.adoptMode || lastInitConfig?.existingAppServerEndpoint) {
     log(`Restart ignored in shared-adopt mode (${reason})`);
@@ -16202,7 +16202,11 @@ async function restartCliProcess(
           startScreenUpdates();
           startStuckDetector();
           try {
-            const restartCfg = { ...lastInitConfig, resume: true, prompt: '', cliSessionId: rpcThreadId ?? lastInitConfig.cliSessionId };
+            // 模型切换要求新线程（codex-app 的 thread/resume 不吃 model/effort，设计
+            // §3.5）：resume:false 且清空 cliSessionId，rpcThreadId 恰是旧线程、不兜底。
+            const restartCfg = opts.freshThread
+              ? { ...lastInitConfig, resume: false, prompt: '', cliSessionId: undefined }
+              : { ...lastInitConfig, resume: true, prompt: '', cliSessionId: rpcThreadId ?? lastInitConfig.cliSessionId };
             spawnedWorkingDir = restartCfg.workingDir;
             // Re-engage RPC so the new --remote pane binds to the CURRENT app-server
             // (a fresh port), not the dead prior one. engageCodexRpc only sets
@@ -18401,6 +18405,10 @@ process.on('message', async (raw: unknown) => {
       if (msg.model !== undefined && lastInitConfig) {
         lastInitConfig.model = msg.model === null ? undefined : msg.model;
       }
+      // 强度镜像同一条 parked-respawn 通道（设计 §3.6.1 通道 2），三分态同上。
+      if (msg.reasoningEffort !== undefined && lastInitConfig) {
+        lastInitConfig.reasoningEffort = (msg.reasoningEffort === null ? undefined : msg.reasoningEffort) as typeof lastInitConfig.reasoningEffort;
+      }
       // NOTE: the mojo credential snapshot is deliberately NOT applied here. It
       // rides on the queue item and is applied when THIS turn is actually written
       // to the backend (see flushPending) — applying at receive time made two
@@ -18639,6 +18647,12 @@ process.on('message', async (raw: unknown) => {
       if (msg.model !== undefined && lastInitConfig) {
         lastInitConfig.model = msg.model === null ? undefined : msg.model;
       }
+      // reasoningEffort 热更：与 model 逐字镜像的第三条三分态通道（卡片切模型/强度
+      // 设计 §3.6）。daemon 侧已按本次解析出的 model 收敛过（convergeSessionEffort），
+      // 这里只做覆盖。undefined=不携带保持快照；null=明确不传强度 → 移除快照。
+      if (msg.reasoningEffort !== undefined && lastInitConfig) {
+        lastInitConfig.reasoningEffort = (msg.reasoningEffort === null ? undefined : msg.reasoningEffort) as typeof lastInitConfig.reasoningEffort;
+      }
       // restart 合并：已有一轮 restart 在飞（teardown 进行中，或 tmux jitter
       // 定时器未触发）时不叠加第二轮——叠加会 clearTimeout 吃掉首轮 teardown、
       // 把重启预算无故烧到 tier-2 强制 FRESH（丢上下文），非 tmux 路径还会
@@ -18680,11 +18694,12 @@ process.on('message', async (raw: unknown) => {
         release: () => { durableTurnInFlight = false; inflightInputs.onTurnComplete(); },
       });
       await restartCliProcess(
-        msg.updateWorkingDir ? `cwd-move respawn → ${msg.updateWorkingDir}` : 'daemon request',
+        msg.updateWorkingDir ? `cwd-move respawn → ${msg.updateWorkingDir}` : (msg.freshThread ? 'daemon request (fresh thread)' : 'daemon request'),
         // cwd-move 是用户主动的目录迁移、不是崩溃恢复，不计入 tier-2 强制
         // FRESH 的重启预算；respawn 真失败仍有 claude_exit → daemon
         // auto-restart 那条裸 restart 的计数兜底。
-        { preservePending: true, skipRestartBudget: !!msg.updateWorkingDir },
+        // freshThread（codex-app 切模型）：新线程，不 resume、不用 rpcThreadId 兜底。
+        { preservePending: true, skipRestartBudget: !!msg.updateWorkingDir, freshThread: msg.freshThread === true },
       );
       break;
     }

@@ -31,6 +31,9 @@ export interface DetectModelsOptions {
   readonly now?: () => number;
   /** 适配器工厂注入，默认 createCliAdapterSync。 */
   readonly adapterFactory?: (cliId: CliId) => CliAdapter;
+  /** 透传给 adapter.detectModels 的 per-bot env（如 pi 需要 provider key 才能列模型）。
+   *  不参与缓存键：同一 key 的候选被认为与 env 无关，调用方需按 bot 分别取 key。 */
+  readonly env?: Readonly<Record<string, string>>;
 }
 
 // ─── 静态候选 ────────────────────────────────────────────────────────────────
@@ -98,7 +101,7 @@ async function detectModelsWith(
       try {
         const adapter = factory(opt.cliId);
         // 适配器未声明 detectModels = 该 CLI 无法枚举模型 → null。
-        const models = adapter.detectModels ? await adapter.detectModels() : null;
+        const models = adapter.detectModels ? await adapter.detectModels(opts?.env ? { env: opts.env } : undefined) : null;
         // 只缓存非空成功结果；失败（null/空数组/异常）不缓存，下次调用重试。
         if (models && models.length > 0) {
           cache.set(opt.key, { at: now(), models: [...models] });

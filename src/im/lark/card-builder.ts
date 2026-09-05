@@ -1,4 +1,5 @@
 import { isRemoteCliId } from '../../core/remote-cli-ids.js';
+import { cliSupportsModelSwitch } from '../../core/model-switch.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import type { CliId, ResumableSession } from '../../adapters/cli/types.js';
 import { adoptTargetKey, adoptTargetLabel, type AdoptableSession } from '../../core/session-discovery.js';
@@ -463,6 +464,8 @@ export function buildSessionCard(
       value: { action: 'restart', ...actionBase },
     });
   }
+  const modelBtn = modelSwitchButton(effectiveCliId, !!adoptMode, actionBase, locale);
+  if (showManageButtons && modelBtn) actions.push(modelBtn);
   if (adoptMode) {
     actions.push({
       tag: 'button',
@@ -1016,6 +1019,8 @@ export function buildStreamingCard(
       value: { action: 'get_write_link', ...actionBase },
     });
   }
+  const modelSwitchBtn = externalChat ? undefined : modelSwitchButton(effectiveCliId, !!adoptMode, actionBase, locale);
+  if (modelSwitchBtn) headerActions.push(modelSwitchBtn);
   if (externalChat) {
     // 外部群：整排操作按钮不渲染（下方快捷键排同样跳过）。
   } else if (adoptMode) {
@@ -2732,4 +2737,156 @@ export function buildCodexAppThreadSelectCard(threads: CodexAppThreadSummary[], 
     ],
   };
   return JSON.stringify(card);
+}
+
+
+// ─── Card-driven model switch (design card-model-switch-s1 rev16, v1) ────────
+
+/** 「⚙ 模型」 button for the session / streaming cards. Only for CLIs that can
+ *  actually take a model on respawn (MODEL_SWITCH_CAPABILITY spawn|fresh-only),
+ *  never for adopt sessions or remote backends (their restart is refused). The
+ *  click handler re-checks everything (proven-internal chat, canOperate, txn). */
+export function modelSwitchButton(
+  cliId: CliId,
+  adoptMode: boolean,
+  actionBase: Record<string, unknown>,
+  locale?: Locale,
+): any | undefined {
+  if (adoptMode || isRemoteCliId(cliId) || !cliSupportsModelSwitch(cliId)) return undefined;
+  return {
+    tag: 'button',
+    text: { tag: 'plain_text', content: t('card.btn.model_switch', undefined, locale) },
+    type: 'default' as const,
+    value: { action: 'model_menu_open', ...actionBase },
+  };
+}
+
+export interface ModelMenuCardData {
+  sessionId: string;
+  rootId: string;
+  cliId: CliId;
+  cliName: string;
+  /** Opaque per-render id; included in every button value so repeated picks
+   *  on different renders never collide in the click dedupe key. */
+  menuId: string;
+  /** Verified running model (launch attestation) or null when unknown. */
+  verifiedModel: string | null | undefined;
+  verifiedEffort: string | null | undefined;
+  /** Session pin (intent) if any. */
+  pin?: { model?: string; effort?: string };
+  models: readonly string[];
+  source: 'static' | 'live' | 'none';
+  efforts: readonly string[];
+  currentEffort?: string;
+  freshThreadNote: boolean;
+  txn?: { state: 'in_flight' | 'ambiguous'; target: string };
+  /** Bot config default (for the "CLI 默认" entry hint). */
+  botDefaultModel?: string;
+}
+
+const MODEL_MENU_MAX_ROWS = 12;
+
+export function buildModelMenuCard(d: ModelMenuCardData, locale?: Locale): string {
+  const actionBase = { root_id: d.rootId, session_id: d.sessionId, cli_id: d.cliId, menu_id: d.menuId };
+  const elements: any[] = [];
+  const verified = d.verifiedModel
+    ? `**${escapeMd(d.verifiedModel)}**${d.verifiedEffort ? ` · ${escapeMd(d.verifiedEffort)}` : ''}`
+    : d.verifiedModel === null ? t('card.model.cli_default', undefined, locale) : t('card.model.unverified', undefined, locale);
+  const lines = [t('card.model.current', { model: verified }, locale)];
+  if (d.pin) {
+    const pinLabel = `${d.pin.model ?? t('card.model.cli_default', undefined, locale)}${d.pin.effort ? ` · ${d.pin.effort}` : ''}`;
+    lines.push(t('card.model.pinned', { model: escapeMd(pinLabel) }, locale));
+  }
+  if (d.txn?.state === 'in_flight') lines.push(t('card.model.switching', { target: escapeMd(d.txn.target) }, locale));
+  if (d.txn?.state === 'ambiguous') lines.push(t('card.model.ambiguous', { target: escapeMd(d.txn.target) }, locale));
+  if (d.freshThreadNote) lines.push(t('card.model.fresh_thread_note', undefined, locale));
+  elements.push({ tag: 'div', text: { tag: 'lark_md', content: lines.join('\n') } });
+
+  if (d.txn?.state === 'ambiguous') {
+    elements.push({ tag: 'action', actions: [
+      { tag: 'button', text: { tag: 'plain_text', content: t('card.model.btn_recheck', undefined, locale) }, type: 'primary', value: { action: 'model_txn_recheck', ...actionBase } },
+      { tag: 'button', text: { tag: 'plain_text', content: t('card.model.btn_force_rollback', undefined, locale) }, type: 'danger', value: { action: 'model_txn_force_rollback', ...actionBase } },
+    ] });
+  } else if (d.txn?.state !== 'in_flight') {
+    const rows = d.models.slice(0, MODEL_MENU_MAX_ROWS);
+    if (rows.length > 0) {
+      elements.push({ tag: 'div', text: { tag: 'lark_md', content: t(d.source === 'live' ? 'card.model.candidates_live' : 'card.model.candidates_static', undefined, locale) } });
+      // Lark renders ≤ ~4 buttons per action row cleanly; chunk.
+      for (let i = 0; i < rows.length; i += 4) {
+        elements.push({ tag: 'action', actions: rows.slice(i, i + 4).map(m => ({
+          tag: 'button',
+          text: { tag: 'plain_text', content: m === (d.pin?.model ?? d.verifiedModel) ? `✓ ${m}` : m },
+          type: m === (d.pin?.model ?? d.verifiedModel) ? 'primary' : 'default',
+          value: { action: 'model_pick', model: m, ...actionBase },
+        })) });
+      }
+    } else {
+      elements.push({ tag: 'div', text: { tag: 'lark_md', content: t('card.model.no_candidates', undefined, locale) } });
+    }
+    if (d.efforts.length > 0) {
+      elements.push({ tag: 'div', text: { tag: 'lark_md', content: t('card.model.effort_title', undefined, locale) } });
+      elements.push({ tag: 'action', actions: d.efforts.map(e => ({
+        tag: 'button',
+        text: { tag: 'plain_text', content: e === d.currentEffort ? `✓ ${e}` : e },
+        type: e === d.currentEffort ? 'primary' : 'default',
+        value: { action: 'effort_pick', effort: e, ...actionBase },
+      })) });
+    }
+    elements.push({ tag: 'action', actions: [
+      { tag: 'button', text: { tag: 'plain_text', content: t('card.model.btn_custom', undefined, locale) }, type: 'default', value: { action: 'model_custom_open', ...actionBase } },
+      { tag: 'button', text: { tag: 'plain_text', content: t('card.model.btn_refresh', undefined, locale) }, type: 'default', value: { action: 'model_menu_refresh', ...actionBase } },
+    ] });
+  }
+  return JSON.stringify({
+    config: { wide_screen_mode: true },
+    header: { template: 'blue', title: { tag: 'plain_text', content: t('card.model.title', { cliName: d.cliName }, locale) } },
+    elements,
+  });
+}
+
+/** Free-text model input (form_submit → model_custom_save). */
+export function buildModelCustomCard(d: Pick<ModelMenuCardData, 'sessionId' | 'rootId' | 'cliId' | 'cliName' | 'menuId'>, locale?: Locale): string {
+  const actionBase = { root_id: d.rootId, session_id: d.sessionId, cli_id: d.cliId, menu_id: d.menuId };
+  return JSON.stringify({
+    config: { wide_screen_mode: true },
+    header: { template: 'blue', title: { tag: 'plain_text', content: t('card.model.custom_title', { cliName: d.cliName }, locale) } },
+    elements: [
+      { tag: 'div', text: { tag: 'lark_md', content: t('card.model.custom_note', undefined, locale) } },
+      {
+        tag: 'form',
+        name: 'model_custom_form',
+        elements: [
+          { tag: 'input', name: 'model', default_value: '', placeholder: { tag: 'plain_text', content: t('card.model.custom_placeholder', undefined, locale) } },
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: t('card.model.btn_switch', undefined, locale) },
+            type: 'primary',
+            name: 'model_custom_save',
+            action_type: 'form_submit',
+            value: { action: 'model_custom_save', ...actionBase },
+          },
+        ],
+      },
+    ],
+  });
+}
+
+/** Confirmation card shown when a switch would interrupt a running turn. */
+export function buildModelPickConfirmCard(
+  d: Pick<ModelMenuCardData, 'sessionId' | 'rootId' | 'cliId' | 'cliName' | 'menuId'>,
+  target: { model?: string; effort?: string },
+  locale?: Locale,
+): string {
+  const actionBase = { root_id: d.rootId, session_id: d.sessionId, cli_id: d.cliId, menu_id: d.menuId };
+  const label = `${target.model ?? t('card.model.cli_default', undefined, locale)}${target.effort ? ` · ${target.effort}` : ''}`;
+  return JSON.stringify({
+    config: { wide_screen_mode: true },
+    header: { template: 'orange', title: { tag: 'plain_text', content: t('card.model.confirm_title', { cliName: d.cliName }, locale) } },
+    elements: [
+      { tag: 'div', text: { tag: 'lark_md', content: t('card.model.confirm_busy', { target: escapeMd(label) }, locale) } },
+      { tag: 'action', actions: [
+        { tag: 'button', text: { tag: 'plain_text', content: t('card.model.btn_confirm_switch', undefined, locale) }, type: 'primary', value: { action: 'model_pick_confirm', ...(target.model !== undefined ? { model: target.model } : {}), ...(target.effort !== undefined ? { effort: target.effort } : {}), ...actionBase } },
+      ] },
+    ],
+  });
 }

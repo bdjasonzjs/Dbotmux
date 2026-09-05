@@ -56,3 +56,19 @@ export function isExternalChatSession(ds: Pick<DaemonSession, 'session' | 'larkA
   }
   return false;
 }
+
+/**
+ * Strict counterpart of isExternalChatSession for privileged surfaces (the
+ * card model switch): true only when the chat is PROVEN internal — p2p, a
+ * persisted `externalChat === false`, or a cached chat.get verdict of
+ * internal. Unknown → false (fail closed), while still kicking the same
+ * throttled background refresh so the verdict becomes known.
+ */
+export function isProvenInternalChat(ds: Pick<DaemonSession, 'session' | 'larkAppId' | 'chatId' | 'chatType'>): boolean {
+  if (ds.chatType === 'p2p' || ds.session.chatType === 'p2p') return true;
+  if (typeof ds.session.externalChat === 'boolean') return !ds.session.externalChat;
+  const cached = getCachedChatExternal(ds.larkAppId, ds.chatId);
+  if (cached !== undefined) return !cached;
+  void isExternalChatSession(ds); // schedules the throttled refresh
+  return false;
+}

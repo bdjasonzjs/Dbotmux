@@ -798,17 +798,18 @@ describe('buildSessionCard', () => {
       expect(closeBtn).toBeDefined();
     });
 
-    it('should have exactly 3 buttons (terminal, restart, close)', () => {
+    it('should have exactly 4 buttons (terminal, restart, model, close)', () => {
       const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, undefined, true));
       const actions = findActions(card);
-      expect(actions).toHaveLength(3);
+      expect(actions).toHaveLength(4);
+      expect(actions.map((a: any) => a.value?.action ?? 'url')).toEqual(['url', 'restart', 'model_menu_open', 'close']);
     });
 
     it('does not include Open Codex in codex DM management cards', () => {
       enableLocalCliOpen();
       const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'codex', true, false, 'en'));
       const actions = findActions(card);
-      expect(actions.map((a: any) => a.value?.action ?? 'url')).toEqual(['url', 'restart', 'close']);
+      expect(actions.map((a: any) => a.value?.action ?? 'url')).toEqual(['url', 'restart', 'model_menu_open', 'close']);
       expect(actions.some((a: any) => a.value?.action === 'open_local_cli')).toBe(false);
     });
   });
@@ -1275,17 +1276,18 @@ describe('buildStreamingCard', () => {
       expect(closeBtn.type).toBe('danger');
     });
 
-    it('should have exactly 4 buttons (toggle, terminal, get_write_link, close)', () => {
+    it('should have exactly 5 buttons (toggle, terminal, get_write_link, model, close)', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle'));
       const actions = findActions(card);
-      expect(actions).toHaveLength(4);
+      expect(actions).toHaveLength(5);
+      expect(actions.map((a: any) => a.value?.action ?? 'url')).toEqual(['toggle_display', 'url', 'get_write_link', 'model_menu_open', 'close']);
     });
 
     it('should include Open TRAE beside Web Terminal for traex streaming cards', () => {
       enableLocalCliOpen();
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle', 'traex', 'hidden', undefined, undefined, false, false, 'en', undefined, undefined, true));
       const actions = findActions(card);
-      expect(actions.map((a: any) => a.value?.action ?? 'url')).toEqual(['toggle_display', 'url', 'open_local_cli', 'get_write_link', 'close']);
+      expect(actions.map((a: any) => a.value?.action ?? 'url')).toEqual(['toggle_display', 'url', 'open_local_cli', 'get_write_link', 'model_menu_open', 'close']);
       expect(actions[2].text.content).toBe('Open TRAE');
       expect(actions[2].value.cli_id).toBe('traex');
     });

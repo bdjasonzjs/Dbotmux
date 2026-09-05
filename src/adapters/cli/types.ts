@@ -157,6 +157,12 @@ export interface McpGatewayInstallSpec {
   readonly format: 'codex-toml' | 'claude-json';
 }
 
+/** Optional per-bot context for `detectModels` (some CLIs only enumerate the
+ *  providers whose API keys are present in the environment, e.g. `pi`). */
+export interface DetectModelsAdapterOptions {
+  readonly env?: Readonly<Record<string, string>>;
+}
+
 export interface CliAdapter {
   /** Unique identifier */
   readonly id: string;
@@ -580,7 +586,7 @@ export interface CliAdapter {
    *    JSON can be hundreds of KB;
    *  - absent = the CLI cannot enumerate its models; the picker shows
    *    `modelChoices` only. */
-  readonly detectModels?: () => Promise<readonly string[] | null>;
+  readonly detectModels?: (opts?: DetectModelsAdapterOptions) => Promise<readonly string[] | null>;
 
   /** Claude-family CLIs only (claude-code, seed). The data root holding
    *  `projects/<hash>/<id>.jsonl`, `sessions/<pid>.json`, `tasks/`,

@@ -2,7 +2,7 @@ import type { CliId } from '../adapters/cli/types.js';
 
 /** Minimal shape of the runtime session needed to resolve a launch model. */
 export type LaunchModelSession = {
-  session: { cliId?: CliId; model?: string };
+  session: { cliId?: CliId; model?: string; modelPin?: { model?: string; cliId: CliId } };
   spawnModelOverride?: string;
 };
 
@@ -44,6 +44,12 @@ export function resolveSessionLaunchModel(
   botCfg?: LaunchModelBotConfig,
 ): string | undefined {
   if (ds.spawnModelOverride) return ds.spawnModelOverride;
+  // 1b. A card-driven per-session pin (see core/model-switch.ts). It is an
+  //     explicit human choice for THIS session and therefore outranks the bot
+  //     config; it only applies while the session still runs the CLI it was
+  //     pinned for. `pin.model === undefined` means "explicitly CLI default".
+  const pin = ds.session.modelPin;
+  if (pin && (!ds.session.cliId || pin.cliId === ds.session.cliId)) return pin.model;
   // No live config to consult (deregistered bot / display surfaces that tolerate
   // a missing registry entry) → the session's own record is the best we have.
   if (!botCfg) return ds.session.model;
