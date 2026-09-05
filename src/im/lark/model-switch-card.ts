@@ -185,6 +185,16 @@ export function collapseModelPanel(ds: DaemonSession): void {
   ds.modelPanel = undefined;
 }
 
+/** CAS continuation check (S3 r6 P1-1, r6.2): after ANY await on the click
+ *  path (catalog lookup), the continuation may only write panel state / start
+ *  a restart if no newer UI action landed meanwhile — i.e. the generation
+ *  captured before the await is unchanged AND the output view is still
+ *  collapsed. Otherwise the caller drops its result and re-renders the current
+ *  state. Every await site uses this one predicate. */
+function uiMovedOn(ds: DaemonSession, genBefore: number): boolean {
+  return panelGeneration(ds) !== genBefore || (ds.displayMode ?? 'hidden') !== 'hidden';
+}
+
 async function openList(ctx: ModelSwitchCardContext, force: boolean, note?: string): Promise<CardResult> {
   const { ds } = ctx;
   const cliId = sessionCliId(ds);
@@ -198,7 +208,7 @@ async function openList(ctx: ModelSwitchCardContext, force: boolean, note?: stri
   // result must not reopen the picker or flip the display mode back.
   const gen = bumpPanelGeneration(ds);
   const { models, source } = await currentCandidates(ctx, force);
-  if (panelGeneration(ds) !== gen || (ds.displayMode ?? 'hidden') !== 'hidden') {
+  if (uiMovedOn(ds, gen)) {
     logger.info(`[${ds.session.sessionId.substring(0, 8)}] model picker: late catalog result dropped (UI moved on)`);
     return renderCard(ds);
   }
@@ -362,7 +372,7 @@ export async function handleModelSwitchCardAction(ctx: ModelSwitchCardContext): 
       const { models } = await currentCandidates(ctx);
       // Same CAS as openList: a pick whose candidate check outlived a newer UI
       // action (显示输出 / 退出选择) must not resurrect the picker.
-      if (panelGeneration(ds) !== pickGen || (ds.displayMode ?? 'hidden') !== 'hidden') return renderCard(ds);
+      if (uiMovedOn(ds, pickGen)) return renderCard(ds);
       if (!models.includes(model)) return refusalToast('not_candidate', loc);
       if (activeSessionRestartAttemptId(ds)) return refusalToast('restart_in_flight', loc);
       if (model === currentModelOf(ds) && !ds.session.modelSwitchTxn) return refusalToast('same', loc);
@@ -375,7 +385,10 @@ export async function handleModelSwitchCardAction(ctx: ModelSwitchCardContext): 
       if (activeSessionRestartAttemptId(ds)) return refusalToast('restart_in_flight', loc);
       if (effort === ds.session.reasoningEffort && !ds.session.modelSwitchTxn) return refusalToast('same', loc);
       const target = { ...(model !== undefined ? { model } : {}), effort };
+      const effortGen = panelGeneration(ds);
       const src: ModelConfirmSource = model === undefined ? 'custom' : (await currentCandidates(ctx)).models.includes(model) ? 'curated' : 'custom';
+      // CAS (r6.2): a late candidate check must not write confirm over a newer 显示输出 / 退出选择.
+      if (uiMovedOn(ds, effortGen)) return renderCard(ds);
       return enterConfirm(ctx, target, freshOnly ? 'fresh' : sessionLooksBusy(ds) ? 'busy' : 'plain', src);
     }
     case 'model_pick_confirm': {
@@ -393,7 +406,11 @@ export async function handleModelSwitchCardAction(ctx: ModelSwitchCardContext): 
         if (model !== undefined && !MODEL_NAME_RE.test(model)) return toast('error', t('card.model.invalid_model', undefined, loc));
       } else {
         if (model === undefined) return refusalToast('not_candidate', loc);
+        const confirmGen = panelGeneration(ds);
         const { models } = await currentCandidates(ctx);
+        // CAS (r6.2): if 显示输出 / 退出选择 landed while the candidate check was
+        // in flight, the offer is already discarded and NO restart may start.
+        if (uiMovedOn(ds, confirmGen)) return renderCard(ds);
         if (!models.includes(model)) return refusalToast('not_candidate', loc);
       }
       if (effort !== undefined && !reasoningEffortsForCliModel(cliId, model).includes(effort as any)) return refusalToast('effort_not_supported', loc);
@@ -410,7 +427,7 @@ export async function handleModelSwitchCardAction(ctx: ModelSwitchCardContext): 
       );
       if (outcome !== 'ambiguous') sessionStore.updateSession(ds.session);
       if (outcome === 'committed') { bumpPanelGeneration(ds); ds.modelPanel = undefined; return renderCard(ds); }
-      if (outcome === 'rolled_back') { ds.modelPanel = { kind: 'failed', menuId: newMenuId(), target: cur.target, reason: t('card.model.recheck_rolled_back', { cliName: cliName(ds) }, loc) }; return renderCard(ds); }
+      if (outcome === 'rolled_back') { bumpPanelGeneration(ds); ds.modelPanel = { kind: 'failed', menuId: newMenuId(), target: cur.target, reason: t('card.model.recheck_rolled_back', { cliName: cliName(ds) }, loc) }; return renderCard(ds); }
       return toast('warning', t('card.model.recheck_ambiguous', undefined, loc));
     }
     case 'model_txn_force_rollback': {

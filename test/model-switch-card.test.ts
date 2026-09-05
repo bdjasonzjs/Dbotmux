@@ -8,6 +8,7 @@
  * Run:  pnpm vitest run test/model-switch-card.test.ts
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { readFileSync } from 'node:fs';
 
 vi.mock('../src/utils/logger.js', () => ({ logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() } }));
 const getBotMock = vi.fn();
@@ -450,5 +451,78 @@ describe('r6.1 P1-2: leaving confirm invalidates the offer', () => {
     expect(panelOf(second).offerId).not.toBe(panelOf(first).offerId);
     expect(panelOf(await handleModelSwitchCardAction(sameDs(c, findConfirmValue(second)))).kind).toBe('switching');
     expect(switchMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('r6.2: remaining catalog-await continuations are CAS-guarded', () => {
+  function gatedCatalog() {
+    let enterCatalog!: () => void;
+    const catalogEntered = new Promise<void>(resolve => { enterCatalog = resolve; });
+    let releaseCatalog!: (value: { models: string[]; source: 'live' }) => void;
+    const catalogResult = new Promise<{ models: string[]; source: 'live' }>(resolve => { releaseCatalog = resolve; });
+    return { catalog: async () => { enterCatalog(); return catalogResult; }, catalogEntered, releaseCatalog };
+  }
+  it('REVIEWER: a stale effort_pick must not enter confirm after a newer output-toggle action', async () => {
+    const g = gatedCatalog();
+    const c = ctx({
+      catalog: g.catalog,
+      session: { modelPin: { model: 'gpt-5.5', cliId: 'codex', txnId: 'pin', setBy: 'x', setAt: 1 } },
+    });
+    const stalePick = handleModelSwitchCardAction(sameDs(c, { action: 'effort_pick', effort: 'high' }));
+    await g.catalogEntered;
+    collapseModelPanel(c.ds);
+    c.ds.displayMode = 'screenshot';
+    g.releaseCatalog({ models: CANDIDATES, source: 'live' });
+    await stalePick;
+    expect(c.ds.modelPanel).toBeUndefined();
+    expect(c.ds.displayMode).toBe('screenshot');
+  });
+  it('REVIEWER: a stale confirm validation must not start a switch after a newer output-toggle action', async () => {
+    switchMock.mockReturnValue({ ok: true, attemptId: 'A1', txn: { target: {}, rollback: {} } });
+    const c = ctx();
+    const confirmCard: any = await handleModelSwitchCardAction(sameDs(c, { action: 'model_pick', model: 'gpt-5.6-sol' }));
+    const g = gatedCatalog();
+    const staleConfirm = handleModelSwitchCardAction(sameDs(c, findConfirmValue(confirmCard), { catalog: g.catalog }));
+    await g.catalogEntered;
+    collapseModelPanel(c.ds);
+    c.ds.displayMode = 'screenshot';
+    g.releaseCatalog({ models: CANDIDATES, source: 'live' });
+    await staleConfirm;
+    expect(switchMock).not.toHaveBeenCalled();
+    expect(c.ds.modelPanel).toBeUndefined();
+    expect(c.ds.displayMode).toBe('screenshot');
+  });
+  it('a stale confirm superseded by a NEWER picker state (gen bump, still hidden) also never starts a switch', async () => {
+    switchMock.mockReturnValue({ ok: true, attemptId: 'A1', txn: { target: {}, rollback: {} } });
+    const c = ctx();
+    const confirmCard: any = await handleModelSwitchCardAction(sameDs(c, { action: 'model_pick', model: 'gpt-5.6-sol' }));
+    const g = gatedCatalog();
+    const staleConfirm = handleModelSwitchCardAction(sameDs(c, findConfirmValue(confirmCard), { catalog: g.catalog }));
+    await g.catalogEntered;
+    await handleModelSwitchCardAction(sameDs(c, { action: 'model_menu_close' }));   // 退出选择 (real path)
+    g.releaseCatalog({ models: CANDIDATES, source: 'live' });
+    await staleConfirm;
+    expect(switchMock).not.toHaveBeenCalled();
+    expect(c.ds.modelPanel).toBeUndefined();
+  });
+  it('P2: recheck → rolled_back writes the failed panel under a new generation', async () => {
+    const amb = { txnId: 'ms-1-A1', seq: 1, attemptId: 'A1', state: 'ambiguous', target: { model: 'gpt-5.6-sol', effort: 'xhigh' }, rollback: { model: 'gpt-5.6-sol', reasoningEffort: 'high', pin: null }, startedAt: 1, setBy: 'x' };
+    const c = ctx({ session: {
+      modelSwitchTxn: amb, reasoningEffort: 'xhigh',
+      modelPin: { model: 'gpt-5.6-sol', effort: 'xhigh', cliId: 'codex', txnId: 'ms-1-A1', setBy: 'x', setAt: 1 },
+      launchAttestation: { model: 'gpt-5.6-sol', effort: 'high', effortProvenance: 'explicit', workerGeneration: 1 },
+    }, value: { action: 'model_txn_recheck' } });
+    c.ds.modelPanelGen = 7;
+    await handleModelSwitchCardAction(c);
+    expect(c.ds.modelPanel?.kind).toBe('failed');
+    expect(c.ds.modelPanelGen).toBeGreaterThan(7);
+  });
+  it('source lock: every ds.modelPanel write in the handler is preceded by a generation bump', () => {
+    const src = readFileSync(new URL('../src/im/lark/model-switch-card.ts', import.meta.url), 'utf8').split('\n');
+    const offenders = src.map((l, i) => [i + 1, l] as const)
+      .filter(([, l]) => l.includes('ds.modelPanel = {'))
+      // the bump must sit on the same line or within the two lines above (if/else pairs share one bump)
+      .filter(([i, l]) => !(l + src[i - 2] + src[i - 3]).includes('bumpPanelGeneration(ds)') && !src[i - 2].includes('uiMovedOn'));
+    expect(offenders).toEqual([]);
   });
 });
