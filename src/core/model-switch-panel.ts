@@ -28,3 +28,14 @@ export type ModelPanelKind = ModelPanelState['kind'];
 export function panelIsSticky(p: ModelPanelState | undefined): boolean {
   return !!p && p.kind !== 'failed';
 }
+
+/** Generation discipline (S3 r6 P1-1): every write to `ds.modelPanel` bumps
+ *  the generation; anything that awaited in between must re-check it before
+ *  writing, and give up if the UI moved on. */
+export function bumpPanelGeneration(ds: { modelPanelGen?: number }): number {
+  ds.modelPanelGen = (ds.modelPanelGen ?? 0) + 1;
+  return ds.modelPanelGen;
+}
+export function panelGeneration(ds: { modelPanelGen?: number }): number {
+  return ds.modelPanelGen ?? 0;
+}

@@ -46,6 +46,7 @@ vi.mock('../src/im/lark/client.js', () => ({
   // awaits it; tests assert on the recorded args.
   sendEphemeralCard: vi.fn(async () => 'om_eph'),
   getChatInfo: vi.fn(),
+  resolveUserUnionId: vi.fn(async () => ({ unionId: 'on_owner' })),
   MessageWithdrawnError: class MessageWithdrawnError extends Error {
     constructor(id: string) { super(`withdrawn: ${id}`); this.name = 'MessageWithdrawnError'; }
   },
@@ -97,6 +98,8 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
   getCliDisplayName: vi.fn(() => 'Claude'),
 }));
 
+// 「显示输出」 is owner-only since 2026-09-05; this suite tests PATCH mechanics, not permissions.
+vi.mock('../src/im/lark/card-owner-gate.js', () => ({ isCardOwnerOperator: () => true }));
 vi.mock('../src/bot-registry.js', () => ({
   getBot: vi.fn(() => ({
     config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },

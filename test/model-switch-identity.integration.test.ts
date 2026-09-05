@@ -17,7 +17,8 @@ process.env.SESSION_DATA_DIR = dataDir;
 
 vi.mock('@larksuiteoapi/node-sdk', () => { class FakeClient { constructor(public opts: Record<string, unknown>) {} } return { Client: FakeClient }; });
 vi.mock('../src/utils/logger.js', () => ({ logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() } }));
-vi.mock('../src/bot-registry.js', async (importOriginal) => ({ ...(await importOriginal() as object), getBot: () => ({ config: { cliId: 'codex' } }) }));
+// The bot's owners (bots.json allowedUsers): one on_ entry and one app-scoped ou_ entry (resolved at start).
+vi.mock('../src/bot-registry.js', async (importOriginal) => ({ ...(await importOriginal() as object), getBot: () => ({ config: { cliId: 'codex', allowedUsers: ['on_human', 'ou_owner_by_open_id'] }, resolvedAllowedUsers: ['ou_owner_by_open_id'] }) }));
 const updateSessionMock = vi.fn();
 vi.mock('../src/services/session-store.js', async (importOriginal) => ({ ...(await importOriginal() as object), updateSession: (...a: unknown[]) => updateSessionMock(...a) }));
 const switchMock = vi.fn();
@@ -97,9 +98,21 @@ describe('production identity composition', () => {
       expect(switchMock).not.toHaveBeenCalled();
     }
   });
-  it('a verified human on_ id (not on any roster) passes', async () => {
-    switchMock.mockReturnValue({ ok: true, attemptId: 'A', txn: { target: { model: 'gpt-5.5' }, rollback: {} } });
-    const { ctx } = run({ open_id: 'ou_x', union_id: 'on_real_human' });
+  it('a verified human who is NOT a bot owner is refused with zero mutation (owner-only)', async () => {
+    const { ctx, ds, before } = run({ open_id: 'ou_x', union_id: 'on_some_colleague' });
+    expect((await handleModelSwitchCardAction(ctx))?.toast.type).toBe('warning');
+    expect(JSON.stringify(ds.session)).toBe(before);
+    expect(ds.modelPanel).toBeUndefined();
+    expect(switchMock).not.toHaveBeenCalled();
+  });
+  it('an owner listed by app-scoped open_id passes (verified union id present but not listed)', async () => {
+    const { ctx } = run({ open_id: 'ou_owner_by_open_id', union_id: 'on_whatever_real' });
     expect((await handleModelSwitchCardAction(ctx) as any)?.panel?.kind).toBe('confirm');
+  });
+  it('a stranger whose open_id is NOT resolved for this bot is refused even with a verified union id', async () => {
+    const { ctx, ds, before } = run({ open_id: 'ou_stranger', union_id: 'on_stranger' });
+    expect((await handleModelSwitchCardAction(ctx))?.toast.type).toBe('warning');
+    expect(JSON.stringify(ds.session)).toBe(before);
+    expect(switchMock).not.toHaveBeenCalled();
   });
 });

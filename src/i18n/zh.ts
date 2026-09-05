@@ -60,6 +60,8 @@ export const messages: Record<string, string> = {
   'card.model.btn_confirm_fresh': '确认切换（新线程）',
   'card.model.refuse.identity': '无法核验操作者身份（需要可核验的真人账号）。',
   'card.model.refuse.not_admin': '你没有操作这个 bot 的权限。',
+  'card.model.refuse.owner_only': '只有这个 bot 的主人才能操作模型切换。',
+  'card.action.owner_only': '只有这个 bot 的主人才能操作「显示输出」。',
   'card.model.refuse.not_candidate': '该模型不在当前候选列表里（卡片可能已过期，请重新打开「⚙ 模型」；任意模型名请用「自定义」）。',
   'card.model.refuse.pane_alive': '旧的 CLI 面板仍在运行、无法保证真正重启，已拒绝切换。请先 /restart 或关闭会话。',
   'card.model.refuse.pane_unknown': '无法确认旧的 CLI 面板是否已退出，已拒绝切换（不做可能失真的"成功"）。',

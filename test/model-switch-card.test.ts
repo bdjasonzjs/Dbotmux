@@ -36,7 +36,7 @@ vi.mock('../src/core/worker-pool.js', async (io) => ({
   sendWorkerSessionInput: (...a: unknown[]) => sessionInputMock(...a),
 }));
 
-import { handleModelSwitchCardAction, MODEL_SWITCH_CARD_ACTIONS, __testOnly_resetPendingConfirms, type ModelSwitchCardContext } from '../src/im/lark/model-switch-card.js';
+import { handleModelSwitchCardAction, collapseModelPanel, MODEL_SWITCH_CARD_ACTIONS, __testOnly_resetPendingConfirms, type ModelSwitchCardContext } from '../src/im/lark/model-switch-card.js';
 import { setChatExternal, _resetChatExternalCacheForTests } from '../src/im/lark/chat-external-cache.js';
 
 const CANDIDATES = ['gpt-5.5', 'gpt-5.6-sol'];
@@ -52,7 +52,7 @@ function ctx(over: Partial<ModelSwitchCardContext> & { session?: Record<string, 
     value: { action: 'model_menu_open', ...(over.value ?? {}) },
     action: undefined,
     sessionReply: vi.fn(async () => 'om_x'),
-    identity: { resolveOperator: async () => ({ unionId: 'on_human', openId: 'ou_human' }), isBotUnionId: () => false, canOperate: () => true, ...(over.identity ?? {}) },
+    identity: { resolveOperator: async () => ({ unionId: 'on_human', openId: 'ou_human' }), isBotUnionId: () => false, canOperate: () => true, isOwnerOperator: (_app: string, op: { unionId: string }) => op.unionId === 'on_human' || op.unionId === 'on_real_human', ...(over.identity ?? {}) },
     catalog: over.catalog ?? (async () => ({ models: CANDIDATES, source: 'live' })),
     ...('operatorOpenId' in over ? { operatorOpenId: over.operatorOpenId } : {}),
   };
@@ -84,7 +84,7 @@ beforeEach(() => {
 });
 
 // ─── identity gate ─────────────────────────────────────────────────────────
-describe('shared identity gate (P1-2, unchanged in v2)', () => {
+describe('shared identity gate (P1-2) + owner-only (2026-09-05)', () => {
   const REFUSALS: Array<[string, Partial<ModelSwitchCardContext> & { session?: any; ds?: any }]> = [
     ['missing operator open_id', { operatorOpenId: undefined }],
     ['operator open_id not ou_', { operatorOpenId: 'on_abc' }],
@@ -93,6 +93,8 @@ describe('shared identity gate (P1-2, unchanged in v2)', () => {
     ['resolve throws', { identity: { resolveOperator: async () => { throw new Error('api'); }, isBotUnionId: () => false, canOperate: () => true } }],
     ['team / platform bot', { identity: { resolveOperator: async () => ({ unionId: 'on_bot' }), isBotUnionId: (u: string) => u === 'on_bot', canOperate: () => true } }],
     ['canOperate false', { identity: { resolveOperator: async () => ({ unionId: 'on_human' }), isBotUnionId: () => false, canOperate: () => false } }],
+    ['verified human but NOT a bot owner (owner-only, 2026-09-05)', { identity: { resolveOperator: async () => ({ unionId: 'on_other_human' }), isBotUnionId: () => false, canOperate: () => true } }],
+    ['owner check throws (fail-closed)', { identity: { resolveOperator: async () => ({ unionId: 'on_human' }), isBotUnionId: () => false, canOperate: () => true, isOwnerOperator: () => { throw new Error('registry'); } } }],
     ['adopt session', { ds: { initConfig: { adoptMode: true } } }],
     ['remote backend', { session: { backendType: 'riff', cliId: 'riff' } }],
     ['unsupported (ttadk-coco wrapper-first)', { session: { cliId: 'coco', wrapperCli: 'ttadk coco' } }],
@@ -224,7 +226,7 @@ describe('pick → confirm (in-card) → switching', () => {
       ['no menu_id', { ...good, menu_id: undefined }, {}],
       ['wrong menu_id', { ...good, menu_id: 'ffffffffffffffff' }, {}],
       ['tampered model', { ...good, model: 'gpt-5.5' }, {}],
-      ['other operator', good, { operatorOpenId: 'ou_other', identity: { resolveOperator: async () => ({ unionId: 'on_other' }), isBotUnionId: () => false, canOperate: () => true } }],
+      ['other operator (also a bot owner)', good, { operatorOpenId: 'ou_other', identity: { resolveOperator: async () => ({ unionId: 'on_other' }), isBotUnionId: () => false, canOperate: () => true, isOwnerOperator: () => true } }],
     ];
     for (const [name, value, over] of bad) {
       const before = snapshot(c);
@@ -351,5 +353,102 @@ describe('ambiguous exits (in-card)', () => {
     r = await handleModelSwitchCardAction(c);
     expect(r?.toast?.type).toBe('warning');
     expect(snapshot(c)).toBe(before);
+  });
+});
+
+// ─── S3 r6.1: late results vs newer UI state (P1-1), cancel invalidates the offer (P1-2) ──
+describe('r6.1 P1-1: UI generation / CAS', () => {
+  function gatedCatalog() {
+    let enterCatalog!: () => void;
+    const catalogEntered = new Promise<void>(resolve => { enterCatalog = resolve; });
+    let releaseCatalog!: (value: { models: string[]; source: 'live' }) => void;
+    const catalogResult = new Promise<{ models: string[]; source: 'live' }>(resolve => { releaseCatalog = resolve; });
+    return { catalog: async () => { enterCatalog(); return catalogResult; }, catalogEntered, releaseCatalog };
+  }
+  it('REVIEWER: a late catalog response must not reopen the picker after a newer output-toggle action', async () => {
+    const g = gatedCatalog();
+    const c = ctx({ catalog: g.catalog });
+    const staleOpen = handleModelSwitchCardAction(c);
+    await g.catalogEntered;
+    c.ds.modelPanel = undefined;
+    c.ds.displayMode = 'screenshot';
+    g.releaseCatalog({ models: CANDIDATES, source: 'live' });
+    await staleOpen;
+    expect(c.ds.displayMode).toBe('screenshot');
+    expect(c.ds.modelPanel).toBeUndefined();
+  });
+  it('production path: the 「显示输出」 toggle collapses via collapseModelPanel; a late open gives up even in hidden mode', async () => {
+    const g = gatedCatalog();
+    const c = ctx({ catalog: g.catalog });
+    const staleOpen = handleModelSwitchCardAction(c);
+    await g.catalogEntered;
+    collapseModelPanel(c.ds);           // what card-handler's toggle branch calls
+    g.releaseCatalog({ models: CANDIDATES, source: 'live' });
+    const r: any = await staleOpen;
+    expect(c.ds.modelPanel).toBeUndefined();
+    expect(panelOf(r)).toBeNull();      // whatever it patches is the CURRENT state
+  });
+  it('a newer open supersedes an older one: only the latest write lands', async () => {
+    const g1 = gatedCatalog();
+    const c = ctx({ catalog: g1.catalog });
+    const first = handleModelSwitchCardAction(c);
+    await g1.catalogEntered;
+    const second: any = await handleModelSwitchCardAction(sameDs(c, { action: 'model_menu_refresh' }, { catalog: async () => ({ models: ['only-new'], source: 'live' }) }));
+    expect(panelOf(second).models).toEqual(['only-new']);
+    g1.releaseCatalog({ models: CANDIDATES, source: 'live' });
+    await first;
+    expect((c.ds.modelPanel as any).models).toEqual(['only-new']);
+  });
+  it('a stale model_pick (candidate check outlived a toggle) does not resurrect the picker', async () => {
+    const g = gatedCatalog();
+    const c = ctx({ catalog: g.catalog });
+    const stalePick = handleModelSwitchCardAction(sameDs(c, { action: 'model_pick', model: 'gpt-5.6-sol' }));
+    await g.catalogEntered;
+    collapseModelPanel(c.ds); c.ds.displayMode = 'screenshot';
+    g.releaseCatalog({ models: CANDIDATES, source: 'live' });
+    await stalePick;
+    expect(c.ds.modelPanel).toBeUndefined();
+    expect(c.ds.displayMode).toBe('screenshot');
+  });
+});
+
+describe('r6.1 P1-2: leaving confirm invalidates the offer', () => {
+  it('REVIEWER: cancel must invalidate the confirmation offer', async () => {
+    switchMock.mockReturnValue({ ok: true, attemptId: 'A1', txn: { target: {}, rollback: {} } });
+    const c = ctx();
+    const conf: any = await handleModelSwitchCardAction(sameDs(c, { action: 'model_pick', model: 'gpt-5.6-sol' }));
+    const staleConfirm = findConfirmValue(conf);
+    await handleModelSwitchCardAction(sameDs(c, { action: 'model_menu_open' }));
+    const r: any = await handleModelSwitchCardAction(sameDs(c, staleConfirm));
+    expect(r?.toast?.type).toBe('warning');
+    expect(switchMock).not.toHaveBeenCalled();
+  });
+  it('退出选择, 刷新候选 and the 「显示输出」 toggle also invalidate a pending offer', async () => {
+    switchMock.mockReturnValue({ ok: true, attemptId: 'A1', txn: { target: {}, rollback: {} } });
+    const leave: Array<(c: ModelSwitchCardContext) => Promise<unknown>> = [
+      c => handleModelSwitchCardAction(sameDs(c, { action: 'model_menu_close' })),
+      c => handleModelSwitchCardAction(sameDs(c, { action: 'model_menu_refresh' })),
+      async c => { collapseModelPanel(c.ds); },
+    ];
+    for (const l of leave) {
+      const c = ctx();
+      const conf: any = await handleModelSwitchCardAction(sameDs(c, { action: 'model_pick', model: 'gpt-5.6-sol' }));
+      const stale = findConfirmValue(conf);
+      await l(c);
+      const before = snapshot(c);
+      expect((await handleModelSwitchCardAction(sameDs(c, stale)) as any)?.toast?.type).toBe('warning');
+      expect(snapshot(c)).toBe(before);
+      expect(switchMock).not.toHaveBeenCalled();
+    }
+  });
+  it('a fresh pick after cancel yields a NEW offer that does confirm', async () => {
+    switchMock.mockReturnValue({ ok: true, attemptId: 'A1', txn: { target: {}, rollback: {} } });
+    const c = ctx();
+    const first: any = await handleModelSwitchCardAction(sameDs(c, { action: 'model_pick', model: 'gpt-5.6-sol' }));
+    await handleModelSwitchCardAction(sameDs(c, { action: 'model_menu_open' }));
+    const second: any = await handleModelSwitchCardAction(sameDs(c, { action: 'model_pick', model: 'gpt-5.6-sol' }));
+    expect(panelOf(second).offerId).not.toBe(panelOf(first).offerId);
+    expect(panelOf(await handleModelSwitchCardAction(sameDs(c, findConfirmValue(second)))).kind).toBe('switching');
+    expect(switchMock).toHaveBeenCalledTimes(1);
   });
 });

@@ -2227,7 +2227,7 @@ export async function postTurnStartingCard(
     reconcilePostedStartingCard(ds, turnId, statusRevisionAtPost);
     logger.info(`[${tag(ds)}] Posted starting card for turn ${turnId.substring(0, 12)}`);
     // The v2 model picker's transient failure line lives until the next turn.
-    if (ds.modelPanel?.kind === 'failed') ds.modelPanel = undefined;
+    if (ds.modelPanel?.kind === 'failed') { ds.modelPanelGen = (ds.modelPanelGen ?? 0) + 1; ds.modelPanel = undefined; }
     if (superseded && ds.streamCardPendingTurnId) {
       void postTurnStartingCard(ds, sessionReply, ds.streamCardPendingTurnId);
     }

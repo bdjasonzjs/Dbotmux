@@ -30,6 +30,7 @@ import { reasoningEffortsForCliModel } from '../../services/codex-reasoning-effo
 import { isTeamBot } from '../../services/team-bots-store.js';
 import { isPlatformTeamBot } from '../../services/platform-team-store.js';
 import { canOperate } from './event-dispatcher.js';
+import { isCardOwnerOperator } from './card-owner-gate.js';
 import {
   sessionSupportsModelSwitch, capabilityForSession, describeModelTarget, recheckModelSwitch,
 } from '../../core/model-switch.js';
@@ -40,8 +41,8 @@ import {
 } from '../../core/worker-pool.js';
 import { getCliDisplayName } from './card-builder.js';
 import type { ModelConfirmSource } from '../../core/model-switch-offers.js';
-import { createOffer, markOfferDelivered, consumeOffer } from '../../core/model-switch-offers.js';
-import type { ModelPanelState } from '../../core/model-switch-panel.js';
+import { createOffer, markOfferDelivered, consumeOffer, discardOffer } from '../../core/model-switch-offers.js';
+import { bumpPanelGeneration, panelGeneration, type ModelPanelState } from '../../core/model-switch-panel.js';
 
 export const MODEL_SWITCH_CARD_ACTIONS = [
   'effort_pick', 'model_custom_open', 'model_custom_save', 'model_menu_open', 'model_menu_refresh', 'model_menu_close',
@@ -69,6 +70,11 @@ export interface ModelSwitchIdentityDeps {
   isBotUnionId: (unionId: string) => boolean;
   /** Bot allowlist check by open id ONLY (never a union id). */
   canOperate: (larkAppId: string, chatId: string, openId: string) => boolean;
+  /** Owner-only rule (2026-09-05): the operator must be one of THIS bot's
+   *  configured owners (bots.json allowedUsers: app-scoped ou_ against the
+   *  verified operator open_id, or on_ against the verified union id).
+   *  Synchronous, re-checked on every callback, fail-closed. */
+  isOwnerOperator: (larkAppId: string, operator: { openId: string; unionId: string }) => boolean;
 }
 
 export function defaultModelSwitchIdentityDeps(
@@ -78,6 +84,7 @@ export function defaultModelSwitchIdentityDeps(
     resolveOperator,
     isBotUnionId: (u) => isTeamBot(config.session.dataDir, u) || isPlatformTeamBot(config.session.dataDir, u),
     canOperate: (appId, chatId, openId) => canOperate(appId, chatId, openId),
+    isOwnerOperator: (appId, op) => isCardOwnerOperator(appId, op),
   };
 }
 
@@ -163,15 +170,40 @@ function currentModelOf(ds: DaemonSession): string | null | undefined {
 }
 
 /** Enter the list state. Mutually exclusive with 「显示输出」: collapse it. */
+/** Leaving the confirm state invalidates its offer (S3 r6 P1-2): a replayed
+ *  old 「确认切换」 button must be refused after 取消 / 退出选择 / 显示输出. */
+function leaveConfirm(ds: DaemonSession): void {
+  if (ds.modelPanel?.kind === 'confirm') discardOffer(ds.modelPanel.offerId);
+}
+
+/** Collapse the picker from OUTSIDE the model-switch handler (the 「显示输出」
+ *  toggle): discards a pending confirm offer, bumps the UI generation so any
+ *  in-flight catalog lookup gives up, and clears the panel. */
+export function collapseModelPanel(ds: DaemonSession): void {
+  leaveConfirm(ds);
+  bumpPanelGeneration(ds);
+  ds.modelPanel = undefined;
+}
+
 async function openList(ctx: ModelSwitchCardContext, force: boolean, note?: string): Promise<CardResult> {
   const { ds } = ctx;
   const cliId = sessionCliId(ds);
+  leaveConfirm(ds);
   if ((ds.displayMode ?? 'hidden') !== 'hidden') {
     ds.displayMode = 'hidden';
     if (ds.worker || isSessionTransferring(ds)) sendWorkerSessionInput(ds, { type: 'set_display_mode', mode: 'hidden' } as any);
   }
+  // CAS (S3 r6 P1-1): the catalog lookup may take a while; if a newer action
+  // (显示输出, 退出选择, another open…) moved the UI on meanwhile, this late
+  // result must not reopen the picker or flip the display mode back.
+  const gen = bumpPanelGeneration(ds);
   const { models, source } = await currentCandidates(ctx, force);
+  if (panelGeneration(ds) !== gen || (ds.displayMode ?? 'hidden') !== 'hidden') {
+    logger.info(`[${ds.session.sessionId.substring(0, 8)}] model picker: late catalog result dropped (UI moved on)`);
+    return renderCard(ds);
+  }
   const current = currentModelOf(ds);
+  bumpPanelGeneration(ds);
   ds.modelPanel = {
     kind: 'list',
     menuId: newMenuId(),
@@ -187,7 +219,7 @@ async function openList(ctx: ModelSwitchCardContext, force: boolean, note?: stri
   return renderCard(ds);
 }
 
-type RefusalKey = ModelSwitchRefusal | 'external' | 'same' | 'no_txn' | 'identity' | 'not_candidate' | 'not_admin' | 'no_pending_confirm';
+type RefusalKey = ModelSwitchRefusal | 'external' | 'same' | 'no_txn' | 'identity' | 'not_candidate' | 'not_admin' | 'owner_only' | 'no_pending_confirm';
 function refusalText(reason: RefusalKey, loc: Locale): string {
   return t(`card.model.refuse.${reason}`, undefined, loc);
 }
@@ -196,7 +228,7 @@ function refusalToast(reason: RefusalKey, loc: Locale): Toast {
 }
 
 /**
- * The shared identity gate (§6, six steps). Returns a refusal key or null.
+ * The shared identity gate (§6, six steps + owner-only). Returns a refusal key or null.
  * Order matters: cheapest / most fundamental first; nothing is mutated here.
  */
 export async function modelSwitchIdentityGate(ctx: ModelSwitchCardContext): Promise<RefusalKey | null> {
@@ -209,6 +241,11 @@ export async function modelSwitchIdentityGate(ctx: ModelSwitchCardContext): Prom
   if (!unionId || !unionId.startsWith('on_')) return 'identity';
   if (ctx.identity.isBotUnionId(unionId)) return 'identity';
   if (!ctx.identity.canOperate(ctx.larkAppId, ds.chatId, openId)) return 'not_admin';
+  // Owner-only (2026-09-05): a verifiable human is NOT enough — the union id
+  // must belong to a bot owner. Re-checked on every callback; fail-closed.
+  let owner = false;
+  try { owner = ctx.identity.isOwnerOperator(ctx.larkAppId, { openId, unionId }); } catch { owner = false; }
+  if (!owner) return 'owner_only';
   if (!isProvenInternalChat(ds)) return 'external';
   if (isSharedAdoptSession(ds)) return 'adopt';
   if (isRemoteBackendSession(ds)) return 'remote';
@@ -222,6 +259,7 @@ function enterConfirm(ctx: ModelSwitchCardContext, target: { model?: string; eff
   const { ds } = ctx;
   const offer = createOffer({ larkAppId: ctx.larkAppId, sessionId: ds.session.sessionId, ...target, source, operatorOpenId: ctx.operatorOpenId ?? '' });
   markOfferDelivered(offer.offerId);
+  bumpPanelGeneration(ds);
   ds.modelPanel = { kind: 'confirm', menuId: newMenuId(), offerId: offer.offerId, target, reason };
   return renderCard(ds);
 }
@@ -236,25 +274,29 @@ function startSwitch(ctx: ModelSwitchCardContext, loc: Locale, target: { model?:
     onSettled: async (outcome, txn) => {
       const menuId = newMenuId();
       if (outcome === 'committed') {
-        ds.modelPanel = undefined;
+        bumpPanelGeneration(ds); ds.modelPanel = undefined;
         patchCard(ds);
         // Owner requirement: the task resumes by itself after a confirmed switch.
         autoContinue(ds, loc);
       } else if (outcome === 'rolled_back') {
         const conv = requestSessionRestart(ds, { source: 'card', notify: () => {} }, { strict: true });
+        bumpPanelGeneration(ds);
         ds.modelPanel = { kind: 'failed', menuId, target: txn.target, reason: t('card.model.reason_restart_failed', { cliName: name }, loc) + (conv ? '' : ` ${t('card.model.convergence_refused', undefined, loc)}`) };
         patchCard(ds);
       } else if (outcome === 'ambiguous') {
+        bumpPanelGeneration(ds);
         ds.modelPanel = { kind: 'ambiguous', menuId, target: txn.target };
         patchCard(ds);
       }
     },
   });
   if (!res.ok) {
+    bumpPanelGeneration(ds);
     ds.modelPanel = { kind: 'failed', menuId: newMenuId(), target, reason: refusalText(res.reason, loc) };
     return renderCard(ds);
   }
   logger.info(`[model-switch] ${ds.session.sessionId} → ${describeModelTarget(target)} attempt=${res.attemptId} by=${ctx.operatorOpenId ?? '?'}`);
+  bumpPanelGeneration(ds);
   ds.modelPanel = { kind: 'switching', menuId: newMenuId(), target, attemptId: res.attemptId };
   return renderCard(ds);
 }
@@ -293,6 +335,7 @@ export async function handleModelSwitchCardAction(ctx: ModelSwitchCardContext): 
   }
   if (ds.session.modelSwitchTxn?.state === 'ambiguous' && ds.modelPanel?.kind !== 'ambiguous'
       && actionType !== 'model_txn_recheck' && actionType !== 'model_txn_force_rollback' && actionType !== 'model_menu_close') {
+    bumpPanelGeneration(ds);
     ds.modelPanel = { kind: 'ambiguous', menuId: newMenuId(), target: ds.session.modelSwitchTxn.target };
     return renderCard(ds);
   }
@@ -303,8 +346,9 @@ export async function handleModelSwitchCardAction(ctx: ModelSwitchCardContext): 
     case 'model_menu_refresh':
       return openList(ctx, true);
     case 'model_menu_close': {
-      // Collapse the picker (also dismisses a transient failure line).
-      ds.modelPanel = undefined;
+      // Collapse the picker (also dismisses a transient failure line and
+      // invalidates a pending confirm offer).
+      collapseModelPanel(ds);
       return renderCard(ds);
     }
     case 'model_custom_open':
@@ -314,7 +358,11 @@ export async function handleModelSwitchCardAction(ctx: ModelSwitchCardContext): 
     case 'model_pick': {
       const model = typeof value.model === 'string' ? value.model.trim() || undefined : undefined;
       if (model === undefined) return refusalToast('not_candidate', loc);
+      const pickGen = panelGeneration(ds);
       const { models } = await currentCandidates(ctx);
+      // Same CAS as openList: a pick whose candidate check outlived a newer UI
+      // action (显示输出 / 退出选择) must not resurrect the picker.
+      if (panelGeneration(ds) !== pickGen || (ds.displayMode ?? 'hidden') !== 'hidden') return renderCard(ds);
       if (!models.includes(model)) return refusalToast('not_candidate', loc);
       if (activeSessionRestartAttemptId(ds)) return refusalToast('restart_in_flight', loc);
       if (model === currentModelOf(ds) && !ds.session.modelSwitchTxn) return refusalToast('same', loc);
@@ -361,7 +409,7 @@ export async function handleModelSwitchCardAction(ctx: ModelSwitchCardContext): 
         ds.workerGeneration,
       );
       if (outcome !== 'ambiguous') sessionStore.updateSession(ds.session);
-      if (outcome === 'committed') { ds.modelPanel = undefined; return renderCard(ds); }
+      if (outcome === 'committed') { bumpPanelGeneration(ds); ds.modelPanel = undefined; return renderCard(ds); }
       if (outcome === 'rolled_back') { ds.modelPanel = { kind: 'failed', menuId: newMenuId(), target: cur.target, reason: t('card.model.recheck_rolled_back', { cliName: cliName(ds) }, loc) }; return renderCard(ds); }
       return toast('warning', t('card.model.recheck_ambiguous', undefined, loc));
     }
@@ -373,12 +421,14 @@ export async function handleModelSwitchCardAction(ctx: ModelSwitchCardContext): 
         source: 'card',
         notify: () => {},
         onSettled: async (outcome) => {
+          bumpPanelGeneration(ds);
           if (outcome === 'rolled_back') ds.modelPanel = undefined;
           else ds.modelPanel = { kind: 'ambiguous', menuId: newMenuId(), target: cur.target };
           patchCard(ds);
         },
       });
       if (!res.ok) return refusalToast(res.reason, loc);
+      bumpPanelGeneration(ds);
       ds.modelPanel = { kind: 'switching', menuId: newMenuId(), target: previous, attemptId: res.attemptId };
       return renderCard(ds);
     }

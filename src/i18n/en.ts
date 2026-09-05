@@ -57,6 +57,8 @@ export const messages: Record<string, string> = {
   'card.model.btn_confirm_fresh': 'Confirm switch (new thread)',
   'card.model.refuse.identity': 'Operator identity cannot be verified (a verifiable human account is required).',
   'card.model.refuse.not_admin': 'You are not allowed to operate this bot.',
+  'card.model.refuse.owner_only': 'Only this bot\'s owner can operate the model switch.',
+  'card.action.owner_only': 'Only this bot\'s owner can toggle the output view.',
   'card.model.refuse.not_candidate': 'That model is not in the current candidate list (the card may be stale; reopen "⚙ Model", or use "Custom" for an arbitrary name).',
   'card.model.refuse.pane_alive': 'The old CLI pane is still running and a genuine restart cannot be guaranteed; switch refused. /restart or close the session first.',
   'card.model.refuse.pane_unknown': 'Cannot confirm the old CLI pane has exited; switch refused (no possibly-false "success").',

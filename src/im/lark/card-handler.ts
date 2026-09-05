@@ -94,7 +94,8 @@ import { forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeS
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { isExternalChatSession } from '../../core/external-chat.js';
 import { modelSwitchAllowedForSession } from '../../core/model-switch-surface.js';
-import { MODEL_SWITCH_CARD_ACTIONS, isModelSwitchCardAction, handleModelSwitchCardAction, defaultModelSwitchIdentityDeps } from './model-switch-card.js';
+import { isCardOwnerOperator } from './card-owner-gate.js';
+import { MODEL_SWITCH_CARD_ACTIONS, isModelSwitchCardAction, handleModelSwitchCardAction, defaultModelSwitchIdentityDeps, collapseModelPanel } from './model-switch-card.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
 import { publishAttentionPatch, publishClosedSessionPatch, announcePendingRepoSession } from '../../core/session-activity.js';
 import { fallbackTurnId, rehomeReplyTargetState } from '../../core/reply-target.js';
@@ -3215,10 +3216,19 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     // Display toggle: hidden ↔ screenshot. 'toggle_stream' is the legacy alias
     // from pre-screenshot cards and is mapped to toggle_display semantics.
     if (actionType === 'toggle_display' || actionType === 'toggle_stream') {
+      // Owner-only (2026-09-05 18:28): 「显示输出」 is operable by the bot owner
+      // alone (bots.json allowedUsers of THIS bot). Checked before ANY
+      // state change; other humans and bots get a toast and an unchanged card.
+      const toggleAppId = larkAppId ?? ds?.larkAppId;
+      const toggleOperator = toggleAppId ? await resolveCardOperatorUnionId(data, toggleAppId) : {};
+      if (!toggleOperator.unionId || !isCardOwnerOperator(toggleAppId, toggleOperator)) {
+        logger.info(`Card action "${actionType}" refused: operator ${operatorOpenId} is not a bot owner`);
+        return { toast: { type: 'warning', content: t('card.action.owner_only', undefined, localeForBot(toggleAppId)) } };
+      }
       // 「显示输出」 and the v2 model picker are mutually exclusive expanded
       // states: opening the output collapses the picker (and clears a transient
       // failure line).
-      if (ds?.modelPanel) ds.modelPanel = undefined;
+      if (ds) collapseModelPanel(ds);
       if (!ds) {
         // 同 close：会话已不在线时「显示 / 隐藏输出」静默无反应 → 给失败 toast（成功不弹）。
         return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, localeForBot(larkAppId)) } };
