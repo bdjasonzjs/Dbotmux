@@ -19,7 +19,9 @@ import {
   findEnvKeyInBuffer,
   firstPidMayBeLeaf,
   isAttestableCliId,
+  LEAF_VERIFY_MAX_RETRIES,
   readLeafArgv,
+  shouldRetryLeafVerdict,
   resolveLaunchEffort,
   verifyLeafArgv,
   type EnvKeyRead,
@@ -268,5 +270,33 @@ describe('identity 只对 Claude 系会话适用（其余 CLI 不显示、也不
     expect(isAttestableCliId('codex')).toBe(false);
     expect(isAttestableCliId('pi')).toBe(false);
     expect(isAttestableCliId(undefined)).toBe(false);
+  });
+});
+
+describe('exec-chain 竞态：direct 契约 mismatch 有界重读，其它情形不重试', () => {
+  it('direct + mismatch 且未超上限 → 重试；到上限停', () => {
+    expect(shouldRetryLeafVerdict({ kind: 'direct' }, 'leaf-argv-mismatch', 0)).toBe(true);
+    expect(shouldRetryLeafVerdict({ kind: 'direct' }, 'leaf-argv-mismatch', LEAF_VERIFY_MAX_RETRIES - 1)).toBe(true);
+    expect(shouldRetryLeafVerdict({ kind: 'direct' }, 'leaf-argv-mismatch', LEAF_VERIFY_MAX_RETRIES)).toBe(false);
+  });
+  it('cmdline 不可读（pid 已死）→ 不重试；wrapped 契约（launcher 永远不会变成 leaf）→ 不重试', () => {
+    expect(shouldRetryLeafVerdict({ kind: 'direct' }, 'leaf-argv-unreadable', 0)).toBe(false);
+    expect(shouldRetryLeafVerdict({ kind: 'wrapped', via: 'bwrap' }, 'leaf-argv-mismatch', 0)).toBe(false);
+  });
+  it('模拟 shell→env→claude 的 argv 演进：前两次 mismatch，第三次精确命中', () => {
+    const expected = { bin: '/x/claude', args: ['--resume', 'sid', '--model', 'claude-fable-5-1[1m]'], contract: { kind: 'direct' } as const };
+    const stages: string[][] = [
+      ['/bin/sh', '-c', 'cd -- "$1" && shift && exec /usr/bin/env "$@"', '_', '/home/u'],
+      ['/usr/bin/env', 'CLAUDE_CODE_OAUTH_TOKEN=redacted', '/x/claude', '--resume', 'sid', '--model', 'claude-fable-5-1[1m]'],
+      ['/x/claude', '--resume', 'sid', '--model', 'claude-fable-5-1[1m]'],
+    ];
+    let retries = 0; let verdict = verifyLeafArgv(expected, stages[0]);
+    while (!verdict.ok && shouldRetryLeafVerdict(expected.contract, verdict.reason, retries)) {
+      retries += 1; verdict = verifyLeafArgv(expected, stages[Math.min(retries, stages.length - 1)]);
+    }
+    expect(verdict).toMatchObject({ ok: true, model: 'claude-fable-5-1[1m]' });
+    expect(retries).toBe(2);
+    // 关键：env 注入阶段的 argv（带 token 前缀）绝不能被当成 leaf 通过
+    expect(verifyLeafArgv(expected, stages[1]).ok).toBe(false);
   });
 });
