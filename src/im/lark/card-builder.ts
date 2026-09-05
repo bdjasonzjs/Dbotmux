@@ -2881,7 +2881,8 @@ export function buildModelCustomCard(d: Pick<ModelMenuCardData, 'sessionId' | 'r
  *  value so the second hop keeps the FIRST hop's entry semantics: a curated
  *  pick is re-validated against the live catalog, a custom entry against the
  *  name grammar. Never inferred from the model string itself. */
-export type ModelConfirmSource = 'curated' | 'custom';
+export type { ModelConfirmSource } from '../../core/model-switch-offers.js';
+import type { ModelConfirmSource } from '../../core/model-switch-offers.js';
 
 /** Confirmation card shown when a switch would interrupt a running turn or
  *  start a new thread. */

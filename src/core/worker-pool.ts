@@ -36,6 +36,7 @@ import {
 import { persistStreamCardState, rememberLastCliInput } from './session-manager.js';
 import { isExternalChatSession } from './external-chat.js';
 import { modelSwitchAllowedForSession } from './model-switch-surface.js';
+import { clearOffersForSession as clearModelSwitchOffersForSession } from './model-switch-offers.js';
 import { resolveSessionLaunchModel } from './session-model.js';
 import { prepareModelSwitch, validateModelSwitch, settleModelSwitch, applyRollbackInMemory, beginForceRollback, type PrepareRefusal, type ModelSwitchTxn, type SettleOutcome } from './model-switch.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, rehomeReplyTargetState, replyTargetKey } from './reply-target.js';
@@ -5720,6 +5721,10 @@ export async function closeSession(
   const awaitWorkerExit = opts?.awaitWorkerExit ?? true;
   const ds = findActiveBySessionId(sessionId);
   const stored = sessionStore.getOwnedSession(sessionId);
+  // A closing session must leave nothing confirmable behind (card model switch).
+  for (const appId of new Set([ds?.larkAppId, stored?.larkAppId].filter((x): x is string => !!x))) {
+    clearModelSwitchOffersForSession(appId, sessionId);
+  }
   const closeFrozenBackendType = ds?.initConfig?.backendType
     ?? ds?.session.backendType ?? stored?.backendType;
   const isOwnedClose = !(ds && isSharedAdoptSession(ds))

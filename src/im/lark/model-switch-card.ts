@@ -38,6 +38,7 @@ import {
   activeSessionRestartAttemptId, type ModelSwitchRefusal,
 } from '../../core/worker-pool.js';
 import { buildModelMenuCard, buildModelCustomCard, buildModelPickConfirmCard, getCliDisplayName, type ModelMenuCardData, type ModelConfirmSource } from './card-builder.js';
+import { createOffer, markOfferDelivered, discardOffer, consumeOffer } from '../../core/model-switch-offers.js';
 
 export const MODEL_SWITCH_CARD_ACTIONS = [
   'effort_pick', 'model_custom_open', 'model_custom_save', 'model_menu_open', 'model_menu_refresh',
@@ -95,41 +96,12 @@ export interface ModelSwitchCardContext {
 }
 
 type Toast = { toast: { type: 'success' | 'info' | 'warning' | 'error'; content: string } };
-
-/**
- * Server-side pending confirmations (P1-1 r3). The confirmation hop must keep
- * the FIRST hop's entry semantics (curated vs custom) without trusting the
- * card: the first hop records what it offered, keyed by bot+session; the
- * confirmation is accepted only when it names exactly that offer, from the
- * same operator, within the TTL, and is consumed on use. The `source` field
- * in the button value is informational (dedupe / debugging), never authority.
- */
-export interface PendingModelConfirm {
-  model?: string;
-  effort?: string;
-  source: ModelConfirmSource;
-  operatorOpenId: string;
-  createdAt: number;
-}
-export const PENDING_CONFIRM_TTL_MS = 10 * 60 * 1000;
-const pendingConfirms = new Map<string, PendingModelConfirm>();
-const pendingKey = (larkAppId: string, sessionId: string) => `${larkAppId}::${sessionId}`;
-export function __testOnly_resetPendingConfirms(): void { pendingConfirms.clear(); }
-function rememberPending(ctx: ModelSwitchCardContext, p: Omit<PendingModelConfirm, 'createdAt' | 'operatorOpenId'>): void {
-  pendingConfirms.set(pendingKey(ctx.larkAppId, ctx.ds.session.sessionId), { ...p, operatorOpenId: ctx.operatorOpenId ?? '', createdAt: Date.now() });
-}
-/** Take the pending offer if the confirmation matches it exactly; else undefined (and nothing is consumed). */
-function takePending(ctx: ModelSwitchCardContext, model: string | undefined, effort: string | undefined): PendingModelConfirm | undefined {
-  const key = pendingKey(ctx.larkAppId, ctx.ds.session.sessionId);
-  const p = pendingConfirms.get(key);
-  if (!p) return undefined;
-  if (Date.now() - p.createdAt > PENDING_CONFIRM_TTL_MS) { pendingConfirms.delete(key); return undefined; }
-  if (p.operatorOpenId !== (ctx.operatorOpenId ?? '')) return undefined;
-  if (p.model !== model || p.effort !== effort) return undefined;
-  pendingConfirms.delete(key);
-  return p;
-}
 const toast = (type: Toast['toast']['type'], content: string): Toast => ({ toast: { type, content } });
+
+// Server-side pending confirmations live in core/model-switch-offers.ts:
+// unique offerId (= the confirm card's menu_id), creating→delivered→consumed
+// lifecycle, one-shot consumption, bounded store, per-session cleanup.
+export { PENDING_CONFIRM_TTL_MS, __testOnly_resetOffers as __testOnly_resetPendingConfirms } from '../../core/model-switch-offers.js';
 
 function sessionCliId(ds: DaemonSession): CliId {
   return (ds.session.cliId ?? getBot(ds.larkAppId).config.cliId) as CliId;
@@ -267,12 +239,24 @@ async function startSwitch(
   return toast('info', t('card.model.switch_started', { cliName: name, target: targetLabel }, loc));
 }
 
+/**
+ * Offer → deliver → CAS. The offer is created `creating`, its id becomes the
+ * confirm card's `menu_id`; only a successful delivery marks it `delivered`
+ * (usable), and a failed delivery discards exactly this instance — a newer
+ * offer created meanwhile is never touched by either outcome.
+ */
 async function confirmFirst(ctx: ModelSwitchCardContext, loc: Locale, target: { model?: string; effort?: string }, reason: 'busy' | 'fresh', source: ModelConfirmSource): Promise<undefined> {
   const { ds } = ctx;
-  rememberPending(ctx, { ...target, source });
-  await deliverCard(ctx, buildModelPickConfirmCard({
-    sessionId: ds.session.sessionId, rootId: ctx.rootId, cliId: sessionCliId(ds), cliName: cliName(ds), menuId: newMenuId(),
-  }, target, loc, reason, source));
+  const offer = createOffer({ larkAppId: ctx.larkAppId, sessionId: ds.session.sessionId, ...target, source, operatorOpenId: ctx.operatorOpenId ?? '' });
+  try {
+    await deliverCard(ctx, buildModelPickConfirmCard({
+      sessionId: ds.session.sessionId, rootId: ctx.rootId, cliId: sessionCliId(ds), cliName: cliName(ds), menuId: offer.offerId,
+    }, target, loc, reason, source));
+  } catch (err) {
+    discardOffer(offer.offerId);
+    throw err;
+  }
+  markOfferDelivered(offer.offerId);
   return undefined;
 }
 
@@ -329,7 +313,11 @@ export async function handleModelSwitchCardAction(ctx: ModelSwitchCardContext): 
       if (actionType === 'model_custom_save') source = 'custom';
       else if (actionType === 'model_pick') source = 'curated';
       else {
-        const pending = takePending(ctx, model, effortRaw);
+        const pending = consumeOffer({
+          offerId: typeof value.menu_id === 'string' ? value.menu_id : undefined,
+          larkAppId: ctx.larkAppId, sessionId: ds.session.sessionId,
+          operatorOpenId: ctx.operatorOpenId ?? '', model, effort: effortRaw,
+        });
         if (!pending) return refusalToast('no_pending_confirm', loc);
         source = pending.source;
       }

@@ -224,7 +224,12 @@ describe('fresh-only (codex-app) always confirms first', () => {
     const confirm = JSON.parse(delivered[0].content);
     expect(JSON.stringify(confirm)).toContain('deepseek/deepseek-v4-pro');
 
-    const second = app({ action: 'model_pick_confirm', model: 'deepseek/deepseek-v4-pro' });
+    // r4 amendment (declared): the confirmation must reference the exact offer
+    // (its menu_id) per review r3 P1-1, so the second hop replays the real
+    // button value instead of a hand-written {action, model} payload.
+    const secondValue = confirm.elements.find((e: any) => e.tag === 'action').actions[0].value;
+    expect(secondValue).toMatchObject({ action: 'model_pick_confirm', model: 'deepseek/deepseek-v4-pro' });
+    const second = app(secondValue);
     expect((await handleModelSwitchCardAction(second))?.toast.type).toBe('info');
     expect(switchMock).toHaveBeenCalledTimes(1);
     expect(switchMock.mock.calls[0][1]).toMatchObject({ model: 'deepseek/deepseek-v4-pro' });
@@ -318,6 +323,108 @@ describe('fresh-only (codex-app) always confirms first', () => {
     expect((await handleModelSwitchCardAction(c))?.toast.type).toBe('warning');
     expectZeroMutation(c, before);
   });
+  it('REVIEWER R3: an older identical confirmation cannot consume a newer offer (ABA)', async () => {
+    switchMock.mockReturnValue({ ok: true, attemptId: 'A1', txn: { target: { model: 'my-private-model' }, rollback: {} } });
+    await handleModelSwitchCardAction(app(
+      { action: 'model_custom_save' },
+      { action: { form_value: { model: 'my-private-model' } } },
+    ));
+    const oldValue = JSON.parse(delivered[0].content).elements.find((e: any) => e.tag === 'action').actions[0].value;
+
+    delivered.length = 0;
+    await handleModelSwitchCardAction(app(
+      { action: 'model_custom_save' },
+      { action: { form_value: { model: 'my-private-model' } } },
+    ));
+    const newValue = JSON.parse(delivered[0].content).elements.find((e: any) => e.tag === 'action').actions[0].value;
+    expect(oldValue.menu_id).not.toBe(newValue.menu_id);
+
+    const stale = app(oldValue);
+    const before = snapshot(stale);
+    expect((await handleModelSwitchCardAction(stale))?.toast.type).toBe('warning');
+    expectZeroMutation(stale, before);
+    expect((await handleModelSwitchCardAction(app(newValue)))?.toast.type).toBe('info');
+    expect(switchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('REVIEWER R3: a failed confirm-card delivery leaves no usable offer', async () => {
+    deliverMock.mockRejectedValueOnce(new Error('delivery failed'));
+    await expect(handleModelSwitchCardAction(app(
+      { action: 'model_custom_save' },
+      { action: { form_value: { model: 'my-private-model' } } },
+    ))).rejects.toThrow('delivery failed');
+
+    switchMock.mockReturnValue({ ok: true, attemptId: 'A1', txn: { target: { model: 'my-private-model' }, rollback: {} } });
+    const forged = app({ action: 'model_pick_confirm', source: 'custom', model: 'my-private-model', menu_id: 'old-card' });
+    const before = snapshot(forged);
+    expect((await handleModelSwitchCardAction(forged))?.toast.type).toBe('warning');
+    expectZeroMutation(forged, before);
+  });
+
+  it('a confirmation must carry the exact offerId (menu_id); a matching model without it is refused', async () => {
+    switchMock.mockReturnValue({ ok: true, attemptId: 'A1', txn: { target: { model: 'my-private-model' }, rollback: {} } });
+    await handleModelSwitchCardAction(app({ action: 'model_custom_save' }, { action: { form_value: { model: 'my-private-model' } } }));
+    const v = JSON.parse(delivered[0].content).elements.find((e: any) => e.tag === 'action').actions[0].value;
+    for (const bad of [{ ...v, menu_id: undefined }, { ...v, menu_id: 'ffffffffffffffff' }, { ...v, menu_id: v.menu_id.slice(0, 8) }]) {
+      const c = app(bad);
+      const before = snapshot(c);
+      expect((await handleModelSwitchCardAction(c))?.toast.type).toBe('warning');
+      expectZeroMutation(c, before);
+    }
+    expect((await handleModelSwitchCardAction(app(v)))?.toast.type).toBe('info');
+    expect(switchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('concurrent cross-delivery: a late-completing OLD delivery cannot resurrect its superseded offer', async () => {
+    switchMock.mockReturnValue({ ok: true, attemptId: 'A1', txn: { target: { model: 'my-private-model' }, rollback: {} } });
+    // Offer A's delivery is held open while offer B is created and delivered.
+    let releaseA!: () => void;
+    deliverMock.mockImplementationOnce(async (_ds: any, _op: any, content: string, msgType: string) => {
+      delivered.push({ content, msgType });
+      await new Promise<void>(r => { releaseA = r; });
+    });
+    const pA = handleModelSwitchCardAction(app({ action: 'model_custom_save' }, { action: { form_value: { model: 'my-private-model' } } }));
+    await new Promise(r => setTimeout(r, 0));
+    const vA = JSON.parse(delivered[0].content).elements.find((e: any) => e.tag === 'action').actions[0].value;
+    delivered.length = 0;
+    await handleModelSwitchCardAction(app({ action: 'model_custom_save' }, { action: { form_value: { model: 'my-private-model' } } }));
+    const vB = JSON.parse(delivered[0].content).elements.find((e: any) => e.tag === 'action').actions[0].value;
+    releaseA(); await pA; // A's delivery "succeeds" late — its offer was already superseded by B
+    const staleA = app(vA);
+    const before = snapshot(staleA);
+    expect((await handleModelSwitchCardAction(staleA))?.toast.type).toBe('warning');
+    expectZeroMutation(staleA, before);
+    expect((await handleModelSwitchCardAction(app(vB)))?.toast.type).toBe('info');
+    expect(switchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('an offer is consumed exactly once, even when two identical confirmations race', async () => {
+    switchMock.mockReturnValue({ ok: true, attemptId: 'A1', txn: { target: { model: 'my-private-model' }, rollback: {} } });
+    await handleModelSwitchCardAction(app({ action: 'model_custom_save' }, { action: { form_value: { model: 'my-private-model' } } }));
+    const v = JSON.parse(delivered[0].content).elements.find((e: any) => e.tag === 'action').actions[0].value;
+    const [r1, r2] = await Promise.all([handleModelSwitchCardAction(app(v)), handleModelSwitchCardAction(app(v))]);
+    expect([r1?.toast.type, r2?.toast.type].sort()).toEqual(['info', 'warning']);
+    expect(switchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('an offer is not confirmable before its card was delivered (creating state)', async () => {
+    let release!: () => void;
+    deliverMock.mockImplementationOnce(async (_ds: any, _op: any, content: string, msgType: string) => {
+      delivered.push({ content, msgType });
+      await new Promise<void>(r => { release = r; });
+    });
+    const p = handleModelSwitchCardAction(app({ action: 'model_custom_save' }, { action: { form_value: { model: 'my-private-model' } } }));
+    await new Promise(r => setTimeout(r, 0));
+    const v = JSON.parse(delivered[0].content).elements.find((e: any) => e.tag === 'action').actions[0].value;
+    const early = app(v);
+    const before = snapshot(early);
+    expect((await handleModelSwitchCardAction(early))?.toast.type).toBe('warning');
+    expectZeroMutation(early, before);
+    release(); await p;
+    switchMock.mockReturnValue({ ok: true, attemptId: 'A1', txn: { target: { model: 'my-private-model' }, rollback: {} } });
+    expect((await handleModelSwitchCardAction(app(v)))?.toast.type).toBe('info');
+  });
+
   it('the identity gate still guards the custom confirmation hop', async () => {
     await handleModelSwitchCardAction(app({ action: 'model_custom_save' }, { action: { form_value: { model: 'deepseek/deepseek-v4-pro' } } }));
     const c = app({ action: 'model_pick_confirm', source: 'custom', model: 'deepseek/deepseek-v4-pro' }, { identity: { resolveOperator: async () => ({ unionId: 'on_bot' }), isBotUnionId: (u: string) => u === 'on_bot', canOperate: () => true } });
@@ -328,8 +435,8 @@ describe('fresh-only (codex-app) always confirms first', () => {
   it('codex-app model_pick_confirm on a current candidate starts the switch (after the offer)', async () => {
     switchMock.mockReturnValue({ ok: true, attemptId: 'A1', txn: { target: { model: 'gpt-5.6-sol' }, rollback: {} } });
     expect(await handleModelSwitchCardAction(app({ action: 'model_pick', model: 'gpt-5.6-sol' }))).toBeUndefined();
-    const c = app({ action: 'model_pick_confirm', source: 'curated', model: 'gpt-5.6-sol' });
-    expect((await handleModelSwitchCardAction(c))?.toast.type).toBe('info');
+    const v = JSON.parse(delivered[0].content).elements.find((e: any) => e.tag === 'action').actions[0].value;
+    expect((await handleModelSwitchCardAction(app(v)))?.toast.type).toBe('info');
     expect(switchMock).toHaveBeenCalledTimes(1);
   });
   it('plain CLI: idle pick switches directly; busy pick confirms first', async () => {
