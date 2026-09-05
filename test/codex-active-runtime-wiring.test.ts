@@ -85,7 +85,12 @@ describe('Claude-family streaming identity（缺陷回修 2026-09-05：卡片只
     // identity is derived first, and the legacy plan-value pair is suppressed whenever it exists
     expect(fn).toContain('const identity = daemonReplyCardIdentity(ds).identity;');
     expect(fn).toContain('identity ? undefined : (ds.activeModel?.trim() || ds.session.model?.trim())');
-    expect(fn).toContain('...(identity ? { identity } : {}),');
+    // P2-1: pin the FINAL (default-streaming) return specifically, not just "somewhere in the function".
+    const finalReturn = fn.slice(fn.lastIndexOf('const quota = peekProviderQuotaForSession(ds);'));
+    expect(finalReturn).toContain('...(identity ? { identity } : {}),');
+    // and the non-streaming early return keeps it too
+    const earlyReturn = fn.slice(fn.indexOf("!== 'streaming'"), fn.indexOf('} catch {'));
+    expect(earlyReturn).toContain('...(identity ? { identity } : {}),');
   });
   it('the worker re-reads a direct-contract leaf on argv mismatch instead of giving up after one read', () => {
     expect(worker).toContain('shouldRetryLeafVerdict(pending.expected.contract, verdict.reason, retriesSoFar)');

@@ -333,4 +333,3 @@ export function shouldRetryLeafVerdict(contract: LaunchContract, reason: string,
   if (reason !== 'leaf-argv-mismatch') return false;
   return retriesSoFar < LEAF_VERIFY_MAX_RETRIES;
 }
-

@@ -1232,7 +1232,10 @@ describe('refreshStreamingCardUsage (interval tick)', () => {
     refreshStreamingCardUsage(ds);
     const call = vi.mocked(buildStreamingCard).mock.calls[0]!;
     // Snapshot present (17th positional arg) and interval < throttle by design.
-    expect(call[16]).toEqual({ context: null, tokens: null, turnTokens: null });
+    // A Claude-family session with no verified launch attestation now carries an
+    // explicit `identity: { state: 'unknown' }` (S2 fail-closed contract: never
+    // blank, never the registry plan value) alongside the empty usage facts.
+    expect(call[16]).toEqual({ context: null, tokens: null, turnTokens: null, identity: { state: 'unknown' } });
     expect(USAGE_REFRESH_INTERVAL_MS).toBeLessThan(15_000);
   });
 

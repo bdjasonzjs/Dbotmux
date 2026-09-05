@@ -403,8 +403,12 @@ export function getDaemonStreamingCardUsageSnapshot(
   const grokModel = effectiveCliId === 'grok' ? snapshot.model?.trim() : undefined;
   const grokReasoningEffort = effectiveCliId === 'grok' ? snapshot.reasoningEffort?.trim() : undefined;
   const quota = peekProviderQuotaForSession(ds);
+  // FINAL (default 'streaming') return: identity must ride here too. The
+  // 2026-09-05 defect-fix review caught this path returning neither identity
+  // nor the (deliberately suppressed) legacy pair, which blanked Claude cards.
   return {
     ...snapshot,
+    ...(identity ? { identity } : {}),
     ...(runtimeModel ? { model: runtimeModel } : grokModel ? { model: grokModel } : {}),
     ...(reasoningEffort ? { reasoningEffort } : grokReasoningEffort ? { reasoningEffort: grokReasoningEffort } : {}),
     ...(quota ? { quota } : {}),
