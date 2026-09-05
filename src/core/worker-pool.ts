@@ -10847,6 +10847,17 @@ function setupWorkerHandlers(
       case 'prompt_ready': {
         if (ds.worker !== worker) break;
         logger.info(`[${t}] ${sessionCliDisplayName(ds, botCfg)} is ready for input`);
+        // An IN-PLACE CLI restart (restart IPC: /restart, card restart, model
+        // switch, crash auto-restart) flips `workerReady=false` to gate the UI
+        // while the CLI is down, but the worker never re-emits `ready` (that
+        // is init-only), so nothing turned it back on: every surface gated by
+        // workerHasInitialized — 显示输出 toggle, screenshot patches, export,
+        // private snapshot… — stayed dead until the next fork. A live prompt
+        // from the CURRENT worker is exactly the "worker is back" signal.
+        if (ds.workerReady === false) {
+          ds.workerReady = true;
+          logger.info(`[${t}] workerReady restored after in-place restart (prompt_ready)`);
+        }
         // A live prompt means a (re)spawn reached a working CLI — clear the lazy
         // cold-resume marker set when we parked a crash diagnostic shell. The
         // common retry path respawns IN-PLACE (worker.ts case 'message'), not via
@@ -10922,6 +10933,12 @@ function setupWorkerHandlers(
         if (ds.worker !== worker) {
           logger.warn(`[${t}] Ignored restart_result from stale worker generation`);
           break;
+        }
+        // Same restore as prompt_ready (belt and braces): a succeeded in-place
+        // restart means the current worker has a live CLI again.
+        if (msg.status === 'succeeded' && ds.workerReady === false) {
+          ds.workerReady = true;
+          logger.info(`[${t}] workerReady restored after in-place restart (restart_result)`);
         }
         restartCoordinator.resolve(ds.session.sessionId, msg.attemptId, msg.status);
         break;
