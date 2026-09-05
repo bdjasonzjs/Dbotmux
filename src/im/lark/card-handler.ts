@@ -2866,6 +2866,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           codexServiceTierBadge(sessionCliId(ds), ds.codexServiceTier),
           isExternalChatSession(ds),
           modelSwitchAllowedForSession(ds),
+          ds.modelPanel,
         );
         scheduleCardPatch(ds, cardJson);
       }
@@ -3214,6 +3215,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     // Display toggle: hidden ↔ screenshot. 'toggle_stream' is the legacy alias
     // from pre-screenshot cards and is mapped to toggle_display semantics.
     if (actionType === 'toggle_display' || actionType === 'toggle_stream') {
+      // 「显示输出」 and the v2 model picker are mutually exclusive expanded
+      // states: opening the output collapses the picker (and clears a transient
+      // failure line).
+      if (ds?.modelPanel) ds.modelPanel = undefined;
       if (!ds) {
         // 同 close：会话已不在线时「显示 / 隐藏输出」静默无反应 → 给失败 toast（成功不弹）。
         return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, localeForBot(larkAppId)) } };
@@ -3266,6 +3271,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
               isExternalChatSession(ds),
               modelSwitchAllowedForSession(ds),
+              ds.modelPanel,
             );
             updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
               logger.debug(`[${tag(ds)}] Failed to migrate unknown frozen card: ${err}`),
@@ -3314,6 +3320,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           effectiveCliId === 'codex' ? frozen.codexServiceTierBadge : undefined,
           isExternalChatSession(ds),
           modelSwitchAllowedForSession(ds),
+          ds.modelPanel,
         );
         updateMessage(ds.larkAppId, frozen.messageId, cardJson).catch(err =>
           logger.debug(`[${tag(ds)}] Failed to migrate frozen card: ${err}`),
@@ -3360,6 +3367,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
           isExternalChatSession(ds),
           modelSwitchAllowedForSession(ds),
+          ds.modelPanel,
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -3431,6 +3439,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
           isExternalChatSession(ds),
           modelSwitchAllowedForSession(ds),
+          ds.modelPanel,
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -3502,6 +3511,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
           isExternalChatSession(ds),
           modelSwitchAllowedForSession(ds),
+          ds.modelPanel,
         );
         try { return JSON.parse(cardJson); } catch { /* fall through */ }
       }

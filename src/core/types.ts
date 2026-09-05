@@ -326,6 +326,8 @@ export interface DaemonSession {
   pendingAckReactions?: Array<{ messageId: string; reactionId?: string }>;
   /** Card body display mode. Default 'hidden'. When user clicks 显示输出, defaults to 'screenshot'. */
   displayMode?: DisplayMode;
+  /** In-card model picker state (v2); undefined = collapsed. In-memory only. */
+  modelPanel?: import('./model-switch-panel.js').ModelPanelState;
   /** Latest uploaded screenshot image_key for the streaming card. */
   currentImageKey?: string;
   lastScreenContent?: string;    // last screen_update content — used to freeze card at idle

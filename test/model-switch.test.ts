@@ -47,7 +47,7 @@ import {
   latestEffortForRespawn, convergeSessionEffort, __testOnly_resetRestartCoordinator, __testOnly_resolveRestart,
 } from '../src/core/worker-pool.js';
 import { parsePiListModels } from '../src/adapters/cli/pi.js';
-import { buildSessionCard, buildStreamingCard, buildModelMenuCard, buildModelCustomCard } from '../src/im/lark/card-builder.js';
+import { buildSessionCard, buildStreamingCard } from '../src/im/lark/card-builder.js';
 import { MODEL_SWITCH_CARD_ACTIONS, MODEL_NAME_RE, sessionLooksBusy } from '../src/im/lark/model-switch-card.js';
 
 const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
@@ -575,8 +575,8 @@ describe('worker.ts restart / message handlers', () => {
 // ─── 7. card layer ────────────────────────────────────────────────────────
 describe('card layer', () => {
   const EXPECTED_ACTIONS = ['effort_pick', 'model_custom_open', 'model_custom_save', 'model_menu_open', 'model_menu_refresh', 'model_pick', 'model_pick_confirm', 'model_txn_force_rollback', 'model_txn_recheck'];
-  it('exactly the nine actions, all in the sensitive gate, all routed', () => {
-    expect([...MODEL_SWITCH_CARD_ACTIONS].sort()).toEqual([...EXPECTED_ACTIONS].sort());
+  it('exactly the ten actions (nine + model_menu_close), all in the sensitive gate, all routed', () => {
+    expect([...MODEL_SWITCH_CARD_ACTIONS].sort()).toEqual([...EXPECTED_ACTIONS, 'model_menu_close'].sort());
     const gate = cardHandlerSource.match(/const isSensitive = value\?\.action && \[([^\]]*)\]/)![1];
     expect(gate).toContain('...MODEL_SWITCH_CARD_ACTIONS');
     expect(cardHandlerSource).toMatch(/if \(isModelSwitchCardAction\(actionType\)\)/);
@@ -584,19 +584,10 @@ describe('card layer', () => {
   it('dedupe key discriminates model / effort / menu_id', () => {
     expect(dispatcherSource).toMatch(/model: value\?\.model,\s*effort: value\?\.effort,\s*menuId: value\?\.menu_id,/);
   });
-  it('session card: ⚙ button ONLY when the caller proved modelSwitchAllowed; never adopt / external / read-only', () => {
-    const has = (json: string) => json.includes('"action":"model_menu_open"');
-    const build = (cli: any, o: { manage?: boolean; adopt?: boolean; external?: boolean; allowed?: boolean } = {}) =>
-      buildSessionCard('s', 'r', 'http://t', 'T', cli, o.manage ?? true, o.adopt ?? false, 'zh', false, undefined, o.external ?? false, o.allowed ?? false);
-    expect(has(build('claude-code'))).toBe(false);                       // default = not proven → no button
-    expect(has(build('claude-code', { allowed: true }))).toBe(true);
-    expect(has(build('codex-app', { allowed: true }))).toBe(true);
-    expect(has(build('opencode2', { allowed: true }))).toBe(false);      // bare-CLI defence stays
-    expect(has(build('claude-code', { allowed: true, adopt: true }))).toBe(false);
-    expect(has(build('claude-code', { allowed: true, manage: false }))).toBe(false);
-    expect(has(build('claude-code', { allowed: true, external: true }))).toBe(false);
+  it('session card never renders a model button (v2: the picker lives on the streaming card only)', () => {
+    expect(buildSessionCard('s', 'r', 'http://t', 'T', 'claude-code', true, false, 'zh', false, undefined, false, true)).not.toContain('model_menu_open');
   });
-  it('streaming card: ⚙ button ONLY when proven; absent by default / externally / adopt / unsupported', () => {
+  it('streaming card: 「选择模型」 ONLY when proven; absent by default / externally / adopt / unsupported', () => {
     const has = (json: string) => json.includes('"action":"model_menu_open"');
     const build = (cli: any, adopt = false, external = false, allowed = false) => buildStreamingCard('s', 'r', 'http://t', 'T', '', 'idle', cli, 'hidden', 'n', undefined, adopt, false, 'zh', undefined, undefined, false, undefined, undefined, undefined, external, allowed);
     expect(has(build('claude-code'))).toBe(false);
@@ -614,27 +605,6 @@ describe('card layer', () => {
       expect(calls, name).toBeGreaterThan(0);
       expect(verdicts, `${name}: ${calls} card calls vs ${verdicts} verdicts`).toBe(calls);
     }
-  });
-  it('menu card lists candidates as model_pick, efforts as effort_pick, and hides picks when ambiguous', () => {
-    const base = { sessionId: 's', rootId: 'r', cliId: 'codex' as const, cliName: 'Codex', menuId: 'm1', verifiedModel: 'gpt-5.5', verifiedEffort: 'high', models: ['gpt-5.5', 'gpt-5.6-sol'], source: 'live' as const, efforts: ['low', 'medium', 'high', 'xhigh'], currentEffort: 'high', freshThreadNote: false };
-    const j = JSON.parse(buildModelMenuCard(base, 'zh'));
-    const values = JSON.stringify(j.elements);
-    expect(values).toContain('"action":"model_pick","model":"gpt-5.6-sol"');
-    expect(values).toContain('"action":"effort_pick","effort":"xhigh"');
-    expect(values).toContain('"menu_id":"m1"');
-    expect(values).toContain('"action":"model_custom_open"');
-    expect(values).toContain('"action":"model_menu_refresh"');
-    const amb = JSON.parse(buildModelMenuCard({ ...base, txn: { state: 'ambiguous', target: 'gpt-5.6-sol' } }, 'zh'));
-    const av = JSON.stringify(amb.elements);
-    expect(av).not.toContain('"action":"model_pick"');
-    expect(av).toContain('"action":"model_txn_recheck"');
-    expect(av).toContain('"action":"model_txn_force_rollback"');
-  });
-  it('custom card is a form_submit → model_custom_save', () => {
-    const j = JSON.parse(buildModelCustomCard({ sessionId: 's', rootId: 'r', cliId: 'pi', cliName: 'Pi', menuId: 'm' }, 'zh'));
-    const form = j.elements.find((e: any) => e.tag === 'form');
-    expect(form.elements[0]).toMatchObject({ tag: 'input', name: 'model' });
-    expect(form.elements[1]).toMatchObject({ action_type: 'form_submit', value: { action: 'model_custom_save' } });
   });
   it('model name validation and busy predicate', () => {
     expect(MODEL_NAME_RE.test('deepseek/deepseek-v4-pro')).toBe(true);

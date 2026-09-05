@@ -963,6 +963,7 @@ function scheduleLocalCliOpenReadinessPatch(ds: DaemonSession): void {
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     isExternalChatSession(ds),
     modelSwitchAllowedForSession(ds),
+    ds.modelPanel,
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1018,6 +1019,7 @@ function scheduleActiveRuntimePatch(ds: DaemonSession): void {
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     isExternalChatSession(ds),
     modelSwitchAllowedForSession(ds),
+    ds.modelPanel,
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1072,6 +1074,7 @@ function scheduleCodexServiceTierPatch(ds: DaemonSession): void {
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     isExternalChatSession(ds),
     modelSwitchAllowedForSession(ds),
+      ds.modelPanel,
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1152,6 +1155,7 @@ export function refreshStreamingCardUsage(ds: DaemonSession): void {
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     isExternalChatSession(ds),
     modelSwitchAllowedForSession(ds),
+      ds.modelPanel,
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1236,6 +1240,7 @@ export function scheduleRiffAccessUrlPatch(ds: DaemonSession): void {
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     isExternalChatSession(ds),
     modelSwitchAllowedForSession(ds),
+      ds.modelPanel,
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1850,6 +1855,7 @@ function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     isExternalChatSession(ds),
     modelSwitchAllowedForSession(ds),
+    ds.modelPanel,
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -2102,6 +2108,7 @@ function reconcilePostedStartingCard(ds: DaemonSession, turnId: string | undefin
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     isExternalChatSession(ds),
     modelSwitchAllowedForSession(ds),
+    ds.modelPanel,
   );
   scheduleCardPatch(ds, cardJson, turnId);
 }
@@ -2168,6 +2175,7 @@ export async function postTurnStartingCard(
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     isExternalChatSession(ds),
     modelSwitchAllowedForSession(ds),
+    ds.modelPanel,
   );
 
   ds.streamCardNonce = nonce;
@@ -2218,6 +2226,8 @@ export async function postTurnStartingCard(
     syncUsageRefreshTimer(ds);
     reconcilePostedStartingCard(ds, turnId, statusRevisionAtPost);
     logger.info(`[${tag(ds)}] Posted starting card for turn ${turnId.substring(0, 12)}`);
+    // The v2 model picker's transient failure line lives until the next turn.
+    if (ds.modelPanel?.kind === 'failed') ds.modelPanel = undefined;
     if (superseded && ds.streamCardPendingTurnId) {
       void postTurnStartingCard(ds, sessionReply, ds.streamCardPendingTurnId);
     }
@@ -2302,6 +2312,7 @@ export async function postFreshStreamingCard(
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     isExternalChatSession(ds),
     modelSwitchAllowedForSession(ds),
+    ds.modelPanel,
   );
   ds.streamCardId = CARD_POSTING_SENTINEL;
   try {
@@ -5615,6 +5626,7 @@ export function buildStreamingCardJson(ds: DaemonSession, status?: StreamStatus)
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     isExternalChatSession(ds),
     modelSwitchAllowedForSession(ds),
+    ds.modelPanel,
   );
 }
 
@@ -10650,6 +10662,7 @@ function setupWorkerHandlers(
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
               isExternalChatSession(ds),
               modelSwitchAllowedForSession(ds),
+              ds.modelPanel,
             );
             await updateMessage(ds.larkAppId, restoredCardId, streamCardJson);
             if (!ownsLifecycleMutation()) break;
@@ -10732,6 +10745,7 @@ function setupWorkerHandlers(
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
             isExternalChatSession(ds),
             modelSwitchAllowedForSession(ds),
+            ds.modelPanel,
           );
           const postedCardId = await scopedReply(
             streamCardJson, 'interactive', cardReplyTarget.turnId,
@@ -10971,6 +10985,7 @@ function setupWorkerHandlers(
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
             isExternalChatSession(ds),
             modelSwitchAllowedForSession(ds),
+            ds.modelPanel,
           );
           scheduleCardPatch(ds, cardJson);
         }
@@ -11217,6 +11232,7 @@ function setupWorkerHandlers(
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
             isExternalChatSession(ds),
             modelSwitchAllowedForSession(ds),
+            ds.modelPanel,
           );
           // Mark POST in-flight so subsequent screen_updates are dropped,
           // not POSTed as duplicate cards.
@@ -11301,6 +11317,7 @@ function setupWorkerHandlers(
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
             isExternalChatSession(ds),
             modelSwitchAllowedForSession(ds),
+            ds.modelPanel,
           );
           scheduleCardPatch(ds, cardJson, msg.turnId);
           // Keep the live usage climbing during a long working phase; stop once
@@ -11377,6 +11394,7 @@ function setupWorkerHandlers(
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
           isExternalChatSession(ds),
           modelSwitchAllowedForSession(ds),
+          ds.modelPanel,
         );
         scheduleCardPatch(ds, cardJson);
         break;
@@ -11788,6 +11806,7 @@ function setupWorkerHandlers(
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
               isExternalChatSession(ds),
               modelSwitchAllowedForSession(ds),
+              ds.modelPanel,
             );
             scheduleCardPatch(ds, frozenCard);
           }
@@ -11861,6 +11880,7 @@ function setupWorkerHandlers(
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
               isExternalChatSession(ds),
               modelSwitchAllowedForSession(ds),
+              ds.modelPanel,
             );
             scheduleCardPatch(ds, frozenCard);
           }

@@ -34,14 +34,17 @@ import {
   sessionSupportsModelSwitch, capabilityForSession, describeModelTarget, recheckModelSwitch,
 } from '../../core/model-switch.js';
 import {
-  requestModelSwitchRestart, requestModelSwitchForceRollback, requestSessionRestart, deliverEphemeralOrReply,
-  activeSessionRestartAttemptId, type ModelSwitchRefusal,
+  requestModelSwitchRestart, requestModelSwitchForceRollback, requestSessionRestart,
+  activeSessionRestartAttemptId, buildStreamingCardJson, scheduleCardPatch, sendWorkerInput, sendWorkerSessionInput, isSessionTransferring,
+  type ModelSwitchRefusal,
 } from '../../core/worker-pool.js';
-import { buildModelMenuCard, buildModelCustomCard, buildModelPickConfirmCard, getCliDisplayName, type ModelMenuCardData, type ModelConfirmSource } from './card-builder.js';
-import { createOffer, markOfferDelivered, discardOffer, consumeOffer } from '../../core/model-switch-offers.js';
+import { getCliDisplayName } from './card-builder.js';
+import type { ModelConfirmSource } from '../../core/model-switch-offers.js';
+import { createOffer, markOfferDelivered, consumeOffer } from '../../core/model-switch-offers.js';
+import type { ModelPanelState } from '../../core/model-switch-panel.js';
 
 export const MODEL_SWITCH_CARD_ACTIONS = [
-  'effort_pick', 'model_custom_open', 'model_custom_save', 'model_menu_open', 'model_menu_refresh',
+  'effort_pick', 'model_custom_open', 'model_custom_save', 'model_menu_open', 'model_menu_refresh', 'model_menu_close',
   'model_pick', 'model_pick_confirm', 'model_txn_force_rollback', 'model_txn_recheck',
 ] as const;
 export type ModelSwitchCardAction = typeof MODEL_SWITCH_CARD_ACTIONS[number];
@@ -97,9 +100,11 @@ export interface ModelSwitchCardContext {
 
 type Toast = { toast: { type: 'success' | 'info' | 'warning' | 'error'; content: string } };
 const toast = (type: Toast['toast']['type'], content: string): Toast => ({ toast: { type, content } });
+/** A raw card object: the dispatcher wraps it as an in-place patch of the clicked card. */
+type CardResult = Record<string, unknown>;
 
 // Server-side pending confirmations live in core/model-switch-offers.ts:
-// unique offerId (= the confirm card's menu_id), creating→delivered→consumed
+// unique offerId (= the confirm button's menu_id), creating→delivered→consumed
 // lifecycle, one-shot consumption, bounded store, per-session cleanup.
 export { PENDING_CONFIRM_TTL_MS, __testOnly_resetOffers as __testOnly_resetPendingConfirms } from '../../core/model-switch-offers.js';
 
@@ -117,7 +122,7 @@ function botEnv(ds: DaemonSession): Record<string, string> | undefined {
 }
 function newMenuId(): string { return randomBytes(4).toString('hex'); }
 
-/** The session is mid-turn: switching would interrupt it → ask first. */
+/** The session is mid-turn: switching would interrupt it → say so in the confirm. */
 export function sessionLooksBusy(ds: Pick<DaemonSession, 'lastScreenStatus' | 'pendingInputCount'>): boolean {
   return ds.lastScreenStatus === 'working' || ds.lastScreenStatus === 'analyzing' || (ds.pendingInputCount ?? 0) > 0;
 }
@@ -133,8 +138,8 @@ const defaultCatalog: CatalogLookup = async (key, opts) => {
   return { models: merged.models, source: merged.source };
 };
 
-/** Authoritative candidate set for THIS session right now (P1-5: never trust
- *  a round-tripped card value; recompute from the selection key + bot env). */
+/** Authoritative candidate set for THIS session right now (never trust a
+ *  round-tripped card value; recompute from the selection key + bot env). */
 async function currentCandidates(ctx: ModelSwitchCardContext, force = false): Promise<{ models: string[]; source: 'static' | 'live' | 'none' }> {
   const { ds } = ctx;
   const key = selectionKeyForBot(sessionCliId(ds), sessionWrapper(ds));
@@ -142,41 +147,52 @@ async function currentCandidates(ctx: ModelSwitchCardContext, force = false): Pr
   return lookup(key, { env: botEnv(ds), scope: ds.larkAppId, force });
 }
 
-async function renderMenu(ctx: ModelSwitchCardContext, loc: Locale, force = false): Promise<string> {
-  const { ds } = ctx;
-  const cliId = sessionCliId(ds);
-  const { models, source } = await currentCandidates(ctx, force);
-  const att = ds.session.launchAttestation;
-  const verifiedCurrent = att && att.workerGeneration === (ds.workerGeneration ?? 0) ? att : undefined;
-  const pin = ds.session.modelPin;
-  const txn = ds.session.modelSwitchTxn;
-  const effortModel = pin?.model ?? verifiedCurrent?.model ?? undefined;
-  const data: ModelMenuCardData = {
-    sessionId: ds.session.sessionId,
-    rootId: ctx.rootId,
-    cliId,
-    cliName: cliName(ds),
-    menuId: newMenuId(),
-    verifiedModel: verifiedCurrent ? verifiedCurrent.model : undefined,
-    verifiedEffort: verifiedCurrent ? verifiedCurrent.effort : undefined,
-    ...(pin ? { pin: { ...(pin.model !== undefined ? { model: pin.model } : {}), ...(pin.effort ? { effort: pin.effort } : {}) } } : {}),
-    models,
-    source,
-    efforts: reasoningEffortsForCliModel(cliId, effortModel),
-    currentEffort: ds.session.reasoningEffort,
-    freshThreadNote: capabilityForSession(cliId, sessionWrapper(ds)) === 'fresh-only',
-    ...(txn ? { txn: { state: txn.state === 'in_flight' ? 'in_flight' : txn.state === 'rolling_back' ? 'in_flight' : 'ambiguous', target: describeModelTarget(txn.target) } } : {}),
-  };
-  return buildModelMenuCard(data, loc);
+/** The card, re-rendered from the session (the panel lives on `ds.modelPanel`). */
+function renderCard(ds: DaemonSession): CardResult {
+  return JSON.parse(buildStreamingCardJson(ds)) as CardResult;
+}
+/** Patch the live streaming card outside a callback (async settle paths). */
+function patchCard(ds: DaemonSession): void {
+  try { scheduleCardPatch(ds, buildStreamingCardJson(ds)); } catch (err) { logger.warn(`[model-switch] card patch failed: ${err}`); }
 }
 
-async function deliverCard(ctx: ModelSwitchCardContext, cardJson: string): Promise<void> {
-  await deliverEphemeralOrReply(ctx.ds, ctx.operatorOpenId, cardJson, 'interactive', () => ctx.sessionReply(ctx.rootId, cardJson, 'interactive'));
+function currentModelOf(ds: DaemonSession): string | null | undefined {
+  const att = ds.session.launchAttestation;
+  const verified = att && att.workerGeneration === (ds.workerGeneration ?? 0) ? att.model : undefined;
+  return ds.session.modelPin?.model ?? verified;
+}
+
+/** Enter the list state. Mutually exclusive with 「显示输出」: collapse it. */
+async function openList(ctx: ModelSwitchCardContext, force: boolean, note?: string): Promise<CardResult> {
+  const { ds } = ctx;
+  const cliId = sessionCliId(ds);
+  if ((ds.displayMode ?? 'hidden') !== 'hidden') {
+    ds.displayMode = 'hidden';
+    if (ds.worker || isSessionTransferring(ds)) sendWorkerSessionInput(ds, { type: 'set_display_mode', mode: 'hidden' } as any);
+  }
+  const { models, source } = await currentCandidates(ctx, force);
+  const current = currentModelOf(ds);
+  ds.modelPanel = {
+    kind: 'list',
+    menuId: newMenuId(),
+    models,
+    source,
+    efforts: reasoningEffortsForCliModel(cliId, current ?? undefined),
+    currentModel: current,
+    currentEffort: ds.session.reasoningEffort,
+    freshThread: capabilityForSession(cliId, sessionWrapper(ds)) === 'fresh-only',
+    restartInFlight: activeSessionRestartAttemptId(ds) !== undefined,
+    ...(note ? { note } : {}),
+  };
+  return renderCard(ds);
 }
 
 type RefusalKey = ModelSwitchRefusal | 'external' | 'same' | 'no_txn' | 'identity' | 'not_candidate' | 'not_admin' | 'no_pending_confirm';
+function refusalText(reason: RefusalKey, loc: Locale): string {
+  return t(`card.model.refuse.${reason}`, undefined, loc);
+}
 function refusalToast(reason: RefusalKey, loc: Locale): Toast {
-  return toast('warning', t(`card.model.refuse.${reason}`, undefined, loc));
+  return toast('warning', refusalText(reason, loc));
 }
 
 /**
@@ -200,67 +216,61 @@ export async function modelSwitchIdentityGate(ctx: ModelSwitchCardContext): Prom
   return null;
 }
 
-/** Start the switch and wire the receipts. Returns a toast for the click. */
-async function startSwitch(
-  ctx: ModelSwitchCardContext,
-  loc: Locale,
-  target: { model?: string; effort?: string },
-): Promise<Toast> {
-  const { ds } = ctx;
-  const name = cliName(ds);
-  const previous = describeModelTarget({
-    model: ds.session.modelPin?.model ?? ds.session.launchAttestation?.model ?? ds.session.model,
-    effort: ds.session.reasoningEffort,
-  });
-  const targetLabel = describeModelTarget(target);
-  const say = (content: string) => deliverEphemeralOrReply(ds, ctx.operatorOpenId, content, 'text', () => ctx.sessionReply(ctx.rootId, content));
-  const res = requestModelSwitchRestart(ds, { ...target, setBy: ctx.operatorOpenId ?? 'card' }, {
-    source: 'card',
-    notify: () => { /* receipts are emitted from onSettled; the generic restart toasts stay quiet */ },
-    onSettled: async (outcome, txn) => {
-      const tl = describeModelTarget(txn.target);
-      if (outcome === 'committed') await say(t('card.model.switch_succeeded', { cliName: name, target: tl }, loc));
-      else if (outcome === 'rolled_back') {
-        // The record is restored; converge the PROCESS too. The worker's launch
-        // snapshot still holds the failed target — this restart IPC carries the
-        // restored model/effort. A refusal is surfaced, never swallowed.
-        const conv = requestSessionRestart(ds, { source: 'card', notify: () => {} }, { strict: true });
-        await say(t('card.model.switch_failed', { cliName: name, target: tl, previous }, loc)
-          + (conv ? '' : `\n${t('card.model.convergence_refused', undefined, loc)}`));
-      }
-      else if (outcome === 'ambiguous') await say(t('card.model.switch_ambiguous', { cliName: name, target: tl }, loc));
-    },
-  });
-  if (!res.ok) return refusalToast(res.reason, loc);
-  logger.info(`[model-switch] ${ds.session.sessionId} → ${targetLabel} attempt=${res.attemptId} by=${ctx.operatorOpenId ?? '?'}`);
-  const dropped = res.txn.rollback.reasoningEffort !== undefined && ds.session.reasoningEffort === undefined && target.effort === undefined;
-  void say(t('card.model.switch_started', { cliName: name, target: targetLabel }, loc)
-    + (dropped ? `\n${t('card.model.effort_dropped', { effort: res.txn.rollback.reasoningEffort ?? '', model: target.model ?? 'CLI default' }, loc)}` : ''));
-  return toast('info', t('card.model.switch_started', { cliName: name, target: targetLabel }, loc));
-}
-
-/**
- * Offer → deliver → CAS. The offer is created `creating`, its id becomes the
- * confirm card's `menu_id`; only a successful delivery marks it `delivered`
- * (usable), and a failed delivery discards exactly this instance — a newer
- * offer created meanwhile is never touched by either outcome.
- */
-async function confirmFirst(ctx: ModelSwitchCardContext, loc: Locale, target: { model?: string; effort?: string }, reason: 'busy' | 'fresh', source: ModelConfirmSource): Promise<undefined> {
+/** Enter the confirm state for `target` (an offer is created and, since the
+ *  patch IS the delivery, marked delivered right away). */
+function enterConfirm(ctx: ModelSwitchCardContext, target: { model?: string; effort?: string }, reason: 'busy' | 'fresh' | 'plain', source: ModelConfirmSource): CardResult {
   const { ds } = ctx;
   const offer = createOffer({ larkAppId: ctx.larkAppId, sessionId: ds.session.sessionId, ...target, source, operatorOpenId: ctx.operatorOpenId ?? '' });
-  try {
-    await deliverCard(ctx, buildModelPickConfirmCard({
-      sessionId: ds.session.sessionId, rootId: ctx.rootId, cliId: sessionCliId(ds), cliName: cliName(ds), menuId: offer.offerId,
-    }, target, loc, reason, source));
-  } catch (err) {
-    discardOffer(offer.offerId);
-    throw err;
-  }
   markOfferDelivered(offer.offerId);
-  return undefined;
+  ds.modelPanel = { kind: 'confirm', menuId: newMenuId(), offerId: offer.offerId, target, reason };
+  return renderCard(ds);
 }
 
-export async function handleModelSwitchCardAction(ctx: ModelSwitchCardContext): Promise<Toast | undefined> {
+/** Start the switch; the card shows "switching" until the coordinator settles it. */
+function startSwitch(ctx: ModelSwitchCardContext, loc: Locale, target: { model?: string; effort?: string }): CardResult | Toast {
+  const { ds } = ctx;
+  const name = cliName(ds);
+  const res = requestModelSwitchRestart(ds, { ...target, setBy: ctx.operatorOpenId ?? 'card' }, {
+    source: 'card',
+    notify: () => { /* the card is the receipt */ },
+    onSettled: async (outcome, txn) => {
+      const menuId = newMenuId();
+      if (outcome === 'committed') {
+        ds.modelPanel = undefined;
+        patchCard(ds);
+        // Owner requirement: the task resumes by itself after a confirmed switch.
+        autoContinue(ds, loc);
+      } else if (outcome === 'rolled_back') {
+        const conv = requestSessionRestart(ds, { source: 'card', notify: () => {} }, { strict: true });
+        ds.modelPanel = { kind: 'failed', menuId, target: txn.target, reason: t('card.model.reason_restart_failed', { cliName: name }, loc) + (conv ? '' : ` ${t('card.model.convergence_refused', undefined, loc)}`) };
+        patchCard(ds);
+      } else if (outcome === 'ambiguous') {
+        ds.modelPanel = { kind: 'ambiguous', menuId, target: txn.target };
+        patchCard(ds);
+      }
+    },
+  });
+  if (!res.ok) {
+    ds.modelPanel = { kind: 'failed', menuId: newMenuId(), target, reason: refusalText(res.reason, loc) };
+    return renderCard(ds);
+  }
+  logger.info(`[model-switch] ${ds.session.sessionId} → ${describeModelTarget(target)} attempt=${res.attemptId} by=${ctx.operatorOpenId ?? '?'}`);
+  ds.modelPanel = { kind: 'switching', menuId: newMenuId(), target, attemptId: res.attemptId };
+  return renderCard(ds);
+}
+
+/** After a committed switch, send "继续" so the interrupted task resumes. */
+function autoContinue(ds: DaemonSession, loc: Locale): void {
+  try {
+    const text = t('card.model.auto_continue_text', undefined, loc);
+    const accepted = ds.worker && !ds.worker.killed ? sendWorkerInput(ds, text) : false;
+    logger.info(`[model-switch] ${ds.session.sessionId} auto-continue ${accepted ? 'sent' : 'NOT sent (no live worker)'}`);
+  } catch (err) {
+    logger.warn(`[model-switch] ${ds.session.sessionId} auto-continue failed: ${err}`);
+  }
+}
+
+export async function handleModelSwitchCardAction(ctx: ModelSwitchCardContext): Promise<Toast | CardResult | undefined> {
   const { ds, value } = ctx;
   const loc = localeForBot(ds.larkAppId);
   const actionType = value.action as ModelSwitchCardAction;
@@ -281,84 +291,65 @@ export async function handleModelSwitchCardAction(ctx: ModelSwitchCardContext): 
     txn.state = 'ambiguous';
     sessionStore.updateSession(ds.session);
   }
+  if (ds.session.modelSwitchTxn?.state === 'ambiguous' && ds.modelPanel?.kind !== 'ambiguous'
+      && actionType !== 'model_txn_recheck' && actionType !== 'model_txn_force_rollback' && actionType !== 'model_menu_close') {
+    ds.modelPanel = { kind: 'ambiguous', menuId: newMenuId(), target: ds.session.modelSwitchTxn.target };
+    return renderCard(ds);
+  }
 
   switch (actionType) {
     case 'model_menu_open':
-    case 'model_menu_refresh': {
-      const card = await renderMenu(ctx, loc, actionType === 'model_menu_refresh');
-      await deliverCard(ctx, card);
-      return undefined;
+      return openList(ctx, false);
+    case 'model_menu_refresh':
+      return openList(ctx, true);
+    case 'model_menu_close': {
+      // Collapse the picker (also dismisses a transient failure line).
+      ds.modelPanel = undefined;
+      return renderCard(ds);
     }
-    case 'model_custom_open': {
-      await deliverCard(ctx, buildModelCustomCard({
-        sessionId: ds.session.sessionId, rootId: ctx.rootId, cliId, cliName: cliName(ds), menuId: newMenuId(),
-      }, loc));
-      return undefined;
+    case 'model_custom_open':
+    case 'model_custom_save':
+      // v2 main-card picker is list-only (owner spec); free-form entry is not offered.
+      return toast('info', t('card.model.custom_not_in_v2', undefined, loc));
+    case 'model_pick': {
+      const model = typeof value.model === 'string' ? value.model.trim() || undefined : undefined;
+      if (model === undefined) return refusalToast('not_candidate', loc);
+      const { models } = await currentCandidates(ctx);
+      if (!models.includes(model)) return refusalToast('not_candidate', loc);
+      if (activeSessionRestartAttemptId(ds)) return refusalToast('restart_in_flight', loc);
+      if (model === currentModelOf(ds) && !ds.session.modelSwitchTxn) return refusalToast('same', loc);
+      return enterConfirm(ctx, { model }, freshOnly ? 'fresh' : sessionLooksBusy(ds) ? 'busy' : 'plain', 'curated');
     }
-    case 'model_pick':
-    case 'model_pick_confirm':
-    case 'model_custom_save': {
-      let model: string | undefined;
-      if (actionType === 'model_custom_save') {
-        const fv = ctx.action?.form_value ?? {};
-        model = String(fv.model ?? ctx.action?.input_value ?? '').trim() || undefined;
-      } else {
-        model = typeof value.model === 'string' ? value.model.trim() || undefined : undefined;
-      }
-      const effortRaw = typeof value.effort === 'string' && value.effort ? value.effort : undefined;
-      // Entry semantics: decided by the ACTION on the first hop; on the
-      // confirmation hop by the SERVER-SIDE pending offer this session made
-      // (never by the card value). No matching offer → refused.
-      let source: ModelConfirmSource;
-      if (actionType === 'model_custom_save') source = 'custom';
-      else if (actionType === 'model_pick') source = 'curated';
-      else {
-        const pending = consumeOffer({
-          offerId: typeof value.menu_id === 'string' ? value.menu_id : undefined,
-          larkAppId: ctx.larkAppId, sessionId: ds.session.sessionId,
-          operatorOpenId: ctx.operatorOpenId ?? '', model, effort: effortRaw,
-        });
-        if (!pending) return refusalToast('no_pending_confirm', loc);
-        source = pending.source;
-      }
-      if (source === 'custom') {
-        // Free-form entry (first hop AND its confirmation): name grammar only.
+    case 'effort_pick': {
+      const effort = typeof value.effort === 'string' ? value.effort.trim() : '';
+      const model = currentModelOf(ds) ?? undefined;
+      if (!effort || !reasoningEffortsForCliModel(cliId, model).includes(effort as any)) return refusalToast('effort_not_supported', loc);
+      if (activeSessionRestartAttemptId(ds)) return refusalToast('restart_in_flight', loc);
+      if (effort === ds.session.reasoningEffort && !ds.session.modelSwitchTxn) return refusalToast('same', loc);
+      const target = { ...(model !== undefined ? { model } : {}), effort };
+      const src: ModelConfirmSource = model === undefined ? 'custom' : (await currentCandidates(ctx)).models.includes(model) ? 'curated' : 'custom';
+      return enterConfirm(ctx, target, freshOnly ? 'fresh' : sessionLooksBusy(ds) ? 'busy' : 'plain', src);
+    }
+    case 'model_pick_confirm': {
+      const model = typeof value.model === 'string' ? value.model.trim() || undefined : undefined;
+      const effort = typeof value.effort === 'string' && value.effort ? value.effort : undefined;
+      // Entry semantics come from the SERVER-SIDE offer this session made (the
+      // confirm button's menu_id is the offer id) — never from the card value.
+      const pending = consumeOffer({
+        offerId: typeof value.menu_id === 'string' ? value.menu_id : undefined,
+        larkAppId: ctx.larkAppId, sessionId: ds.session.sessionId,
+        operatorOpenId: ctx.operatorOpenId ?? '', model, effort,
+      });
+      if (!pending) return refusalToast('no_pending_confirm', loc);
+      if (pending.source === 'custom') {
         if (model !== undefined && !MODEL_NAME_RE.test(model)) return toast('error', t('card.model.invalid_model', undefined, loc));
       } else {
-        // P1-5: a curated pick (and its confirmation) is only ever a click on a
-        // CURRENT candidate. Recompute the authoritative set; the value is a hint.
         if (model === undefined) return refusalToast('not_candidate', loc);
         const { models } = await currentCandidates(ctx);
         if (!models.includes(model)) return refusalToast('not_candidate', loc);
       }
-      const effort = effortRaw;
       if (effort !== undefined && !reasoningEffortsForCliModel(cliId, model).includes(effort as any)) return refusalToast('effort_not_supported', loc);
-      const currentModel = ds.session.modelPin?.model ?? ds.session.launchAttestation?.model ?? undefined;
-      if (actionType !== 'model_custom_save' && model === currentModel && (effort === undefined || effort === ds.session.reasoningEffort)
-          && !ds.session.modelSwitchTxn) {
-        return refusalToast('same', loc);
-      }
-      const target = { ...(model !== undefined ? { model } : {}), ...(effort !== undefined ? { effort } : {}) };
-      if (actionType !== 'model_pick_confirm') {
-        // fresh-only (codex-app) ALWAYS confirms: the old thread is lost (P1-4).
-        if (freshOnly) return confirmFirst(ctx, loc, target, 'fresh', source);
-        if (sessionLooksBusy(ds)) return confirmFirst(ctx, loc, target, 'busy', source);
-      }
-      return startSwitch(ctx, loc, target);
-    }
-    case 'effort_pick': {
-      const effort = typeof value.effort === 'string' ? value.effort.trim() : '';
-      const model = ds.session.modelPin?.model ?? ds.session.launchAttestation?.model ?? undefined;
-      if (!effort || !reasoningEffortsForCliModel(cliId, model).includes(effort as any)) return refusalToast('effort_not_supported', loc);
-      if (effort === ds.session.reasoningEffort && !ds.session.modelSwitchTxn) return refusalToast('same', loc);
-      const target = { ...(model !== undefined ? { model } : {}), effort };
-      // The effort row edits the CURRENT model (pin / attested), which need not
-      // be a catalog member (it may itself have been a custom entry) → 'custom'
-      // keeps the second hop on the grammar check rather than membership.
-      const src: ModelConfirmSource = model === undefined ? 'custom' : (await currentCandidates(ctx)).models.includes(model) ? 'curated' : 'custom';
-      if (freshOnly) return confirmFirst(ctx, loc, target, 'fresh', src);
-      if (sessionLooksBusy(ds)) return confirmFirst(ctx, loc, target, 'busy', src);
-      return startSwitch(ctx, loc, target);
+      return startSwitch(ctx, loc, { ...(model !== undefined ? { model } : {}), ...(effort !== undefined ? { effort } : {}) });
     }
     case 'model_txn_recheck': {
       const cur = ds.session.modelSwitchTxn;
@@ -370,28 +361,26 @@ export async function handleModelSwitchCardAction(ctx: ModelSwitchCardContext): 
         ds.workerGeneration,
       );
       if (outcome !== 'ambiguous') sessionStore.updateSession(ds.session);
-      const name = cliName(ds);
-      if (outcome === 'committed') return toast('success', t('card.model.recheck_committed', { cliName: name, target: describeModelTarget(cur.target) }, loc));
-      if (outcome === 'rolled_back') return toast('info', t('card.model.recheck_rolled_back', { cliName: name }, loc));
+      if (outcome === 'committed') { ds.modelPanel = undefined; return renderCard(ds); }
+      if (outcome === 'rolled_back') { ds.modelPanel = { kind: 'failed', menuId: newMenuId(), target: cur.target, reason: t('card.model.recheck_rolled_back', { cliName: cliName(ds) }, loc) }; return renderCard(ds); }
       return toast('warning', t('card.model.recheck_ambiguous', undefined, loc));
     }
     case 'model_txn_force_rollback': {
       const cur = ds.session.modelSwitchTxn;
       if (!cur || cur.state !== 'ambiguous') return refusalToast('no_txn', loc);
-      const previous = describeModelTarget({ model: cur.rollback.pin?.model ?? cur.rollback.model, effort: cur.rollback.reasoningEffort });
-      const name = cliName(ds);
-      const say = (content: string) => deliverEphemeralOrReply(ds, ctx.operatorOpenId, content, 'text', () => ctx.sessionReply(ctx.rootId, content));
+      const previous = { model: cur.rollback.pin?.model ?? cur.rollback.model, effort: cur.rollback.reasoningEffort };
       const res = requestModelSwitchForceRollback(ds, {
         source: 'card',
         notify: () => {},
         onSettled: async (outcome) => {
-          if (outcome === 'rolled_back') await say(t('card.model.force_rollback_done', { cliName: name, previous }, loc));
-          else await say(t('card.model.force_rollback_failed', { cliName: name }, loc));
+          if (outcome === 'rolled_back') ds.modelPanel = undefined;
+          else ds.modelPanel = { kind: 'ambiguous', menuId: newMenuId(), target: cur.target };
+          patchCard(ds);
         },
       });
       if (!res.ok) return refusalToast(res.reason, loc);
-      // Not a success receipt: the record is restored, the process is converging.
-      return toast('info', t('card.model.force_rollback_started', { cliName: name, previous }, loc));
+      ds.modelPanel = { kind: 'switching', menuId: newMenuId(), target: previous, attemptId: res.attemptId };
+      return renderCard(ds);
     }
     default:
       return undefined;

@@ -27,8 +27,12 @@ vi.mock('../src/core/worker-pool.js', async (importOriginal) => ({
   requestModelSwitchRestart: (...a: unknown[]) => switchMock(...a),
   requestModelSwitchForceRollback: vi.fn(),
   requestSessionRestart: vi.fn(),
-  deliverEphemeralOrReply: async (_ds: any, _op: any, content: string) => { delivered.push(content); },
   activeSessionRestartAttemptId: () => undefined,
+  isSessionTransferring: () => false,
+  buildStreamingCardJson: (ds: any) => { delivered.push(JSON.stringify(ds.modelPanel ?? null)); return JSON.stringify({ panel: ds.modelPanel ?? null }); },
+  scheduleCardPatch: vi.fn(),
+  sendWorkerInput: vi.fn(() => true),
+  sendWorkerSessionInput: vi.fn(() => true),
 }));
 vi.mock('../src/im/lark/event-dispatcher.js', async (importOriginal) => ({ ...(await importOriginal() as object), canOperate: () => true }));
 
@@ -81,9 +85,9 @@ describe('production identity composition', () => {
   it('an absent union id resolves through the contact API; a human on_ id passes the gate', async () => {
     switchMock.mockReturnValue({ ok: true, attemptId: 'A', txn: { target: { model: 'gpt-5.5' }, rollback: {} } });
     const { ctx, resolveUserUnionId } = run({ open_id: 'ou_x' });
-    expect((await handleModelSwitchCardAction(ctx))?.toast.type).toBe('info');
+    expect((await handleModelSwitchCardAction(ctx) as any)?.panel?.kind).toBe('confirm');
     expect(resolveUserUnionId).toHaveBeenCalledWith('app', 'ou_x');
-    expect(switchMock).toHaveBeenCalledTimes(1);
+    expect(switchMock).not.toHaveBeenCalled(); // v2: confirm is a card state; the restart starts on model_pick_confirm
   });
   it('contact API returning a non-on_ id, or throwing, is refused', async () => {
     for (const r of [vi.fn(async () => ({ unionId: 'ou_bad' })), vi.fn(async () => { throw new Error('api'); })]) {
@@ -96,6 +100,6 @@ describe('production identity composition', () => {
   it('a verified human on_ id (not on any roster) passes', async () => {
     switchMock.mockReturnValue({ ok: true, attemptId: 'A', txn: { target: { model: 'gpt-5.5' }, rollback: {} } });
     const { ctx } = run({ open_id: 'ou_x', union_id: 'on_real_human' });
-    expect((await handleModelSwitchCardAction(ctx))?.toast.type).toBe('info');
+    expect((await handleModelSwitchCardAction(ctx) as any)?.panel?.kind).toBe('confirm');
   });
 });

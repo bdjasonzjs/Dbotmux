@@ -406,8 +406,10 @@ describe('restoreUsageLimitRuntimeState', () => {
       // 20th arg: externalChat — this fixture's chat is not a known 外部群.
       false,
       // 21st arg: modelSwitchAllowed — the chat is not PROVEN internal here
-      // (no cached chat.get verdict), so the 「⚙ 模型」 surface stays hidden.
+      // (no cached chat.get verdict), so the 「🎛 选择模型」 surface stays hidden.
       false,
+      // 22nd arg: v2 in-card model picker state — none on a recalled card.
+      undefined,
     );
     expect(updateMessageMock).toHaveBeenCalledWith(APP_ID, 'om_live_limit', '{}');
   });

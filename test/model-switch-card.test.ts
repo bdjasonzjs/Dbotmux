@@ -1,8 +1,9 @@
 /**
- * Card-driven model switch — click handler end-to-end through the REAL
- * handler (`handleModelSwitchCardAction`) with the daemon seams faked at the
- * module boundary (worker-pool restart primitives, session store, bot
- * registry). Each refusal asserts ZERO mutation and ZERO restart.
+ * Card-driven model switch v2 — the picker is a STATE of the main streaming
+ * card, patched in place (owner decision 2026-09-05). Driven through the REAL
+ * `handleModelSwitchCardAction`; daemon seams (restart primitives, card patch,
+ * worker input, store, registry) are faked at the module boundary. Every
+ * refusal asserts ZERO mutation (session record AND panel) and ZERO restart.
  *
  * Run:  pnpm vitest run test/model-switch-card.test.ts
  */
@@ -10,24 +11,32 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 vi.mock('../src/utils/logger.js', () => ({ logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() } }));
 const getBotMock = vi.fn();
-vi.mock('../src/bot-registry.js', async (importOriginal) => ({ ...(await importOriginal() as object), getBot: (...a: unknown[]) => getBotMock(...a) }));
+vi.mock('../src/bot-registry.js', async (io) => ({ ...(await io() as object), getBot: (...a: unknown[]) => getBotMock(...a) }));
 const updateSessionMock = vi.fn();
-vi.mock('../src/services/session-store.js', async (importOriginal) => ({ ...(await importOriginal() as object), updateSession: (...a: unknown[]) => updateSessionMock(...a) }));
+vi.mock('../src/services/session-store.js', async (io) => ({ ...(await io() as object), updateSession: (...a: unknown[]) => updateSessionMock(...a) }));
 const switchMock = vi.fn();
 const forceRollbackMock = vi.fn();
 const restartMock = vi.fn();
-const deliverMock = vi.fn(async (_ds: any, _op: any, content: string, msgType: string) => { delivered.push({ content, msgType }); });
-const delivered: Array<{ content: string; msgType: string }> = [];
-vi.mock('../src/core/worker-pool.js', async (importOriginal) => ({
-  ...(await importOriginal() as object),
+const patchMock = vi.fn();
+const inputMock = vi.fn(() => true);
+const sessionInputMock = vi.fn(() => true);
+let activeAttempt: string | undefined;
+vi.mock('../src/core/worker-pool.js', async (io) => ({
+  ...(await io() as object),
   requestModelSwitchRestart: (...a: unknown[]) => switchMock(...a),
   requestModelSwitchForceRollback: (...a: unknown[]) => forceRollbackMock(...a),
   requestSessionRestart: (...a: unknown[]) => restartMock(...a),
-  deliverEphemeralOrReply: (...a: any[]) => deliverMock(a[0], a[1], a[2], a[3]),
-  activeSessionRestartAttemptId: () => undefined,
+  activeSessionRestartAttemptId: () => activeAttempt,
+  isSessionTransferring: () => false,
+  // The real builder needs the registry/terminal; render a faithful stand-in
+  // that exposes the panel so tests can assert the card state.
+  buildStreamingCardJson: (ds: any) => JSON.stringify({ panel: ds.modelPanel ?? null, displayMode: ds.displayMode ?? 'hidden' }),
+  scheduleCardPatch: (...a: unknown[]) => patchMock(...a),
+  sendWorkerInput: (...a: unknown[]) => inputMock(...a),
+  sendWorkerSessionInput: (...a: unknown[]) => sessionInputMock(...a),
 }));
 
-import { handleModelSwitchCardAction, MODEL_SWITCH_CARD_ACTIONS, __testOnly_resetPendingConfirms, PENDING_CONFIRM_TTL_MS, type ModelSwitchCardContext } from '../src/im/lark/model-switch-card.js';
+import { handleModelSwitchCardAction, MODEL_SWITCH_CARD_ACTIONS, __testOnly_resetPendingConfirms, type ModelSwitchCardContext } from '../src/im/lark/model-switch-card.js';
 import { setChatExternal, _resetChatExternalCacheForTests } from '../src/im/lark/chat-external-cache.js';
 
 const CANDIDATES = ['gpt-5.5', 'gpt-5.6-sol'];
@@ -39,98 +48,102 @@ function ctx(over: Partial<ModelSwitchCardContext> & { session?: Record<string, 
     ...(over.ds ?? {}),
   };
   return {
-    ds,
-    operatorOpenId: 'ou_human',
-    rootId: 'om_root',
-    larkAppId: 'app',
+    ds, operatorOpenId: 'ou_human', rootId: 'om_root', larkAppId: 'app',
     value: { action: 'model_menu_open', ...(over.value ?? {}) },
     action: undefined,
     sessionReply: vi.fn(async () => 'om_x'),
-    identity: {
-      resolveOperator: async () => ({ unionId: 'on_human', openId: 'ou_human' }),
-      isBotUnionId: () => false,
-      canOperate: () => true,
-      ...(over.identity ?? {}),
-    },
+    identity: { resolveOperator: async () => ({ unionId: 'on_human', openId: 'ou_human' }), isBotUnionId: () => false, canOperate: () => true, ...(over.identity ?? {}) },
     catalog: over.catalog ?? (async () => ({ models: CANDIDATES, source: 'live' })),
-    ...(over.action !== undefined ? { action: over.action } : {}),
     ...('operatorOpenId' in over ? { operatorOpenId: over.operatorOpenId } : {}),
   };
 }
-const snapshot = (c: ModelSwitchCardContext) => JSON.stringify(c.ds.session);
+/** Same session object across hops (the picker state lives on ds). */
+function sameDs(c: ModelSwitchCardContext, value: Record<string, any>, over: Partial<ModelSwitchCardContext> = {}): ModelSwitchCardContext {
+  return { ...c, ...over, value };
+}
+const snapshot = (c: ModelSwitchCardContext) => JSON.stringify({ s: c.ds.session, p: c.ds.modelPanel ?? null });
 const expectZeroMutation = (c: ModelSwitchCardContext, before: string) => {
-  expect(JSON.stringify(c.ds.session)).toBe(before);
+  expect(snapshot(c)).toBe(before);
   expect(updateSessionMock).not.toHaveBeenCalled();
   expect(switchMock).not.toHaveBeenCalled();
   expect(forceRollbackMock).not.toHaveBeenCalled();
   expect(restartMock).not.toHaveBeenCalled();
 };
+const panelOf = (r: any) => (r && 'panel' in r ? r.panel : undefined);
+const findConfirmValue = (r: any) => {
+  // the confirm button carries menu_id = offerId; reconstruct the value the real card would carry
+  const p = panelOf(r); return { action: 'model_pick_confirm', ...(p.target.model !== undefined ? { model: p.target.model } : {}), ...(p.target.effort !== undefined ? { effort: p.target.effort } : {}), root_id: 'om_root', session_id: 's1', cli_id: 'codex', menu_id: p.offerId };
+};
 
 beforeEach(() => {
   getBotMock.mockReset(); getBotMock.mockReturnValue({ config: { cliId: 'codex' } });
-  updateSessionMock.mockReset(); switchMock.mockReset(); forceRollbackMock.mockReset(); restartMock.mockReset();
-  deliverMock.mockClear(); delivered.length = 0;
+  updateSessionMock.mockReset(); switchMock.mockReset(); forceRollbackMock.mockReset(); restartMock.mockReset(); patchMock.mockReset(); inputMock.mockClear(); sessionInputMock.mockClear();
+  activeAttempt = undefined;
   _resetChatExternalCacheForTests(); setChatExternal('app', 'oc_1', false);
-  __testOnly_resetPendingConfirms(); vi.useRealTimers();
+  __testOnly_resetPendingConfirms();
 });
 
-// ─── identity gate: every refusal class, every action, zero mutation ───────
-describe('shared identity gate (P1-2)', () => {
-  const REFUSALS: Array<[string, Partial<ModelSwitchCardContext> & { session?: any; ds?: any }, string]> = [
-    ['missing operator open_id', { operatorOpenId: undefined }, 'refuse.identity'],
-    ['operator open_id not ou_', { operatorOpenId: 'on_abc' }, 'refuse.identity'],
-    ['union id absent (fail-closed resolve)', { identity: { resolveOperator: async () => ({ openId: 'ou_human' }), isBotUnionId: () => false, canOperate: () => true } }, 'refuse.identity'],
-    ['union id malformed', { identity: { resolveOperator: async () => ({ unionId: 'ou_notunion' }), isBotUnionId: () => false, canOperate: () => true } }, 'refuse.identity'],
-    ['resolve throws', { identity: { resolveOperator: async () => { throw new Error('api'); }, isBotUnionId: () => false, canOperate: () => true } }, 'refuse.identity'],
-    ['team / platform bot', { identity: { resolveOperator: async () => ({ unionId: 'on_bot' }), isBotUnionId: (u: string) => u === 'on_bot', canOperate: () => true } }, 'refuse.identity'],
-    ['canOperate false', { identity: { resolveOperator: async () => ({ unionId: 'on_human' }), isBotUnionId: () => false, canOperate: () => false } }, 'refuse.not_admin'],
-    ['adopt session', { ds: { initConfig: { adoptMode: true } } }, 'refuse.adopt'],
-    ['remote backend', { session: { backendType: 'riff', cliId: 'riff' } }, 'refuse.remote'],
-    ['unsupported (ttadk-coco wrapper-first)', { session: { cliId: 'coco', wrapperCli: 'ttadk coco' } }, 'refuse.unsupported'],
+// ─── identity gate ─────────────────────────────────────────────────────────
+describe('shared identity gate (P1-2, unchanged in v2)', () => {
+  const REFUSALS: Array<[string, Partial<ModelSwitchCardContext> & { session?: any; ds?: any }]> = [
+    ['missing operator open_id', { operatorOpenId: undefined }],
+    ['operator open_id not ou_', { operatorOpenId: 'on_abc' }],
+    ['union id absent', { identity: { resolveOperator: async () => ({ openId: 'ou_human' }), isBotUnionId: () => false, canOperate: () => true } }],
+    ['union id malformed', { identity: { resolveOperator: async () => ({ unionId: 'ou_notunion' }), isBotUnionId: () => false, canOperate: () => true } }],
+    ['resolve throws', { identity: { resolveOperator: async () => { throw new Error('api'); }, isBotUnionId: () => false, canOperate: () => true } }],
+    ['team / platform bot', { identity: { resolveOperator: async () => ({ unionId: 'on_bot' }), isBotUnionId: (u: string) => u === 'on_bot', canOperate: () => true } }],
+    ['canOperate false', { identity: { resolveOperator: async () => ({ unionId: 'on_human' }), isBotUnionId: () => false, canOperate: () => false } }],
+    ['adopt session', { ds: { initConfig: { adoptMode: true } } }],
+    ['remote backend', { session: { backendType: 'riff', cliId: 'riff' } }],
+    ['unsupported (ttadk-coco wrapper-first)', { session: { cliId: 'coco', wrapperCli: 'ttadk coco' } }],
   ];
-  for (const [name, over, key] of REFUSALS) {
+  for (const [name, over] of REFUSALS) {
     for (const action of MODEL_SWITCH_CARD_ACTIONS) {
-      it(`${action}: ${name} → refused, zero mutation`, async () => {
+      it(`${action}: ${name} → refused, zero mutation, no panel`, async () => {
         const c = ctx({ ...over, value: { action, model: 'gpt-5.5', effort: 'high' } });
         const before = snapshot(c);
-        const r = await handleModelSwitchCardAction(c);
-        expect(r?.toast.type).toBe('warning');
-        expect(r?.toast.content).toBeTruthy();
+        const r: any = await handleModelSwitchCardAction(c);
+        expect(r?.toast?.type).toBe('warning');
         expectZeroMutation(c, before);
-        expect(deliverMock).not.toHaveBeenCalled();
-        void key;
+        expect(c.ds.modelPanel).toBeUndefined();
+        expect(patchMock).not.toHaveBeenCalled();
       });
     }
   }
-  it('canOperate is called with the OPEN id, never the union id', async () => {
-    const canOperate = vi.fn(() => true);
-    const c = ctx({ identity: { resolveOperator: async () => ({ unionId: 'on_human', openId: 'ou_human' }), isBotUnionId: () => false, canOperate } });
-    await handleModelSwitchCardAction(c);
-    expect(canOperate).toHaveBeenCalledWith('app', 'oc_1', 'ou_human');
-  });
   it('external / unknown chat → refused even for a verified human', async () => {
-    _resetChatExternalCacheForTests(); // unknown
+    _resetChatExternalCacheForTests();
     let c = ctx(); let before = snapshot(c);
-    expect((await handleModelSwitchCardAction(c))?.toast.type).toBe('warning'); expectZeroMutation(c, before);
+    expect((await handleModelSwitchCardAction(c) as any)?.toast?.type).toBe('warning'); expectZeroMutation(c, before);
     setChatExternal('app', 'oc_1', true);
     c = ctx(); before = snapshot(c);
-    expect((await handleModelSwitchCardAction(c))?.toast.type).toBe('warning'); expectZeroMutation(c, before);
+    expect((await handleModelSwitchCardAction(c) as any)?.toast?.type).toBe('warning'); expectZeroMutation(c, before);
   });
 });
 
-// ─── menu / candidates ─────────────────────────────────────────────────────
-describe('menu and candidate authority (P1-5 / P1-6)', () => {
-  it('menu_open delivers an ephemeral card built from the CURRENT catalog with a per-render menu id', async () => {
+// ─── in-card state machine ─────────────────────────────────────────────────
+describe('in-card picker: open / refresh / close / mutual exclusion', () => {
+  it('model_menu_open returns the SAME card re-rendered in list state (no new card, no DM)', async () => {
     const c = ctx();
-    expect(await handleModelSwitchCardAction(c)).toBeUndefined();
-    expect(delivered).toHaveLength(1);
-    expect(delivered[0].msgType).toBe('interactive');
-    const card = JSON.parse(delivered[0].content);
-    const s = JSON.stringify(card);
-    expect(s).toContain('"action":"model_pick","model":"gpt-5.6-sol"');
-    expect(s).toMatch(/"menu_id":"[0-9a-f]{8}"/);
+    const r: any = await handleModelSwitchCardAction(c);
+    expect(panelOf(r)).toMatchObject({ kind: 'list', models: CANDIDATES, source: 'live', freshThread: false, restartInFlight: false });
+    expect(panelOf(r).currentEffort).toBeUndefined();
+    expect(Array.isArray(panelOf(r).efforts)).toBe(true); // codex default effort domain even before a pin
+    expect(c.sessionReply).not.toHaveBeenCalled();  // nothing posted
+    expect(c.ds.modelPanel?.kind).toBe('list');
   });
-  it('menu_refresh asks the catalog with force=true and a per-bot scope; menu_open does not force', async () => {
+  it('list shows the effort row for codex when a current model is known, marks current', async () => {
+    const c = ctx({ session: { modelPin: { model: 'gpt-5.6-sol', cliId: 'codex', txnId: 't', setBy: 'x', setAt: 1 }, reasoningEffort: 'high' } });
+    const r: any = await handleModelSwitchCardAction(c);
+    expect(panelOf(r)).toMatchObject({ currentModel: 'gpt-5.6-sol', currentEffort: 'high' });
+    expect(panelOf(r).efforts).toEqual(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
+  });
+  it('opening the picker collapses 「显示输出」 (mutual exclusion) and tells the worker', async () => {
+    const c = ctx({ ds: { displayMode: 'screenshot' } });
+    await handleModelSwitchCardAction(c);
+    expect(c.ds.displayMode).toBe('hidden');
+    expect(sessionInputMock).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ type: 'set_display_mode', mode: 'hidden' }));
+  });
+  it('refresh forces the catalog probe with per-bot scope; open does not', async () => {
     const calls: any[] = [];
     const catalog = async (key: string, opts: any) => { calls.push([key, opts]); return { models: CANDIDATES, source: 'live' as const }; };
     await handleModelSwitchCardAction(ctx({ catalog, value: { action: 'model_menu_refresh' } }));
@@ -139,383 +152,204 @@ describe('menu and candidate authority (P1-5 / P1-6)', () => {
     expect(calls[0][1]).toMatchObject({ force: true, scope: 'app' });
     expect(calls[1][1]).toMatchObject({ force: false, scope: 'app' });
   });
-  it('model_pick with a value NOT in the current candidates is refused (stale / forged card), zero mutation', async () => {
+  it('model_menu_close collapses the panel and re-renders the plain card', async () => {
+    const c = ctx();
+    await handleModelSwitchCardAction(c);
+    const r: any = await handleModelSwitchCardAction(sameDs(c, { action: 'model_menu_close' }));
+    expect(panelOf(r)).toBeNull();
+    expect(c.ds.modelPanel).toBeUndefined();
+  });
+  it('a restart in flight renders the list with buttons disabled and refuses picks', async () => {
+    activeAttempt = 'other';
+    const c = ctx();
+    const r: any = await handleModelSwitchCardAction(c);
+    expect(panelOf(r).restartInFlight).toBe(true);
+    const before = snapshot(c);
+    expect((await handleModelSwitchCardAction(sameDs(c, { action: 'model_pick', model: 'gpt-5.5' })) as any)?.toast?.type).toBe('warning');
+    expect(snapshot(c)).toBe(before);
+  });
+  it('custom entry is not offered in v2 (info toast, no mutation)', async () => {
+    const c = ctx({ value: { action: 'model_custom_open' } });
+    const before = snapshot(c);
+    expect((await handleModelSwitchCardAction(c) as any)?.toast?.type).toBe('info');
+    expect(snapshot(c)).toBe(before);
+  });
+});
+
+describe('pick → confirm (in-card) → switching', () => {
+  it('model_pick on a current candidate enters the confirm state with a server-side offer', async () => {
+    const c = ctx();
+    await handleModelSwitchCardAction(c);
+    const r: any = await handleModelSwitchCardAction(sameDs(c, { action: 'model_pick', model: 'gpt-5.6-sol' }));
+    expect(panelOf(r)).toMatchObject({ kind: 'confirm', target: { model: 'gpt-5.6-sol' }, reason: 'plain' });
+    expect(panelOf(r).offerId).toMatch(/^[0-9a-f]{16}$/);
+    expect(switchMock).not.toHaveBeenCalled();
+  });
+  it('busy session → confirm reason busy; codex-app → reason fresh', async () => {
+    const busy = ctx({ ds: { lastScreenStatus: 'working' } });
+    let r: any = await handleModelSwitchCardAction(sameDs(busy, { action: 'model_pick', model: 'gpt-5.6-sol' }));
+    expect(panelOf(r).reason).toBe('busy');
+    getBotMock.mockReturnValue({ config: { cliId: 'codex-app' } });
+    const app = ctx({ session: { cliId: 'codex-app' } });
+    r = await handleModelSwitchCardAction(sameDs(app, { action: 'model_pick', model: 'gpt-5.6-sol' }));
+    expect(panelOf(r).reason).toBe('fresh');
+  });
+  it('a value NOT in the current candidates is refused (stale / forged), zero mutation', async () => {
     const c = ctx({ value: { action: 'model_pick', model: 'gpt-9-forged' } });
     const before = snapshot(c);
-    const r = await handleModelSwitchCardAction(c);
-    expect(r?.toast.type).toBe('warning');
+    expect((await handleModelSwitchCardAction(c) as any)?.toast?.type).toBe('warning');
     expectZeroMutation(c, before);
   });
-  it('model_pick_confirm re-validates against the catalog too (the confirm card value is not authority)', async () => {
-    const c = ctx({ value: { action: 'model_pick_confirm', source: 'curated', model: 'gpt-9-forged' } });
-    // no server-side offer for a forged value → refused before any catalog work
-    const before = snapshot(c);
-    expect((await handleModelSwitchCardAction(c))?.toast.type).toBe('warning');
-    expectZeroMutation(c, before);
-  });
-  it('model_pick on a current candidate starts the switch with that target', async () => {
+  it('confirm (replaying the real button value) starts the switch and shows switching', async () => {
     switchMock.mockReturnValue({ ok: true, attemptId: 'A1', txn: { target: { model: 'gpt-5.6-sol' }, rollback: {} } });
-    const c = ctx({ value: { action: 'model_pick', model: 'gpt-5.6-sol' } });
-    const r = await handleModelSwitchCardAction(c);
-    expect(r?.toast.type).toBe('info');
+    const c = ctx();
+    const conf: any = await handleModelSwitchCardAction(sameDs(c, { action: 'model_pick', model: 'gpt-5.6-sol' }));
+    const r: any = await handleModelSwitchCardAction(sameDs(c, findConfirmValue(conf)));
+    expect(panelOf(r)).toMatchObject({ kind: 'switching', target: { model: 'gpt-5.6-sol' }, attemptId: 'A1' });
     expect(switchMock).toHaveBeenCalledTimes(1);
     expect(switchMock.mock.calls[0][1]).toMatchObject({ model: 'gpt-5.6-sol', setBy: 'ou_human' });
   });
-  it('custom-save keeps the free-form entry (any legal name), rejects illegal names', async () => {
-    switchMock.mockReturnValue({ ok: true, attemptId: 'A1', txn: { target: { model: 'deepseek/deepseek-v4-pro' }, rollback: {} } });
-    let c = ctx({ value: { action: 'model_custom_save' }, action: { form_value: { model: 'deepseek/deepseek-v4-pro' } } });
-    expect((await handleModelSwitchCardAction(c))?.toast.type).toBe('info');
-    expect(switchMock.mock.calls[0][1]).toMatchObject({ model: 'deepseek/deepseek-v4-pro' });
-    switchMock.mockReset();
-    c = ctx({ value: { action: 'model_custom_save' }, action: { form_value: { model: 'x; rm -rf /' } } });
-    const before = snapshot(c);
-    expect((await handleModelSwitchCardAction(c))?.toast.type).toBe('error');
-    expectZeroMutation(c, before);
+  it('cancel from confirm goes back to the list', async () => {
+    const c = ctx();
+    await handleModelSwitchCardAction(sameDs(c, { action: 'model_pick', model: 'gpt-5.6-sol' }));
+    const r: any = await handleModelSwitchCardAction(sameDs(c, { action: 'model_menu_open' }));
+    expect(panelOf(r).kind).toBe('list');
   });
-  it('effort_pick outside the model effort domain is refused; inside it starts the switch', async () => {
-    let c = ctx({ session: { modelPin: { model: 'gpt-5.5', cliId: 'codex', txnId: 't', setBy: 'x', setAt: 1 } }, value: { action: 'effort_pick', effort: 'ultra' } });
-    const before = snapshot(c);
-    expect((await handleModelSwitchCardAction(c))?.toast.type).toBe('warning');
-    expectZeroMutation(c, before);
-    switchMock.mockReturnValue({ ok: true, attemptId: 'A1', txn: { target: { model: 'gpt-5.5', effort: 'high' }, rollback: {} } });
-    c = ctx({ session: { modelPin: { model: 'gpt-5.5', cliId: 'codex', txnId: 't', setBy: 'x', setAt: 1 } }, value: { action: 'effort_pick', effort: 'high' } });
-    expect((await handleModelSwitchCardAction(c))?.toast.type).toBe('info');
-    expect(switchMock.mock.calls[0][1]).toMatchObject({ model: 'gpt-5.5', effort: 'high' });
-  });
-});
-
-// ─── codex-app: unconditional confirmation (P1-4) ──────────────────────────
-describe('fresh-only (codex-app) always confirms first', () => {
-  const app = (value: Record<string, any>, extra: any = {}) => {
-    getBotMock.mockReturnValue({ config: { cliId: 'codex-app' } });
-    return ctx({ session: { cliId: 'codex-app' }, value, ...extra });
-  };
-  void app;
-  it('idle codex-app model_pick → confirm card, ZERO mutation, no switch', async () => {
-    const c = app({ action: 'model_pick', model: 'gpt-5.6-sol' });
-    const before = snapshot(c);
-    expect(await handleModelSwitchCardAction(c)).toBeUndefined();
-    expectZeroMutation(c, before);
-    expect(delivered).toHaveLength(1);
-    const card = JSON.parse(delivered[0].content);
-    const s = JSON.stringify(card);
-    expect(s).toContain('"action":"model_pick_confirm"');
-    expect(s).toContain('"model":"gpt-5.6-sol"');
-    expect(s).toMatch(/新线程|new thread/);
-  });
-  it('idle codex-app effort_pick and custom-save also confirm first', async () => {
-    for (const [value, action] of [[{ action: 'effort_pick', effort: 'high' }, undefined], [{ action: 'model_custom_save' }, { form_value: { model: 'gpt-5.5' } }]] as const) {
-      delivered.length = 0;
-      const c = app(value as any, action ? { action } : {});
-      const before = snapshot(c);
-      expect(await handleModelSwitchCardAction(c)).toBeUndefined();
-      expectZeroMutation(c, before);
-      expect(JSON.stringify(JSON.parse(delivered[0].content))).toContain('"action":"model_pick_confirm"');
-    }
-  });
-  it('REVIEWER: custom-save confirmation preserves free-form authority', async () => {
-    switchMock.mockReturnValue({ ok: true, attemptId: 'A1', txn: { target: { model: 'deepseek/deepseek-v4-pro' }, rollback: {} } });
-    const first = app(
-      { action: 'model_custom_save' },
-      { action: { form_value: { model: 'deepseek/deepseek-v4-pro' } } },
-    );
-    expect(await handleModelSwitchCardAction(first)).toBeUndefined();
-    expect(switchMock).not.toHaveBeenCalled();
-    const confirm = JSON.parse(delivered[0].content);
-    expect(JSON.stringify(confirm)).toContain('deepseek/deepseek-v4-pro');
-
-    // r4 amendment (declared): the confirmation must reference the exact offer
-    // (its menu_id) per review r3 P1-1, so the second hop replays the real
-    // button value instead of a hand-written {action, model} payload.
-    const secondValue = confirm.elements.find((e: any) => e.tag === 'action').actions[0].value;
-    expect(secondValue).toMatchObject({ action: 'model_pick_confirm', model: 'deepseek/deepseek-v4-pro' });
-    const second = app(secondValue);
-    expect((await handleModelSwitchCardAction(second))?.toast.type).toBe('info');
-    expect(switchMock).toHaveBeenCalledTimes(1);
-    expect(switchMock.mock.calls[0][1]).toMatchObject({ model: 'deepseek/deepseek-v4-pro' });
-  });
-  it('custom-save → confirm → switch, replaying the REAL confirm-card button value (codex-app fresh-only)', async () => {
-    switchMock.mockReturnValue({ ok: true, attemptId: 'A1', txn: { target: { model: 'deepseek/deepseek-v4-pro' }, rollback: {} } });
-    const first = app({ action: 'model_custom_save' }, { action: { form_value: { model: 'deepseek/deepseek-v4-pro' } } });
-    expect(await handleModelSwitchCardAction(first)).toBeUndefined();
-    const btn = JSON.parse(delivered[0].content).elements.find((e: any) => e.tag === 'action').actions[0];
-    expect(btn.value).toMatchObject({ action: 'model_pick_confirm', source: 'custom', model: 'deepseek/deepseek-v4-pro' });
-    const second = app(btn.value);
-    expect((await handleModelSwitchCardAction(second))?.toast.type).toBe('info');
-    expect(switchMock).toHaveBeenCalledTimes(1);
-    expect(switchMock.mock.calls[0][1]).toMatchObject({ model: 'deepseek/deepseek-v4-pro' });
-  });
-  it('custom-save → confirm → switch on a BUSY plain CLI, replaying the real button value', async () => {
-    switchMock.mockReturnValue({ ok: true, attemptId: 'A1', txn: { target: { model: 'my-private-model' }, rollback: {} } });
-    const first = ctx({ value: { action: 'model_custom_save' }, action: { form_value: { model: 'my-private-model' } }, ds: { lastScreenStatus: 'working' } });
-    expect(await handleModelSwitchCardAction(first)).toBeUndefined();
-    expect(switchMock).not.toHaveBeenCalled();
-    const btn = JSON.parse(delivered[0].content).elements.find((e: any) => e.tag === 'action').actions[0];
-    expect(btn.value).toMatchObject({ action: 'model_pick_confirm', source: 'custom', model: 'my-private-model' });
-    const second = ctx({ value: btn.value, ds: { lastScreenStatus: 'working' } });
-    expect((await handleModelSwitchCardAction(second))?.toast.type).toBe('info');
-    expect(switchMock.mock.calls[0][1]).toMatchObject({ model: 'my-private-model' });
-  });
-  it('curated pick → confirm carries source=curated and is re-validated against the live catalog', async () => {
-    switchMock.mockReturnValue({ ok: true, attemptId: 'A1', txn: { target: { model: 'gpt-5.6-sol' }, rollback: {} } });
-    const first = app({ action: 'model_pick', model: 'gpt-5.6-sol' });
-    expect(await handleModelSwitchCardAction(first)).toBeUndefined();
-    const btn = JSON.parse(delivered[0].content).elements.find((e: any) => e.tag === 'action').actions[0];
-    expect(btn.value).toMatchObject({ source: 'curated', model: 'gpt-5.6-sol' });
-    // catalog changed between the two hops → stale curated confirm is refused
-    const stale = app(btn.value, { catalog: async () => ({ models: ['gpt-5.5'], source: 'live' as const }) });
-    const before = snapshot(stale);
-    expect((await handleModelSwitchCardAction(stale))?.toast.type).toBe('warning');
-    expectZeroMutation(stale, before);
-    // the offer was consumed by the refused hop → a fresh pick is needed
-    delivered.length = 0;
-    expect(await handleModelSwitchCardAction(app({ action: 'model_pick', model: 'gpt-5.6-sol' }))).toBeUndefined();
-    const btn2 = JSON.parse(delivered[0].content).elements.find((e: any) => e.tag === 'action').actions[0];
-    expect((await handleModelSwitchCardAction(app(btn2.value)))?.toast.type).toBe('info');
-  });
-  it('a confirmation without a matching server-side offer is refused (forged / stale / replayed), zero mutation', async () => {
-    const offer = async (model = 'deepseek/deepseek-v4-pro') => {
-      delivered.length = 0;
-      await handleModelSwitchCardAction(app({ action: 'model_custom_save' }, { action: { form_value: { model } } }));
-      return JSON.parse(delivered[0].content).elements.find((e: any) => e.tag === 'action').actions[0].value;
-    };
-    const cases: Array<[string, () => Promise<Record<string, any>>, Partial<ModelSwitchCardContext>]> = [
-      ['no offer at all', async () => ({ action: 'model_pick_confirm', source: 'custom', model: 'deepseek/deepseek-v4-pro' }), {}],
-      ['card source says custom but the offer was for another model', async () => ({ ...(await offer('other/model')), model: 'deepseek/deepseek-v4-pro' }), {}],
-      ['offer exists but effort tampered', async () => ({ ...(await offer()), effort: 'high' }), {}],
-      ['offer made by a different operator', async () => offer(), { operatorOpenId: 'ou_other', identity: { resolveOperator: async () => ({ unionId: 'on_other' }), isBotUnionId: () => false, canOperate: () => true } }],
-      ['offer replayed twice (consumed on first use)', async () => { const v = await offer(); switchMock.mockReturnValue({ ok: true, attemptId: 'A', txn: { target: {}, rollback: {} } }); await handleModelSwitchCardAction(app(v)); switchMock.mockReset(); return v; }, {}],
+  it('a confirmation without an exact matching offer is refused: no id / wrong id / tampered model / other operator / replay', async () => {
+    switchMock.mockReturnValue({ ok: true, attemptId: 'A1', txn: { target: {}, rollback: {} } });
+    const c = ctx();
+    const conf: any = await handleModelSwitchCardAction(sameDs(c, { action: 'model_pick', model: 'gpt-5.6-sol' }));
+    const good = findConfirmValue(conf);
+    const bad: Array<[string, Record<string, any>, Partial<ModelSwitchCardContext>]> = [
+      ['no menu_id', { ...good, menu_id: undefined }, {}],
+      ['wrong menu_id', { ...good, menu_id: 'ffffffffffffffff' }, {}],
+      ['tampered model', { ...good, model: 'gpt-5.5' }, {}],
+      ['other operator', good, { operatorOpenId: 'ou_other', identity: { resolveOperator: async () => ({ unionId: 'on_other' }), isBotUnionId: () => false, canOperate: () => true } }],
     ];
-    for (const [name, mk, extra] of cases) {
-      __testOnly_resetPendingConfirms();
-      const value = await mk();
-      const c = app(value, extra);
+    for (const [name, value, over] of bad) {
       const before = snapshot(c);
-      const r = await handleModelSwitchCardAction(c);
-      expect(r?.toast.type, name).toBe('warning');
-      expectZeroMutation(c, before);
+      expect((await handleModelSwitchCardAction(sameDs(c, value, over)) as any)?.toast?.type, name).toBe('warning');
+      expect(snapshot(c), name).toBe(before);
+      expect(switchMock, name).not.toHaveBeenCalled();
     }
-  });
-  it('an expired offer is refused', async () => {
-    vi.useFakeTimers({ now: 1_000_000 });
-    delivered.length = 0;
-    await handleModelSwitchCardAction(app({ action: 'model_custom_save' }, { action: { form_value: { model: 'deepseek/deepseek-v4-pro' } } }));
-    const v = JSON.parse(delivered[0].content).elements.find((e: any) => e.tag === 'action').actions[0].value;
-    vi.setSystemTime(1_000_000 + PENDING_CONFIRM_TTL_MS + 1);
-    const c = app(v);
+    expect(panelOf(await handleModelSwitchCardAction(sameDs(c, good))).kind).toBe('switching');
+    // replay after consumption
+    c.ds.modelPanel = undefined;
     const before = snapshot(c);
-    expect((await handleModelSwitchCardAction(c))?.toast.type).toBe('warning');
-    expectZeroMutation(c, before);
+    expect((await handleModelSwitchCardAction(sameDs(c, good)) as any)?.toast?.type).toBe('warning');
+    expect(snapshot(c)).toBe(before);
+    expect(switchMock).toHaveBeenCalledTimes(1);
   });
-  it('a custom offer confirmed with an illegal name (tampered) is rejected; effort re-validated', async () => {
-    delivered.length = 0;
-    await handleModelSwitchCardAction(app({ action: 'model_custom_save' }, { action: { form_value: { model: 'ok-model' } } }));
-    let c = app({ action: 'model_pick_confirm', source: 'custom', model: 'x; rm -rf /' });
+  it('ABA: an older confirm cannot consume a newer offer for the same target', async () => {
+    switchMock.mockReturnValue({ ok: true, attemptId: 'A1', txn: { target: {}, rollback: {} } });
+    const c = ctx();
+    const first: any = await handleModelSwitchCardAction(sameDs(c, { action: 'model_pick', model: 'gpt-5.6-sol' }));
+    const second: any = await handleModelSwitchCardAction(sameDs(c, { action: 'model_pick', model: 'gpt-5.6-sol' }));
+    expect(panelOf(first).offerId).not.toBe(panelOf(second).offerId);
+    const before = snapshot(c);
+    expect((await handleModelSwitchCardAction(sameDs(c, findConfirmValue(first))) as any)?.toast?.type).toBe('warning');
+    expect(snapshot(c)).toBe(before);
+    expect(panelOf(await handleModelSwitchCardAction(sameDs(c, findConfirmValue(second)))).kind).toBe('switching');
+    expect(switchMock).toHaveBeenCalledTimes(1);
+  });
+  it('effort_pick within the domain enters confirm; outside is refused', async () => {
+    const c = ctx({ session: { modelPin: { model: 'gpt-5.5', cliId: 'codex', txnId: 't', setBy: 'x', setAt: 1 } } });
     let before = snapshot(c);
-    expect((await handleModelSwitchCardAction(c))?.toast.type).toBe('warning'); // no matching offer for that name
-    expectZeroMutation(c, before);
-    // curated offer whose model dropped out of the catalog between hops → refused
-    __testOnly_resetPendingConfirms(); delivered.length = 0;
-    await handleModelSwitchCardAction(app({ action: 'model_pick', model: 'gpt-5.6-sol' }));
-    const v = JSON.parse(delivered[0].content).elements.find((e: any) => e.tag === 'action').actions[0].value;
-    c = app(v, { catalog: async () => ({ models: ['gpt-5.5'], source: 'live' as const }) });
-    before = snapshot(c);
-    expect((await handleModelSwitchCardAction(c))?.toast.type).toBe('warning');
-    expectZeroMutation(c, before);
+    expect((await handleModelSwitchCardAction(sameDs(c, { action: 'effort_pick', effort: 'ultra' })) as any)?.toast?.type).toBe('warning');
+    expect(snapshot(c)).toBe(before);
+    const r: any = await handleModelSwitchCardAction(sameDs(c, { action: 'effort_pick', effort: 'high' }));
+    expect(panelOf(r)).toMatchObject({ kind: 'confirm', target: { model: 'gpt-5.5', effort: 'high' } });
+    before = snapshot(c); void before;
   });
-  it('REVIEWER R3: an older identical confirmation cannot consume a newer offer (ABA)', async () => {
-    switchMock.mockReturnValue({ ok: true, attemptId: 'A1', txn: { target: { model: 'my-private-model' }, rollback: {} } });
-    await handleModelSwitchCardAction(app(
-      { action: 'model_custom_save' },
-      { action: { form_value: { model: 'my-private-model' } } },
-    ));
-    const oldValue = JSON.parse(delivered[0].content).elements.find((e: any) => e.tag === 'action').actions[0].value;
-
-    delivered.length = 0;
-    await handleModelSwitchCardAction(app(
-      { action: 'model_custom_save' },
-      { action: { form_value: { model: 'my-private-model' } } },
-    ));
-    const newValue = JSON.parse(delivered[0].content).elements.find((e: any) => e.tag === 'action').actions[0].value;
-    expect(oldValue.menu_id).not.toBe(newValue.menu_id);
-
-    const stale = app(oldValue);
-    const before = snapshot(stale);
-    expect((await handleModelSwitchCardAction(stale))?.toast.type).toBe('warning');
-    expectZeroMutation(stale, before);
-    expect((await handleModelSwitchCardAction(app(newValue)))?.toast.type).toBe('info');
-    expect(switchMock).toHaveBeenCalledTimes(1);
-  });
-
-  it('REVIEWER R3: a failed confirm-card delivery leaves no usable offer', async () => {
-    deliverMock.mockRejectedValueOnce(new Error('delivery failed'));
-    await expect(handleModelSwitchCardAction(app(
-      { action: 'model_custom_save' },
-      { action: { form_value: { model: 'my-private-model' } } },
-    ))).rejects.toThrow('delivery failed');
-
-    switchMock.mockReturnValue({ ok: true, attemptId: 'A1', txn: { target: { model: 'my-private-model' }, rollback: {} } });
-    const forged = app({ action: 'model_pick_confirm', source: 'custom', model: 'my-private-model', menu_id: 'old-card' });
-    const before = snapshot(forged);
-    expect((await handleModelSwitchCardAction(forged))?.toast.type).toBe('warning');
-    expectZeroMutation(forged, before);
-  });
-
-  it('a confirmation must carry the exact offerId (menu_id); a matching model without it is refused', async () => {
-    switchMock.mockReturnValue({ ok: true, attemptId: 'A1', txn: { target: { model: 'my-private-model' }, rollback: {} } });
-    await handleModelSwitchCardAction(app({ action: 'model_custom_save' }, { action: { form_value: { model: 'my-private-model' } } }));
-    const v = JSON.parse(delivered[0].content).elements.find((e: any) => e.tag === 'action').actions[0].value;
-    for (const bad of [{ ...v, menu_id: undefined }, { ...v, menu_id: 'ffffffffffffffff' }, { ...v, menu_id: v.menu_id.slice(0, 8) }]) {
-      const c = app(bad);
-      const before = snapshot(c);
-      expect((await handleModelSwitchCardAction(c))?.toast.type).toBe('warning');
-      expectZeroMutation(c, before);
-    }
-    expect((await handleModelSwitchCardAction(app(v)))?.toast.type).toBe('info');
-    expect(switchMock).toHaveBeenCalledTimes(1);
-  });
-
-  it('concurrent cross-delivery: a late-completing OLD delivery cannot resurrect its superseded offer', async () => {
-    switchMock.mockReturnValue({ ok: true, attemptId: 'A1', txn: { target: { model: 'my-private-model' }, rollback: {} } });
-    // Offer A's delivery is held open while offer B is created and delivered.
-    let releaseA!: () => void;
-    deliverMock.mockImplementationOnce(async (_ds: any, _op: any, content: string, msgType: string) => {
-      delivered.push({ content, msgType });
-      await new Promise<void>(r => { releaseA = r; });
-    });
-    const pA = handleModelSwitchCardAction(app({ action: 'model_custom_save' }, { action: { form_value: { model: 'my-private-model' } } }));
-    await new Promise(r => setTimeout(r, 0));
-    const vA = JSON.parse(delivered[0].content).elements.find((e: any) => e.tag === 'action').actions[0].value;
-    delivered.length = 0;
-    await handleModelSwitchCardAction(app({ action: 'model_custom_save' }, { action: { form_value: { model: 'my-private-model' } } }));
-    const vB = JSON.parse(delivered[0].content).elements.find((e: any) => e.tag === 'action').actions[0].value;
-    releaseA(); await pA; // A's delivery "succeeds" late — its offer was already superseded by B
-    const staleA = app(vA);
-    const before = snapshot(staleA);
-    expect((await handleModelSwitchCardAction(staleA))?.toast.type).toBe('warning');
-    expectZeroMutation(staleA, before);
-    expect((await handleModelSwitchCardAction(app(vB)))?.toast.type).toBe('info');
-    expect(switchMock).toHaveBeenCalledTimes(1);
-  });
-
-  it('an offer is consumed exactly once, even when two identical confirmations race', async () => {
-    switchMock.mockReturnValue({ ok: true, attemptId: 'A1', txn: { target: { model: 'my-private-model' }, rollback: {} } });
-    await handleModelSwitchCardAction(app({ action: 'model_custom_save' }, { action: { form_value: { model: 'my-private-model' } } }));
-    const v = JSON.parse(delivered[0].content).elements.find((e: any) => e.tag === 'action').actions[0].value;
-    const [r1, r2] = await Promise.all([handleModelSwitchCardAction(app(v)), handleModelSwitchCardAction(app(v))]);
-    expect([r1?.toast.type, r2?.toast.type].sort()).toEqual(['info', 'warning']);
-    expect(switchMock).toHaveBeenCalledTimes(1);
-  });
-
-  it('an offer is not confirmable before its card was delivered (creating state)', async () => {
-    let release!: () => void;
-    deliverMock.mockImplementationOnce(async (_ds: any, _op: any, content: string, msgType: string) => {
-      delivered.push({ content, msgType });
-      await new Promise<void>(r => { release = r; });
-    });
-    const p = handleModelSwitchCardAction(app({ action: 'model_custom_save' }, { action: { form_value: { model: 'my-private-model' } } }));
-    await new Promise(r => setTimeout(r, 0));
-    const v = JSON.parse(delivered[0].content).elements.find((e: any) => e.tag === 'action').actions[0].value;
-    const early = app(v);
-    const before = snapshot(early);
-    expect((await handleModelSwitchCardAction(early))?.toast.type).toBe('warning');
-    expectZeroMutation(early, before);
-    release(); await p;
-    switchMock.mockReturnValue({ ok: true, attemptId: 'A1', txn: { target: { model: 'my-private-model' }, rollback: {} } });
-    expect((await handleModelSwitchCardAction(app(v)))?.toast.type).toBe('info');
-  });
-
-  it('the identity gate still guards the custom confirmation hop', async () => {
-    await handleModelSwitchCardAction(app({ action: 'model_custom_save' }, { action: { form_value: { model: 'deepseek/deepseek-v4-pro' } } }));
-    const c = app({ action: 'model_pick_confirm', source: 'custom', model: 'deepseek/deepseek-v4-pro' }, { identity: { resolveOperator: async () => ({ unionId: 'on_bot' }), isBotUnionId: (u: string) => u === 'on_bot', canOperate: () => true } });
-    const before = snapshot(c);
-    expect((await handleModelSwitchCardAction(c))?.toast.type).toBe('warning');
-    expectZeroMutation(c, before);
-  });
-  it('codex-app model_pick_confirm on a current candidate starts the switch (after the offer)', async () => {
-    switchMock.mockReturnValue({ ok: true, attemptId: 'A1', txn: { target: { model: 'gpt-5.6-sol' }, rollback: {} } });
-    expect(await handleModelSwitchCardAction(app({ action: 'model_pick', model: 'gpt-5.6-sol' }))).toBeUndefined();
-    const v = JSON.parse(delivered[0].content).elements.find((e: any) => e.tag === 'action').actions[0].value;
-    expect((await handleModelSwitchCardAction(app(v)))?.toast.type).toBe('info');
-    expect(switchMock).toHaveBeenCalledTimes(1);
-  });
-  it('plain CLI: idle pick switches directly; busy pick confirms first', async () => {
-    switchMock.mockReturnValue({ ok: true, attemptId: 'A1', txn: { target: { model: 'gpt-5.6-sol' }, rollback: {} } });
-    expect((await handleModelSwitchCardAction(ctx({ value: { action: 'model_pick', model: 'gpt-5.6-sol' } })))?.toast.type).toBe('info');
-    switchMock.mockReset(); delivered.length = 0;
-    const busy = ctx({ value: { action: 'model_pick', model: 'gpt-5.6-sol' }, ds: { lastScreenStatus: 'working' } });
-    expect(await handleModelSwitchCardAction(busy)).toBeUndefined();
-    expect(switchMock).not.toHaveBeenCalled();
-    expect(JSON.stringify(JSON.parse(delivered[0].content))).toContain('"action":"model_pick_confirm"');
+  it('daemon refusal at confirm renders a failed line in the card (not a new card)', async () => {
+    switchMock.mockReturnValue({ ok: false, reason: 'pane_alive' });
+    const c = ctx();
+    const conf: any = await handleModelSwitchCardAction(sameDs(c, { action: 'model_pick', model: 'gpt-5.6-sol' }));
+    const r: any = await handleModelSwitchCardAction(sameDs(c, findConfirmValue(conf)));
+    expect(panelOf(r).kind).toBe('failed');
+    expect(panelOf(r).reason.length).toBeGreaterThan(3);
   });
 });
 
-// ─── refusals from the daemon primitive are surfaced verbatim ─────────────
-describe('daemon refusals surface as warnings', () => {
-  for (const reason of ['restart_in_flight', 'switch_in_flight', 'ambiguous_frozen', 'pane_alive', 'pane_unknown', 'transferring'] as const) {
-    it(reason, async () => {
-      switchMock.mockReturnValue({ ok: false, reason });
-      const r = await handleModelSwitchCardAction(ctx({ value: { action: 'model_pick', model: 'gpt-5.5' } }));
-      expect(r?.toast.type).toBe('warning');
-      expect(r?.toast.content.length).toBeGreaterThan(3);
-    });
-  }
-  it('failed switch → rollback receipt; a refused convergence restart is reported, not swallowed', async () => {
+describe('settlement patches the card in place', () => {
+  async function switchAndSettle(outcome: 'committed' | 'rolled_back' | 'ambiguous', restartAccepted = true) {
     let onSettled: any;
     switchMock.mockImplementation((_ds: any, _t: any, obs: any) => { onSettled = obs.onSettled; return { ok: true, attemptId: 'A1', txn: { target: { model: 'gpt-5.6-sol' }, rollback: { model: 'gpt-5.5' } } }; });
-    restartMock.mockReturnValue(undefined); // refused
-    await handleModelSwitchCardAction(ctx({ value: { action: 'model_pick', model: 'gpt-5.6-sol' } }));
-    delivered.length = 0;
-    await onSettled('rolled_back', { target: { model: 'gpt-5.6-sol' }, rollback: { model: 'gpt-5.5' } });
+    restartMock.mockReturnValue(restartAccepted ? { attemptId: 'R', joined: false } : undefined);
+    const c = ctx();
+    const conf: any = await handleModelSwitchCardAction(sameDs(c, { action: 'model_pick', model: 'gpt-5.6-sol' }));
+    await handleModelSwitchCardAction(sameDs(c, findConfirmValue(conf)));
+    patchMock.mockClear();
+    await onSettled(outcome, { target: { model: 'gpt-5.6-sol' }, rollback: { model: 'gpt-5.5' } });
+    return c;
+  }
+  it('committed → panel cleared, card patched, and "继续" is sent to the session automatically', async () => {
+    const c = await switchAndSettle('committed');
+    expect(c.ds.modelPanel).toBeUndefined();
+    expect(patchMock).toHaveBeenCalledTimes(1);
+    expect(inputMock).toHaveBeenCalledTimes(1);
+    expect(inputMock.mock.calls[0][1]).toMatch(/继续|continue/);
+  });
+  it('rolled back → failed line in the card + process convergence restart; no auto-continue', async () => {
+    const c = await switchAndSettle('rolled_back');
+    expect(c.ds.modelPanel).toMatchObject({ kind: 'failed', target: { model: 'gpt-5.6-sol' } });
     expect(restartMock).toHaveBeenCalledWith(expect.anything(), expect.anything(), { strict: true });
-    expect(delivered[0].content).toMatch(/回滚|rolled back/);
-    expect(delivered[0].content).toMatch(/未能自动收敛|could not be converged/);
+    expect(patchMock).toHaveBeenCalledTimes(1);
+    expect(inputMock).not.toHaveBeenCalled();
+  });
+  it('rolled back with a refused convergence restart says so in the failure line', async () => {
+    const c = await switchAndSettle('rolled_back', false);
+    expect((c.ds.modelPanel as any).reason).toMatch(/未能自动收敛|could not be converged/);
+  });
+  it('ambiguous → ambiguous panel (recheck / force rollback) in the card', async () => {
+    const c = await switchAndSettle('ambiguous');
+    expect(c.ds.modelPanel).toMatchObject({ kind: 'ambiguous' });
+    expect(patchMock).toHaveBeenCalledTimes(1);
+  });
+  it('a transient failed line is dismissed by 退出选择 (model_menu_close)', async () => {
+    const c = await switchAndSettle('rolled_back');
+    const r: any = await handleModelSwitchCardAction(sameDs(c, { action: 'model_menu_close' }));
+    expect(panelOf(r)).toBeNull();
   });
 });
 
-// ─── ambiguous exits (P1-7) ────────────────────────────────────────────────
-describe('ambiguous exits', () => {
+describe('ambiguous exits (in-card)', () => {
   const amb = (extra: Record<string, unknown> = {}) => ({
     txnId: 'ms-1-A1', seq: 1, attemptId: 'A1', state: 'ambiguous', target: { model: 'gpt-5.6-sol', effort: 'xhigh' },
     rollback: { model: 'gpt-5.6-sol', reasoningEffort: 'high', pin: null }, startedAt: 1, setBy: 'x', ...extra,
   });
-  it('recheck: same model but OLD effort attested → rolled back (not committed)', async () => {
+  it('any picker action while ambiguous renders the ambiguous panel first', async () => {
+    const c = ctx({ session: { modelSwitchTxn: amb() } });
+    const r: any = await handleModelSwitchCardAction(sameDs(c, { action: 'model_menu_open' }));
+    expect(panelOf(r).kind).toBe('ambiguous');
+  });
+  it('recheck: same model but OLD effort attested → rolled back → failed line', async () => {
     const c = ctx({ session: {
       modelSwitchTxn: amb(), reasoningEffort: 'xhigh',
       modelPin: { model: 'gpt-5.6-sol', effort: 'xhigh', cliId: 'codex', txnId: 'ms-1-A1', setBy: 'x', setAt: 1 },
       launchAttestation: { model: 'gpt-5.6-sol', effort: 'high', effortProvenance: 'explicit', workerGeneration: 1 },
     }, value: { action: 'model_txn_recheck' } });
-    const r = await handleModelSwitchCardAction(c);
-    expect(r?.toast.type).toBe('info');
+    const r: any = await handleModelSwitchCardAction(c);
+    expect(panelOf(r).kind).toBe('failed');
     expect(c.ds.session.modelSwitchTxn).toBeUndefined();
     expect(c.ds.session.reasoningEffort).toBe('high');
-    expect(updateSessionMock).toHaveBeenCalled();
   });
-  it('recheck: attestation from an older generation → still ambiguous, nothing persisted', async () => {
+  it('recheck: attestation from an older generation → still ambiguous (toast), nothing persisted', async () => {
     const c = ctx({ session: { modelSwitchTxn: amb(), launchAttestation: { model: 'gpt-5.6-sol', effort: 'xhigh', effortProvenance: 'explicit', workerGeneration: 0 } }, value: { action: 'model_txn_recheck' } });
-    expect((await handleModelSwitchCardAction(c))?.toast.type).toBe('warning');
+    expect((await handleModelSwitchCardAction(c) as any)?.toast?.type).toBe('warning');
     expect(c.ds.session.modelSwitchTxn.state).toBe('ambiguous');
     expect(updateSessionMock).not.toHaveBeenCalled();
   });
-  it('force rollback: click toast is "started", not success; daemon refusal keeps everything', async () => {
+  it('force rollback: card shows switching(rolling back); daemon refusal keeps everything', async () => {
     forceRollbackMock.mockReturnValue({ ok: true, attemptId: 'R1', txn: amb({ state: 'rolling_back' }) });
     let c = ctx({ session: { modelSwitchTxn: amb() }, value: { action: 'model_txn_force_rollback' } });
-    let r = await handleModelSwitchCardAction(c);
-    expect(r?.toast.type).toBe('info');
-    expect(r?.toast.content).toMatch(/收敛|converge/);
+    let r: any = await handleModelSwitchCardAction(c);
+    expect(panelOf(r)).toMatchObject({ kind: 'switching', attemptId: 'R1', target: { model: 'gpt-5.6-sol', effort: 'high' } });
     forceRollbackMock.mockReturnValue({ ok: false, reason: 'restart_in_flight' });
     c = ctx({ session: { modelSwitchTxn: amb() }, value: { action: 'model_txn_force_rollback' } });
     const before = snapshot(c);
     r = await handleModelSwitchCardAction(c);
-    expect(r?.toast.type).toBe('warning');
-    expect(JSON.stringify(c.ds.session)).toBe(before);
-  });
-  it('recheck / force-rollback without an ambiguous txn are refused', async () => {
-    for (const action of ['model_txn_recheck', 'model_txn_force_rollback']) {
-      const c = ctx({ value: { action } });
-      const before = snapshot(c);
-      expect((await handleModelSwitchCardAction(c))?.toast.type).toBe('warning');
-      expectZeroMutation(c, before);
-    }
+    expect(r?.toast?.type).toBe('warning');
+    expect(snapshot(c)).toBe(before);
   });
 });
