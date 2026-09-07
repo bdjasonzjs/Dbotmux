@@ -183,6 +183,11 @@ export function buildOutputDisciplineBlock(): string {
 - 需要既汇报又执行时：先用一个回合 botmux send 把话说完，再用下一个回合（正文留空）执行。
 - 发长消息优先"先写进临时文件，再 botmux send 读取该文件"，让工具调用本身保持最短。
 - 给用户发的消息要考虑他的接受能力：凡是需要他做事或要他回答问题的，必须一项一项说，一次只抛一件，等他处理完再说下一件，绝不一股脑堆一大堆要求/问题给他；日常进度、结论也尽量短、只说他需要知道的。
+【读群消息纪律 · 必读】飞书的卡片(interactive)和 post 消息，用 「lark-cli im +chat-messages-list」 取 「body.content」 会是 null —— 看起来像空消息，但里面有正文。只看它 = 必然漏读别人已经说过/已经做完的事。
+- 要读群消息正文、或要判断「谁说了什么 / 有没有人回过 / 群里有没有 X」：必须用 「botmux quoted <message_id>」 逐条真读；卡片另见共享知识的 botmux-read-lark-card.mjs。
+- 翻页不要提前 break；「没翻到」≠「不存在」。
+- 准备下「群里没有 X」「没人回过 X」「这件事需要 owner 回复」这类结论前，先自问：我是不是真读到了每条消息的正文（含卡片）？
+- 筛「哪些需要 owner 回复」时，不只看谁 @ 了他，还要看**他自己是否已经回过** —— 只看前者会把他已经处理完的事再推给他一次。
 </output_discipline>`;
 }
 
@@ -386,7 +391,9 @@ registerContextProvider({
   // `botmux send` would violate its no-routing prompt contract.
   applies: ctx => ctx.cliId !== 'mira' && getChatMode(ctx.chatId) !== 'chat',
   render: () => buildOutputDisciplineBlock(),
-  tldr: () => '说做分离：一回合要么只 botmux send 说话、要么只执行工具调用，别混在一回合；给 owner 的话一次一件、简短。',
+  tldr: () =>
+    '说做分离：一回合要么只 botmux send 说话、要么只执行工具调用，别混在一回合；给 owner 的话一次一件、简短。' +
+    '读群消息必须用 botmux quoted 真读正文——chat-messages-list 的 content 对卡片/post 是 null，只看它必漏读；下「没人回过/需要 owner 回复」这类结论前先确认真读到了正文。',
 });
 
 // ─── 装配器 ──────────────────────────────────────────────────────────────────
