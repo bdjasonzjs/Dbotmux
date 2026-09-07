@@ -28,6 +28,7 @@ export class RestartCoordinator {
     sessionId: string,
     observer: RestartObserver,
     startPhysicalRestart: (attemptId: string) => void | Promise<void>,
+    opts: { attemptId?: string } = {},
   ): { attemptId: string; joined: boolean } {
     const existing = this.attempts.get(sessionId);
     if (existing) {
@@ -36,7 +37,7 @@ export class RestartCoordinator {
       return { attemptId: existing.id, joined: true };
     }
 
-    const attemptId = this.options.createAttemptId?.() ?? randomBytes(12).toString('hex');
+    const attemptId = opts.attemptId ?? this.options.createAttemptId?.() ?? randomBytes(12).toString('hex');
     const timer = setTimeout(
       () => this.resolve(sessionId, attemptId, 'timed_out'),
       this.options.timeoutMs ?? 40_000,

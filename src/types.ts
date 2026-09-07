@@ -602,6 +602,13 @@ export interface Session {
    * live config applies, which is what keeps a config change effective.
    */
   model?: string;
+  /** Card-driven per-session model pin (core/model-switch.ts). Outranks the
+   *  bot config at every spawn while `pin.cliId` matches the session's CLI. */
+  modelPin?: import('./core/model-switch.js').ModelPin;
+  /** The one in-flight / ambiguous model-switch transaction, if any. */
+  modelSwitchTxn?: import('./core/model-switch.js').ModelSwitchTxn;
+  /** Monotonic switch counter (dedupe / txn ids). */
+  modelSwitchSeq?: number;
   /** The VERIFIED launch fact of the CLI generation currently backing this
    *  session: what the real leaf process was actually started with, committed
    *  once per generation after cmdline/pid/proc-start verification. Unlike
@@ -1052,7 +1059,7 @@ type DaemonToWorkerBase =
    *  the next message, with no restart IPC to refresh the snapshot. Same
    *  three-state contract (undefined = not carried → keep snapshot; null = launch
    *  with no model). It never affects the CLI already running. */
-  | { type: 'message'; content: string; metadata?: PendingInputMetadata; codexAppInput?: CodexAppTurnInput; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; codexAppDispatchId?: string; codexAppSteerable?: true; queuedActivationToken?: string; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; atMostOnce?: true; mojoLivePatch?: MojoLivePatch; model?: string | null }
+  | { type: 'message'; content: string; reasoningEffort?: string | null; metadata?: PendingInputMetadata; codexAppInput?: CodexAppTurnInput; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; codexAppDispatchId?: string; codexAppSteerable?: true; queuedActivationToken?: string; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; atMostOnce?: true; mojoLivePatch?: MojoLivePatch; model?: string | null }
   | { type: 'codex_app_dispatch_persisted'; requestId: string; ok: boolean; error?: string }
   /** Literal slash-command passthrough. `followUpContent` rides along so the
    *  worker enqueues it strictly AFTER the slash command's Enter — two separate
@@ -1089,7 +1096,13 @@ type DaemonToWorkerBase =
    *  /restart 真正生效（否则 live-worker restart 一直用 fork 时刻的旧快照）。
    *  三分态：undefined = 不携带（旧 daemon / 兜底，worker 保持快照不动）；
    *  null = 明确清空（dashboard 清除了 env，worker 移除快照）。 */
-  | { type: 'restart'; reason?: 'operator' | 'cli_crash'; attemptId?: string; updateWorkingDir?: string; env?: Record<string, string> | null; mojoLivePatch?: MojoLivePatch; model?: string | null }
+  | { type: 'restart'; reason?: 'operator' | 'cli_crash'; attemptId?: string; updateWorkingDir?: string; env?: Record<string, string> | null; mojoLivePatch?: MojoLivePatch; model?: string | null;
+      /** Same three-state hot update as `model`, for the reasoning effort
+       *  (codex / codex-app / grok). undefined = keep snapshot; null = clear. */
+      reasoningEffort?: string | null;
+      /** Start a NEW CLI thread instead of resuming (codex-app model switch:
+       *  `thread/resume` ignores model/effort, so a switch must be fresh). */
+      freshThread?: true }
   /** Lease watchdog fencing: only the exact still-running durable attempt may
    * tear down/restart the CLI. A late command after terminal/current-turn
    * advance is ignored worker-side. */

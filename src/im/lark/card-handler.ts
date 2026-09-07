@@ -93,6 +93,9 @@ import { resumeStartsFresh } from '../../services/resume-fresh-policy.js';
 import { forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, buildStreamingCardJson, type WorkerSessionReplyOptions } from '../../core/worker-pool.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { isExternalChatSession } from '../../core/external-chat.js';
+import { modelSwitchAllowedForSession } from '../../core/model-switch-surface.js';
+import { isCardOwnerOperator } from './card-owner-gate.js';
+import { MODEL_SWITCH_CARD_ACTIONS, isModelSwitchCardAction, handleModelSwitchCardAction, defaultModelSwitchIdentityDeps, collapseModelPanel } from './model-switch-card.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
 import { publishAttentionPatch, publishClosedSessionPatch, announcePendingRepoSession } from '../../core/session-activity.js';
 import { fallbackTurnId, rehomeReplyTargetState } from '../../core/reply-target.js';
@@ -1962,7 +1965,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     );
   }
 
-  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'get_write_link', 'open_local_terminal', 'open_local_cli', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);
+  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'get_write_link', 'open_local_terminal', 'open_local_cli', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel', ...MODEL_SWITCH_CARD_ACTIONS].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     // activeSessions is keyed by sessionKey(anchor, larkAppId) — `${anchor}::${larkAppId}`
@@ -2487,6 +2490,21 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       });
     }
 
+    // ── Card-driven model switch (9 actions, all in the sensitive gate above) ──
+    if (isModelSwitchCardAction(actionType)) {
+      if (!ds || !larkAppId) return;
+      return handleModelSwitchCardAction({
+        ds,
+        operatorOpenId: data?.operator?.open_id,
+        rootId,
+        larkAppId,
+        value,
+        action: action as any,
+        sessionReply: (rid, content, msgType) => sessionReply(rid, content, msgType),
+        identity: defaultModelSwitchIdentityDeps(() => resolveCardOperatorUnionId(data, larkAppId)),
+      });
+    }
+
     if (actionType === 'close') {
       if (!ds) {
         // 会话已不在 activeSessions（已关过 / 卡片过期 / daemon 重启丢失）——点「关闭
@@ -2848,6 +2866,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           sessionRuntimeDisplayName(ds),
           codexServiceTierBadge(sessionCliId(ds), ds.codexServiceTier),
           isExternalChatSession(ds),
+          modelSwitchAllowedForSession(ds),
+          ds.modelPanel,
         );
         scheduleCardPatch(ds, cardJson);
       }
@@ -3173,6 +3193,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           locDs,
           isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
           sessionRuntimeDisplayName(ds),
+          isExternalChatSession(ds),
+          modelSwitchAllowedForSession(ds, effectiveCliId),
         );
         // 普通群发「仅自己可见」私密卡，话题群 / 单聊自动回退私聊 DM（两条通道都私密，
         // 不泄露写入 token）。fire-and-forget，保持卡片回调快速返回。
@@ -3194,6 +3216,19 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     // Display toggle: hidden ↔ screenshot. 'toggle_stream' is the legacy alias
     // from pre-screenshot cards and is mapped to toggle_display semantics.
     if (actionType === 'toggle_display' || actionType === 'toggle_stream') {
+      // Owner-only (2026-09-05 18:28): 「显示输出」 is operable by the bot owner
+      // alone (bots.json allowedUsers of THIS bot). Checked before ANY
+      // state change; other humans and bots get a toast and an unchanged card.
+      const toggleAppId = larkAppId ?? ds?.larkAppId;
+      const toggleOperator = toggleAppId ? await resolveCardOperatorUnionId(data, toggleAppId) : {};
+      if (!toggleOperator.unionId || !isCardOwnerOperator(toggleAppId, toggleOperator)) {
+        logger.info(`Card action "${actionType}" refused: operator ${operatorOpenId} is not a bot owner`);
+        return { toast: { type: 'warning', content: t('card.action.owner_only', undefined, localeForBot(toggleAppId)) } };
+      }
+      // 「显示输出」 and the v2 model picker are mutually exclusive expanded
+      // states: opening the output collapses the picker (and clears a transient
+      // failure line).
+      if (ds) collapseModelPanel(ds);
       if (!ds) {
         // 同 close：会话已不在线时「显示 / 隐藏输出」静默无反应 → 给失败 toast（成功不弹）。
         return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, localeForBot(larkAppId)) } };
@@ -3245,6 +3280,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
               sessionRuntimeDisplayName(ds),
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
               isExternalChatSession(ds),
+              modelSwitchAllowedForSession(ds),
+              ds.modelPanel,
             );
             updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
               logger.debug(`[${tag(ds)}] Failed to migrate unknown frozen card: ${err}`),
@@ -3292,6 +3329,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           sessionRuntimeDisplayName(ds),
           effectiveCliId === 'codex' ? frozen.codexServiceTierBadge : undefined,
           isExternalChatSession(ds),
+          modelSwitchAllowedForSession(ds),
+          ds.modelPanel,
         );
         updateMessage(ds.larkAppId, frozen.messageId, cardJson).catch(err =>
           logger.debug(`[${tag(ds)}] Failed to migrate frozen card: ${err}`),
@@ -3337,6 +3376,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           sessionRuntimeDisplayName(ds),
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
           isExternalChatSession(ds),
+          modelSwitchAllowedForSession(ds),
+          ds.modelPanel,
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -3407,6 +3448,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           sessionRuntimeDisplayName(ds),
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
           isExternalChatSession(ds),
+          modelSwitchAllowedForSession(ds),
+          ds.modelPanel,
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -3477,6 +3520,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           sessionRuntimeDisplayName(ds),
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
           isExternalChatSession(ds),
+          modelSwitchAllowedForSession(ds),
+          ds.modelPanel,
         );
         try { return JSON.parse(cardJson); } catch { /* fall through */ }
       }

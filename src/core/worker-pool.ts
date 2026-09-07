@@ -35,7 +35,10 @@ import {
 } from '../services/message-listener-run-preview-store.js';
 import { persistStreamCardState, rememberLastCliInput } from './session-manager.js';
 import { isExternalChatSession } from './external-chat.js';
+import { modelSwitchAllowedForSession } from './model-switch-surface.js';
+import { clearOffersForSession as clearModelSwitchOffersForSession } from './model-switch-offers.js';
 import { resolveSessionLaunchModel } from './session-model.js';
+import { prepareModelSwitch, validateModelSwitch, settleModelSwitch, applyRollbackInMemory, beginForceRollback, type PrepareRefusal, type ModelSwitchTxn, type SettleOutcome } from './model-switch.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, rehomeReplyTargetState, replyTargetKey } from './reply-target.js';
 import { updateMessage, deleteMessage, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, MessageWithdrawnError } from '../im/lark/client.js';
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, getCliDisplayName } from '../im/lark/card-builder.js';
@@ -959,6 +962,8 @@ function scheduleLocalCliOpenReadinessPatch(ds: DaemonSession): void {
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     isExternalChatSession(ds),
+    modelSwitchAllowedForSession(ds),
+    ds.modelPanel,
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1013,6 +1018,8 @@ function scheduleActiveRuntimePatch(ds: DaemonSession): void {
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     isExternalChatSession(ds),
+    modelSwitchAllowedForSession(ds),
+    ds.modelPanel,
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1066,6 +1073,8 @@ function scheduleCodexServiceTierPatch(ds: DaemonSession): void {
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     isExternalChatSession(ds),
+    modelSwitchAllowedForSession(ds),
+      ds.modelPanel,
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1145,6 +1154,8 @@ export function refreshStreamingCardUsage(ds: DaemonSession): void {
     // ⚡ badge until the next status-edge PATCH.
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     isExternalChatSession(ds),
+    modelSwitchAllowedForSession(ds),
+      ds.modelPanel,
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1228,6 +1239,8 @@ export function scheduleRiffAccessUrlPatch(ds: DaemonSession): void {
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     isExternalChatSession(ds),
+    modelSwitchAllowedForSession(ds),
+      ds.modelPanel,
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1501,19 +1514,36 @@ function sessionAgentConfig(
   recordLaunchModel(ds, model);
   // Effort is frozen per session, but whether it is *supported* depends on the
   // model this spawn actually uses — which is resolved live above, not frozen.
-  if (ds.session.reasoningEffort
-      && !cliModelSupportsReasoningEffort(ds.session.cliId, model, ds.session.reasoningEffort)) {
-    ds.session.reasoningEffort = undefined;
-    sessionStore.updateSession(ds.session);
-  }
+  // ONE persistent convergence point shared with the live-restart path
+  // (latestEffortForRespawn) — see convergeSessionEffort, which applies
+  // cliModelSupportsReasoningEffort(ds.session.cliId, model, ds.session.reasoningEffort).
+  const reasoningEffort = convergeSessionEffort(ds, model);
   return {
     cliId: ds.session.cliId ?? botCfg.cliId,
     cliRuntime: ds.session.cliRuntime,
     cliPathOverride: ds.session.cliPathOverride,
     wrapperCli: ds.session.wrapperCli,
     model,
-    reasoningEffort: ds.session.reasoningEffort,
+    reasoningEffort,
   };
+}
+
+/**
+ * The single daemon-side persistent convergence point for a session's effort
+ * (design rev16 §3.6.2): given the model THIS spawn resolves to, an effort the
+ * model cannot take is cleared (never silently downgraded) and persisted.
+ * Returns the effort to hand the CLI. Both the fork path (sessionAgentConfig)
+ * and the live-restart / parked-respawn path (latestEffortForRespawn) go
+ * through here, so there is exactly one implementation.
+ */
+export function convergeSessionEffort(ds: DaemonSession, resolvedModel: string | undefined): DaemonSession['session']['reasoningEffort'] {
+  const effort = ds.session.reasoningEffort;
+  if (effort && !cliModelSupportsReasoningEffort(ds.session.cliId, resolvedModel, effort)) {
+    ds.session.reasoningEffort = undefined;
+    sessionStore.updateSession(ds.session);
+    return undefined;
+  }
+  return effort;
 }
 
 
@@ -1824,6 +1854,8 @@ function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
     sessionRuntimeDisplayName(ds, bot.config),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     isExternalChatSession(ds),
+    modelSwitchAllowedForSession(ds),
+    ds.modelPanel,
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -2075,6 +2107,8 @@ function reconcilePostedStartingCard(ds: DaemonSession, turnId: string | undefin
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     isExternalChatSession(ds),
+    modelSwitchAllowedForSession(ds),
+    ds.modelPanel,
   );
   scheduleCardPatch(ds, cardJson, turnId);
 }
@@ -2140,6 +2174,8 @@ export async function postTurnStartingCard(
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     isExternalChatSession(ds),
+    modelSwitchAllowedForSession(ds),
+    ds.modelPanel,
   );
 
   ds.streamCardNonce = nonce;
@@ -2190,6 +2226,8 @@ export async function postTurnStartingCard(
     syncUsageRefreshTimer(ds);
     reconcilePostedStartingCard(ds, turnId, statusRevisionAtPost);
     logger.info(`[${tag(ds)}] Posted starting card for turn ${turnId.substring(0, 12)}`);
+    // The v2 model picker's transient failure line lives until the next turn.
+    if (ds.modelPanel?.kind === 'failed') { ds.modelPanelGen = (ds.modelPanelGen ?? 0) + 1; ds.modelPanel = undefined; }
     if (superseded && ds.streamCardPendingTurnId) {
       void postTurnStartingCard(ds, sessionReply, ds.streamCardPendingTurnId);
     }
@@ -2273,6 +2311,8 @@ export async function postFreshStreamingCard(
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     isExternalChatSession(ds),
+    modelSwitchAllowedForSession(ds),
+    ds.modelPanel,
   );
   ds.streamCardId = CARD_POSTING_SENTINEL;
   try {
@@ -2452,6 +2492,8 @@ export function buildWritableTerminalCard(ds: DaemonSession): string | null {
       localeForBot(ds.larkAppId),
       false,
       sessionRuntimeDisplayName(ds, botCfg),
+      isExternalChatSession(ds),
+      modelSwitchAllowedForSession(ds, effectiveCliId),
       );
   }
   const port = ds.workerPort ?? ds.session.webPort;
@@ -2469,6 +2511,8 @@ export function buildWritableTerminalCard(ds: DaemonSession): string | null {
     localeForBot(ds.larkAppId),
     isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
     sessionRuntimeDisplayName(ds, botCfg),
+    isExternalChatSession(ds),
+    modelSwitchAllowedForSession(ds, effectiveCliId),
   );
 }
 
@@ -2558,6 +2602,8 @@ function buildSubstituteControlCard(ds: DaemonSession): string | null {
     localeForBot(ds.larkAppId),
     isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
     sessionRuntimeDisplayName(ds, botCfg),
+    isExternalChatSession(ds),
+    modelSwitchAllowedForSession(ds, effectiveCliId),
   );
 }
 
@@ -3454,19 +3500,55 @@ export function latestModelForRespawn(ds: DaemonSession): string | null | undefi
   }
 }
 
+/**
+ * Effort mirror of latestModelForRespawn (design rev16 §3.6): the effort a
+ * live-worker restart / parked respawn should launch with, already converged
+ * against the model that spawn resolves to. Three-state like `model`:
+ * string = use it; null = explicitly none; undefined = unresolvable, keep the
+ * worker snapshot.
+ */
+export function latestEffortForRespawn(ds: DaemonSession): string | null | undefined {
+  try {
+    const model = resolveSessionLaunchModel(ds, getBot(ds.larkAppId).config);
+    return convergeSessionEffort(ds, model) ?? null;
+  } catch {
+    return undefined;
+  }
+}
+
+export interface SessionRestartOptions {
+  /** Bind the physical restart to a caller-chosen attempt id (model switch
+   *  transactions need the id BEFORE the restart is issued). */
+  attemptId?: string;
+  /** Start a fresh CLI thread instead of resuming (codex-app model switch). */
+  freshThread?: boolean;
+  /** Refuse instead of joining when a restart is already in flight. */
+  strict?: boolean;
+}
+
+export function activeSessionRestartAttemptId(ds: Pick<DaemonSession, 'session'>): string | undefined {
+  return restartCoordinator.activeAttemptId(ds.session.sessionId);
+}
+
 /** Join or start one correlated physical restart for a session. */
 export function requestSessionRestart(
   ds: DaemonSession,
   observer: RestartObserver,
+  opts: SessionRestartOptions = {},
 ): { attemptId: string; joined: boolean } | undefined {
   if (isSessionTransferring(ds)) {
     logger.warn(`[${tag(ds)}] Restart refused while routing transfer is in progress`);
     return undefined;
   }
+  if (opts.strict && restartCoordinator.activeAttemptId(ds.session.sessionId)) {
+    logger.warn(`[${tag(ds)}] Strict restart refused: another restart attempt is in flight`);
+    return undefined;
+  }
   return restartCoordinator.request(ds.session.sessionId, observer, attemptId => {
     if (ds.worker && !ds.worker.killed) {
       ds.workerReady = false;
-      ds.worker.send({ type: 'restart', attemptId, env: latestPerBotEnvForRestart(ds), model: latestModelForRespawn(ds) } as DaemonToWorker);
+      // Kept on one line: restart-live-worker-{env,model} scan every restart send.
+      ds.worker.send({ type: 'restart', attemptId, env: latestPerBotEnvForRestart(ds), model: latestModelForRespawn(ds), reasoningEffort: latestEffortForRespawn(ds), ...(opts.freshThread ? { freshThread: true as const } : {}) } as DaemonToWorker);
       return;
     }
     // No live worker but the persistent pane may still be alive (e.g. after a
@@ -3475,14 +3557,165 @@ export function requestSessionRestart(
     // successful restart.
     destroyLivePaneBeforeRestart(ds);
     forkWorker(ds, '', {
-      resume: ds.hasHistory,
+      // Both branches must agree on fresh-vs-resume, otherwise "is there a live
+      // worker" would decide whether a codex-app switch takes effect (§3.5).
+      resume: !opts.freshThread && ds.hasHistory,
       restartAttemptId: attemptId,
     });
-  });
+  }, { attemptId: opts.attemptId });
+}
+
+export type ModelSwitchRefusal =
+  | PrepareRefusal
+  | 'restart_in_flight'
+  | 'transferring'
+  | 'remote'
+  | 'adopt'
+  /** No live worker and the persistent pane is still alive / indeterminate:
+   *  a fork would REATTACH the old CLI and `succeeded` would be untruthful. */
+  | 'pane_alive'
+  | 'pane_unknown';
+
+/**
+ * A model switch must be a genuine relaunch. With no live worker the fork path
+ * may reattach a surviving persistent pane (see destroyLivePaneBeforeRestart,
+ * which deliberately tolerates that for plain restarts). For a switch that is
+ * unacceptable — the reattached CLI runs the OLD model yet reports succeeded —
+ * so kill first and only proceed when the pane is PROVEN gone.
+ */
+export function ensureFreshSpawnForSwitch(ds: DaemonSession): 'ok' | 'pane_alive' | 'pane_unknown' {
+  if (ds.worker && !ds.worker.killed) return 'ok';
+  if (!shouldDestroyPaneBeforeRestart(ds)) return 'ok';
+  const target = persistentBackendTargetForSession(ds);
+  if (!target) return 'ok';
+  const kill = (): void => {
+    try { killPersistentBackendTarget(target, ds.session.sessionId); } catch { /* probe decides */ }
+  };
+  kill();
+  let probe = probePersistentBackendTarget(target);
+  if (probe === 'exists') { kill(); probe = probePersistentBackendTarget(target); }
+  if (probe === 'missing') return 'ok';
+  return probe === 'exists' ? 'pane_alive' : 'pane_unknown';
+}
+
+export type ModelSwitchRequestResult =
+  | { ok: true; attemptId: string; txn: ModelSwitchTxn }
+  | { ok: false; reason: ModelSwitchRefusal };
+
+export type ForceRollbackResult =
+  | { ok: true; attemptId: string; txn: ModelSwitchTxn }
+  | { ok: false; reason: 'no_txn' | 'restart_in_flight' | 'transferring' | 'pane_alive' | 'pane_unknown' };
+
+/**
+ * Force-rollback an `ambiguous` switch. The record is restored ONLY once the
+ * convergence restart has been accepted by the coordinator, and the
+ * transaction stays (state `rolling_back`) until that attempt reports
+ * `succeeded`; a refusal leaves record and transaction exactly as they were.
+ */
+export function requestModelSwitchForceRollback(
+  ds: DaemonSession,
+  observer: RestartObserver & { onSettled?: (outcome: SettleOutcome, txn: ModelSwitchTxn) => void | Promise<void> },
+): ForceRollbackResult {
+  const txn = ds.session.modelSwitchTxn;
+  if (!txn || txn.state !== 'ambiguous') return { ok: false, reason: 'no_txn' };
+  if (isSessionTransferring(ds)) return { ok: false, reason: 'transferring' };
+  if (restartCoordinator.activeAttemptId(ds.session.sessionId)) return { ok: false, reason: 'restart_in_flight' };
+  const fresh = ensureFreshSpawnForSwitch(ds);
+  if (fresh !== 'ok') return { ok: false, reason: fresh };
+  const attemptId = randomBytes(12).toString('hex');
+  // Preconditions are all synchronous and just verified, so the request below
+  // is accepted under our id; restore the record first so the restart IPC
+  // carries the restored model/effort.
+  const snapshot = { model: ds.session.model, reasoningEffort: ds.session.reasoningEffort, pin: ds.session.modelPin, state: txn.state, attemptId: txn.attemptId };
+  beginForceRollback(ds.session, attemptId);
+  const settle = (status: 'succeeded' | 'failed' | 'timed_out'): void | Promise<void> => {
+    const outcome = settleModelSwitch(ds.session, attemptId, status);
+    if (outcome === 'ignored') return;
+    sessionStore.updateSession(ds.session);
+    logger.info(`[${tag(ds)}] model switch ${txn.txnId} force-rollback ${outcome} (restart ${status})`);
+    return observer.onSettled?.(outcome, txn);
+  };
+  const result = requestSessionRestart(ds, {
+    source: observer.source,
+    notify: async status => {
+      if (status === 'succeeded' || status === 'failed' || status === 'timed_out') await settle(status);
+      await observer.notify(status);
+    },
+  }, { attemptId, strict: true, freshThread: txn.freshThread });
+  if (!result || result.joined || result.attemptId !== attemptId) {
+    // Not issued under our id: undo the in-memory restore, keep ambiguous.
+    ds.session.model = snapshot.model;
+    ds.session.reasoningEffort = snapshot.reasoningEffort;
+    ds.session.modelPin = snapshot.pin;
+    txn.state = 'ambiguous';
+    txn.attemptId = snapshot.attemptId;
+    return { ok: false, reason: !result ? 'transferring' : 'restart_in_flight' };
+  }
+  sessionStore.updateSession(ds.session);
+  return { ok: true, attemptId, txn };
+}
+
+/**
+ * Card-driven model switch (design rev16 §7, v1 subset): pin the target on the
+ * session, bind a transaction to ONE restart attempt, issue that restart in
+ * strict mode, and settle the transaction from the coordinator's terminal
+ * status for exactly that attempt. `succeeded` commits, `failed` rolls back,
+ * `timed_out` freezes the session in `ambiguous` (no automatic rollback).
+ */
+export function requestModelSwitchRestart(
+  ds: DaemonSession,
+  target: { model?: string; effort?: string; setBy: string },
+  observer: RestartObserver & { onSettled?: (outcome: SettleOutcome, txn: ModelSwitchTxn) => void | Promise<void> },
+): ModelSwitchRequestResult {
+  if (isSharedAdoptSession(ds)) return { ok: false, reason: 'adopt' };
+  if (isRemoteBackendSession(ds)) return { ok: false, reason: 'remote' };
+  if (isSessionTransferring(ds)) return { ok: false, reason: 'transferring' };
+  if (restartCoordinator.activeAttemptId(ds.session.sessionId)) return { ok: false, reason: 'restart_in_flight' };
+  // Every NON-destructive refusal (state / capability / effort domain) comes
+  // BEFORE the persistent-pane teardown: a request that cannot enter a
+  // transaction must leave the external CLI pane untouched.
+  const valid = validateModelSwitch(ds.session, target);
+  if (!valid.ok) return valid;
+  const fresh = ensureFreshSpawnForSwitch(ds);
+  if (fresh !== 'ok') {
+    logger.warn(`[${tag(ds)}] model switch refused: persistent pane ${fresh === 'pane_alive' ? 'still alive' : 'indeterminate'} with no live worker`);
+    return { ok: false, reason: fresh };
+  }
+  const attemptId = randomBytes(12).toString('hex');
+  const prepared = prepareModelSwitch(ds.session, { ...target, attemptId });
+  if (!prepared.ok) return prepared;
+  const { txn } = prepared;
+  sessionStore.updateSession(ds.session);
+  const settle = (status: 'succeeded' | 'failed' | 'timed_out'): void | Promise<void> => {
+    const outcome = settleModelSwitch(ds.session, attemptId, status);
+    if (outcome === 'ignored') return;
+    sessionStore.updateSession(ds.session);
+    logger.info(`[${tag(ds)}] model switch ${txn.txnId} ${outcome} (restart ${status}) target=${JSON.stringify(txn.target)}`);
+    return observer.onSettled?.(outcome, txn);
+  };
+  const result = requestSessionRestart(ds, {
+    source: observer.source,
+    notify: async status => {
+      if (status === 'succeeded' || status === 'failed' || status === 'timed_out') await settle(status);
+      await observer.notify(status);
+    },
+  }, { attemptId, strict: true, freshThread: txn.freshThread });
+  if (!result || result.joined || result.attemptId !== attemptId) {
+    // The restart was not issued under our attempt id: undo the pin right away.
+    applyRollbackInMemory(ds.session, txn);
+    sessionStore.updateSession(ds.session);
+    return { ok: false, reason: !result ? 'transferring' : 'restart_in_flight' };
+  }
+  return { ok: true, attemptId, txn };
 }
 
 export function __testOnly_resetRestartCoordinator(): void {
   restartCoordinator.reset();
+}
+
+/** Test seam: resolve a restart attempt exactly as the `restart_result` IPC handler does. */
+export function __testOnly_resolveRestart(sessionId: string, attemptId: string, status: 'succeeded' | 'failed' | 'timed_out'): boolean {
+  return restartCoordinator.resolve(sessionId, attemptId, status);
 }
 
 /**
@@ -5392,6 +5625,8 @@ export function buildStreamingCardJson(ds: DaemonSession, status?: StreamStatus)
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     isExternalChatSession(ds),
+    modelSwitchAllowedForSession(ds),
+    ds.modelPanel,
   );
 }
 
@@ -5511,6 +5746,10 @@ export async function closeSession(
   const awaitWorkerExit = opts?.awaitWorkerExit ?? true;
   const ds = findActiveBySessionId(sessionId);
   const stored = sessionStore.getOwnedSession(sessionId);
+  // A closing session must leave nothing confirmable behind (card model switch).
+  for (const appId of new Set([ds?.larkAppId, stored?.larkAppId].filter((x): x is string => !!x))) {
+    clearModelSwitchOffersForSession(appId, sessionId);
+  }
   const closeFrozenBackendType = ds?.initConfig?.backendType
     ?? ds?.session.backendType ?? stored?.backendType;
   const isOwnedClose = !(ds && isSharedAdoptSession(ds))
@@ -8231,6 +8470,7 @@ export function sendWorkerInput(
     // itself. Only while parked: an ordinary turn changes no launch config, and
     // an unconditional field would be pure noise on every message.
     ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds) } : {}),
+    ...(ds.crashDiagnosticParked ? { reasoningEffort: latestEffortForRespawn(ds) } : {}),
     ...(codexAppInput ? { codexAppInput } : {}),
     ...(nativeSessionTitle ? { nativeSessionTitle } : {}),
     ...(nativeSessionTitlePrompt ? { nativeSessionTitlePrompt } : {}),
@@ -8609,6 +8849,7 @@ export function promoteQueuedActivationTail(
       content: exactInput.content,
       // Same parked-worker launch-snapshot refresh as the ordinary send.
       ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds) } : {}),
+    ...(ds.crashDiagnosticParked ? { reasoningEffort: latestEffortForRespawn(ds) } : {}),
       ...(codexAppInput ? { codexAppInput } : {}),
       turnId: head.turnId,
       ...(head.dispatchAttempt !== undefined
@@ -10420,6 +10661,8 @@ function setupWorkerHandlers(
               sessionRuntimeDisplayName(ds, botCfg),
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
               isExternalChatSession(ds),
+              modelSwitchAllowedForSession(ds),
+              ds.modelPanel,
             );
             await updateMessage(ds.larkAppId, restoredCardId, streamCardJson);
             if (!ownsLifecycleMutation()) break;
@@ -10501,6 +10744,8 @@ function setupWorkerHandlers(
             sessionRuntimeDisplayName(ds, botCfg),
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
             isExternalChatSession(ds),
+            modelSwitchAllowedForSession(ds),
+            ds.modelPanel,
           );
           const postedCardId = await scopedReply(
             streamCardJson, 'interactive', cardReplyTarget.turnId,
@@ -10571,6 +10816,7 @@ function setupWorkerHandlers(
               localCliReadyAtBuild,
               sessionRuntimeDisplayName(ds, botCfg),
               isExternalChatSession(ds),
+              modelSwitchAllowedForSession(ds),
             );
             const fallbackCardId = await scopedReply(cardJson, 'interactive', msg.turnId);
             if (!ownsLifecycleMutation()) {
@@ -10591,6 +10837,7 @@ function setupWorkerHandlers(
                 true,
                 sessionRuntimeDisplayName(ds, botCfg),
                 isExternalChatSession(ds),
+                modelSwitchAllowedForSession(ds),
               );
               try {
                 await updateMessage(ds.larkAppId, fallbackCardId, readyCardJson);
@@ -10614,6 +10861,17 @@ function setupWorkerHandlers(
       case 'prompt_ready': {
         if (ds.worker !== worker) break;
         logger.info(`[${t}] ${sessionCliDisplayName(ds, botCfg)} is ready for input`);
+        // An IN-PLACE CLI restart (restart IPC: /restart, card restart, model
+        // switch, crash auto-restart) flips `workerReady=false` to gate the UI
+        // while the CLI is down, but the worker never re-emits `ready` (that
+        // is init-only), so nothing turned it back on: every surface gated by
+        // workerHasInitialized — 显示输出 toggle, screenshot patches, export,
+        // private snapshot… — stayed dead until the next fork. A live prompt
+        // from the CURRENT worker is exactly the "worker is back" signal.
+        if (ds.workerReady === false) {
+          ds.workerReady = true;
+          logger.info(`[${t}] workerReady restored after in-place restart (prompt_ready)`);
+        }
         // A live prompt means a (re)spawn reached a working CLI — clear the lazy
         // cold-resume marker set when we parked a crash diagnostic shell. The
         // common retry path respawns IN-PLACE (worker.ts case 'message'), not via
@@ -10690,6 +10948,12 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Ignored restart_result from stale worker generation`);
           break;
         }
+        // Same restore as prompt_ready (belt and braces): a succeeded in-place
+        // restart means the current worker has a live CLI again.
+        if (msg.status === 'succeeded' && ds.workerReady === false) {
+          ds.workerReady = true;
+          logger.info(`[${t}] workerReady restored after in-place restart (restart_result)`);
+        }
         restartCoordinator.resolve(ds.session.sessionId, msg.attemptId, msg.status);
         break;
       }
@@ -10720,6 +10984,8 @@ function setupWorkerHandlers(
             sessionRuntimeDisplayName(ds, botCfg),
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
             isExternalChatSession(ds),
+            modelSwitchAllowedForSession(ds),
+            ds.modelPanel,
           );
           scheduleCardPatch(ds, cardJson);
         }
@@ -10965,6 +11231,8 @@ function setupWorkerHandlers(
             sessionRuntimeDisplayName(ds, botCfg),
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
             isExternalChatSession(ds),
+            modelSwitchAllowedForSession(ds),
+            ds.modelPanel,
           );
           // Mark POST in-flight so subsequent screen_updates are dropped,
           // not POSTed as duplicate cards.
@@ -11048,6 +11316,8 @@ function setupWorkerHandlers(
             sessionRuntimeDisplayName(ds, botCfg),
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
             isExternalChatSession(ds),
+            modelSwitchAllowedForSession(ds),
+            ds.modelPanel,
           );
           scheduleCardPatch(ds, cardJson, msg.turnId);
           // Keep the live usage climbing during a long working phase; stop once
@@ -11123,6 +11393,8 @@ function setupWorkerHandlers(
           sessionRuntimeDisplayName(ds, botCfg),
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
           isExternalChatSession(ds),
+          modelSwitchAllowedForSession(ds),
+          ds.modelPanel,
         );
         scheduleCardPatch(ds, cardJson);
         break;
@@ -11533,6 +11805,8 @@ function setupWorkerHandlers(
               sessionRuntimeDisplayName(ds, botCfg),
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
               isExternalChatSession(ds),
+              modelSwitchAllowedForSession(ds),
+              ds.modelPanel,
             );
             scheduleCardPatch(ds, frozenCard);
           }
@@ -11605,6 +11879,8 @@ function setupWorkerHandlers(
               sessionRuntimeDisplayName(ds, botCfg),
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
               isExternalChatSession(ds),
+              modelSwitchAllowedForSession(ds),
+              ds.modelPanel,
             );
             scheduleCardPatch(ds, frozenCard);
           }

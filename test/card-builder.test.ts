@@ -2211,3 +2211,60 @@ describe('streaming card 运行时行：Claude 系用 verified identity，codex 
     expect(json).toContain('xhigh');
   });
 });
+
+// ─── v2 in-card model picker (streaming card states) ───────────────────────
+describe('buildStreamingCard v2 model picker panel', () => {
+  const build = (panel: any, allowed = true, cli: any = 'codex') =>
+    JSON.parse(buildStreamingCard('s', 'r', 'http://t', 'T', '', 'idle', cli, 'hidden', 'n', undefined, false, false, 'zh', undefined, undefined, false, undefined, undefined, undefined, false, allowed, panel));
+  const buttons = (card: any) => card.elements.filter((e: any) => e.tag === 'action').flatMap((e: any) => e.actions);
+  const labels = (card: any) => buttons(card).map((b: any) => b.text?.content);
+  it('collapsed: 「选择模型」 sits right after 「显示输出」 only when proven', () => {
+    const l = labels(build(undefined));
+    expect(l[0]).toMatch(/显示输出/);
+    expect(l[1]).toMatch(/选择模型/);
+    expect(labels(build(undefined, false)).some((x: string) => /选择模型/.test(x))).toBe(false);
+  });
+  it('list: first button is 「退出选择」, output toggle gone, candidates ✔ current, effort row, refresh', () => {
+    const card = build({ kind: 'list', menuId: 'm', models: ['gpt-5.5', 'gpt-5.6-sol'], source: 'live', efforts: ['low', 'high'], currentModel: 'gpt-5.5', currentEffort: 'high', freshThread: false, restartInFlight: false });
+    const l = labels(card);
+    expect(l[0]).toMatch(/退出选择/);
+    expect(l.some((x: string) => /显示输出|隐藏输出|选择模型/.test(x))).toBe(false);
+    expect(l).toContain('✔ gpt-5.5'); expect(l).toContain('gpt-5.6-sol'); expect(l).toContain('✔ high'); expect(l).toContain('low');
+    const pick = buttons(card).find((b: any) => b.value?.action === 'model_pick' && b.value.model === 'gpt-5.6-sol');
+    expect(pick.value.menu_id).toBe('m');
+    expect(buttons(card).some((b: any) => b.value?.action === 'model_menu_refresh')).toBe(true);
+    expect(l.some((x: string) => /关闭会话/.test(x))).toBe(true);   // bottom row kept
+  });
+  it('list with a restart in flight disables candidate buttons and says so', () => {
+    const card = build({ kind: 'list', menuId: 'm', models: ['gpt-5.5'], source: 'static', efforts: [], currentModel: null, freshThread: false, restartInFlight: true });
+    expect(buttons(card).find((b: any) => b.value?.action === 'model_pick').disabled).toBe(true);
+    expect(JSON.stringify(card)).toMatch(/重启正在进行/);
+  });
+  it('confirm: 确认切换 carries the offer id as menu_id; 取消 returns to the list', () => {
+    const card = build({ kind: 'confirm', menuId: 'm', offerId: 'deadbeefdeadbeef', target: { model: 'gpt-5.6-sol', effort: 'high' }, reason: 'fresh' });
+    const ok = buttons(card).find((b: any) => b.value?.action === 'model_pick_confirm');
+    expect(ok.value).toMatchObject({ model: 'gpt-5.6-sol', effort: 'high', menu_id: 'deadbeefdeadbeef' });
+    expect(buttons(card).some((b: any) => b.value?.action === 'model_menu_open')).toBe(true);
+    expect(JSON.stringify(card)).toMatch(/新线程/);
+  });
+  it('switching: first button disabled 「切换中…」, no picks', () => {
+    const card = build({ kind: 'switching', menuId: 'm', target: { model: 'gpt-5.6-sol' }, attemptId: 'A' });
+    expect(buttons(card)[0].disabled).toBe(true);
+    expect(buttons(card).some((b: any) => b.value?.action === 'model_pick')).toBe(false);
+  });
+  it('failed: plain main card plus one failure line', () => {
+    const card = build({ kind: 'failed', menuId: 'm', target: { model: 'gpt-5.6-sol' }, reason: 'boom' });
+    expect(labels(card)[0]).toMatch(/显示输出/);
+    expect(labels(card)[1]).toMatch(/选择模型/);
+    expect(JSON.stringify(card)).toMatch(/失败.*boom/);
+  });
+  it('ambiguous: recheck / force-rollback buttons', () => {
+    const card = build({ kind: 'ambiguous', menuId: 'm', target: { model: 'gpt-5.6-sol' } });
+    const acts = buttons(card).map((b: any) => b.value?.action);
+    expect(acts).toContain('model_txn_recheck'); expect(acts).toContain('model_txn_force_rollback');
+  });
+  it('external chat renders no picker at all even with a panel', () => {
+    const card = JSON.parse(buildStreamingCard('s', 'r', 'http://t', 'T', '', 'idle', 'codex', 'hidden', 'n', undefined, false, false, 'zh', undefined, undefined, false, undefined, undefined, undefined, true, true, { kind: 'list', menuId: 'm', models: ['x'], source: 'static', efforts: [], currentModel: null, freshThread: false, restartInFlight: false }));
+    expect(JSON.stringify(card)).not.toMatch(/model_pick|退出选择|选择模型/);
+  });
+});

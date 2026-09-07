@@ -1,4 +1,6 @@
 import { isRemoteCliId } from '../../core/remote-cli-ids.js';
+import { cliSupportsModelSwitch } from '../../core/model-switch.js';
+import type { ModelPanelState } from '../../core/model-switch-panel.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import type { CliId, ResumableSession } from '../../adapters/cli/types.js';
 import { adoptTargetKey, adoptTargetLabel, type AdoptableSession } from '../../core/session-discovery.js';
@@ -413,6 +415,9 @@ export function buildSessionCard(
   localCliReady = false,
   runtimeDisplayName?: string,
   externalChat = false,
+  /** Kept for call-site symmetry with buildStreamingCard; the v2 picker lives
+   *  only on the main streaming card, so the session card renders no model button. */
+  _modelSwitchAllowed = false,
 ): string {
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(cliId ?? 'claude-code');
   const effectiveCliId = cliId ?? 'claude-code';
@@ -961,6 +966,11 @@ export function buildStreamingCard(
   runtimeDisplayName?: string,
   serviceTierBadge?: string,
   externalChat = false,
+  /** Caller-proven surface verdict (core/model-switch-surface.ts); default
+   *  false = never render the model button unless the call site proved it. */
+  modelSwitchAllowed = false,
+  /** In-card model picker state (v2). undefined = collapsed. */
+  modelPanel?: ModelPanelState,
 ): string {
   const effectiveCliId = cliId ?? 'claude-code';
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(effectiveCliId);
@@ -975,12 +985,29 @@ export function buildStreamingCard(
   // ── Main control row: display toggle, mode toggle, terminal, manage ─────
   const headerActions: any[] = [];
 
-  if (!externalChat) headerActions.push({
+  // v2 model picker: an expanded panel REPLACES the output toggle as the first
+  // button (「退出选择」) — the two expanded states are mutually exclusive.
+  const panelOpen = !!modelPanel && modelPanel.kind !== 'failed';
+  if (!externalChat && panelOpen && modelPanel) {
+    headerActions.push(modelPanel.kind === 'switching'
+      ? { tag: 'button', text: { tag: 'plain_text', content: t('card.model.btn_switching', undefined, locale) }, type: 'default' as const, disabled: true, value: { action: 'model_menu_close', ...actionBase } }
+      : { tag: 'button', text: { tag: 'plain_text', content: t('card.model.btn_exit_select', undefined, locale) }, type: 'default' as const, value: { action: 'model_menu_close', ...actionBase } });
+  } else if (!externalChat) headerActions.push({
     tag: 'button',
     text: { tag: 'plain_text', content: t(displayMode === 'hidden' ? 'card.btn.show_output' : 'card.btn.hide_output', undefined, locale) },
     type: 'default' as const,
     value: { action: 'toggle_display', ...actionBase },
   });
+  // 「选择模型」 sits right under/after 「显示输出」 (owner spec) — only when
+  // the picker is collapsed and the surface is proven.
+  if (!externalChat && !panelOpen && modelSwitchAllowed && !adoptMode && !isRemoteCliId(effectiveCliId) && cliSupportsModelSwitch(effectiveCliId)) {
+    headerActions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.btn.model_switch', undefined, locale) },
+      type: 'default' as const,
+      value: { action: 'model_menu_open', ...actionBase },
+    });
+  }
   if (!externalChat && displayMode !== 'hidden') {
     headerActions.push({
       tag: 'button',
@@ -1049,6 +1076,9 @@ export function buildStreamingCard(
     });
   }
   if (headerActions.length > 0) elements.push({ tag: 'action', actions: headerActions });
+
+  // ── v2 model picker panel (in-card, below the control row) ───────────────
+  if (!externalChat && modelPanel) pushModelPanel(elements, modelPanel, actionBase, effectiveCliId, locale);
 
   // ── Writable terminal link (opt-in) ─────────────────────────────────────
   // When the bot enables `writableTerminalLinkInCard`, embed the token-bearing
@@ -2739,4 +2769,78 @@ export function buildCodexAppThreadSelectCard(threads: CodexAppThreadSummary[], 
     ],
   };
   return JSON.stringify(card);
+}
+
+
+// ─── Card-driven model switch (design card-model-switch-s1 rev16, v1) ────────
+
+/** Render the expanded model picker states inside the main streaming card. */
+export function pushModelPanel(
+  elements: any[],
+  p: ModelPanelState,
+  actionBase: Record<string, unknown>,
+  cliId: CliId,
+  locale?: Locale,
+): void {
+  const base = { ...actionBase, menu_id: p.menuId };
+  const label = (tg: { model?: string; effort?: string }) => `${tg.model ?? t('card.model.cli_default', undefined, locale)}${tg.effort ? ` · ${tg.effort}` : ''}`;
+  const md = (content: string) => elements.push({ tag: 'div', text: { tag: 'lark_md', content } });
+  switch (p.kind) {
+    case 'list': {
+      const lines: string[] = [];
+      lines.push(t(p.source === 'live' ? 'card.model.candidates_live' : p.source === 'static' ? 'card.model.candidates_static' : 'card.model.no_candidates', undefined, locale));
+      if (p.freshThread) lines.push(t('card.model.fresh_thread_note', undefined, locale));
+      if (p.restartInFlight) lines.push(t('card.model.restart_in_flight_note', undefined, locale));
+      if (p.note) lines.push(p.note);
+      md(lines.join('\n'));
+      const rows = p.models.slice(0, 16);
+      for (let i = 0; i < rows.length; i += 4) {
+        elements.push({ tag: 'action', actions: rows.slice(i, i + 4).map(m => ({
+          tag: 'button',
+          text: { tag: 'plain_text', content: m === p.currentModel ? `✔ ${m}` : m },
+          type: m === p.currentModel ? 'primary' : 'default',
+          ...(p.restartInFlight ? { disabled: true } : {}),
+          value: { action: 'model_pick', model: m, ...base },
+        })) });
+      }
+      if (p.efforts.length > 0) {
+        md(t('card.model.effort_title', undefined, locale));
+        elements.push({ tag: 'action', actions: p.efforts.map(e => ({
+          tag: 'button',
+          text: { tag: 'plain_text', content: e === p.currentEffort ? `✔ ${e}` : e },
+          type: e === p.currentEffort ? 'primary' : 'default',
+          ...(p.restartInFlight ? { disabled: true } : {}),
+          value: { action: 'effort_pick', effort: e, ...base },
+        })) });
+      }
+      elements.push({ tag: 'action', actions: [
+        { tag: 'button', text: { tag: 'plain_text', content: t('card.model.btn_refresh', undefined, locale) }, type: 'default', value: { action: 'model_menu_refresh', ...base } },
+      ] });
+      break;
+    }
+    case 'confirm': {
+      const key = p.reason === 'fresh' ? 'card.model.confirm_fresh_inline' : p.reason === 'busy' ? 'card.model.confirm_busy_inline' : 'card.model.confirm_plain_inline';
+      md(t(key, { target: escapeMd(label(p.target)) }, locale));
+      elements.push({ tag: 'action', actions: [
+        { tag: 'button', text: { tag: 'plain_text', content: t('card.model.btn_confirm', undefined, locale) }, type: 'primary',
+          value: { action: 'model_pick_confirm', ...(p.target.model !== undefined ? { model: p.target.model } : {}), ...(p.target.effort !== undefined ? { effort: p.target.effort } : {}), ...actionBase, menu_id: p.offerId } },
+        { tag: 'button', text: { tag: 'plain_text', content: t('card.model.btn_cancel', undefined, locale) }, type: 'default', value: { action: 'model_menu_open', ...base } },
+      ] });
+      break;
+    }
+    case 'switching':
+      md(t('card.model.switching', { target: escapeMd(label(p.target)) }, locale));
+      break;
+    case 'failed':
+      md(t('card.model.failed_inline', { target: escapeMd(label(p.target)), reason: escapeMd(p.reason) }, locale));
+      break;
+    case 'ambiguous':
+      md(t('card.model.ambiguous', { target: escapeMd(label(p.target)) }, locale));
+      elements.push({ tag: 'action', actions: [
+        { tag: 'button', text: { tag: 'plain_text', content: t('card.model.btn_recheck', undefined, locale) }, type: 'primary', value: { action: 'model_txn_recheck', ...base } },
+        { tag: 'button', text: { tag: 'plain_text', content: t('card.model.btn_force_rollback', undefined, locale) }, type: 'danger', value: { action: 'model_txn_force_rollback', ...base } },
+      ] });
+      break;
+  }
+  void cliId;
 }

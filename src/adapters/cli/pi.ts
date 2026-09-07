@@ -1,3 +1,5 @@
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { preparePiInitialPromptArg } from './pi-initial-prompt.js';
@@ -81,6 +83,27 @@ export function createPiAdapter(pathOverride?: string): CliAdapter {
     authPaths: ['~/.pi/agent/auth.json'],
     resolvedBin: bin,
 
+    /** `pi --list-models` prints a table of the models whose provider keys are
+     *  present in the environment (verified on pi 0.84.4: header
+     *  `provider  model  context  max-out  thinking  images`, rows
+     *  `deepseek  deepseek-v4-flash  …`). Without the key it prints
+     *  "No models available" → null. Fail-soft per the CliAdapter contract. */
+    async detectModels(opts): Promise<readonly string[] | null> {
+      try {
+        const execFileAsync = promisify(execFile);
+        const { stdout } = await execFileAsync(this.resolvedBin, ['--list-models'], {
+          timeout: 8000,
+          maxBuffer: 4 * 1024 * 1024,
+          windowsHide: true,
+          env: { ...process.env, ...(opts?.env ?? {}) },
+        });
+        const models = parsePiListModels(stdout);
+        return models.length > 0 ? models : null;
+      } catch {
+        return null;
+      }
+    },
+
     buildArgs({ sessionId, initialPrompt, model }) {
       const args = [
         '--session-id', sessionId,
@@ -149,3 +172,26 @@ export function createPiAdapter(pathOverride?: string): CliAdapter {
 }
 
 export const create = createPiAdapter;
+
+
+/** Parse `pi --list-models` table output into `provider/model` ids. Pure,
+ *  exported for tests. Skips the header, blank lines and anything that is not
+ *  a two-token-prefixed row. */
+export function parsePiListModels(stdout: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of stdout.split(/\r?\n/)) {
+    const line = raw.replace(/\x1b\[[0-9;]*m/g, '').trim();
+    if (!line) continue;
+    const cols = line.split(/\s{2,}|\t/).map(c => c.trim()).filter(Boolean);
+    if (cols.length < 2) continue;
+    const [provider, model] = cols;
+    if (provider.toLowerCase() === 'provider' && model.toLowerCase() === 'model') continue;
+    if (!/^[a-z0-9][a-z0-9._-]*$/i.test(provider) || !/^[a-z0-9][a-z0-9._:/-]*$/i.test(model)) continue;
+    const id = `${provider}/${model}`;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
+}

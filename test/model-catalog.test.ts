@@ -214,3 +214,43 @@ describe('buildModelChoicesResponse（端点 200 响应体构造）', () => {
     expect(body.detectedAt).toBe(99_000);
   });
 });
+
+// ─── P1-6: per-bot/env scope + real force semantics ────────────────────────
+describe('detectModels scope + force (card model switch)', () => {
+  it('different env → different probe (no cross-bot candidate reuse); same env → cache hit', async () => {
+    const { createModelCatalog } = await import('../src/services/model-catalog.js');
+    const catalog = createModelCatalog();
+    let calls = 0;
+    const factory = () => ({ detectModels: async (o?: { env?: Record<string, string> }) => { calls++; return [o?.env?.KEY ?? 'none']; } }) as any;
+    let now = 1_000_000;
+    const A = await catalog.detectModels('codex', { adapterFactory: factory, env: { KEY: 'a' }, now: () => now });
+    const B = await catalog.detectModels('codex', { adapterFactory: factory, env: { KEY: 'b' }, now: () => now });
+    expect(A).toEqual(['a']); expect(B).toEqual(['b']); expect(calls).toBe(2);
+    const A2 = await catalog.detectModels('codex', { adapterFactory: factory, env: { KEY: 'a' }, now: () => now });
+    expect(A2).toEqual(['a']); expect(calls).toBe(2);
+  });
+  it('force skips the cache every time, then a normal lookup hits the freshly written entry', async () => {
+    const { createModelCatalog, MODEL_DETECT_TTL_MS } = await import('../src/services/model-catalog.js');
+    const catalog = createModelCatalog();
+    let calls = 0;
+    const factory = () => ({ detectModels: async () => { calls++; return [`m${calls}`]; } }) as any;
+    let now = 1_000_000;
+    expect(await catalog.detectModels('codex', { adapterFactory: factory, now: () => now })).toEqual(['m1']);
+    expect(await catalog.detectModels('codex', { adapterFactory: factory, now: () => now, force: true })).toEqual(['m2']);
+    expect(await catalog.detectModels('codex', { adapterFactory: factory, now: () => now, force: true })).toEqual(['m3']);
+    expect(calls).toBe(3);
+    // normal lookup right after → the forced result, no new probe
+    expect(await catalog.detectModels('codex', { adapterFactory: factory, now: () => now })).toEqual(['m3']);
+    expect(calls).toBe(3);
+    // the forced write used the REAL completion time: TTL still expires normally
+    now += MODEL_DETECT_TTL_MS + 1;
+    expect(await catalog.detectModels('codex', { adapterFactory: factory, now: () => now })).toEqual(['m4']);
+  });
+  it('cache key never embeds env values', async () => {
+    const { detectCacheKey } = await import('../src/services/model-catalog.js');
+    const k = detectCacheKey('pi', { env: { DEEPSEEK_API_KEY: 'sk-secret-value' }, scope: 'app1' });
+    expect(k).not.toContain('sk-secret');
+    expect(k).toMatch(/^pi::s=app1;e=[0-9a-f]{16}$/);
+    expect(detectCacheKey('pi')).toBe('pi');
+  });
+});
