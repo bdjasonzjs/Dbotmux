@@ -83,7 +83,7 @@ const QUOTA_CURRENCY_SYMBOLS: Readonly<Record<string, string>> = {
 };
 
 /** Format the account quota as one compact segment (`余额 ¥472.34` /
- *  `周额度剩 92%`). Returns null for a missing or malformed quota so the caller
+ *  `周额度剩 92%` / `共享 AFP 剩 8.8K/10K(5h) / …`). Returns null for a missing or malformed quota so the caller
  *  omits it like any other missing metric. */
 export function cardQuotaSegment(
   quota: ProviderQuota | null | undefined,
@@ -103,6 +103,19 @@ export function cardQuotaSegment(
     && isNonNegativeFinite(quota.remainingPercent) && quota.remainingPercent <= 100) {
     const pct = Math.round(quota.remainingPercent);
     return `${t('card.usage.weekly_left', undefined, locale)} ${pct}%`;
+  }
+  if (quota.kind === 'afp') {
+    const normalized = normalizeProviderQuota(quota);
+    if (!normalized || normalized.kind !== 'afp') return null;
+    const labels: Record<(typeof normalized.windows)[number]['window'], string> = {
+      five_hour: '5h',
+      weekly: locale === 'en' ? 'week' : '周',
+      monthly: locale === 'en' ? 'month' : '月',
+    };
+    const windows = normalized.windows.map(window => (
+      `${compactTokenCount(window.remaining)}/${compactTokenCount(window.quota)}(${labels[window.window]})`
+    ));
+    return `${t('card.usage.shared_afp_left', undefined, locale)} ${windows.join(' / ')}`;
   }
   return null;
 }
@@ -129,6 +142,32 @@ export function normalizeProviderQuota(value: unknown): ProviderQuota | null {
       remainingPercent: raw.remainingPercent,
       ...(isNonNegativeFinite(raw.resetsAt) ? { resetsAt: raw.resetsAt } : {}),
     };
+  }
+  if (raw.kind === 'afp') {
+    if (raw.shared !== true || !Array.isArray(raw.windows) || raw.windows.length !== 3) return null;
+    const expected = ['five_hour', 'weekly', 'monthly'] as const;
+    const windows: Extract<ProviderQuota, { kind: 'afp' }>['windows'] = [];
+    for (const windowName of expected) {
+      const item = raw.windows.find(value => (
+        !!value && typeof value === 'object' && (value as Record<string, unknown>).window === windowName
+      ));
+      if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
+      const record = item as Record<string, unknown>;
+      if (!isNonNegativeFinite(record.quota) || record.quota <= 0
+        || !isNonNegativeFinite(record.used) || record.used > record.quota
+        || !isNonNegativeFinite(record.remaining) || record.remaining > record.quota
+        || Math.abs((record.quota - record.used) - record.remaining) > 0.0001) return null;
+      windows.push({
+        window: windowName,
+        quota: record.quota,
+        used: record.used,
+        remaining: record.remaining,
+        ...(isNonNegativeFinite(record.resetsAt) ? { resetsAt: record.resetsAt } : {}),
+      });
+    }
+    const plan = typeof raw.plan === 'string' ? raw.plan.trim() : '';
+    if (plan.length > 64) return null;
+    return { kind: 'afp', shared: true, ...(plan ? { plan } : {}), windows };
   }
   return null;
 }
@@ -465,7 +504,7 @@ export function cardUsageFooterSegment(
       + `↑${compactTokenCount(usage.tokens.in)} ↓${compactTokenCount(usage.tokens.out)}`,
     );
   }
-  // Account quota (balance / weekly window) sits after the token metrics and
+  // Account quota (balance / weekly window / shared AFP windows) sits after the token metrics and
   // before the runtime tail. Missing or unparseable → omitted, never estimated.
   const quotaSeg = cardQuotaSegment(usage.quota, locale);
   if (quotaSeg) parts.push(quotaSeg);

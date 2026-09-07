@@ -343,7 +343,7 @@ export function getDaemonReplyCardUsageSnapshot(
   };
 }
 
-/** Account quota (DeepSeek balance / subscription weekly window) for the bot
+/** Account quota (DeepSeek balance / subscription weekly window / shared AFP) for the bot
  *  that owns this session. Non-blocking: served from the provider-quota cache,
  *  which refreshes itself in the background; any failure → null (hidden). */
 function peekProviderQuotaForSession(ds: DaemonSession): ProviderQuota | null {
