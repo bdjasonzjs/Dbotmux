@@ -19,6 +19,7 @@ import {
   __defaultProviderQuotaTransportForTests,
   __resetProviderQuotaForTests,
   __setProviderQuotaClockForTests,
+  __setProviderQuotaConsoleCredentialReaderForTests,
   __setProviderQuotaFileReaderForTests,
   __setProviderQuotaTransportForTests,
   describeProviderQuotaSource,
@@ -50,6 +51,23 @@ const CODEX_BODY = JSON.stringify({
   },
 });
 
+const VOLCENGINE_BODY = JSON.stringify({
+  ResponseMetadata: {
+    RequestId: 'test-request',
+    Action: 'GetAFPUsage',
+    Version: '2024-01-01',
+    Service: 'ark',
+    Region: 'cn-beijing',
+  },
+  Result: {
+    PlanType: 'medium',
+    AFPFiveHour: { Quota: 10_000, Used: 1_156.4788, ResetTime: 1_788_814_495_000 },
+    AFPWeekly: { Quota: 35_000, Used: 1_156.4788, ResetTime: 1_789_315_200_000 },
+    AFPMonthly: { Quota: 100_000, Used: 1_156.4788, ResetTime: 1_791_388_799_000 },
+    AFPDaily: { Quota: 50_000, Used: 0, ResetTime: 1_788_883_200_000 },
+  },
+});
+
 /** Real header shape observed 2026-09-02 on a max_tokens=1 Messages call. */
 const CLAUDE_HEADERS: Record<string, string> = {
   'anthropic-ratelimit-unified-status': 'allowed',
@@ -65,10 +83,28 @@ const CLAUDE_QUOTA = { kind: 'window', window: 'weekly', remainingPercent: 36.8,
 
 const DEEPSEEK_QUOTA = { kind: 'balance', currency: 'CNY', amount: 472.34 };
 const CODEX_QUOTA = { kind: 'window', window: 'weekly', remainingPercent: 92, resetsAt: 1788803049_000 };
+const VOLCENGINE_QUOTA = {
+  kind: 'afp',
+  shared: true,
+  plan: 'medium',
+  windows: [
+    { window: 'five_hour', quota: 10_000, used: 1_156.4788, remaining: 8_843.5212, resetsAt: 1_788_814_495_000 },
+    { window: 'weekly', quota: 35_000, used: 1_156.4788, remaining: 33_843.5212, resetsAt: 1_789_315_200_000 },
+    { window: 'monthly', quota: 100_000, used: 1_156.4788, remaining: 98_843.5212, resetsAt: 1_791_388_799_000 },
+  ],
+};
 
 const DS_CFG = { cliId: 'pi', env: { DEEPSEEK_API_KEY: 'sk-test' }, model: 'deepseek/deepseek-v4-flash' };
 const CLAUDE_CFG = { cliId: 'claude-code', env: { CLAUDE_CODE_OAUTH_TOKEN: 'tok' } };
 const CODEX_CFG = { cliId: 'codex', env: { CODEX_HOME: '/virtual/codex' } };
+const VOLCENGINE_CFG = {
+  cliId: 'pi',
+  env: {
+    ARK_API_KEY: 'sk-ark-plan-test',
+    ARK_CONSOLE_CDP_URL: 'http://127.0.0.1:9444/json/list',
+  },
+  model: 'volcengine/kimi-k3',
+};
 const CODEX_AUTH = (accessToken: string, accountId = 'acc-1') => JSON.stringify({
   auth_mode: 'chatgpt', tokens: { access_token: accessToken, account_id: accountId },
 });
@@ -155,6 +191,27 @@ describe('provider-quota parsers', () => {
     expect(parseProviderQuota('codex-chatgpt', { rate_limit: null })).toBeNull();
   });
 
+  it('Volcengine: parses the three enforced AFP windows as absolute shared quota', () => {
+    expect(parseProviderQuota('volcengine-agent-plan', JSON.parse(VOLCENGINE_BODY)))
+      .toEqual(VOLCENGINE_QUOTA);
+  });
+
+  it('Volcengine: rejects partial, inconsistent, or business-error responses', () => {
+    const valid = JSON.parse(VOLCENGINE_BODY);
+    expect(parseProviderQuota('volcengine-agent-plan', {
+      ...valid,
+      Result: { ...valid.Result, AFPMonthly: undefined },
+    })).toBeNull();
+    expect(parseProviderQuota('volcengine-agent-plan', {
+      ...valid,
+      Result: { ...valid.Result, AFPWeekly: { Quota: 35_000, Used: 35_001 } },
+    })).toBeNull();
+    expect(parseProviderQuota('volcengine-agent-plan', {
+      ResponseMetadata: { Error: { Code: 'InvalidAuthorization' } },
+      Result: valid.Result,
+    })).toBeNull();
+  });
+
   it('Claude: the 7-day window comes from the unified rate-limit response headers (fraction → remaining %)', () => {
     expect(parseClaudeRateLimitHeaders(CLAUDE_HEADERS)).toEqual(CLAUDE_QUOTA);
     expect(parseClaudeRateLimitHeaders({ 'anthropic-ratelimit-unified-7d-utilization': '0' }))
@@ -215,6 +272,31 @@ describe('provider-quota source resolution (memory-only)', () => {
     expect(describeProviderQuotaSource({ cliId: 'claude-code', env: { DEEPSEEK_API_KEY: 'sk-x', CLAUDE_CODE_OAUTH_TOKEN: 't' } })).toBe('claude-oauth');
   });
 
+  it('Volcengine Agent Plan is selected by the provider/model plus inference key', () => {
+    for (const model of [
+      'volcengine/kimi-k3',
+      'volcengine/glm-5.3',
+      'volcengine/minimax-m3',
+      'volcengine/deepseek-v4-pro',
+      'volcengine/auto',
+    ]) {
+      expect(describeProviderQuotaSource({ ...VOLCENGINE_CFG, model })).toBe('volcengine-agent-plan');
+    }
+    expect(describeProviderQuotaSource({ ...VOLCENGINE_CFG, env: {} })).toBeNull();
+    expect(describeProviderQuotaSource({
+      ...VOLCENGINE_CFG,
+      env: { ARK_API_KEY: 'sk-ark-plan-test' },
+    })).toBeNull();
+    expect(describeProviderQuotaSource({
+      ...VOLCENGINE_CFG,
+      env: {
+        ARK_API_KEY: 'sk-ark-plan-test',
+        ARK_CONSOLE_CDP_URL: 'http://console.example.com/json/list',
+      },
+    })).toBeNull();
+    expect(describeProviderQuotaSource({ ...VOLCENGINE_CFG, model: 'deepseek/deepseek-v4-pro' })).toBeNull();
+  });
+
   it('claude-code with CLAUDE_CODE_OAUTH_TOKEN → claude-oauth; third-party relay → none', () => {
     expect(describeProviderQuotaSource(CLAUDE_CFG)).toBe('claude-oauth');
     expect(describeProviderQuotaSource({
@@ -251,6 +333,80 @@ describe('provider-quota source resolution (memory-only)', () => {
 });
 
 describe('provider-quota cache / refresh policy', () => {
+  it('Volcengine console fallback shares one in-flight/cache entry across all five bot apps', async () => {
+    const consoleReads: string[] = [];
+    __setProviderQuotaConsoleCredentialReaderForTests(async url => {
+      consoleReads.push(url);
+      return { cookie: 'session=test', csrfToken: 'csrf-test', webId: 'web-test' };
+    });
+    const calls = installTransport(() => ok(VOLCENGINE_BODY));
+    const [first, second] = await Promise.all([
+      refreshProviderQuota('app-kimi', VOLCENGINE_CFG),
+      refreshProviderQuota('app-glm', { ...VOLCENGINE_CFG, model: 'volcengine/glm-5.3' }),
+    ]);
+    expect(first).toEqual(VOLCENGINE_QUOTA);
+    expect(second).toEqual(VOLCENGINE_QUOTA);
+    expect(consoleReads).toEqual(['http://127.0.0.1:9444/json/list']);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
+      url: 'https://console.volcengine.com/api/top/ark/cn-beijing/2024-01-01/GetAgentPlanAFPUsage',
+      method: 'POST',
+      body: '{}',
+    });
+    expect(calls[0]!.headers).toMatchObject({
+      Cookie: 'session=test',
+      'X-Csrf-Token': 'csrf-test',
+      'X-Web-Id': 'web-test',
+    });
+  });
+
+  it('Volcengine official control-plane path signs GetAFPUsage with account AK/SK', async () => {
+    const calls = installTransport(() => ok(VOLCENGINE_BODY));
+    const cfg = {
+      ...VOLCENGINE_CFG,
+      env: {
+        ...VOLCENGINE_CFG.env,
+        ARK_ACCESS_KEY_ID: 'AKLTTEST',
+        ARK_SECRET_ACCESS_KEY: 'secret-test',
+      },
+    };
+    expect(await refreshProviderQuota('app-kimi', cfg)).toEqual(VOLCENGINE_QUOTA);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.url).toBe(
+      'https://open.volcengineapi.com/?Action=GetAFPUsage&Region=cn-beijing&Version=2024-01-01',
+    );
+    expect(calls[0]!.method).toBe('POST');
+    expect(calls[0]!.body).toBeUndefined();
+    expect(calls[0]!.headers.Authorization).toMatch(
+      /^HMAC-SHA256 Credential=AKLTTEST\/\d{8}\/cn-beijing\/ark\/request, SignedHeaders=host;x-date;x-content-sha256;content-type, Signature=[0-9a-f]{64}$/,
+    );
+    expect(calls[0]!.headers['X-Date']).toMatch(/^\d{8}T\d{6}Z$/);
+    expect(calls[0]!.headers['X-Content-Sha256']).toBe(
+      'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+    );
+    expect(JSON.stringify(calls[0])).not.toContain('secret-test');
+  });
+
+  it('Volcengine console fallback fails closed when no authenticated console page is available', async () => {
+    __setProviderQuotaConsoleCredentialReaderForTests(async () => null);
+    const calls = installTransport(() => ok(VOLCENGINE_BODY));
+    expect(await refreshProviderQuota('app-kimi', VOLCENGINE_CFG)).toBeNull();
+    expect(calls).toHaveLength(0);
+  });
+
+  it('Volcengine shared cache stays separated when the plan inference credential changes', async () => {
+    __setProviderQuotaConsoleCredentialReaderForTests(async () => (
+      { cookie: 'session=test', csrfToken: 'csrf-test', webId: 'web-test' }
+    ));
+    const calls = installTransport(() => ok(VOLCENGINE_BODY));
+    await refreshProviderQuota('app-a', VOLCENGINE_CFG);
+    await refreshProviderQuota('app-b', {
+      ...VOLCENGINE_CFG,
+      env: { ...VOLCENGINE_CFG.env, ARK_API_KEY: 'different-account-plan-key' },
+    });
+    expect(calls).toHaveLength(2);
+  });
+
   it('peek never blocks: first call returns null and triggers one background fetch', async () => {
     const calls = installTransport(() => ok(DEEPSEEK_BODY));
     expect(peekProviderQuota('app-a', DS_CFG)).toBeNull();
@@ -456,6 +612,14 @@ describe('provider-quota cache / refresh policy', () => {
 });
 
 describe('provider-quota source identity (no cross-account leakage)', () => {
+  it('an unsupported config clears a bot-local cached quota', async () => {
+    installTransport(() => ok(DEEPSEEK_BODY));
+    await refreshProviderQuota('same-app', DS_CFG);
+    expect(peekProviderQuota('same-app', DS_CFG)).toEqual(DEEPSEEK_QUOTA);
+    expect(peekProviderQuota('same-app', { cliId: 'pi', model: 'openai/gpt-5' })).toBeNull();
+    expect(peekProviderQuota('same-app', DS_CFG)).toBeNull();
+  });
+
   it('provider A → B on the same bot: old quota is dropped, null until B answers, B is fetched', async () => {
     const calls = installTransport(call => (call.url.includes('deepseek') ? ok(DEEPSEEK_BODY) : ok(CLAUDE_BODY, CLAUDE_HEADERS)));
     await refreshProviderQuota('same-app', DS_CFG);

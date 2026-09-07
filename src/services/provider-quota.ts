@@ -1,13 +1,15 @@
 /**
  * Provider quota / balance for the streaming-card usage line.
  *
- * Three account-level facts, one per credential kind:
+ * Four account-level facts, one per credential kind:
  *   - DeepSeek (pay-as-you-go API key)       → account balance (¥ / $)
  *   - Claude Code (claude.ai OAuth login)    → 7-day window remaining %, read
  *     from the `anthropic-ratelimit-unified-7d-*` response headers of one
  *     minimal (max_tokens=1) Messages call — the dedicated usage endpoint is
  *     account-rate-limited by the CLI's own polling and answers 429 for hours.
  *   - Codex (ChatGPT login)                  → 7-day window remaining %
+ *   - Volcengine Agent Plan (shared account) → absolute AFP remaining for
+ *     the 5-hour, weekly and monthly windows
  *
  * Invariants (each one is guarded by a test in test/provider-quota.test.ts):
  *   - The card render path is synchronous and hot. {@link peekProviderQuota}
@@ -31,13 +33,14 @@
  *     metadata, so a rotation can never be mistaken for "unchanged".
  */
 import { readFile } from 'node:fs/promises';
-import { createHmac, randomBytes } from 'node:crypto';
+import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { request as httpsRequest } from 'node:https';
 import { request as httpRequest } from 'node:http';
 import type { IncomingMessage } from 'node:http';
 import { ProxyAgent } from 'proxy-agent';
+import WebSocket from 'ws';
 import { logger } from '../utils/logger.js';
 
 /** Account-level quota fact rendered on the usage line. */
@@ -56,6 +59,21 @@ export type ProviderQuota =
     remainingPercent: number;
     /** Epoch ms when the window resets, if upstream reports it. */
     resetsAt?: number;
+  }
+  | {
+    kind: 'afp';
+    /** Agent Plan is shared by every bot using the same inference credential. */
+    shared: true;
+    /** Upstream plan label when reported (for example `medium`). */
+    plan?: string;
+    windows: Array<{
+      window: 'five_hour' | 'weekly' | 'monthly';
+      /** Absolute AFP values reported by GetAFPUsage. */
+      quota: number;
+      used: number;
+      remaining: number;
+      resetsAt?: number;
+    }>;
   };
 
 /** The subset of a bot config the resolver needs. Kept structural so this
@@ -66,7 +84,11 @@ export interface ProviderQuotaBotConfig {
   model?: string;
 }
 
-export type ProviderQuotaProvider = 'deepseek' | 'claude-oauth' | 'codex-chatgpt';
+export type ProviderQuotaProvider =
+  | 'deepseek'
+  | 'claude-oauth'
+  | 'codex-chatgpt'
+  | 'volcengine-agent-plan';
 
 export interface ProviderQuotaTransportResponse {
   status: number;
@@ -100,6 +122,20 @@ export type ProviderQuotaTransport = (
  *  hot path never touches it). */
 export type ProviderQuotaFileReader = (path: string) => Promise<string>;
 
+interface VolcengineConsoleCredentials {
+  cookie: string;
+  csrfToken: string;
+  webId: string;
+}
+
+/** Optional local-console credential bridge. It reads the already-authenticated
+ * Chrome CDP session only; the actual console API request still goes through
+ * the normal proxy-agent transport. */
+export type ProviderQuotaConsoleCredentialReader = (
+  cdpListUrl: string,
+  limits: ProviderQuotaTransportLimits,
+) => Promise<VolcengineConsoleCredentials | null>;
+
 /** A successful value is served without refetching for this long. */
 export const PROVIDER_QUOTA_TTL_MS = 10 * 60_000;
 /** After a failure, wait this long before retrying (unless Retry-After is larger). */
@@ -130,6 +166,13 @@ const CLAUDE_USAGE_PROBE_BODY = JSON.stringify({
 const CLAUDE_7D_UTILIZATION_HEADER = 'anthropic-ratelimit-unified-7d-utilization';
 const CLAUDE_7D_RESET_HEADER = 'anthropic-ratelimit-unified-7d-reset';
 const CODEX_USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage';
+const VOLCENGINE_OPENAPI_HOST = 'open.volcengineapi.com';
+const VOLCENGINE_OPENAPI_REGION = 'cn-beijing';
+const VOLCENGINE_OPENAPI_QUERY = 'Action=GetAFPUsage&Region=cn-beijing&Version=2024-01-01';
+const VOLCENGINE_OPENAPI_URL = `https://${VOLCENGINE_OPENAPI_HOST}/?${VOLCENGINE_OPENAPI_QUERY}`;
+const VOLCENGINE_CONSOLE_PAGE_URL = 'https://console.volcengine.com/ark/region:cn-beijing/subscription/agent-plan';
+const VOLCENGINE_CONSOLE_QUOTA_URL = 'https://console.volcengine.com/api/top/ark/cn-beijing/2024-01-01/GetAgentPlanAFPUsage';
+const VOLCENGINE_CONTENT_TYPE = 'application/json; charset=utf-8';
 const WEEK_SECONDS = 7 * 24 * 3600;
 
 /** Per-process random salt: fingerprints are only ever compared within this
@@ -146,9 +189,13 @@ interface SourceSpec {
   method: 'GET' | 'POST';
   body?: string;
   configIdentity: string;
+  /** A shared provider uses one cache/inflight entry across all Lark apps. */
+  sharedCache: boolean;
   credential:
     | { kind: 'inline'; headers: Record<string, string> }
-    | { kind: 'file'; path: string };
+    | { kind: 'file'; path: string }
+    | { kind: 'volcengine-aksk'; accessKeyId: string; secretAccessKey: string }
+    | { kind: 'volcengine-console'; cdpListUrl: string };
 }
 
 /** A fully resolved request: headers plus the identity of the credential
@@ -182,6 +229,7 @@ interface CacheEntry {
 const cache = new Map<string, CacheEntry>();
 let transport: ProviderQuotaTransport = defaultTransport;
 let readCredentialFile: ProviderQuotaFileReader = path => readFile(path, 'utf8');
+let readConsoleCredentials: ProviderQuotaConsoleCredentialReader = defaultConsoleCredentialReader;
 let clock: () => number = () => Date.now();
 
 // ---------------------------------------------------------------------------
@@ -198,14 +246,15 @@ export function peekProviderQuota(
   try {
     const spec = resolveSourceSpec(config);
     if (!spec) {
-      cache.delete(larkAppId);
+      cache.delete(`app:${larkAppId}`);
       return null;
     }
+    const cacheKey = providerCacheKey(larkAppId, spec);
     const now = clock();
-    const entry = entryFor(larkAppId, spec);
+    const entry = entryFor(cacheKey, spec);
     const fresh = entry.quota !== null && now - entry.fetchedAt < PROVIDER_QUOTA_TTL_MS;
     if (!fresh && !entry.inflight && now >= entry.nextAttemptAt) {
-      startRefresh(larkAppId, entry, spec);
+      startRefresh(larkAppId, cacheKey, entry, spec);
     } else if (
       spec.credential.kind === 'file'
       && entry.quota !== null
@@ -213,7 +262,7 @@ export function peekProviderQuota(
       && !entry.probing
       && now - entry.lastProbeAt >= PROVIDER_QUOTA_CREDENTIAL_PROBE_MS
     ) {
-      startCredentialProbe(larkAppId, entry, spec);
+      startCredentialProbe(larkAppId, cacheKey, entry, spec);
     }
     if (entry.quota !== null && now - entry.fetchedAt <= PROVIDER_QUOTA_STALE_GRACE_MS) {
       return entry.quota;
@@ -232,13 +281,14 @@ export async function refreshProviderQuota(
 ): Promise<ProviderQuota | null> {
   const spec = resolveSourceSpec(config);
   if (!spec) {
-    cache.delete(larkAppId);
+    cache.delete(`app:${larkAppId}`);
     return null;
   }
-  const entry = entryFor(larkAppId, spec);
-  if (!entry.inflight && clock() >= entry.nextAttemptAt) startRefresh(larkAppId, entry, spec);
+  const cacheKey = providerCacheKey(larkAppId, spec);
+  const entry = entryFor(cacheKey, spec);
+  if (!entry.inflight && clock() >= entry.nextAttemptAt) startRefresh(larkAppId, cacheKey, entry, spec);
   if (entry.inflight) await entry.inflight;
-  const current = cache.get(larkAppId);
+  const current = cache.get(cacheKey);
   return current && current.configIdentity === spec.configIdentity ? current.quota : null;
 }
 
@@ -268,47 +318,51 @@ function newEntry(configIdentity: string): CacheEntry {
   };
 }
 
+function providerCacheKey(larkAppId: string, spec: SourceSpec): string {
+  return spec.sharedCache ? `shared:${spec.configIdentity}` : `app:${larkAppId}`;
+}
+
 /** Return the live entry for this bot, atomically replacing it when the
  *  in-memory config identity changed (provider switch, inline key rotation,
  *  credential file relocation). The old entry object is simply orphaned: any
  *  refresh still running against it writes into an object no longer in the map. */
-function entryFor(larkAppId: string, spec: SourceSpec): CacheEntry {
-  const existing = cache.get(larkAppId);
+function entryFor(cacheKey: string, spec: SourceSpec): CacheEntry {
+  const existing = cache.get(cacheKey);
   if (existing && existing.configIdentity === spec.configIdentity) return existing;
   const entry = newEntry(spec.configIdentity);
-  cache.set(larkAppId, entry);
+  cache.set(cacheKey, entry);
   return entry;
 }
 
 /** Replace `entry` with a fresh one for the same config (used when the async
  *  loader discovers the credential *contents* changed). Returns the new entry. */
-function supersede(larkAppId: string, entry: CacheEntry): CacheEntry {
-  if (cache.get(larkAppId) !== entry) return cache.get(larkAppId) ?? entry;
+function supersede(cacheKey: string, entry: CacheEntry): CacheEntry {
+  if (cache.get(cacheKey) !== entry) return cache.get(cacheKey) ?? entry;
   const next = newEntry(entry.configIdentity);
-  cache.set(larkAppId, next);
+  cache.set(cacheKey, next);
   return next;
 }
 
-function isLive(larkAppId: string, entry: CacheEntry): boolean {
-  return cache.get(larkAppId) === entry;
+function isLive(cacheKey: string, entry: CacheEntry): boolean {
+  return cache.get(cacheKey) === entry;
 }
 
-function startRefresh(larkAppId: string, entry: CacheEntry, spec: SourceSpec): void {
-  const done: Promise<void> = refreshEntry(larkAppId, entry, spec)
+function startRefresh(larkAppId: string, cacheKey: string, entry: CacheEntry, spec: SourceSpec): void {
+  const done: Promise<void> = refreshEntry(larkAppId, cacheKey, entry, spec)
     .catch(() => undefined)
     .finally(() => {
       // The refresh may have superseded `entry` mid-flight (credential
       // rotation) and carried its in-flight marker to the successor.
       if (entry.inflight === done) entry.inflight = null;
-      const current = cache.get(larkAppId);
+      const current = cache.get(cacheKey);
       if (current && current !== entry && current.inflight === done) current.inflight = null;
     });
   entry.inflight = done;
 }
 
-function startCredentialProbe(larkAppId: string, entry: CacheEntry, spec: SourceSpec): void {
+function startCredentialProbe(larkAppId: string, cacheKey: string, entry: CacheEntry, spec: SourceSpec): void {
   entry.lastProbeAt = clock();
-  entry.probing = probeCredentialFile(larkAppId, entry, spec)
+  entry.probing = probeCredentialFile(larkAppId, cacheKey, entry, spec)
     .catch(() => undefined)
     .finally(() => { entry.probing = null; });
 }
@@ -319,16 +373,21 @@ function startCredentialProbe(larkAppId: string, entry: CacheEntry, spec: Source
  *  another account's: drop it now and refresh against the new identity. File
  *  metadata is deliberately not consulted — a same-mtime or mid-read
  *  replacement is caught by the next probe because only contents count. */
-async function probeCredentialFile(larkAppId: string, entry: CacheEntry, spec: SourceSpec): Promise<void> {
+async function probeCredentialFile(
+  larkAppId: string,
+  cacheKey: string,
+  entry: CacheEntry,
+  spec: SourceSpec,
+): Promise<void> {
   if (spec.credential.kind !== 'file') return;
   const source = await loadSource(spec);
-  if (!isLive(larkAppId, entry) || entry.sourceIdentity === null) return;
+  if (!isLive(cacheKey, entry) || entry.sourceIdentity === null) return;
   if (source === null) {
-    supersede(larkAppId, entry).nextAttemptAt = clock() + PROVIDER_QUOTA_FAILURE_BACKOFF_MS;
+    supersede(cacheKey, entry).nextAttemptAt = clock() + PROVIDER_QUOTA_FAILURE_BACKOFF_MS;
     return;
   }
   if (source.identity !== entry.sourceIdentity) {
-    startRefresh(larkAppId, supersede(larkAppId, entry), spec);
+    startRefresh(larkAppId, cacheKey, supersede(cacheKey, entry), spec);
   }
 }
 
@@ -346,9 +405,53 @@ function isDeepSeekModel(model: string | undefined): boolean {
   return /^deepseek(?:[/-]|$)/i.test((model ?? '').trim());
 }
 
+function isVolcengineModel(model: string | undefined): boolean {
+  return /^volcengine(?:[/-]|$)/i.test((model ?? '').trim());
+}
+
+function loopbackCdpListUrl(raw: string | undefined): string | null {
+  const value = raw?.trim();
+  if (!value) return null;
+  try {
+    const url = new URL(value);
+    const loopback = url.hostname === '127.0.0.1' || url.hostname === 'localhost' || url.hostname === '[::1]';
+    if (url.protocol !== 'http:' || !loopback || url.username || url.password) return null;
+    url.pathname = '/json/list';
+    url.search = '';
+    url.hash = '';
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
 function resolveSourceSpec(config: ProviderQuotaBotConfig | undefined): SourceSpec | null {
   if (!config) return null;
   const env = config.env ?? {};
+  const arkKey = env.ARK_API_KEY?.trim();
+  if (arkKey && isVolcengineModel(config.model)) {
+    const accessKeyId = env.ARK_ACCESS_KEY_ID?.trim() || env.VOLCENGINE_ACCESS_KEY_ID?.trim();
+    const secretAccessKey = env.ARK_SECRET_ACCESS_KEY?.trim() || env.VOLCENGINE_SECRET_ACCESS_KEY?.trim();
+    // The browser session is an account credential in its own right. Require an
+    // explicit per-bot opt-in so a future second Ark account cannot silently read
+    // whichever Volcengine console happens to be open on the host.
+    const cdpListUrl = loopbackCdpListUrl(env.ARK_CONSOLE_CDP_URL);
+    if ((!accessKeyId || !secretAccessKey) && !cdpListUrl) return null;
+    const identity = accessKeyId && secretAccessKey
+      ? `volcengine-agent-plan:aksk:${fingerprint(accessKeyId, secretAccessKey)}`
+      : `volcengine-agent-plan:console:${fingerprint(arkKey, cdpListUrl!)}`;
+    return {
+      provider: 'volcengine-agent-plan',
+      url: accessKeyId && secretAccessKey ? VOLCENGINE_OPENAPI_URL : VOLCENGINE_CONSOLE_QUOTA_URL,
+      method: 'POST',
+      ...(accessKeyId && secretAccessKey ? {} : { body: '{}' }),
+      configIdentity: identity,
+      sharedCache: true,
+      credential: accessKeyId && secretAccessKey
+        ? { kind: 'volcengine-aksk', accessKeyId, secretAccessKey }
+        : { kind: 'volcengine-console', cdpListUrl: cdpListUrl! },
+    };
+  }
   // DeepSeek is chosen by the bot's *model* identity; the key alone does not
   // decide (a Codex/Claude bot may carry a DeepSeek key for tool calls).
   const deepseekKey = env.DEEPSEEK_API_KEY?.trim();
@@ -358,6 +461,7 @@ function resolveSourceSpec(config: ProviderQuotaBotConfig | undefined): SourceSp
       url: DEEPSEEK_BALANCE_URL,
       method: 'GET',
       configIdentity: `deepseek:${fingerprint(deepseekKey)}`,
+      sharedCache: false,
       credential: { kind: 'inline', headers: { Authorization: `Bearer ${deepseekKey}` } },
     };
   }
@@ -373,6 +477,7 @@ function resolveSourceSpec(config: ProviderQuotaBotConfig | undefined): SourceSp
         method: 'POST',
         body: CLAUDE_USAGE_PROBE_BODY,
         configIdentity: `claude-oauth:${fingerprint(token)}`,
+        sharedCache: false,
         credential: { kind: 'inline', headers: claudeHeaders(token) },
       };
     }
@@ -386,6 +491,7 @@ function resolveSourceSpec(config: ProviderQuotaBotConfig | undefined): SourceSp
       method: 'POST',
       body: CLAUDE_USAGE_PROBE_BODY,
       configIdentity: `claude-oauth:file:${path}`,
+      sharedCache: false,
       credential: { kind: 'file', path },
     };
   }
@@ -399,6 +505,7 @@ function resolveSourceSpec(config: ProviderQuotaBotConfig | undefined): SourceSp
       url: CODEX_USAGE_URL,
       method: 'GET',
       configIdentity: `codex-chatgpt:file:${path}`,
+      sharedCache: false,
       credential: { kind: 'file', path },
     };
   }
@@ -415,6 +522,48 @@ function claudeHeaders(token: string): Record<string, string> {
   };
 }
 
+function sha256Hex(value: string): string {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+/** Volcengine's Signature V4 variant for the Ark control plane. Unlike AWS,
+ * the algorithm is `HMAC-SHA256`, the secret has no `AWS4` prefix, and the
+ * scope terminates in `request`. Header order is intentionally fixed. */
+function volcengineOpenApiHeaders(
+  accessKeyId: string,
+  secretAccessKey: string,
+  nowMs: number,
+): Record<string, string> {
+  const now = new Date(nowMs);
+  const xDate = now.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
+  const shortDate = xDate.slice(0, 8);
+  const bodyHash = sha256Hex('');
+  const signedHeaders = 'host;x-date;x-content-sha256;content-type';
+  const canonicalHeaders = `host:${VOLCENGINE_OPENAPI_HOST}\n`
+    + `x-date:${xDate}\n`
+    + `x-content-sha256:${bodyHash}\n`
+    + `content-type:${VOLCENGINE_CONTENT_TYPE}\n`;
+  const canonicalRequest = `POST\n/\n${VOLCENGINE_OPENAPI_QUERY}\n${canonicalHeaders}\n${signedHeaders}\n${bodyHash}`;
+  const credentialScope = `${shortDate}/${VOLCENGINE_OPENAPI_REGION}/ark/request`;
+  const stringToSign = `HMAC-SHA256\n${xDate}\n${credentialScope}\n${sha256Hex(canonicalRequest)}`;
+  const hmac = (key: string | Buffer, value: string): Buffer => createHmac('sha256', key).update(value).digest();
+  const kDate = hmac(secretAccessKey, shortDate);
+  const kRegion = hmac(kDate, VOLCENGINE_OPENAPI_REGION);
+  const kService = hmac(kRegion, 'ark');
+  const kSigning = hmac(kService, 'request');
+  const signature = createHmac('sha256', kSigning).update(stringToSign).digest('hex');
+  return {
+    Authorization: `HMAC-SHA256 Credential=${accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`,
+    'X-Date': xDate,
+    'X-Content-Sha256': bodyHash,
+    'Content-Type': VOLCENGINE_CONTENT_TYPE,
+  };
+}
+
+function safeHeaderValue(value: string): boolean {
+  return value.length > 0 && !/[\r\n]/.test(value);
+}
+
 /** Async: turn a spec into headers + credential identity. Returns null when
  *  the credential is missing or unusable (API-key Codex login, empty token). */
 async function loadSource(spec: SourceSpec): Promise<ResolvedSource | null> {
@@ -426,6 +575,54 @@ async function loadSource(spec: SourceSpec): Promise<ResolvedSource | null> {
       ...(spec.body !== undefined ? { body: spec.body } : {}),
       headers: spec.credential.headers,
       identity: spec.configIdentity,
+    };
+  }
+  if (spec.credential.kind === 'volcengine-aksk') {
+    return {
+      provider: spec.provider,
+      url: spec.url,
+      method: spec.method,
+      headers: volcengineOpenApiHeaders(
+        spec.credential.accessKeyId,
+        spec.credential.secretAccessKey,
+        clock(),
+      ),
+      identity: spec.configIdentity,
+    };
+  }
+  if (spec.credential.kind === 'volcengine-console') {
+    let consoleAuth: VolcengineConsoleCredentials | null;
+    try {
+      consoleAuth = await readConsoleCredentials(spec.credential.cdpListUrl, {
+        timeoutMs: PROVIDER_QUOTA_REQUEST_TIMEOUT_MS,
+        deadlineMs: PROVIDER_QUOTA_REQUEST_DEADLINE_MS,
+        maxBodyBytes: PROVIDER_QUOTA_MAX_BODY_BYTES,
+      });
+    } catch {
+      return null;
+    }
+    if (!consoleAuth
+      || !safeHeaderValue(consoleAuth.cookie)
+      || !safeHeaderValue(consoleAuth.csrfToken)
+      || !safeHeaderValue(consoleAuth.webId)) return null;
+    return {
+      provider: spec.provider,
+      url: spec.url,
+      method: spec.method,
+      body: spec.body,
+      headers: {
+        Cookie: consoleAuth.cookie,
+        'X-Csrf-Token': consoleAuth.csrfToken,
+        'X-Web-Id': consoleAuth.webId,
+        Referer: VOLCENGINE_CONSOLE_PAGE_URL,
+        Accept: 'application/json, text/plain, */*',
+        'Content-Type': 'application/json',
+      },
+      identity: `volcengine-agent-plan:console:${fingerprint(
+        consoleAuth.cookie,
+        consoleAuth.csrfToken,
+        consoleAuth.webId,
+      )}`,
     };
   }
   const path = spec.credential.path;
@@ -475,14 +672,19 @@ async function loadSource(spec: SourceSpec): Promise<ResolvedSource | null> {
 // Refresh + parsing
 // ---------------------------------------------------------------------------
 
-async function refreshEntry(larkAppId: string, entry: CacheEntry, spec: SourceSpec): Promise<void> {
+async function refreshEntry(
+  larkAppId: string,
+  cacheKey: string,
+  entry: CacheEntry,
+  spec: SourceSpec,
+): Promise<void> {
   const tag = `[provider-quota ${larkAppId.slice(-6)} ${spec.provider}]`;
   const source = await loadSource(spec);
-  if (!isLive(larkAppId, entry)) return;
+  if (!isLive(cacheKey, entry)) return;
   if (!source) {
     // Unusable credential: nothing to show, back off; if the file changed
     // underneath a cached value, that value belongs to a gone credential.
-    if (entry.sourceIdentity !== null) supersede(larkAppId, entry).nextAttemptAt = clock() + PROVIDER_QUOTA_FAILURE_BACKOFF_MS;
+    if (entry.sourceIdentity !== null) supersede(cacheKey, entry).nextAttemptAt = clock() + PROVIDER_QUOTA_FAILURE_BACKOFF_MS;
     else entry.nextAttemptAt = clock() + PROVIDER_QUOTA_FAILURE_BACKOFF_MS;
     return;
   }
@@ -491,7 +693,7 @@ async function refreshEntry(larkAppId: string, entry: CacheEntry, spec: SourceSp
   // to a fresh entry and continue the fetch against it.
   let live = entry;
   if (entry.sourceIdentity !== null && entry.sourceIdentity !== source.identity) {
-    live = supersede(larkAppId, entry);
+    live = supersede(cacheKey, entry);
     live.inflight = entry.inflight;
   }
   live.sourceIdentity = source.identity;
@@ -509,12 +711,12 @@ async function refreshEntry(larkAppId: string, entry: CacheEntry, spec: SourceSp
       maxBodyBytes: PROVIDER_QUOTA_MAX_BODY_BYTES,
     });
   } catch (error) {
-    if (!isLive(larkAppId, live)) return;
+    if (!isLive(cacheKey, live)) return;
     live.nextAttemptAt = clock() + PROVIDER_QUOTA_FAILURE_BACKOFF_MS;
     logger.warn(`${tag} fetch failed: ${safeErrorLabel(error)}`);
     return;
   }
-  if (!isLive(larkAppId, live)) return;
+  if (!isLive(cacheKey, live)) return;
   // Claude reports utilisation in response headers. Only a served answer (200)
   // or a rate-limit answer (429) is trusted: an auth/server failure that
   // happens to carry a plausible header is still a failure. On 429 the value
@@ -634,8 +836,58 @@ export function parseProviderQuota(
     // Claude's quota lives in response headers, never in a body.
     case 'claude-oauth': return null;
     case 'codex-chatgpt': return parseCodexUsage(body as Record<string, unknown>);
+    case 'volcengine-agent-plan': return parseVolcengineAfpUsage(body as Record<string, unknown>);
     default: return null;
   }
+}
+
+function strictNonNegativeNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+/** `GetAFPUsage` / console `GetAgentPlanAFPUsage` share the same Result shape.
+ * All three enforced windows must be present and internally consistent; a
+ * partial or over-limit response is hidden rather than presented as a full
+ * shared balance. AFPDaily is intentionally ignored because it is not one of
+ * the subscription's enforced/displayed limits. */
+function parseVolcengineAfpUsage(body: Record<string, unknown>): ProviderQuota | null {
+  const metadata = body.ResponseMetadata;
+  if (metadata && typeof metadata === 'object' && (metadata as Record<string, unknown>).Error) return null;
+  const rawResult = body.Result ?? body;
+  if (!rawResult || typeof rawResult !== 'object' || Array.isArray(rawResult)) return null;
+  const result = rawResult as Record<string, unknown>;
+  const specs = [
+    ['AFPFiveHour', 'five_hour'],
+    ['AFPWeekly', 'weekly'],
+    ['AFPMonthly', 'monthly'],
+  ] as const;
+  const windows: Extract<ProviderQuota, { kind: 'afp' }>['windows'] = [];
+  for (const [field, window] of specs) {
+    const raw = result[field];
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const record = raw as Record<string, unknown>;
+    const quota = strictNonNegativeNumber(record.Quota);
+    const used = strictNonNegativeNumber(record.Used);
+    if (quota === undefined || quota <= 0 || used === undefined || used > quota) return null;
+    const reset = strictNonNegativeNumber(record.ResetTime);
+    const resetsAt = reset !== undefined && reset > 0
+      ? (reset < 1_000_000_000_000 ? reset * 1000 : reset)
+      : undefined;
+    windows.push({
+      window,
+      quota,
+      used,
+      remaining: Math.round((quota - used) * 10_000) / 10_000,
+      ...(resetsAt !== undefined ? { resetsAt } : {}),
+    });
+  }
+  const plan = typeof result.PlanType === 'string' ? result.PlanType.trim() : '';
+  return {
+    kind: 'afp',
+    shared: true,
+    ...(plan ? { plan } : {}),
+    windows,
+  };
 }
 
 /** `GET /user/balance` → `{ balance_infos: [{ currency, total_balance, … }] }`.
@@ -791,6 +1043,139 @@ function defaultTransport(
   });
 }
 
+interface CdpTargetDescriptor {
+  type?: unknown;
+  url?: unknown;
+  webSocketDebuggerUrl?: unknown;
+}
+
+function validatedCdpWebSocketUrl(value: unknown, cdpListUrl: string): string | null {
+  if (typeof value !== 'string') return null;
+  try {
+    const wsUrl = new URL(value);
+    const listUrl = new URL(cdpListUrl);
+    const loopback = (host: string) => host === '127.0.0.1' || host === 'localhost' || host === '[::1]';
+    if (wsUrl.protocol !== 'ws:' || !loopback(wsUrl.hostname) || !loopback(listUrl.hostname)) return null;
+    if (wsUrl.port !== listUrl.port || !wsUrl.pathname.startsWith('/devtools/page/')) return null;
+    return wsUrl.toString();
+  } catch {
+    return null;
+  }
+}
+
+interface CdpCommandResponse {
+  id?: number;
+  result?: Record<string, unknown>;
+  error?: unknown;
+}
+
+function readConsoleCredentialsFromCdp(
+  webSocketUrl: string,
+  limits: ProviderQuotaTransportLimits,
+): Promise<VolcengineConsoleCredentials | null> {
+  return new Promise((resolve, reject) => {
+    const socket = new WebSocket(webSocketUrl, {
+      handshakeTimeout: limits.timeoutMs,
+      maxPayload: limits.maxBodyBytes,
+    });
+    let settled = false;
+    const replies = new Map<number, CdpCommandResponse>();
+    const finish = (value: VolcengineConsoleCredentials | null, error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      try { socket.close(); } catch { /* best effort */ }
+      if (error) reject(error);
+      else resolve(value);
+    };
+    const deadline = setTimeout(
+      () => finish(null, new TransportError('ERR_CDP_UNAVAILABLE')),
+      limits.deadlineMs,
+    );
+    deadline.unref?.();
+    socket.on('open', () => {
+      socket.send(JSON.stringify({
+        id: 1,
+        method: 'Network.getCookies',
+        params: { urls: [VOLCENGINE_CONSOLE_QUOTA_URL] },
+      }));
+      socket.send(JSON.stringify({
+        id: 2,
+        method: 'Runtime.evaluate',
+        params: {
+          expression: `(() => {
+            const raw = document.cookie.split(';').map(v => v.trim())
+              .find(v => v.startsWith('csrfToken='))?.slice('csrfToken='.length) || '';
+            let csrfToken = raw;
+            try { csrfToken = decodeURIComponent(raw); } catch {}
+            return { csrfToken, webId: localStorage.getItem('=^_^=athena_web_id') || '' };
+          })()`,
+          returnByValue: true,
+        },
+      }));
+    });
+    socket.on('message', data => {
+      if (Buffer.byteLength(data as Buffer) > limits.maxBodyBytes) {
+        finish(null, new TransportError('ERR_BODY_TOO_LARGE'));
+        return;
+      }
+      let message: CdpCommandResponse;
+      try { message = JSON.parse(data.toString()) as CdpCommandResponse; }
+      catch { finish(null, new TransportError('ERR_CDP_UNAVAILABLE')); return; }
+      if (message.id !== 1 && message.id !== 2) return;
+      if (message.error) { finish(null, new TransportError('ERR_CDP_UNAVAILABLE')); return; }
+      replies.set(message.id, message);
+      if (replies.size < 2) return;
+      const cookieResult = replies.get(1)?.result;
+      const cookies = Array.isArray(cookieResult?.cookies) ? cookieResult.cookies : [];
+      const cookie = cookies
+        .filter((item): item is Record<string, unknown> => !!item && typeof item === 'object')
+        .map(item => ({ name: item.name, value: item.value }))
+        .filter((item): item is { name: string; value: string } => (
+          typeof item.name === 'string'
+          && /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(item.name)
+          && typeof item.value === 'string'
+          && !/[;\r\n]/.test(item.value)
+        ))
+        .map(item => `${item.name}=${item.value}`)
+        .join('; ');
+      const evalResult = replies.get(2)?.result?.result;
+      const value = evalResult && typeof evalResult === 'object'
+        ? (evalResult as Record<string, unknown>).value
+        : undefined;
+      const auth = value && typeof value === 'object' ? value as Record<string, unknown> : {};
+      const csrfToken = typeof auth.csrfToken === 'string' ? auth.csrfToken : '';
+      const webId = typeof auth.webId === 'string' ? auth.webId : '';
+      finish(cookie && csrfToken && webId ? { cookie, csrfToken, webId } : null);
+    });
+    socket.on('error', () => finish(null, new TransportError('ERR_CDP_UNAVAILABLE')));
+    socket.on('unexpected-response', () => finish(null, new TransportError('ERR_CDP_UNAVAILABLE')));
+  });
+}
+
+async function defaultConsoleCredentialReader(
+  cdpListUrl: string,
+  limits: ProviderQuotaTransportLimits,
+): Promise<VolcengineConsoleCredentials | null> {
+  const list = await defaultTransport({
+    url: cdpListUrl,
+    method: 'GET',
+    headers: { Accept: 'application/json' },
+  }, limits);
+  if (list.status !== 200) return null;
+  let targets: CdpTargetDescriptor[];
+  try {
+    const parsed = JSON.parse(list.body);
+    targets = Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return null;
+  }
+  const target = targets.find(item => item?.type === 'page' && item.url === VOLCENGINE_CONSOLE_PAGE_URL);
+  const webSocketUrl = validatedCdpWebSocketUrl(target?.webSocketDebuggerUrl, cdpListUrl);
+  if (!webSocketUrl) return null;
+  return readConsoleCredentialsFromCdp(webSocketUrl, limits);
+}
+
 // ---------------------------------------------------------------------------
 // Test hooks
 // ---------------------------------------------------------------------------
@@ -801,6 +1186,12 @@ export function __setProviderQuotaTransportForTests(next: ProviderQuotaTransport
 
 export function __setProviderQuotaFileReaderForTests(reader: ProviderQuotaFileReader | null): void {
   readCredentialFile = reader ?? (path => readFile(path, 'utf8'));
+}
+
+export function __setProviderQuotaConsoleCredentialReaderForTests(
+  reader: ProviderQuotaConsoleCredentialReader | null,
+): void {
+  readConsoleCredentials = reader ?? defaultConsoleCredentialReader;
 }
 
 export function __setProviderQuotaClockForTests(next: (() => number) | null): void {
@@ -814,5 +1205,6 @@ export function __resetProviderQuotaForTests(): void {
   cache.clear();
   transport = defaultTransport;
   readCredentialFile = path => readFile(path, 'utf8');
+  readConsoleCredentials = defaultConsoleCredentialReader;
   clock = () => Date.now();
 }

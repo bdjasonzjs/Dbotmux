@@ -783,6 +783,25 @@ describe('buildMarkdownCard', () => {
     expect(seg).toBe('Context 10K/200K (5%) · Total ↑100 ↓50 · Weekly left 37%');
   });
 
+  it('renders Volcengine absolute AFP windows with an explicit shared label', () => {
+    const quota = {
+      kind: 'afp' as const,
+      shared: true as const,
+      plan: 'medium',
+      windows: [
+        { window: 'five_hour' as const, quota: 10_000, used: 1_156.4788, remaining: 8_843.5212 },
+        { window: 'weekly' as const, quota: 35_000, used: 1_156.4788, remaining: 33_843.5212 },
+        { window: 'monthly' as const, quota: 100_000, used: 1_156.4788, remaining: 98_843.5212 },
+      ],
+    };
+    expect(cardQuotaSegment(quota, 'zh')).toBe(
+      '共享 AFP 剩 8.8K/10K(5h) / 33.8K/35K(周) / 98.8K/100K(月)',
+    );
+    expect(cardQuotaSegment(quota, 'en')).toBe(
+      'Shared AFP left 8.8K/10K(5h) / 33.8K/35K(week) / 98.8K/100K(month)',
+    );
+  });
+
   it('quota alone still renders (no native metrics yet) and USD / unknown currencies format sanely', () => {
     expect(cardUsageFooterSegment(
       { context: null, tokens: null, quota: { kind: 'window', window: 'weekly', remainingPercent: 92 } },
@@ -820,6 +839,34 @@ describe('buildMarkdownCard', () => {
     expect(normalizeProviderQuota({ kind: 'window', window: 'weekly', remainingPercent: Number.POSITIVE_INFINITY })).toBeNull();
     expect(normalizeProviderQuota({ kind: 'window', window: 'weekly', remainingPercent: 100 }))
       .toEqual({ kind: 'window', window: 'weekly', remainingPercent: 100 });
+    const afp = {
+      kind: 'afp',
+      shared: true,
+      plan: ' medium ',
+      windows: [
+        { window: 'monthly', quota: 100_000, used: 10, remaining: 99_990 },
+        { window: 'five_hour', quota: 10_000, used: 10, remaining: 9_990 },
+        { window: 'weekly', quota: 35_000, used: 10, remaining: 34_990 },
+      ],
+    };
+    expect(normalizeProviderQuota(afp)).toEqual({
+      kind: 'afp',
+      shared: true,
+      plan: 'medium',
+      windows: [
+        { window: 'five_hour', quota: 10_000, used: 10, remaining: 9_990 },
+        { window: 'weekly', quota: 35_000, used: 10, remaining: 34_990 },
+        { window: 'monthly', quota: 100_000, used: 10, remaining: 99_990 },
+      ],
+    });
+    expect(normalizeProviderQuota({ ...afp, shared: false })).toBeNull();
+    expect(normalizeProviderQuota({ ...afp, windows: afp.windows.slice(0, 2) })).toBeNull();
+    expect(normalizeProviderQuota({
+      ...afp,
+      windows: afp.windows.map(window => window.window === 'weekly'
+        ? { ...window, remaining: window.remaining + 1 }
+        : window),
+    })).toBeNull();
     expect(cardQuotaSegment({ kind: 'window', window: 'weekly', remainingPercent: 100.5 })).toBeNull();
     expect(normalizeProviderQuota({ kind: 'window', window: '5h', remainingPercent: 1 })).toBeNull();
     expect(normalizeProviderQuota({ kind: 'balance', currency: '', amount: 1 })).toBeNull();

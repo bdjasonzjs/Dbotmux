@@ -1266,6 +1266,7 @@ export const messages: Record<string, string> = {
   'card.usage.total': 'Total',
   'card.usage.balance': 'Balance',
   'card.usage.weekly_left': 'Weekly left',
+  'card.usage.shared_afp_left': 'Shared AFP left',
 
   // Adopt preamble card title
   'card.adopt_last_round': '📜 Last exchange before /adopt',
