@@ -18,6 +18,7 @@ import { isWorkflowFeatureEnabled } from '../../global-config.js';
 import { config } from '../../config.js';
 import { escapeXmlTagLikeTokens, escapeXmlText } from '../../utils/xml.js';
 import { resolveConditionalLine } from '../../skills/effective-builtins.js';
+import { activeHumanSessionRoutingPrompt } from '../../core/human-session-routing-prompt.js';
 
 /** The gated "no visible output is OK" hint reads `config.noVisibleOutputHint`
  *  by default, but a user customization can force it on/off. Keyed by the i18n
@@ -76,6 +77,7 @@ function hiddenContextDefense(locale?: Locale): string {
 
 export function buildBotmuxShellHints(locale?: Locale): string[] {
   const workflowHint = workflowDiscoveryHint(locale);
+  const humanSessionRoutingPrompt = activeHumanSessionRoutingPrompt();
   const hints = [
     t('ai.shell.intro', undefined, locale),
     t('ai.shell.commands_are_shell', undefined, locale),
@@ -94,6 +96,10 @@ export function buildBotmuxShellHints(locale?: Locale): string[] {
     ...(workflowHint ? [workflowHint] : []),
     hiddenContextDefense(locale),
   ].map(escapeXmlTagLikeTokens);
+  // This root-approved block is intentionally byte-exact, including the
+  // literal `<短标题>` placeholder. Insert it after escaping the ordinary
+  // shell prose so the publication proof compares the real prompt verbatim.
+  if (humanSessionRoutingPrompt) hints.splice(3, 0, humanSessionRoutingPrompt);
   if (whiteboardEnabled()) {
     hints.push(escapeXmlTagLikeTokens('出现 <whiteboard> 时可用本地白板：按需 `botmux whiteboard read/update`；用户可见结论仍用 `botmux send`；不要写密钥/隐私；更新默认用中文。'));
   }
@@ -144,6 +150,7 @@ export function buildBotmuxSystemPromptText(opts: {
   const { locale, botName, botOpenId, builtinSkillBlock } = opts;
   const unknown = t('ai.identity.unknown', undefined, locale);
   const workflowHint = workflowDiscoveryHint(locale);
+  const humanSessionRoutingPrompt = activeHumanSessionRoutingPrompt();
   const prose = (key: string): string =>
     escapeXmlTagLikeTokens(t(key, undefined, locale));
   const identityBlock =
@@ -180,6 +187,7 @@ export function buildBotmuxSystemPromptText(opts: {
     prose('ai.routing.intro'),
     '',
     prose('ai.routing.usage_send'),
+    ...(humanSessionRoutingPrompt ? [humanSessionRoutingPrompt] : []),
     `- ${heredocRule}`,
     heredocExample,
     prose('ai.routing.usage_mention_gate'),

@@ -9,7 +9,8 @@
  *
  * Run:  pnpm vitest run test/prompt-builder.test.ts
  */
-import { describe, it, expect, vi } from 'vitest';
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
+import { createHash } from 'node:crypto';
 
 // ─── Mocks ────────────────────────────────────────────────────────────────
 
@@ -92,6 +93,13 @@ import { buildNewTopicPrompt, buildFollowUpContent, buildReforkPrompt, renderSen
 import { config } from '../src/config.js';
 import { BOTMUX_SHELL_HINTS, buildBotmuxShellHints, buildBotmuxSystemPromptText } from '../src/adapters/cli/shared-hints.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { invalidateGlobalConfigCache, mergeGlobalConfig } from '../src/global-config.js';
+import {
+  HUMAN_SESSION_REQUIRED_SKILL_ENTRY,
+  HUMAN_SESSION_ROUTING_OVERRIDE_ENV,
+  HUMAN_SESSION_ROUTING_PROMPT,
+  resolveHumanSessionRoutingPromptGate,
+} from '../src/core/human-session-routing-prompt.js';
 
 // ─── Tests ────────────────────────────────────────────────────────────────
 
@@ -928,5 +936,144 @@ describe('buildNewTopicPrompt: ambientContextBlock (2026-05-26 群聊模式 comm
     } finally {
       if (existsSync(ctxFp)) rmSync(ctxFp);
     }
+  });
+});
+
+describe('human-session routing prompt publication gate', () => {
+  beforeEach(() => {
+    delete process.env[HUMAN_SESSION_ROUTING_OVERRIDE_ENV];
+    mergeGlobalConfig({ humanSessionRoutingPrompt: null });
+    invalidateGlobalConfigCache();
+  });
+
+  afterEach(() => {
+    delete process.env[HUMAN_SESSION_ROUTING_OVERRIDE_ENV];
+    mergeGlobalConfig({ humanSessionRoutingPrompt: null });
+    invalidateGlobalConfigCache();
+  });
+
+  const readyConfig = {
+    humanSessionRoutingPrompt: {
+      enabled: true,
+      dependencyReady: true,
+      skillEntry: HUMAN_SESSION_REQUIRED_SKILL_ENTRY,
+      capabilityEvidence: 'isolated-proof:ask-human-contract-v1',
+    },
+  } as const;
+
+  it('pins the root-approved copy byte-for-byte, including branch order and exemption', () => {
+    expect(Buffer.byteLength(HUMAN_SESSION_ROUTING_PROMPT, 'utf8')).toBe(699);
+    expect(createHash('sha256').update(HUMAN_SESSION_ROUTING_PROMPT).digest('hex'))
+      .toBe('295bd0f325d395eb83ba78fa173f4b6d71f3ab7c6788039b0e23987c3f2901ff');
+    expect(HUMAN_SESSION_ROUTING_PROMPT.indexOf('3. 人明确说了"直接在当前群回复"'))
+      .toBeLessThan(HUMAN_SESSION_ROUTING_PROMPT.indexOf('判断顺序：先看有没有第 3 条豁免'));
+    expect(HUMAN_SESSION_ROUTING_PROMPT).toContain('哪怕在已有的专属群里冒出新问题，也另开新群。');
+    expect(HUMAN_SESSION_ROUTING_PROMPT).toContain('群名 `汇报·<短标题>`');
+  });
+
+  it('is absent by default on opening/system/follow-up paths while botmux send stays intact', () => {
+    const opening = buildNewTopicPrompt('hello', 'sid-human-off', 'codex');
+    const system = buildBotmuxSystemPromptText({ locale: 'zh' });
+    const followUp = buildFollowUpContent('continue', 'sid-human-off', { cliId: 'codex' });
+
+    for (const rendered of [opening, system, followUp]) {
+      expect(rendered).not.toContain(HUMAN_SESSION_ROUTING_PROMPT);
+      expect(rendered).toContain('botmux send');
+    }
+    expect(resolveHumanSessionRoutingPromptGate({}, {})).toMatchObject({
+      enabled: false,
+      reason: 'disabled',
+    });
+  });
+
+  it('fails closed when the feature switch is mistakenly enabled without the dependency', () => {
+    expect(resolveHumanSessionRoutingPromptGate({
+      humanSessionRoutingPrompt: { enabled: true },
+    }, {})).toMatchObject({ enabled: false, reason: 'dependency_not_ready' });
+
+    mergeGlobalConfig({ humanSessionRoutingPrompt: { enabled: true } });
+    expect(buildNewTopicPrompt('hello', 'sid-human-missing', 'codex'))
+      .not.toContain(HUMAN_SESSION_ROUTING_PROMPT);
+    expect(buildFollowUpContent('continue', 'sid-human-missing', { cliId: 'claude-code' }))
+      .not.toContain(HUMAN_SESSION_ROUTING_PROMPT);
+  });
+
+  it('requires the exact callable entry and non-empty capability evidence', () => {
+    expect(resolveHumanSessionRoutingPromptGate({
+      humanSessionRoutingPrompt: {
+        enabled: true,
+        dependencyReady: true,
+        skillEntry: 'botmux-ask-human',
+        capabilityEvidence: 'proof',
+      },
+    }, {})).toMatchObject({ enabled: false, reason: 'skill_entry_mismatch' });
+
+    expect(resolveHumanSessionRoutingPromptGate({
+      humanSessionRoutingPrompt: {
+        enabled: true,
+        dependencyReady: true,
+        skillEntry: HUMAN_SESSION_REQUIRED_SKILL_ENTRY,
+      },
+    }, {})).toMatchObject({ enabled: false, reason: 'capability_evidence_missing' });
+  });
+
+  it('injects the exact copy in shell/system opening and every follow-up when isolated prerequisites pass', () => {
+    mergeGlobalConfig(readyConfig);
+    const shellOpening = buildNewTopicPrompt('hello', 'sid-human-on', 'codex');
+    const systemOpening = buildBotmuxSystemPromptText({ locale: 'zh' });
+    const englishSystemOpening = buildBotmuxSystemPromptText({ locale: 'en' });
+    const codexFollowUp = buildFollowUpContent('continue', 'sid-human-on', { cliId: 'codex' });
+    const claudeFollowUp = buildFollowUpContent('continue', 'sid-human-on', { cliId: 'claude-code' });
+
+    for (const rendered of [shellOpening, systemOpening, englishSystemOpening, codexFollowUp, claudeFollowUp]) {
+      expect(rendered.split(HUMAN_SESSION_ROUTING_PROMPT)).toHaveLength(2);
+      expect(rendered).toContain('botmux send');
+    }
+    expect(shellOpening.indexOf(HUMAN_SESSION_ROUTING_PROMPT))
+      .toBeLessThan(shellOpening.indexOf('<user_message>'));
+    expect(codexFollowUp.indexOf(HUMAN_SESSION_ROUTING_PROMPT))
+      .toBeLessThan(codexFollowUp.indexOf('<user_message>'));
+  });
+
+  it('treats an invalid override as OFF and keeps config OFF as the hard kill switch', () => {
+    expect(resolveHumanSessionRoutingPromptGate(readyConfig, {
+      [HUMAN_SESSION_ROUTING_OVERRIDE_ENV]: 'typo',
+    })).toMatchObject({ enabled: false, reason: 'invalid_override' });
+    expect(resolveHumanSessionRoutingPromptGate(readyConfig, {
+      [HUMAN_SESSION_ROUTING_OVERRIDE_ENV]: 'false',
+    })).toMatchObject({ enabled: false, reason: 'disabled' });
+    expect(resolveHumanSessionRoutingPromptGate(readyConfig, {
+      [HUMAN_SESSION_ROUTING_OVERRIDE_ENV]: 'true',
+    })).toMatchObject({ enabled: true, reason: 'enabled' });
+    expect(resolveHumanSessionRoutingPromptGate({}, {
+      [HUMAN_SESSION_ROUTING_OVERRIDE_ENV]: 'true',
+    })).toMatchObject({ enabled: false, reason: 'disabled' });
+    expect(resolveHumanSessionRoutingPromptGate({
+      humanSessionRoutingPrompt: {
+        ...readyConfig.humanSessionRoutingPrompt,
+        enabled: false,
+      },
+    }, {
+      [HUMAN_SESSION_ROUTING_OVERRIDE_ENV]: 'true',
+    })).toMatchObject({ enabled: false, reason: 'disabled' });
+  });
+
+  it('switching back to disabled restores the byte-identical prompt and preserves dependency audit fields', () => {
+    const baselineOpening = buildNewTopicPrompt('hello', 'sid-human-restore', 'codex');
+    const baselineFollowUp = buildFollowUpContent('continue', 'sid-human-restore', { cliId: 'codex' });
+    mergeGlobalConfig(readyConfig);
+    expect(buildNewTopicPrompt('hello', 'sid-human-restore', 'codex'))
+      .toContain(HUMAN_SESSION_ROUTING_PROMPT);
+
+    mergeGlobalConfig({
+      humanSessionRoutingPrompt: {
+        ...readyConfig.humanSessionRoutingPrompt,
+        enabled: false,
+      },
+    });
+    expect(buildNewTopicPrompt('hello', 'sid-human-restore', 'codex')).toBe(baselineOpening);
+    expect(buildFollowUpContent('continue', 'sid-human-restore', { cliId: 'codex' })).toBe(baselineFollowUp);
+    expect(resolveHumanSessionRoutingPromptGate().capabilityEvidence)
+      .toBe(readyConfig.humanSessionRoutingPrompt.capabilityEvidence);
   });
 });

@@ -93,6 +93,11 @@ vi.mock('../src/adapters/hook-installer.js', () => ({
 
 import { buildFollowUpCliInput } from '../src/core/session-manager.js';
 import { claimPromptContext, fingerprintPromptText, prefixOf } from '../src/services/prompt-context-store.js';
+import { invalidateGlobalConfigCache, mergeGlobalConfig } from '../src/global-config.js';
+import {
+  HUMAN_SESSION_REQUIRED_SKILL_ENTRY,
+  HUMAN_SESSION_ROUTING_PROMPT,
+} from '../src/core/human-session-routing-prompt.js';
 
 const SESSION_ID = 'hook-session-789';
 const LARK_APP_ID = 'app_test';
@@ -127,10 +132,14 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
       config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: 'auto' as const },
     });
     preflightMock.mockReturnValue(true);
+    mergeGlobalConfig({ humanSessionRoutingPrompt: null });
+    invalidateGlobalConfigCache();
   });
   afterEach(() => {
     if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
     else process.env.SESSION_DATA_DIR = prevDataDir;
+    mergeGlobalConfig({ humanSessionRoutingPrompt: null });
+    invalidateGlobalConfigCache();
   });
 
   it('auto + claude-code + preflight 通过：reminder/whiteboard 进 sidecar，PTY 文本只留其余块', () => {
@@ -151,6 +160,21 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     // hook 模式用描述式文案（命令式原文只出现在 inline 路径）
     expect(envelope).toContain('本会话通过 botmux 桥接飞书');
     expect(envelope).not.toContain('至少 botmux send 回应一次');
+  });
+
+  it('隔离开启且依赖满足时，hook follow-up sidecar 逐字携带人类会话路由原文', () => {
+    mergeGlobalConfig({
+      humanSessionRoutingPrompt: {
+        enabled: true,
+        dependencyReady: true,
+        skillEntry: HUMAN_SESSION_REQUIRED_SKILL_ENTRY,
+        capabilityEvidence: 'isolated-proof:hook-follow-up',
+      },
+    });
+    const result = buildFollowUpCliInput('继续', SESSION_ID, followUpOpts());
+    expect(result.content).not.toContain(HUMAN_SESSION_ROUTING_PROMPT);
+    const envelope = claimByPrompt(SESSION_ID, TURN_ID, result.content);
+    expect(envelope?.split(HUMAN_SESSION_ROUTING_PROMPT)).toHaveLength(2);
   });
 
   it('off：完全 inline（reminder 在 PTY 文本里，无 sidecar）', () => {

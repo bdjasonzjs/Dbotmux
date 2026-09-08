@@ -93,6 +93,7 @@ import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-host
 import { removePromptContextTurn, writePromptContext } from '../services/prompt-context-store.js';
 import { hasInstalledPromptHookCached } from '../adapters/hook-installer.js';
 import { isSharedAdoptPersistedSession, isSharedAdoptSession } from './shared-adopt.js';
+import { activeHumanSessionRoutingPrompt } from './human-session-routing-prompt.js';
 
 export { getAttachmentsDir } from './attachment-path.js';
 // Keep the fork's public prompt-builder API while the implementation lives in
@@ -1442,7 +1443,11 @@ function buildFollowUpBlocks(
     const reminderKey = hookMode
       ? 'ai.followup.reminder_hook'
       : config.noVisibleOutputHint ? 'ai.followup.reminder_no_resend' : 'ai.followup.reminder';
-    const reminder = t(reminderKey, undefined, opts?.locale);
+    const baseReminder = t(reminderKey, undefined, opts?.locale);
+    const humanSessionRoutingPrompt = activeHumanSessionRoutingPrompt();
+    const reminder = humanSessionRoutingPrompt
+      ? `${baseReminder}\n\n${humanSessionRoutingPrompt}`
+      : baseReminder;
     blocks.push({ key: 'reminder', text: `<botmux_reminder>${reminder}</botmux_reminder>` });
   }
   if (whiteboardBlock) blocks.push({ key: 'whiteboard', text: whiteboardBlock });

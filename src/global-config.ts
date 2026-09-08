@@ -111,6 +111,16 @@ export interface WorkflowFeatureGlobalConfig {
   enabled?: boolean;
 }
 
+/** Default-off publication gate for the per-turn human-session routing copy.
+ * `enabled` alone is deliberately insufficient: the dependency leaf must also
+ * publish a matching callable entry plus concrete readiness evidence. */
+export interface HumanSessionRoutingPromptConfig {
+  enabled?: boolean;
+  dependencyReady?: boolean;
+  skillEntry?: string;
+  capabilityEvidence?: string;
+}
+
 export interface GlobalConfig {
   lang?: Locale;
   /** Machine-wide default prefix for groups created via `/group` or `/g`.
@@ -145,6 +155,10 @@ export interface GlobalConfig {
    *  the feature ON (legacy behavior); set false to disable it host-wide. The
    *  `BOTMUX_WORKFLOW_ENABLED` env var overrides this when set. */
   workflow?: WorkflowFeatureGlobalConfig;
+  /** Human-session routing copy injected into opening + follow-up prompts.
+   * Default OFF. Enabling is fail-closed unless dependencyReady, skillEntry and
+   * capabilityEvidence also satisfy the publication gate. */
+  humanSessionRoutingPrompt?: HumanSessionRoutingPromptConfig;
   /** Optional HTTP(S) proxy for the daemon's own outbound downloads (e.g. the
    *  HD2D office assets). Node's global fetch ignores HTTP_PROXY/HTTPS_PROXY,
    *  so hosts behind a proxy must set this (or the env vars, which we read as a
@@ -525,6 +539,21 @@ function readWorkflowFeature(raw: unknown): WorkflowFeatureGlobalConfig | undefi
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+function readHumanSessionRoutingPrompt(raw: unknown): HumanSessionRoutingPromptConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const value = raw as Record<string, unknown>;
+  const out: HumanSessionRoutingPromptConfig = {};
+  if (typeof value.enabled === 'boolean') out.enabled = value.enabled;
+  if (typeof value.dependencyReady === 'boolean') out.dependencyReady = value.dependencyReady;
+  if (typeof value.skillEntry === 'string' && value.skillEntry.trim()) {
+    out.skillEntry = value.skillEntry.trim();
+  }
+  if (typeof value.capabilityEvidence === 'string' && value.capabilityEvidence.trim()) {
+    out.capabilityEvidence = value.capabilityEvidence.trim();
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 export function globalConfigPath(): string {
   return join(homedir(), '.botmux', 'config.json');
 }
@@ -593,6 +622,8 @@ export function readGlobalConfig(): GlobalConfig {
   if (vcMeetingAgent) out.vcMeetingAgent = vcMeetingAgent;
   const workflow = readWorkflowFeature(raw.workflow);
   if (workflow) out.workflow = workflow;
+  const humanSessionRoutingPrompt = readHumanSessionRoutingPrompt(raw.humanSessionRoutingPrompt);
+  if (humanSessionRoutingPrompt) out.humanSessionRoutingPrompt = humanSessionRoutingPrompt;
   if (typeof raw.httpProxy === 'string' && raw.httpProxy.trim()) out.httpProxy = raw.httpProxy.trim();
   // Lenient http(s) origin check; resolveOAuthRedirectUri re-validates shape.
   if (typeof raw.oauthRedirectBase === 'string' && /^https?:\/\//.test(raw.oauthRedirectBase.trim())) {

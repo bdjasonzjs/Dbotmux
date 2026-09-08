@@ -231,6 +231,34 @@ describe('global dashboard config', () => {
     expect(isWorkflowFeatureEnabled()).toBe(true); // blank ⇒ fall through to config (enabled)
   });
 
+  it('human-session routing prompt config is strict, trimmed, and default-off capable', () => {
+    mergeGlobalConfig({
+      humanSessionRoutingPrompt: {
+        enabled: false,
+        dependencyReady: true,
+        skillEntry: ' 人类会话 ',
+        capabilityEvidence: ' proof:sha256 ',
+      },
+    });
+    expect(readGlobalConfig().humanSessionRoutingPrompt).toEqual({
+      enabled: false,
+      dependencyReady: true,
+      skillEntry: '人类会话',
+      capabilityEvidence: 'proof:sha256',
+    });
+
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      humanSessionRoutingPrompt: {
+        enabled: 'true',
+        dependencyReady: 1,
+        skillEntry: '   ',
+        capabilityEvidence: null,
+      },
+    }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().humanSessionRoutingPrompt).toBeUndefined();
+  });
+
   it('keeps codexNotifier strictly disabled by default', () => {
     expect(readGlobalConfig().codexNotifier).toBeUndefined();
     expect(resolveCodexNotifierConfig()).toEqual({

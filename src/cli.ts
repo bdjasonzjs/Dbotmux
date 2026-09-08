@@ -14772,10 +14772,25 @@ switch (command) {
       console.error(`✅ mainTopicChatId cleared`);
       process.exit(0);
     }
+    if (sub === 'human-session-routing-status') {
+      const { resolveHumanSessionRoutingPromptGate } = await import('./core/human-session-routing-prompt.js');
+      console.log(JSON.stringify(resolveHumanSessionRoutingPromptGate(), null, 2));
+      process.exit(0);
+    }
+    if (sub === 'disable-human-session-routing') {
+      const current = readGlobalConfig().humanSessionRoutingPrompt ?? {};
+      mergeGlobalConfig({ humanSessionRoutingPrompt: { ...current, enabled: false } });
+      console.error('✅ human-session routing prompt disabled (takes effect on subsequent prompt builds; no session/message data changed)');
+      process.exit(0);
+    }
     console.error(`用法:
   botmux config get-main-topic            打印当前 mainTopicChatId（env 优先，回落 config 文件）
   botmux config set-main-topic <chatId>   写入 ~/.botmux/config.json 并同步 ChatTopology.rootChatId
   botmux config clear-main-topic          清除文件配置（env 仍可能生效）
+  botmux config human-session-routing-status
+                                            查看人类会话路由提示发布闸门（默认关闭）
+  botmux config disable-human-session-routing
+                                            一键关闭提示；不改消息/会话数据
 
 主话题（mainTopicChatId）= 主 bot 可调用 \`botmux subtask-create\` 派活的 chat。
 env override: \`export ${MAIN_TOPIC_ENV_VAR}=oc_...\``);
