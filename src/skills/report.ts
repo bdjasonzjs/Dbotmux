@@ -1,12 +1,16 @@
 /** One public report entry, backed by the existing room and reply transport. */
 export const REPORT_SKILL = `---
 name: botmux-report
-description: 向用户提问、答复或汇报时使用；每次独立创建汇报群，用户回复自动回原群并圈原 bot。用户明确要求本群回复，或 bot 间沟通，用 botmux send。create-group 只创建工作子群。
+description: 向用户提问、答复或汇报时使用；每次先读汇报规范，再独立创建汇报群，用户回复自动回原群并圈原 bot。用户明确要求本群回复，或 bot 间沟通，用 botmux send。create-group 只创建工作子群。
 ---
 
 # botmux-report — 汇报
 
 在原业务会话调用一次，命令自动建汇报群、发正文并回传原群链接。不要自己用 create-group 或 send 拼装汇报；来源身份由运行环境提供。
+
+## 先读规范
+
+每次准备汇报前，先完整读取《汇报规范》：\`botmux skill read botmux-report references/report-rules.md\`，按规范组织正文并自查。详细写作要求以该独立文档为准，不凭历史印象省略阅读；读不到时先说明问题，不绕过规范发送。
 
 ## 一次调用
 

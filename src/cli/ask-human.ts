@@ -6,6 +6,7 @@ import { ASK_HUMAN_IPC_MAX_BYTES, ASK_HUMAN_IPC_ROUTE } from '../core/ask-human-
 
 export const ASK_HUMAN_CLI_USAGE = `汇报能力 — botmux-report 技能的底层命令
 使用说明：botmux skill show botmux-report
+汇报前必读：botmux skill read botmux-report references/report-rules.md
 botmux human-session --input <JSON文件|->
 兼容入口：botmux ask-human --input <JSON文件|->
 独立汇报：operation=report、direction=assistant_answer，必填 requestId、title、body。

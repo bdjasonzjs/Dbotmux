@@ -2,6 +2,7 @@ import { readSessionSkillManifest } from './manifest-store.js';
 import { listSkillResources, readSkillEntrypoint, readSkillResource } from './resource-reader.js';
 import { builtinSkillContent, builtinSkillEntries } from '../../skills/injection-mode.js';
 import { whiteboardEnabled } from '../../services/whiteboard-store.js';
+import { readFileSync } from 'node:fs';
 
 export interface SkillCommandResult {
   code: number;
@@ -34,6 +35,23 @@ export function runSkillSessionCommand(
     if (!name) return { code: 2, stdout: '', stderr: 'usage: botmux skill show <name>\n' };
     const builtin = builtinSkillContent(name);
     if (builtin) return { code: 0, stdout: builtin.endsWith('\n') ? builtin : builtin + '\n', stderr: '' };
+  }
+  // The shipped report reference is available wherever its built-in entry is,
+  // including fresh sessions without a user-skill manifest. Other resources
+  // retain their existing manifest resolution.
+  if ((sub === 'read' || sub === 'resources') && args[1] === 'botmux-report') {
+    const builtin = builtinSkillContent('botmux-report');
+    if (builtin) {
+      if (sub === 'resources') return { code: 0, stdout: 'SKILL.md\nreferences/report-rules.md\n', stderr: '' };
+      if (args[2] === 'SKILL.md') return { code: 0, stdout: builtin, stderr: '' };
+      if (!args[2]) return { code: 2, stdout: '', stderr: 'usage: botmux skill read <name> <path>\n' };
+      if (args[2] !== 'references/report-rules.md') return { code: 1, stdout: '', stderr: 'skill_resource_not_found\n' };
+      try {
+        return { code: 0, stdout: readFileSync(new URL('../../skills/references/report-rules.md', import.meta.url), 'utf8'), stderr: '' };
+      } catch {
+        return { code: 1, stdout: '', stderr: 'report_rules_unavailable: 汇报规范未安装，请检查部署文件\n' };
+      }
+    }
   }
   const sessionId = sessionIdFromEnv(env);
   if (!sessionId) return { code: 2, stdout: '', stderr: 'missing BOTMUX_SESSION_ID\n' };

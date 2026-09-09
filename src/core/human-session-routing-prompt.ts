@@ -4,7 +4,7 @@ import {
 } from '../global-config.js';
 
 /** One business entry, distinct from ordinary work-group creation. */
-export const HUMAN_SESSION_ROUTING_PROMPT = `向用户提问、答复或汇报，使用 botmux-report（先读 botmux skill show botmux-report）；每次独立汇报，回复回原群，继续答复再用一次。
+export const HUMAN_SESSION_ROUTING_PROMPT = `向用户提问、答复或汇报，使用 botmux-report（先读技能及其汇报规范：botmux skill show botmux-report）；每次独立汇报，回复回原群，继续答复再用一次。
 用户明确要求本群回复，或 bot 间沟通，用 botmux send。
 create-group 只用于创建工作子群，不用于汇报。`;
 

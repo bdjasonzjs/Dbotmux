@@ -4,6 +4,8 @@
 
 向用户提问、答复或汇报，读取 `botmux skill show botmux-report` 并按技能调用。该内置技能包装现有 `botmux human-session --input <JSON文件|->`，不新增第二套汇报实现。原群、原会话和来源 bot 由实际运行上下文提供；现有能力负责建汇报群、登记来源、展示正文和回复回源。
 
+每次准备汇报前，按技能指引运行 `botmux skill read botmux-report references/report-rules.md`，完整阅读独立的[汇报规范](../src/skills/references/report-rules.md)。规范要求不用开发代号、按读者完全不知道前情补齐上下文、一次只讲一件事，并区分事实、建议和未知。每轮提示只保留阅读入口，不注入规范全文。文档随构建进入 npm 包，可在没有用户 skill manifest 的新会话读取；不依赖业务 origin 凭据，不增加阅读回执、审核模型、发送拦截或生命周期状态。其他技能资源仍按原 manifest 读取。
+
 启用汇报能力的会话在既有每轮提示里看到三条分流说明：面向用户走 `botmux-report`，每次独立汇报、回复回原群、继续答复再用一次；用户明确要求本群回复或 bot 间沟通走 `botmux send`；`create-group` 只用于工作子群。初始共享说明、send 技能描述和底层命令帮助同步使用这一区分。未启用的会话保持原提示；安装配置里的旧 `skillEntry` 名称不变，不借此扩大启用范围。
 
 按 bot 启用时，提示生成使用会话传入的真实 `larkAppId`：daemon 的新消息/续轮来自 `ds.larkAppId`，CLI 初始 system prompt 来自 worker 的 `cfg.larkAppId`。daemon 启动本来就会清除继承的会话环境变量，不能依赖其中的 `BOTMUX_LARK_APP_ID` 判断提示是否启用；不修改这项清理或配置开关。
@@ -12,7 +14,7 @@
 
 ## 独立汇报：不等待业务结束
 
-每次技能只调用一次 `operation=report`，提交 `requestId`、`direction=assistant_answer`、`title` 和 `body`。提问、答复和进展都用这一种形式；每次新汇报创建新群。无需读取/确认细则、冻结事实、模型检查或领取/消费回复。正文仍需写清必要背景、事实与未知，由调用者对内容负责。
+每次技能只调用一次 `operation=report`，提交 `requestId`、`direction=assistant_answer`、`title` 和 `body`。提问、答复和进展都用这一种形式；每次新汇报创建新群。写正文前阅读汇报规范，但不再走旧协议的细则确认、冻结事实、模型检查或领取/消费回复。正文仍需写清必要背景、事实与未知，由调用者对内容负责。
 
 调用完成只表示这条汇报正文及原群链接已送达，不表示用户已回复或业务完成。后续汇报不占用旧请求的排队槽位，不等待旧回复被消费，也不取得回答输出锁。旧群的新回复仍带着对应汇报正文回到原群，作为普通消息唤醒原 bot；需要继续答复就再次调用技能。
 
