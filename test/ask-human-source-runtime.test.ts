@@ -20,6 +20,7 @@ import { setAskHumanIpcApi, startIpcServer, setIpcAuthSecret } from '../src/core
 import { config } from '../src/config.js';
 import { readAskHumanCliOrigin } from '../src/core/ask-human-cli-origin.js';
 import { askHumanTextWire } from '../src/core/ask-human-message.js';
+import { fetchDaemonIpc } from '../src/core/daemon-ipc-auth.js';
 
 let root: string;
 const time = 1700000000000, cap = 'b'.repeat(64);
@@ -104,10 +105,109 @@ function setup(realTriggerBinding = false, fileInstallation = false) {
 beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'human-source-runtime-')); });
 afterEach(() => { vi.restoreAllMocks(); rmSync(root, { recursive: true, force: true }); });
 
+function standaloneSetup() {
+  const x = setup();
+  x.grant.replyForward = { userProfile: 'user', fallbackProfile: 'only-fallback', fallbackAppId: 'fallback-app' };
+  x.sdk.sendReply = vi.fn(async input => {
+    const wire = askHumanTextWire(input.body, input.mentions), id = 'reply-' + x.messages.size;
+    x.messages.set(id, { message_id: id, chat_id: input.chatId, create_time: String(time + 20), deleted: false,
+      msg_type: 'text', sender: { id: f.source.decisionOpenId, sender_type: 'user', id_type: 'open_id' },
+      body: { content: wire.content }, mentions: [{ key: '@_user_1', id: 'ou_bot', id_type: 'open_id' }] });
+    return { messageId: id, sender: { type: 'user', id: f.source.decisionOpenId } };
+  });
+  x.restart();
+  const example = JSON.parse(/```json\n([\s\S]*?)\n```/.exec(REPORT_SKILL)![1]);
+  const command = (id = 'report-one', extra = {}) => ({ ...example, requestId: id, sessionId: 's', originCapability: '', ...extra });
+  const send = (id = 'report-one', extra = {}) => x.runtime.handle(command(id, extra), { trustedHost: true }) as Promise<any>;
+  const saved = (id = 'report-one') => new AskHumanLedger(join(x.stateDir, 'ledger'), () => time).get(f.source, 'assistant_answer', id);
+  return { ...x, get runtime() { return x.runtime; }, command, send, saved };
+}
+
+describe('independent reports: delivery state only, no business handshake', () => {
+  it('skill example delivers once; a second report does not wait for a reply or worker terminal', async () => {
+    const x = standaloneSetup();
+    const a = await x.send(), b = await x.send('report-two');
+    expect(a).toMatchObject({ state: 'COMPLETED', sealed: true, roomName: '汇报·导出功能进展' });
+    expect(b.roomId).not.toBe(a.roomId);
+    expect(x.sdk.create).toHaveBeenCalledTimes(2);
+    expect(x.fetchImpl).not.toHaveBeenCalled();
+    expect(x.guards.answerGuarded(f)).toBe(false);
+    x.ds.managedTurnOrigin = undefined;
+    x.terminal();
+    expect(x.runtime.terminalFailures()).toEqual([]);
+    await expect(x.send('report-three')).resolves.toMatchObject({ state: 'COMPLETED' });
+    await expect(x.runtime.handle({ ...x.command(), operation: 'read_rules', title: undefined, body: undefined })).rejects.toBeDefined();
+  });
+  it('late and repeated replies preserve original text and mention, without claim/consume or extra wake', async () => {
+    const x = standaloneSetup(), a = await x.send();
+    await x.send('report-two');
+    x.ds.managedTurnOrigin = undefined;
+    x.restart();
+    const original = '  先看原文\r\n保留空格。  ', event = x.human(a.roomId, 'late-one', original);
+    await x.incoming(event); await x.incoming(event);
+    expect(x.sdk.sendReply).toHaveBeenCalledOnce();
+    expect(x.sdk.sendReply).toHaveBeenCalledWith(expect.objectContaining({ chatId: f.source.chatId, replyAsUser: true,
+      mentions: ['ou_bot'], body: expect.stringContaining(original) }));
+    const body = vi.mocked(x.sdk.sendReply!).mock.calls[0][0].body;
+    expect(body).toContain(a.body); expect(body).not.toContain('claim_event'); expect(body).not.toContain('consume_event');
+    expect(x.saved().events[0]).toMatchObject({ kind: 'human_message', inboxAck: true });
+    expect(x.trigger).not.toHaveBeenCalled();
+    expect(readdirSync(join(x.stateDir, 'inbox')).filter(n => !n.endsWith('.lock'))).toEqual([]);
+    await x.incoming(x.human(a.roomId, 'late-two', '另一个补充'));
+    expect(x.sdk.sendReply).toHaveBeenCalledTimes(2);
+    await x.send(); expect(x.sdk.create).toHaveBeenCalledTimes(2); expect(x.sdk.sendReply).toHaveBeenCalledTimes(2);
+  });
+  it('retry is idempotent, changed body rejected, unresolved create does not block a different report', async () => {
+    const x = standaloneSetup();
+    const a = await x.send(); await x.send(); expect(x.sdk.create).toHaveBeenCalledOnce();
+    await expect(x.send('report-one', { body: '不同正文' })).rejects.toMatchObject({ code: 'REQUEST_CHANGED' });
+    vi.mocked(x.sdk.create).mockRejectedValueOnce(new Error('provider result unknown'));
+    await expect(x.send('uncertain')).rejects.toThrow('provider result unknown');
+    await expect(x.send('uncertain')).rejects.toMatchObject({ code: 'CREATE_RECONCILIATION_REQUIRED' });
+    expect(x.sdk.create).toHaveBeenCalledTimes(2);
+    await expect(x.send('independent')).resolves.toMatchObject({ state: 'COMPLETED' });
+    expect(x.saved().roomId).toBe(a.roomId);
+  });
+  it('a released legacy preparation and revoked turn capability cannot block a new independent report', async () => {
+    const x = standaloneSetup();
+    await x.call('read_rules', 'assistant_answer', 'legacy');
+    x.ds.managedTurnOrigin = undefined; x.terminal();
+    await expect(x.send()).resolves.toMatchObject({ state: 'COMPLETED' });
+    await expect(x.runtime.handle({ operation: 'read_rules', direction: 'assistant_answer', requestId: 'legacy',
+      sessionId: 's', originCapability: cap }, { trustedHost: true })).rejects.toMatchObject({ code: 'ORIGIN_UNPROVEN' });
+  });
+  it.each(['no-host', 'closed', 'wrong-chat'])('retains real source binding: %s', async kind => {
+    const x = standaloneSetup();
+    if (kind === 'closed') x.ds.session.status = 'closed' as any;
+    if (kind === 'wrong-chat') x.ds.chatId = 'unrelated';
+    await expect(x.runtime.handle(x.command(), { trustedHost: kind !== 'no-host' })).rejects.toMatchObject({ code: 'ORIGIN_UNPROVEN' });
+    expect(x.sdk.create).not.toHaveBeenCalled();
+  });
+  it('real CLI/HTTP uses host HMAC without a turn capability; unsigned report stays rejected', async () => {
+    const x = standaloneSetup(), oldDataDir = config.session.dataDir, secret = 'report-local-host-secret';
+    config.session.dataDir = root; setIpcAuthSecret(secret); setAskHumanIpcApi(x.runtime);
+    const server = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    x.ds.managedTurnOrigin = undefined;
+    try {
+      const stdout = vi.fn(), stderr = vi.fn(), { sessionId: _s, originCapability: _o, ...input } = x.command();
+      const rc = await runAskHumanCli(['--input', '-'], { stdout, stderr, readInput: async () => input,
+        context: async () => ({ sessionId: 's', originCapability: '', ipcPort: server.port }),
+        reportFetch: (port, path, init) => fetchDaemonIpc(port, path, init, secret) });
+      expect({ rc, stderr: stderr.mock.calls }).toEqual({ rc: 0, stderr: [] });
+      expect(JSON.parse(stdout.mock.calls[0][0]).result.state).toBe('COMPLETED');
+      const response = await fetch(`http://127.0.0.1:${server.port}/api/human-session`, { method: 'POST',
+        headers: { 'content-type': 'application/json' }, body: JSON.stringify(x.command('unsigned')) });
+      expect(response.status).toBe(403); expect(x.sdk.create).toHaveBeenCalledOnce();
+    } finally {
+      await server.close(); setAskHumanIpcApi(null); setIpcAuthSecret(null); config.session.dataDir = oldDataDir;
+    }
+  });
+});
+
 describe('piece4 connected source consumer and safe release (no live provider)', () => {
-  it('published report skill example runs through the existing API, room registration, user reply and consumption', async () => {
+  it('legacy answer API still supports room registration, user reply and consumption', async () => {
     const x = setup();
-    const d = JSON.parse(/```json\n([\s\S]*?)\n```/.exec(REPORT_SKILL)![1]);
+    const d = draft('assistant_answer');
     d.expiresAt = time + 60000;
     const call = (operation: string, extra = {}) => x.call(operation, d.direction, d.requestId, extra);
     const read = await call('read_rules');

@@ -4,7 +4,7 @@
  * Caller drives one request at a time per lane; use separate calls per direction.
  */
 import { AskHumanAdmission, type AskHumanReaders, type AskHumanSourceBinding } from './ask-human-admission.js';
-import { AskHumanLedger, type AskHumanEntry, type AskHumanFrame, type AskHumanReadMessage, type AskHumanSendIntent, type AskHumanSendPurpose } from './ask-human-ledger.js';
+import { AskHumanLedger, isStandaloneReport, type AskHumanEntry, type AskHumanFrame, type AskHumanReadMessage, type AskHumanSendIntent, type AskHumanSendPurpose } from './ask-human-ledger.js';
 import { AskHumanPreflightError } from './ask-human-preflight.js';
 import { AskHumanReplyNotSent, type AskHumanSendReceipt } from './ask-human-reply.js';
 
@@ -45,6 +45,27 @@ export interface AskHumanExecutorPorts {
 
 export class AskHumanExecutor {
   constructor(private readonly ledger: AskHumanLedger, private readonly ports: AskHumanExecutorPorts) {}
+  /** One independent report delivery; no admission, answer lease or business ACK. */
+  async report(frame: AskHumanFrame, requestId: string, title: string, body: string): Promise<AskHumanEntry> {
+    if (frame.source.appId !== this.ports.runtimeAppId) throw new AskHumanPreflightError('RUNTIME_APP_MISMATCH', '只允许原业务所在 app');
+    const r = this.ledger.enqueueReport(frame, requestId, title, body);
+    if (r.state !== 'QUEUED') return this.reconcile(undefined, r.frame, requestId);
+    const source = frame.source;
+    await this.liveSource(source);
+    const creating = this.ledger.beginReportCreate(source, requestId);
+    try {
+      const roomId = await this.ports.createBotOnlyRoom({ appId: source.appId, uuid: creating.createAttemptId!, name: creating.roomName });
+      const room = await this.ports.readRoom(roomId);
+      if (room.roomId !== roomId || room.appId !== source.appId || !room.private
+        || room.memberIds.length !== 1 || room.memberIds[0] !== frame.botSenderId || room.name !== creating.roomName)
+        throw new AskHumanPreflightError('ROOM_NOT_ISOLATED', '新汇报群回读不符');
+      this.ledger.registerRoom(source, 'assistant_answer', requestId, creating.createAttemptId!, roomId);
+      return await this.resumeRegisteredRoom(undefined, frame, requestId);
+    } catch (e) {
+      this.ledger.recordFailure(source, 'assistant_answer', requestId, 'presentation', (e as Error).message || '投递结果未知');
+      throw e;
+    }
+  }
   private checkRuntime(frame: AskHumanFrame, admission: AskHumanAdmission): void {
     if (this.ports.runtimeAppId !== frame.source.appId) throw new AskHumanPreflightError('RUNTIME_APP_MISMATCH', '只允许原业务所在 app');
     if (admission.direction === 'assistant_answer' && !this.ports.outputGuardReady(frame)) throw new AskHumanPreflightError('OUTPUT_GUARD_UNAVAILABLE', '原群全部输出路径尚未受控');
@@ -83,9 +104,10 @@ export class AskHumanExecutor {
    * room. Purpose registration and invitation must be idempotent adapters.
    * Every retry rechecks membership, live source, rules and expiry before IO.
    */
-  private async resumeRegisteredRoom(admission: AskHumanAdmission, frame: AskHumanFrame, requestId: string, readers: AskHumanReaders): Promise<AskHumanEntry> {
-    const source = frame.source, direction = admission.direction;
+  private async resumeRegisteredRoom(admission: AskHumanAdmission | undefined, frame: AskHumanFrame, requestId: string, readers?: AskHumanReaders): Promise<AskHumanEntry> {
+    const source = frame.source, direction = admission?.direction ?? 'assistant_answer';
     let r = this.ledger.get(source, direction, requestId);
+    if (!admission && !isStandaloneReport(r)) throw new AskHumanPreflightError('INVALID_REQUEST', '不是独立汇报');
     if (r.sealed) return r;
     if (r.state !== 'ROOM_REGISTERED' || !r.roomId) throw new AskHumanPreflightError('CREATE_RECONCILIATION_REQUIRED', '没有可回读的已登记群；须保留故障并取消或核实原建群结果');
     const roomId = r.roomId, room = await this.ports.readRoom(roomId);
@@ -96,12 +118,12 @@ export class AskHumanExecutor {
     if (room.name !== r.roomName) throw new AskHumanPreflightError('ROOM_NAME_MISMATCH', '已登记群名称与已检查短标题不符');
     await this.liveSource(source);
     await this.ports.registerPurpose({ roomId, requestKey: r.key, noWorker: true, noObserver: true });
-    this.checkRuntime(frame, admission);
-    const current = admission.admit(source, requestId, source.appId, readers);
+    if (admission) this.checkRuntime(frame, admission);
+    const current = admission ? admission.admit(source, requestId, source.appId, readers!) : r;
     r = this.ledger.get(source, direction, requestId);
     if (current.state === 'EXPIRED' || r.sealed) return r;
     if (!room.memberIds.includes(source.decisionOpenId)) await this.ports.inviteHuman({ roomId, openId: source.decisionOpenId, appId: source.appId });
-    this.checkRuntime(frame, admission);
+    if (admission) this.checkRuntime(frame, admission);
     await this.liveSource(source);
     const readback = await this.deliver(source, direction, requestId, 'presentation', admission, readers);
     this.ledger.recordPresented(source, direction, requestId, readback);
@@ -151,11 +173,12 @@ export class AskHumanExecutor {
    * Expired/cancelled entries can audit already-sent IO and relay late messages,
    * but cannot regain a queue slot or become an answer to the expired question.
    */
-  async reconcile(admission: AskHumanAdmission, frame: AskHumanFrame, requestId: string, readers: AskHumanReaders): Promise<AskHumanEntry> {
-    this.checkRuntime(frame, admission);
-    const source = frame.source, direction = admission.direction;
+  async reconcile(admission: AskHumanAdmission | undefined, frame: AskHumanFrame, requestId: string, readers?: AskHumanReaders): Promise<AskHumanEntry> {
+    if (admission) this.checkRuntime(frame, admission);
+    const source = frame.source, direction = admission?.direction ?? 'assistant_answer';
     try {
       let r = this.ledger.get(source, direction, requestId);
+      if (!admission && !isStandaloneReport(r)) throw new AskHumanPreflightError('INVALID_REQUEST', '不是独立汇报');
       if (JSON.stringify(r.frame) !== JSON.stringify(frame)) throw new AskHumanPreflightError('SOURCE_MISMATCH', '对账来源与已登记请求不符');
       const presentation = this.ledger.findSend(source, direction, requestId, 'presentation');
       if (!r.sealed) {
@@ -172,7 +195,7 @@ export class AskHumanExecutor {
       r = this.ledger.get(source, direction, requestId);
       for (const event of r.events) {
         if (!event.inboxAck) await this.relay(source, direction, requestId, event);
-        await this.notifyRouting(source, event);
+        if (!isStandaloneReport(r)) await this.notifyRouting(source, event);
       }
       if (direction === 'human_decision') await this.resumeWake(source, requestId);
       r = this.ledger.get(source, direction, requestId);
@@ -201,6 +224,12 @@ export class AskHumanExecutor {
     if (this.ports.runtimeAppId !== source.appId) throw new AskHumanPreflightError('RUNTIME_APP_MISMATCH', '回传必须同 app');
     const event = this.ledger.receive(source, direction, requestId, input);
     if (!event) return;
+    if (isStandaloneReport(this.ledger.get(source, direction, requestId))) {
+      // Native user/fallback-bot message already wakes the source bot through
+      // ordinary IM. Keep delivery dedup; do not create a claim/consume task.
+      if (!event.inboxAck) await this.relay(source, direction, requestId, event);
+      return;
+    }
     if (event.inboxAck) {
       if (event.kind === 'human_candidate') await this.resumeWake(source, requestId);
       else await this.notifyRouting(source, event);

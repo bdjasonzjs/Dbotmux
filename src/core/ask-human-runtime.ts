@@ -8,7 +8,7 @@ import { isAbsolute, join } from 'node:path';
 import { AskHumanApi, askHumanCommandSchema, type AskHumanApiDeps, type AskHumanLiveSource } from './ask-human-api.js';
 import { authorizeSessionScopedIpc } from './daemon-ipc-session-auth.js';
 import { AskHumanAdmission } from './ask-human-admission.js';
-import { AskHumanLedger, parseAskHumanFrame, type AskHumanFrame } from './ask-human-ledger.js';
+import { AskHumanLedger, isStandaloneReport, parseAskHumanFrame, type AskHumanFrame } from './ask-human-ledger.js';
 import { AskHumanExecutor, type AskHumanExecutorPorts } from './ask-human-executor.js';
 import { AskHumanRouting } from './ask-human-routing.js';
 import { AskHumanSourceInbox, createAskHumanSourcePorts } from './ask-human-source.js';
@@ -64,6 +64,8 @@ export function resolveAskHumanLiveSource(appId: string, session: LiveSession | 
 }
 
 export interface AskHumanDaemonRuntime extends Pick<AskHumanApi, 'handle'> {
+  /** Trusted source adapter only; the frame is never taken from request JSON. */
+  report(input: unknown, frame: AskHumanFrame): Promise<unknown>;
   /** Daemon-only verified room intake, NOT an IPC operation. */
   receiveRoomEvent(room: Readonly<AskHumanProtectedRoom>, data: unknown): Promise<void>;
 }
@@ -71,7 +73,7 @@ export function createAskHumanDaemonRuntime(host: AskHumanRuntimeHost, testPorts
   bindLark?: typeof bindAskHumanLarkTransport; fetchImpl?: typeof fetch; now?: () => number;
 } = {}): AskHumanDaemonRuntime {
   const now = testPorts.now ?? Date.now;
-  const run = async (input: unknown, incoming?: { room: Readonly<AskHumanProtectedRoom>; data: unknown }): Promise<unknown> => {
+  const run = async (input: unknown, incoming?: { room: Readonly<AskHumanProtectedRoom>; data: unknown }, reportFrame?: AskHumanFrame): Promise<unknown> => {
       // No installation means no directory creation, model call, SDK binding
       // or origin lookup. The real daemon mounts exactly this dormant state.
       const installed = host.installation?.();
@@ -82,24 +84,27 @@ export function createAskHumanDaemonRuntime(host: AskHumanRuntimeHost, testPorts
       const c = incoming ? { sessionId: incoming.room.frame.source.sessionId,
         requestId: incoming.room.requestId!, direction: incoming.room.direction,
         operation: 'reconcile' as const, originCapability: '' } : askHumanCommandSchema.parse(input);
+      if ((c.operation === 'report') !== !!reportFrame) return fail('ORIGIN_UNPROVEN');
       const fingerprint = (i: AskHumanRuntimeInstallation) => askHumanHash(JSON.stringify([
         i.grantId, i.appId, i.botMemberOpenId, i.expiresAt, i.stateDir, i.rulesDir, i.checker, i.sourceDefaults ?? i.sources,
       ]));
       const pinned = fingerprint(installed);
       const resolveLive = (id: string) => resolveAskHumanLiveSource(host.appId, host.lookupSession(id), installed.sources);
       const live = resolveLive(c.sessionId);
-      const intakeSession = incoming ? host.lookupSession(c.sessionId) : undefined;
+      const boundFrame = incoming?.room.frame ?? reportFrame;
+      const intakeSession = boundFrame ? host.lookupSession(c.sessionId) : undefined;
       const auth = () => {
-        if (incoming) {
-          const current = host.lookupSession(c.sessionId), room = incoming.room;
+        if (boundFrame) {
+          const current = host.lookupSession(c.sessionId);
           const bindings = installed.sources.filter(f => f.source.sessionId === c.sessionId);
           if (!current || current !== intakeSession || current.larkAppId !== host.appId
             || current.session.sessionId !== c.sessionId || current.session.status !== 'active'
-            || current.session.vcMeetingReceiver || current.chatId !== room.frame.source.chatId
-            || bindings.length !== 1 || !equal(bindings[0].source, room.frame.source)
-            || bindings[0].sourceMessageId !== room.frame.sourceMessageId
-            || bindings[0].botSenderId !== host.appId || !room.requestId) return fail('ORIGIN_UNPROVEN');
-          return parseAskHumanFrame(room.frame);
+            || current.session.vcMeetingReceiver || current.chatId !== boundFrame.source.chatId
+            || boundFrame.source.sessionId !== c.sessionId
+            || bindings.length !== 1 || !equal(bindings[0].source, boundFrame.source)
+            || bindings[0].sourceMessageId !== boundFrame.sourceMessageId
+            || bindings[0].botSenderId !== host.appId || (incoming && !incoming.room.requestId)) return fail('ORIGIN_UNPROVEN');
+          return parseAskHumanFrame(boundFrame);
         }
         const current = resolveLive(c.sessionId);
         if (!current || !live || !equal(current, live) || !authorizeSessionScopedIpc({
@@ -111,7 +116,8 @@ export function createAskHumanDaemonRuntime(host: AskHumanRuntimeHost, testPorts
       const frame = auth();
       if (!host.protectionRoot) return fail('NOT_ENABLED');
       const guards = new AskHumanProtectionRegistry(host.protectionRoot);
-      const assertEnabled = (given: AskHumanFrame) => {
+      let standalone = !!reportFrame;
+      const assertEnabled = (given: AskHumanFrame, checkAnswerLease = true) => {
         const current = host.installation?.();
         if (current !== installed || fingerprint(current) !== pinned || !current.grantId.trim()
           || current.appId !== host.appId || (current.expiresAt !== undefined && (!Number.isSafeInteger(current.expiresAt) || now() >= current.expiresAt))
@@ -128,9 +134,9 @@ export function createAskHumanDaemonRuntime(host: AskHumanRuntimeHost, testPorts
         if (!equal(given.source, currentFrame.source) || given.botSenderId !== host.appId) return fail('ORIGIN_UNPROVEN');
         const consumer = guards.probeSource(given);
         if (!consumer || consumer.trigger !== current.trigger || consumer.routeMetadata !== current.routeMetadata) return fail('NOT_ENABLED');
-        if (c.direction === 'assistant_answer' && !guards.answerGuarded(given) && !guards.answerReleased(given, c.requestId)) return fail('NOT_ENABLED');
+        if (checkAnswerLease && !standalone && c.direction === 'assistant_answer' && !guards.answerGuarded(given) && !guards.answerReleased(given, c.requestId)) return fail('NOT_ENABLED');
       };
-      assertEnabled(frame);
+      assertEnabled(frame, !incoming);
       if (!isAbsolute(installed.stateDir) || !isAbsolute(installed.rulesDir)) return fail('RUNTIME_PATH_INVALID');
       // Roots must already be explicitly provisioned. No default .botmux root.
       const directory = (path: string) => {
@@ -140,6 +146,8 @@ export function createAskHumanDaemonRuntime(host: AskHumanRuntimeHost, testPorts
       const stateDir = directory(installed.stateDir), rulesDir = directory(installed.rulesDir);
       if (stateDir === rulesDir) return fail('RUNTIME_PATH_INVALID');
       const ledger = new AskHumanLedger(join(stateDir, 'ledger'), now);
+      if (incoming) standalone = isStandaloneReport(ledger.get(frame.source, c.direction, c.requestId));
+      assertEnabled(frame);
       const admission = new AskHumanAdmission(join(stateDir, 'admission', c.direction), rulesDir, now, c.direction);
       const inbox = new AskHumanSourceInbox(join(stateDir, 'inbox'));
       const receipts = new AskHumanTransportReceipts(join(stateDir, 'receipts'));
@@ -199,7 +207,7 @@ export function createAskHumanDaemonRuntime(host: AskHumanRuntimeHost, testPorts
       const sourcePorts = createAskHumanSourcePorts({ appId: host.appId, inbox, receipts, readMessage,
         nativeReply: !!installed.replyForward,
         location: () => ({ requestId: c.requestId, direction: c.direction }),
-        currentSource: async id => { assertEnabled(frame); return incoming
+        currentSource: async id => { assertEnabled(frame); return boundFrame
           ? (id === frame.source.sessionId ? auth().source : null) : resolveLive(id)?.frame.source ?? null; },
         assertEnabled: source => { assertEnabled(frame); if (!equal(source, frame.source)) fail('ORIGIN_UNPROVEN'); },
         event: (source, id) => {
@@ -279,7 +287,8 @@ export function createAskHumanDaemonRuntime(host: AskHumanRuntimeHost, testPorts
             && (!!guards.room(event.raw.chatId) || (event.raw.chatId === f.source.chatId && guards.answerGuarded(f))) };
         },
       });
-      const result = await api.handle(c);
+      const result = c.operation === 'report'
+        ? await executor.report(frame, c.requestId, c.title, c.body) : await api.handle(c);
       if (c.operation === 'consume_event' && c.direction === 'human_decision') {
         await executor.resumeWake(frame.source, c.requestId);
         if (ledger.get(frame.source, c.direction, c.requestId).state === 'SOURCE_ACKED') ledger.seal(frame.source, c.direction, c.requestId);
@@ -293,6 +302,7 @@ export function createAskHumanDaemonRuntime(host: AskHumanRuntimeHost, testPorts
   };
   return {
     handle: input => run(input),
+    report: (input, frame) => run(input, undefined, frame),
     async receiveRoomEvent(room, data) {
       const installed = host.installation?.();
       if (!installed || !host.protectionRoot) return fail('NOT_ENABLED');

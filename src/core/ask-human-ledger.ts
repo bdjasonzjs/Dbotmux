@@ -61,6 +61,9 @@ const entrySchema = z.object({
   sealed: z.boolean(),
 }).strict();
 export type AskHumanEntry = z.infer<typeof entrySchema>;
+/** Delivery-only reports use the existing wire format, not a checker approval.
+ * Keep the schema readable by other bots sharing this ledger during reload. */
+export const isStandaloneReport = (r: AskHumanEntry) => r.rulesVersion === 'report-v1' && r.rulesHash === 'not-applicable';
 // S1 journals were local fixtures only. Old shapes fail closed; no implicit migration.
 const ledgerSchema = z.object({ v: z.literal(2), lane: text, active: text.optional(), entries: z.array(entrySchema) }).strict();
 const roomSchema = z.object({ roomId: text, owner: text }).strict();
@@ -137,6 +140,32 @@ export class AskHumanLedger {
       j.entries.push(r); return r;
     }));
   }
+  enqueueReport(frame: AskHumanFrame, requestId: string, title: string, body: string): AskHumanEntry {
+    frame = frameSchema.parse(frame);
+    return this.tx(frame.source, 'assistant_answer', j => {
+      const key = keyOf(frame.source, requestId), old = j.entries.find(r => r.key === key);
+      const roomName = askHumanRoomName(title);
+      if (old) {
+        if (!isStandaloneReport(old) || JSON.stringify(old.frame.source) !== JSON.stringify(frame.source)
+          || old.body !== body || old.roomName !== roomName) fail('REQUEST_CHANGED', '重复汇报编号不能更换正文或来源');
+        return old;
+      }
+      const createdAt = this.now();
+      const r: AskHumanEntry = { key, requestId, direction: 'assistant_answer', frame, createdAt,
+        expiresAt: createdAt + ASK_HUMAN_MAX_LIFETIME_MS, body, roomName,
+        reportHash: askHumanHash(body), rulesHash: 'not-applicable', rulesVersion: 'report-v1',
+        state: 'QUEUED', events: [], intents: [], failures: [], wake: 'NONE', sealed: false };
+      j.entries.push(r); return r;
+    });
+  }
+  beginReportCreate(source: AskHumanSourceBinding, requestId: string): AskHumanEntry {
+    return this.tx(source, 'assistant_answer', j => {
+      const r = this.entry(j, source, requestId);
+      if (!isStandaloneReport(r) || r.state !== 'QUEUED') fail('CREATE_UNCERTAIN', '已有建群意图，不能重复建群');
+      // Independent delivery: never takes the human decision/answer queue slot.
+      r.state = 'CREATING'; r.createAttemptId = randomUUID(); return r;
+    });
+  }
   get(source: AskHumanSourceBinding, direction: AskHumanDirection, requestId: string): AskHumanEntry {
     return this.tx(source, direction, j => { this.expire(j); return this.entry(j, source, requestId); });
   }
@@ -150,7 +179,7 @@ export class AskHumanLedger {
     return this.tx(source, direction, j => {
       this.expire(j);
       if (j.active) return j.entries.find(r => r.key === j.active);
-      return j.entries.find(r => !terminal(r));
+      return j.entries.find(r => !terminal(r) && !isStandaloneReport(r));
     });
   }
   beginCreate(admission: AskHumanAdmission, source: AskHumanSourceBinding, requestId: string, readers: AskHumanReaders): AskHumanEntry | { state: 'EXPIRED' } {
@@ -159,7 +188,7 @@ export class AskHumanLedger {
       const r = this.entry(j, source, requestId);
       if (terminal(r)) fail('REQUEST_TERMINAL', '请求已结束，禁止建群');
       if (r.body !== a.body || r.reportHash !== a.reportHash) fail('QUALITY_STALE', '排队后正文或细则更新，须重新提交已检查请求');
-      const first = j.entries.find(e => !terminal(e));
+      const first = j.entries.find(e => !terminal(e) && !isStandaloneReport(e));
       if (first?.key !== r.key || (j.active && j.active !== r.key)) fail('QUEUE_BLOCKED', '本方向前一项尚未结束');
       if (r.state !== 'QUEUED') fail('CREATE_UNCERTAIN', '已存在建群意图，只能按原意图对账');
       j.active = r.key; r.state = 'CREATING'; r.createAttemptId = randomUUID(); return r;
@@ -216,10 +245,10 @@ export class AskHumanLedger {
         if (JSON.stringify(old.raw) !== JSON.stringify(m)) fail('SOURCE_EDITED', '原消息变化，需要人工核对，不能覆盖');
         return old;
       }
-      const reason = r.sealed || terminal(r) ? `请求已结束（${r.state}）` : !r.presented || m.createdAt <= r.presented.createdAt ? '呈现前或时间不符' : m.createdAt >= r.expiresAt ? '超过截止时间' : undefined;
+      const reason = isStandaloneReport(r) ? undefined : r.sealed || terminal(r) ? `请求已结束（${r.state}）` : !r.presented || m.createdAt <= r.presented.createdAt ? '呈现前或时间不符' : m.createdAt >= r.expiresAt ? '超过截止时间' : undefined;
       const kind = reason ? 'routing_notice' : direction === 'assistant_answer' ? 'human_message' : r.events.some(e => e.kind === 'human_candidate') ? 'supplement' : 'human_candidate';
       const e: AskHumanEntry['events'][number] = { eventId: askHumanHash(JSON.stringify([r.key, m.messageId])), kind, ...(reason ? { reason } : {}), raw: m, inboxAck: false };
-      if (reason || kind === 'human_message') this.failure(r, `routing:${e.eventId}`, `${reason ?? '回答型群后续消息'}；须原样回源业务判断新问题，不复活旧请求`);
+      if (!isStandaloneReport(r) && (reason || kind === 'human_message')) this.failure(r, `routing:${e.eventId}`, `${reason ?? '回答型群后续消息'}；须原样回源业务判断新问题，不复活旧请求`);
       r.events.push(e); return e;
     });
   }
@@ -239,6 +268,7 @@ export class AskHumanLedger {
     });
   }
   private renderRelay(r: AskHumanEntry, e: AskHumanEntry['events'][number]): string {
+    if (isStandaloneReport(r)) return `汇报回复\n汇报消息：${r.presented?.messageId ?? ''}\n回复消息：${e.raw.messageId}\n\n原汇报\n${r.body}\n\n用户原回复\n${e.raw.body}\n\n请在原业务继续处理；需要向用户答复时，再使用一次 botmux-report。无需领取、消费或关闭本条汇报。`;
     // Raw text kept in its own JSON field as well as byte-for-byte in the body.
     const notice = e.kind === 'routing_notice' || e.kind === 'human_message'
       ? `\n来源业务提示：${e.reason ?? '汇报后的补充回复'}。请结合当前任务处理这条回复。` : '';
@@ -254,7 +284,7 @@ export class AskHumanLedger {
       this.expire(j); const r = this.entry(j, source, requestId);
       let chatId: string, body: string, mentions: string[] = [];
       if (purpose === 'presentation') {
-        if (!approved || approved.body !== r.body || approved.reportHash !== r.reportHash) fail('QUALITY_STALE', '发送前须重新核验当前细则与正文');
+        if (!isStandaloneReport(r) && (!approved || approved.body !== r.body || approved.reportHash !== r.reportHash)) fail('QUALITY_STALE', '发送前须重新核验当前细则与正文');
         if (terminal(r) || r.state !== 'ROOM_REGISTERED' || !r.roomId) fail('INVALID_STATE', '不能发送呈现正文');
         chatId = r.roomId; body = r.body; mentions = [source.decisionOpenId];
       } else if (purpose === 'link') {
@@ -276,6 +306,7 @@ export class AskHumanLedger {
       r.intents.push(intent); return intent;
     });
     if (purpose !== 'presentation') return persist();
+    if (isStandaloneReport(this.get(source, direction, requestId))) return persist();
     if (!admission || !readers || admission.direction !== direction) fail('QUALITY_STALE', '发送前缺少当前细则检查');
     const result = admission.withAdmittedIntent(source, requestId, source.appId, readers, approved => persist(approved));
     if ('state' in result) fail('REQUEST_TERMINAL', '请求已过期');

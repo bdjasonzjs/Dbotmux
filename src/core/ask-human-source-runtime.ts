@@ -230,10 +230,37 @@ export function createAskHumanSourceRuntime(host: AskHumanSourceHost, testPorts:
           expiresAt: current.installed.expiresAt });
       } catch { logger.error('[human-session] CLI_ORIGIN_PUBLICATION_FAILED'); }
     },
-    async handle(input: unknown): Promise<unknown> {
+    async handle(input: unknown, context?: { trustedHost: boolean }): Promise<unknown> {
       // Crucial ordinary/dormant path: no parse, lookup, filesystem or import.
       if (!host.installation?.()) return fail();
       const command = askHumanCommandSchema.parse(input);
+      if (command.operation === 'report') {
+        // The existing local CLI HMAC authenticates this operation. Bind to
+        // the real active source session, not a worker's transient turn end.
+        if (!context?.trustedHost) return fail('ORIGIN_UNPROVEN');
+        const installed = intakeInstallation(), ds = host.lookupSession(command.sessionId);
+        const frames = installed?.sources.filter(f => f.source.sessionId === command.sessionId) ?? [];
+        const registered = [...host.triggerDeps.activeSessions.values()].filter(s => s.session.sessionId === command.sessionId);
+        if (!installed?.replyForward) return fail();
+        if (!ds || registered.length !== 1 || registered[0] !== ds || frames.length !== 1
+          || ds.larkAppId !== host.appId || ds.session.status !== 'active' || ds.session.vcMeetingReceiver
+          || ds.chatId !== frames[0].source.chatId) return fail('ORIGIN_UNPROVEN');
+        const frame = frames[0], old = connections.get(command.sessionId), turnId = ds.managedTurnOrigin?.turnId;
+        if (!old || old.ds !== ds || !same(old.frame.source, frame.source)) {
+          old?.unbind();
+          connections.set(command.sessionId, { frame, ds, stateDir: realpathSync(installed.stateDir),
+            turns: new Set(), unbind: guards.bindSource(frame, consumer) });
+        }
+        try {
+          const result = await intakeRuntime.report(command, frame);
+          if (installed !== intakeInstallation()) return fail('NOT_ENABLED');
+          if (turnId && ds.managedTurnOrigin?.turnId === turnId) armTriggerFinalSuppression(ds, turnId, now());
+          return result;
+        } catch (e) {
+          if (e instanceof AskHumanPreflightError && ['NOT_ENABLED', 'ORIGIN_UNPROVEN', 'RUNTIME_PATH_INVALID', 'INVALID_REQUEST'].includes(e.code)) return fail('OPERATION_UNCERTAIN');
+          throw e;
+        }
+      }
       const before = beforeConnect(command); // provable rejection before any registration
       // A completed worker turn must not reuse its still-cached capability
       // for new effects after releasing output. The next business turn gets
@@ -270,6 +297,8 @@ export function createAskHumanSourceRuntime(host: AskHumanSourceHost, testPorts:
         // internal callback runs AFTER worker-pool revokes managedTurnOrigin.
         if (!host.installation?.()) return;
         const connection = connections.get(ds.session.sessionId);
+        // Independent reports do not acquire a worker-turn answer lease.
+        if (connection && connection.turns.size === 0) return;
         // Restart may have lost the memory binding. Ignore unrelated ordinary
         // sources, but NEVER silently swallow a configured source's terminal.
         const grant = host.installation?.();

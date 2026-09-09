@@ -11,6 +11,7 @@ botmux human-session --input <JSON文件|->
 JSON必填：operation、requestId、direction（human_decision / assistant_answer）。
 操作：read_rules / confirm_read / freeze_facts / check / approve_understanding /
 present / reconcile / status / cancel / claim_event / consume_event / route_event。
+一次性汇报：operation=report、direction=assistant_answer，附加 title 和 body；一次调用完成投递，无需领取或消费回复。
 各操作的附加字段遵循严格API格式；不能提交sessionId、originCapability、身份或检查报告。
 可用性由当前 bot 的运行配置决定；NOT_ENABLED 表示当前会话未启用。
 无enable或细则发布命令；HTTP结果未知时不会自动重试。
@@ -54,6 +55,7 @@ export interface AskHumanCliDeps {
   context(): Promise<AskHumanCliContext>;
   readInput?(path: string): Promise<unknown>;
   fetchImpl?: typeof fetch;
+  reportFetch?(port: number, path: string, init: RequestInit): Promise<Response>;
   stdout(text: string): void;
   stderr(text: string): void;
 }
@@ -82,17 +84,21 @@ export async function runAskHumanCli(args: string[], deps: AskHumanCliDeps): Pro
   try {
     const input = await (deps.readInput ?? readAskHumanCliInput)(args[1]);
     const ctx = await deps.context();
-    if (!ctx.sessionId || !ctx.originCapability) fail('ORIGIN_UNPROVEN');
+    const standalone = !!input && typeof input === 'object' && (input as Record<string, unknown>).operation === 'report';
+    if (!ctx.sessionId || (!standalone && !ctx.originCapability)) fail('ORIGIN_UNPROVEN');
     if (!Number.isSafeInteger(ctx.ipcPort) || ctx.ipcPort < 1 || ctx.ipcPort > 65535) fail('DAEMON_UNAVAILABLE');
     const body = JSON.stringify(parseAskHumanCliPayload(input, ctx));
     if (Buffer.byteLength(body) > ASK_HUMAN_IPC_MAX_BYTES) fail('BODY_TOO_LARGE');
     let response: Response;
     submitted = true;
     try {
-      response = await (deps.fetchImpl ?? fetch)(`http://127.0.0.1:${ctx.ipcPort}${ASK_HUMAN_IPC_ROUTE}`, {
+      const init: RequestInit = {
         method: 'POST', headers: { 'content-type': 'application/json' }, body,
-        signal: AbortSignal.timeout(30_000), redirect: 'error',
-      });
+        signal: AbortSignal.timeout(standalone ? 60_000 : 30_000), redirect: 'error',
+      };
+      response = standalone && deps.reportFetch
+        ? await deps.reportFetch(ctx.ipcPort, ASK_HUMAN_IPC_ROUTE, init)
+        : await (deps.fetchImpl ?? fetch)(`http://127.0.0.1:${ctx.ipcPort}${ASK_HUMAN_IPC_ROUTE}`, init);
     } catch { return fail('TRANSPORT_UNCERTAIN'); }
     let output: unknown;
     try { output = await responseJson(response); } catch { return fail('RESPONSE_UNPROVEN'); }

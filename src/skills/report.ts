@@ -1,67 +1,36 @@
-/** The canonical report skill. The existing authenticated API owns all IO. */
+/** One public report entry, backed by the existing room and reply transport. */
 export const REPORT_SKILL = `---
 name: botmux-report
-description: 向用户汇报进展或结果、回答问题、请求用户判断时使用。调用已有汇报能力，自动建汇报群、关联来源并把用户回复回传原会话；不用于创建工作子群或 bot 间协作。用户明确要求本群回复时改用 botmux send。
+description: 向用户提问、答复或汇报时使用；每次独立创建汇报群，用户回复自动回原群并圈原 bot。用户明确要求本群回复，或 bot 间沟通，用 botmux send。create-group 只创建工作子群。
 ---
 
 # botmux-report — 汇报
 
-在原业务会话调用本技能。群创建、邀请、来源绑定、正文展示、原群链接和回复回源均由命令处理；不要用 create-group、普通 send 或直接飞书 API 拼装。运行环境自动提供原群、原 session 和原 bot，不手填身份参数。
+在原业务会话调用一次，命令自动建汇报群、发正文并回传原群链接。不要自己用 create-group 或 send 拼装汇报；来源身份由运行环境提供。
 
-唯一底层入口：\`botmux human-session --input <JSON文件|->\`。它是 CLI，不是另一项技能。每次返回 \`{ok:true,result:...}\`；下文字段从 result 读取。
+## 一次调用
 
-## 准备正文
-
-一次一件事。答复或进展/结果汇报用 \`assistant_answer\`；需要用户选择方案用 \`human_decision\`。请求编号 requestId 自取唯一的字母、数字、下划线或连字符（最多 80 字符），同一事项全过程保持不变。
-
-以下是答复草稿的完整结构；把示例内容换成真实事项，expiresAt 用当前毫秒时间加一小时（最长 24 小时）。这是操作有效期，不用找用户确认时间。
+准备以下 JSON，通过 \`botmux human-session --input <文件|->\` 发送（CLI，不是另一项技能）：
 
 \`\`\`json
 {
+  "operation": "report",
   "direction": "assistant_answer",
   "requestId": "report-example-1",
-  "shortTitle": "导出功能进展",
-  "background": "用户要求增加导出功能，本次说明已完成范围。",
-  "answers": [{
-    "question": "导出功能进展如何？",
-    "conclusion": "代码和本地测试已完成，线上尚未验证。",
-    "basis": "本地测试通过；尚未部署。",
-    "limitations": "目前不能宣称线上可用。"
-  }],
-  "criticalFacts": [],
-  "references": [],
-  "expiresAt": 2000000000000
+  "title": "导出功能进展",
+  "body": "你问导出功能进展：代码和本地测试已完成，尚未部署，线上效果还不能确认。"
 }
 \`\`\`
 
-shortTitle 为 2–30 字的具体标题，不带“汇报·”前缀。criticalFacts 如非空，每项为 \`{id,text,explanation}\`；references 每项为 \`{id,explanation}\`。数组可空，但不得为了省字段删掉重要事实。
+title 为 2–30 字，不带“汇报·”。body 一次一件事，带必要背景；可以是提问、答复或进展，不省略重要风险和未知。requestId 每次新汇报取新值（字母、数字、下划线、连字符，最多 80 字符）；同一笔重试保持编号和正文不变。
 
-选择方案时，草稿改为 \`{requestId,shortTitle,background,whyNow,decisions,criticalFacts,references,expiresAt}\`，不带 direction 或 answers。decisions 只含一个 \`{question,options}\`；options 为 2–12 个真实选项，每项有非空的 \`key,label,meaning,difference,consequence,cost,risk\`。仅在确实需要选择时用这个方向，不把普通答复改成选择题。
+读取真实返回的 \`result.state\`、\`result.roomId\` 和 \`result.presented.messageId\`。COMPLETED 仅指汇报已送达，不表示用户已回复或业务完成。不要手工重复发正文或链接。
 
-## 调用顺序
+## 用户回复
 
-所有命令都带同一个 requestId 和 direction。JSON 文件或 stdin 都可；例如：
+原话连同这次汇报背景，会以用户身份回原群并真正圈原 bot；用户身份明确不可用才使用唯一配置的回退 bot。按普通消息处理，不需要 claim_event、consume_event 或关闭汇报。要继续答复，再调用一次本技能，创建新的汇报群；旧群的新回复仍回原来源。
 
-\`\`\`bash
-botmux human-session --input - <<'JSON'
-{"operation":"read_rules","requestId":"report-example-1","direction":"assistant_answer"}
-JSON
-\`\`\`
+## 失败
 
-1. \`read_rules\`：完整阅读返回的 rules.text。
-2. \`confirm_read\`：附加 \`token=result.receiptToken\`、\`hash=result.rules.sha256\`，值来自上一步真实返回。
-3. \`freeze_facts\`：附加 \`draft\`（上述完整草稿）。
-4. \`check\`：附加同一份 \`draft\`。现有服务自动检查正文，不需要另找 reviewer 或让用户批准。
-5. 阅读 check 返回的 understanding，确认没有曲解正文后，调用 \`approve_understanding\`，附加真实 \`reportHash\`。这是作者核对文本，不是替用户作决定。
-6. \`present\`：不加其它字段。能力自动创建并登记汇报群、发送正文和原群链接。查看返回的 roomId、presented.messageId、state；不再手工创建群或重复发正文/链接。
-
-每一步读取上一步结果再继续，不猜 token/hash，也不提交 sessionId、originCapability 或检查器报告。改正文后重新 check；重要事实改变时使用新的事项编号。
-
-## 回复与失败
-
-用户回复会自动带着原汇报上下文、请求和事件 ID 回到原业务会话，并真正 mention 原 bot。发送身份由现有配置决定：用户身份优先，明确不可用才使用唯一配置的回退 bot；调用者不选择其它身份。
-
-收到回源事件后，\`claim_event\` 附加 eventId。若已 CONSUMED，不重复执行业务；领取成功后处理原话，再用 \`consume_event\` 附加 eventId、领取返回的 token 和业务 receipt。不要只发“收到”就当业务已处理。
-
-命令非零时说明实际失败阶段。NOT_ENABLED/ORIGIN_UNPROVEN 不要改用普通建群冒充汇报成功；结果不确定时保留原 requestId，通过 status/reconcile 核实，不换编号盲重发。已有未登记汇报群不会因安装本技能而自动接入，旧失败消息也不会自动补发。
+如实说明失败阶段。结果未知时，用原编号、原正文再次调用 report 核对原发送意图，不换编号盲重发；未知建群结果不会自动创建第二个群。未登记旧群不会自动接入，历史失败不会自动补发。
 `;

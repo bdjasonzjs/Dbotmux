@@ -14408,6 +14408,7 @@ switch (command) {
   case 'ask-human': {
     const { runAskHumanCli } = await import('./cli/ask-human.js');
     process.exitCode = await runAskHumanCli(process.argv.slice(3), {
+      reportFetch: fetchDaemonIpc,
       context: async () => {
         const { sid, larkAppId } = await resolveSessionAppId(undefined);
         const { readAskHumanCliOrigin } = await import('./core/ask-human-cli-origin.js');

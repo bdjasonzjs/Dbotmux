@@ -19,7 +19,9 @@ describe('built-in botmux-report skill', () => {
     expect(skill.content).toContain('botmux human-session --input');
     expect(skill.content).toContain('用户明确要求本群回复');
     const example = JSON.parse(/```json\n([\s\S]*?)\n```/.exec(skill.content)![1]);
-    expect(example.answers).toHaveLength(1);
+    expect(example).toMatchObject({ operation: 'report', direction: 'assistant_answer', title: expect.any(String), body: expect.any(String) });
+    expect(example).not.toHaveProperty('expiresAt');
+    expect(skill.content).not.toContain('"operation": "read_rules"');
     expect(example).not.toHaveProperty('sessionId');
     expect(example).not.toHaveProperty('originCapability');
     expect(skill.content).not.toContain('create-group --');

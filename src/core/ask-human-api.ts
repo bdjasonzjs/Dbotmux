@@ -19,6 +19,8 @@ const common = {
   direction: z.enum(['human_decision', 'assistant_answer']),
 };
 export const askHumanCommandSchema = z.discriminatedUnion('operation', [
+  z.object({ ...common, operation: z.literal('report'), direction: z.literal('assistant_answer'),
+    originCapability: z.string(), title: z.string().trim().min(2).max(30), body: z.string().min(1).max(60000).refine(s => !!s.trim()) }).strict(),
   z.object({ ...common, operation: z.literal('read_rules') }).strict(),
   z.object({ ...common, operation: z.literal('confirm_read'), token: z.string().min(1), hash: z.string().min(1) }).strict(),
   z.object({ ...common, operation: z.literal('freeze_facts'), draft: z.unknown() }).strict(),
@@ -70,6 +72,7 @@ export class AskHumanApi {
   }
   async handle(input: unknown): Promise<unknown> {
     const c = askHumanCommandSchema.parse(input), d = this.deps;
+    if (c.operation === 'report') throw new AskHumanPreflightError('ORIGIN_UNPROVEN', '独立汇报由当前会话的本地 CLI 入口处理');
     const authenticate = (): AskHumanFrame => {
       const live = d.resolveLive(c.sessionId);
       const allowed = authorizeSessionScopedIpc({ trustedHost: false, sessionExists: !!live,
