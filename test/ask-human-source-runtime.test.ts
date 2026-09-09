@@ -222,11 +222,13 @@ describe('piece4 connected source consumer and safe release (no live provider)',
     await expect(x.incoming(x.human(r.roomId))).rejects.toMatchObject({ code: 'ORIGIN_UNPROVEN' });
     expect(x.trigger).not.toHaveBeenCalled(); expect(x.sdk.sendText).toHaveBeenCalledOnce();
   });
-  it('answer readback completes but source output and DM stay fenced until exact terminal', async () => {
+  it('answer lease and DM wait for exact terminal without muting source-group replies', async () => {
     const x = setup(); await x.prepare('assistant_answer'); const r = await x.call('present', 'assistant_answer');
-    expect(r).toMatchObject({ state: 'COMPLETED', sealed: true }); expect(x.out).toThrow();
+    expect(x.ds.suppressedTriggerFinalTurns?.has('turn-1')).toBe(true);
+    expect(x.ds.suppressedTriggerFinalTurns?.has('turn-2')).not.toBe(true);
+    expect(r).toMatchObject({ state: 'COMPLETED', sealed: true }); expect(x.guards.answerGuarded(f)).toBe(true); expect(x.out).not.toThrow();
     expect(() => assertAskHumanDirectMessage(x.guards.root, 'a', 'ou_person')).toThrow();
-    x.terminal('wrong-turn'); x.terminal('turn-1', 8); expect(x.out).toThrow();
+    x.terminal('wrong-turn'); x.terminal('turn-1', 8); expect(x.guards.answerGuarded(f)).toBe(true); expect(x.out).not.toThrow();
     x.ds.managedTurnOrigin = undefined; // real worker-pool terminal ordering
     x.terminal('turn-1'); expect(x.out).not.toThrow(); expect(() => assertAskHumanDirectMessage(x.guards.root, 'a', 'ou_person')).not.toThrow();
     expect(x.guards.room(r.roomId)?.sealed).toBe(true); expect(x.guards.answerReleased(f, 'r1')).toBe(true);
@@ -246,7 +248,7 @@ describe('piece4 connected source consumer and safe release (no live provider)',
     x.ds.managedTurnOrigin = undefined;
     const log = vi.spyOn(logger, 'error').mockImplementation(() => {});
     const projection = vi.spyOn(AskHumanProtectionRegistry.prototype, 'recordAnswerTerminal').mockImplementationOnce(() => { throw Error('SECRET private diagnostic'); });
-    expect(() => x.terminal()).not.toThrow(); expect(x.out).toThrow();
+    expect(() => x.terminal()).not.toThrow(); expect(x.guards.answerGuarded(f)).toBe(true); expect(x.out).not.toThrow();
     const failures = x.runtime.terminalFailures(); expect(failures).toHaveLength(1);
     expect(failures[0]).toMatchObject({ turnId: 'turn-1', workerGeneration: 7, code: 'TERMINAL_PERSISTENCE_FAILED', persisted: true });
     const dir = join(x.stateDir, 'terminal-events');
@@ -262,7 +264,7 @@ describe('piece4 connected source consumer and safe release (no live provider)',
     const before = readFileSync(join(x.guards.root, 'index.json'), 'utf8');
     const log = vi.spyOn(logger, 'error').mockImplementation(() => { throw Error('log sink failed too'); });
     const disk = vi.spyOn(atomicWrites, 'atomicWriteFileSync').mockImplementation(() => { throw Error('disk unavailable'); });
-    expect(() => x.terminal()).not.toThrow(); expect(x.out).toThrow();
+    expect(() => x.terminal()).not.toThrow(); expect(x.guards.answerGuarded(f)).toBe(true); expect(x.out).not.toThrow();
     expect(x.runtime.terminalFailures()[0]).toMatchObject({ persisted: false, code: 'TERMINAL_PERSISTENCE_FAILED' });
     expect(readFileSync(join(x.guards.root, 'index.json'), 'utf8')).toBe(before);
     expect(log).toHaveBeenCalledOnce(); disk.mockRestore(); log.mockRestore();
@@ -271,7 +273,7 @@ describe('piece4 connected source consumer and safe release (no live provider)',
   it('release failure after persisting terminal retains that terminal for an explicit repeat', async () => {
     const x = setup(); await x.prepare('assistant_answer'); await x.call('present', 'assistant_answer'); x.ds.managedTurnOrigin = undefined;
     const release = vi.spyOn(AskHumanProtectionRegistry.prototype, 'releaseCompletedAnswers').mockImplementationOnce(() => { throw Error('lane write failed'); });
-    expect(() => x.terminal()).not.toThrow(); expect(x.out).toThrow();
+    expect(() => x.terminal()).not.toThrow(); expect(x.guards.answerGuarded(f)).toBe(true); expect(x.out).not.toThrow();
     const lease = JSON.parse(readFileSync(join(x.guards.root, 'index.json'), 'utf8')).sources[0].answerLeases[0];
     expect(lease).toMatchObject({ terminal: true, released: false });
     expect(x.runtime.terminalFailures()[0]).toMatchObject({ persisted: true });
@@ -281,12 +283,12 @@ describe('piece4 connected source consumer and safe release (no live provider)',
     const x = setup(); await x.prepare('assistant_answer'); await x.call('present', 'assistant_answer'); x.ds.managedTurnOrigin = undefined;
     const fake = { ...x.ds }; x.active.set('s', fake);
     expect(() => x.runtime.onTurnTerminal(fake, { type: 'turn_terminal', sessionId: 's', turnId: 'turn-1', status: 'completed' }, { workerGeneration: 7 })).not.toThrow();
-    expect(x.out).toThrow(); expect(x.runtime.terminalFailures()[0]).toMatchObject({ code: 'TERMINAL_UNPROVEN', persisted: true });
+    expect(x.guards.answerGuarded(f)).toBe(true); expect(x.out).not.toThrow(); expect(x.runtime.terminalFailures()[0]).toMatchObject({ code: 'TERMINAL_UNPROVEN', persisted: true });
   });
   it('expired grant cannot release a terminal and the rejection remains auditable', async () => {
     const x = setup(); await x.prepare('assistant_answer'); await x.call('present', 'assistant_answer'); x.ds.managedTurnOrigin = undefined;
     x.grant.expiresAt = time;
-    expect(() => x.terminal()).not.toThrow(); expect(x.out).toThrow();
+    expect(() => x.terminal()).not.toThrow(); expect(x.guards.answerGuarded(f)).toBe(true); expect(x.out).not.toThrow();
     expect(x.runtime.terminalFailures()[0]).toMatchObject({ code: 'NOT_ENABLED', persisted: true });
   });
   it('an abandoned preparation releases without pretending it was delivered', async () => {
@@ -299,7 +301,7 @@ describe('piece4 connected source consumer and safe release (no live provider)',
   });
   it('terminal before failed readback never releases an unproven answer', async () => {
     const x = setup(); await x.prepare('assistant_answer'); vi.mocked(x.sdk.detail).mockRejectedValueOnce(Error('read failed'));
-    await expect(x.call('present', 'assistant_answer')).rejects.toThrow('read failed'); x.terminal(); expect(x.out).toThrow();
+    await expect(x.call('present', 'assistant_answer')).rejects.toThrow('read failed'); x.terminal(); expect(x.guards.answerGuarded(f)).toBe(true); expect(x.out).not.toThrow();
     x.ds.managedTurnOrigin = { turnId: 'turn-2', capability: 'd'.repeat(64) };
     await x.call('reconcile', 'assistant_answer'); expect(x.out).not.toThrow();
   });
@@ -347,8 +349,8 @@ describe('piece4 connected source consumer and safe release (no live provider)',
     const x = setup(); await x.prepare('assistant_answer'); await x.call('present', 'assistant_answer');
     x.ds.managedTurnOrigin = { turnId: 'turn-2', capability: 'd'.repeat(64) }; x.ds.workerGeneration = 8;
     await x.prepare('assistant_answer', 'r2');
-    x.terminal('turn-1', 7); expect(x.guards.answerReleased(f, 'r1')).toBe(true); expect(x.guards.answerReleased(f, 'r2')).toBe(false); expect(x.out).toThrow();
-    await x.call('present', 'assistant_answer', 'r2'); expect(x.out).toThrow(); x.terminal('turn-2', 8); expect(x.out).not.toThrow();
+    x.terminal('turn-1', 7); expect(x.guards.answerReleased(f, 'r1')).toBe(true); expect(x.guards.answerReleased(f, 'r2')).toBe(false); expect(x.guards.answerGuarded(f)).toBe(true); expect(x.out).not.toThrow();
+    await x.call('present', 'assistant_answer', 'r2'); expect(x.guards.answerGuarded(f)).toBe(true); expect(x.out).not.toThrow(); x.terminal('turn-2', 8); expect(x.out).not.toThrow();
   });
   it.each(['expired', 'closed', 'sandbox', 'duplicate-session'])('%s source is refused before consumer registration', async kind => {
     const x = setup(), before = readFileSync(join(x.guards.root, 'index.json'), 'utf8');
@@ -368,7 +370,7 @@ describe('piece4 connected source consumer and safe release (no live provider)',
     const x = setup(); await x.call('read_rules', 'assistant_answer');
     const ledger = new AskHumanLedger(join(x.stateDir, 'ledger'), () => time);
     expect(ledger.find(f.source, 'assistant_answer', 'r1')).toBeUndefined();
-    expect(x.out).toThrow(); // while this turn is still generating an answer
+    expect(x.guards.answerGuarded(f)).toBe(true); expect(x.out).not.toThrow(); // while this turn is still generating an answer
     x.ds.managedTurnOrigin = undefined;
     x.terminal(); // real worker ordering, not a live capability in the fixture
     x.ds.session.status = 'closed'; x.active.delete('s'); x.restart();
@@ -385,7 +387,7 @@ describe('piece4 connected source consumer and safe release (no live provider)',
     for (const operation of ['read_rules', 'present', 'reconcile'])
       await expect(x.call(operation, 'assistant_answer')).rejects.toMatchObject({ code: 'REQUEST_ENDED' });
     expect(x.sdk.create).not.toHaveBeenCalled(); expect(x.out).not.toThrow();
-    await x.prepare('assistant_answer', 'fresh'); expect(x.out).toThrow();
+    await x.prepare('assistant_answer', 'fresh'); expect(x.guards.answerGuarded(f)).toBe(true); expect(x.out).not.toThrow();
     await x.call('present', 'assistant_answer', 'fresh'); x.ds.managedTurnOrigin = undefined; x.terminal('turn-2', 8);
     expect(x.out).not.toThrow(); expect(x.sdk.create).toHaveBeenCalledOnce();
   });
@@ -394,7 +396,7 @@ describe('piece4 connected source consumer and safe release (no live provider)',
     const ledger = new AskHumanLedger(join(x.stateDir, 'ledger'), () => time);
     writeFileSync(join(x.stateDir, 'ledger', ledger.lane(f.source, 'assistant_answer') + '.json'), 'broken');
     x.ds.managedTurnOrigin = undefined; x.terminal();
-    expect(x.out).toThrow(); expect(x.guards.answerReleased(f, 'r1')).toBe(false);
+    expect(x.guards.answerGuarded(f)).toBe(true); expect(x.out).not.toThrow(); expect(x.guards.answerReleased(f, 'r1')).toBe(false);
     expect(x.runtime.terminalFailures()[0]).toMatchObject({ code: 'STORE_UNREADABLE' });
   });
 });
@@ -568,15 +570,15 @@ describe('piece5 bounded idle and restart recovery (temporary state, no live act
   it('missing connection after restart is now visible and never manufactures terminal authority', async () => {
     const x = setup(); await x.prepare('assistant_answer'); await x.call('present', 'assistant_answer');
     x.ds.managedTurnOrigin = undefined; x.restart();
-    expect(() => x.terminal()).not.toThrow(); expect(x.out).toThrow();
+    expect(() => x.terminal()).not.toThrow(); expect(x.guards.answerGuarded(f)).toBe(true); expect(x.out).not.toThrow();
     const failure = x.runtime.terminalFailures()[0]; expect(failure).toMatchObject({ code: 'TERMINAL_BINDING_MISSING', persisted: true });
     expect(readdirSync(join(x.stateDir, 'terminal-events'))).toEqual([failure.eventId + '.failed.json']);
-    expect(() => x.runtime.recoverTerminal(failure.eventId)).toThrow(); expect(x.out).toThrow();
+    expect(() => x.runtime.recoverTerminal(failure.eventId)).toThrow(); expect(x.guards.answerGuarded(f)).toBe(true); expect(x.out).not.toThrow();
   });
   it('validated pending terminal survives a fresh runtime and can finish projection with origin absent', async () => {
     const x = setup(); await x.prepare('assistant_answer'); await x.call('present', 'assistant_answer'); x.ds.managedTurnOrigin = undefined;
     const projection = vi.spyOn(AskHumanProtectionRegistry.prototype, 'recordAnswerTerminal').mockImplementationOnce(() => { throw Error('projection crash'); });
-    x.terminal(); const eventId = x.runtime.terminalFailures()[0].eventId; expect(x.out).toThrow(); projection.mockRestore();
+    x.terminal(); const eventId = x.runtime.terminalFailures()[0].eventId; expect(x.guards.answerGuarded(f)).toBe(true); expect(x.out).not.toThrow(); projection.mockRestore();
     x.restart(); x.runtime.recoverTerminal(eventId);
     expect(x.out).not.toThrow(); expect(() => assertAskHumanDirectMessage(x.guards.root, 'a', 'ou_person')).not.toThrow();
     expect(x.guards.answerReleased(f, 'r1')).toBe(true); expect(x.ds.managedTurnOrigin).toBeUndefined();
@@ -586,7 +588,7 @@ describe('piece5 bounded idle and restart recovery (temporary state, no live act
   it('a separate OS process reconstructs the persisted terminal with no original connections map', async () => {
     const x = setup(); await x.prepare('assistant_answer'); await x.call('present', 'assistant_answer'); x.ds.managedTurnOrigin = undefined;
     vi.spyOn(AskHumanProtectionRegistry.prototype, 'recordAnswerTerminal').mockImplementationOnce(() => { throw Error('process ended before projection'); });
-    x.terminal(); const eventId = x.runtime.terminalFailures()[0].eventId; expect(x.out).toThrow();
+    x.terminal(); const eventId = x.runtime.terminalFailures()[0].eventId; expect(x.guards.answerGuarded(f)).toBe(true); expect(x.out).not.toThrow();
     const script = `import { createAskHumanSourceRuntime } from './src/core/ask-human-source-runtime.ts';
       import { AskHumanProtectionRegistry } from './src/core/ask-human-guards.ts';
       const [grant, ds, root, eventId, now] = JSON.parse(process.argv[1]);
@@ -612,7 +614,7 @@ describe('piece5 bounded idle and restart recovery (temporary state, no live act
     }
     if (kind === 'different-grant') x.grant.grantId = 'another-grant';
     if (kind === 'expired-grant') x.grant.expiresAt = time;
-    expect(() => x.runtime.recoverTerminal(eventId)).toThrow(); expect(x.out).toThrow();
+    expect(() => x.runtime.recoverTerminal(eventId)).toThrow(); expect(x.guards.answerGuarded(f)).toBe(true); expect(x.out).not.toThrow();
     expect(x.guards.answerReleased(f, 'r1')).toBe(false);
   });
   it('reconstructed old terminal does not release a new turn or another unfinished lease', async () => {
@@ -622,7 +624,7 @@ describe('piece5 bounded idle and restart recovery (temporary state, no live act
     x.ds.managedTurnOrigin = { turnId: 'turn-2', capability: 'e'.repeat(64) }; x.ds.workerGeneration = 8;
     await x.prepare('assistant_answer', 'r2');
     x.restart(); x.runtime.recoverTerminal(eventId);
-    expect(x.guards.answerReleased(f, 'r1')).toBe(true); expect(x.guards.answerReleased(f, 'r2')).toBe(false); expect(x.out).toThrow();
+    expect(x.guards.answerReleased(f, 'r1')).toBe(true); expect(x.guards.answerReleased(f, 'r2')).toBe(false); expect(x.guards.answerGuarded(f)).toBe(true); expect(x.out).not.toThrow();
   });
   it('dormant recovery entry is a no-op rejection before filesystem or source lookups', async () => {
     const lookupSession = vi.fn(), bindTrigger = vi.fn();

@@ -281,8 +281,11 @@ export async function interceptAskHumanRoom(root: string, appId: string, chatId:
 }
 export function assertAskHumanOutbound(root: string, input: { appId: string; chatId: string; operation: string; content?: string; uuid?: string; permit?: object }): void {
   const i = read(root);
-  const protectedTarget = i?.rooms.some(r => r.chatId === input.chatId)
-    || i?.sources.some(s => s.outputFence && s.frame.source.appId === input.appId && s.frame.source.chatId === input.chatId);
+  // This transport has a chat target, not a worker turn. An answer lease must
+  // not mute every later turn (or another session) in the source work group.
+  // Keep dedicated report rooms isolated; automatic answer-final suppression
+  // remains turn-scoped in the source runtime. Do not delete pending journals.
+  const protectedTarget = i?.rooms.some(r => r.chatId === input.chatId);
   if (!protectedTarget && !input.permit) return;
   const permit = input.permit && permits.get(input.permit);
   if (!permit || permit.root !== resolve(root) || input.operation !== 'send' || permit.appId !== input.appId

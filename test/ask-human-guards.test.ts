@@ -133,17 +133,32 @@ describe('piece3 durable room and source protection', () => {
     protectedFixture(false); await sendMessage('app', 'source-chat', 'business progress');
     expect(sdk.create).toHaveBeenCalledOnce(); expect(registry.answerGuarded(f)).toBe(false);
   });
+  it('stale and active answer leases do not block source-group progress, replies or card updates', async () => {
+    protectedFixture();
+    const next = { ...f, sourceTurnId: 'later-turn' };
+    registry.bindSource(next, consumer()); registry.beginAnswer(next, 'later-answer', 2);
+    const before = readFileSync(join(registry.root, 'index.json'), 'utf8');
+    sdk.request.mockResolvedValue({ code: 0, data: { items: [{ chat_id: 'source-chat' }] } });
+    await sendMessage('app', 'source-chat', 'work-group progress');
+    await replyMessage('app', 'source-question', 'new direct reply');
+    await updateMessage('app', 'source-card', '{}');
+    expect(sdk.create).toHaveBeenCalledOnce(); expect(sdk.reply).toHaveBeenCalledOnce(); expect(sdk.patch).toHaveBeenCalledOnce();
+    expect(readFileSync(join(registry.root, 'index.json'), 'utf8')).toBe(before);
+    await expect(sendMessage('app', 'report-chat', 'unrelated reply')).rejects.toMatchObject({ code: 'OUTPUT_GUARD_BLOCKED' });
+  });
   it.each(['corrupt', 'missing-index', 'symlink-index'])('unprovable index %s never becomes ordinary fallback', kind => {
     protectedFixture(); const path = join(registry.root, 'index.json');
     if (kind === 'corrupt') writeFileSync(path, '{');
     else { rmSync(path); if (kind === 'symlink-index') { writeFileSync(join(dataDir, 'alternate'), '{}'); symlinkSync(join(dataDir, 'alternate'), path); } }
     expect(() => askHumanRoomProtected(registry.root, 'report-chat')).toThrow();
   });
-  it('real independent OS process sees the same fence without any callback registration', () => {
+  it('fresh CLI permits source-group replies without releasing an old answer lease', () => {
     protectedFixture();
+    const before = readFileSync(join(registry.root, 'index.json'), 'utf8');
     const output = execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e',
-      `import { assertAskHumanOutbound } from './src/core/ask-human-guards.ts'; try { assertAskHumanOutbound(process.argv[1], {appId:'app',chatId:'source-chat',operation:'send',content:'must not leak'}); process.exit(9); } catch(e) { if(e.code!=='OUTPUT_GUARD_BLOCKED') throw e; console.log(e.code); }`, registry.root], { encoding: 'utf8' });
-    expect(output.trim()).toBe('OUTPUT_GUARD_BLOCKED');
+      `import { assertAskHumanOutbound } from './src/core/ask-human-guards.ts'; assertAskHumanOutbound(process.argv[1], {appId:'app',chatId:'source-chat',operation:'send',content:'new reply'}); try { assertAskHumanOutbound(process.argv[1], {appId:'app',chatId:'report-chat',operation:'send'}); process.exit(9); } catch(e) { if(e.code!=='OUTPUT_GUARD_BLOCKED') throw e; console.log('SOURCE_ALLOWED_REPORT_PROTECTED'); }`, registry.root], { encoding: 'utf8' });
+    expect(output.trim()).toBe('SOURCE_ALLOWED_REPORT_PROTECTED');
+    expect(readFileSync(join(registry.root, 'index.json'), 'utf8')).toBe(before);
   });
   it('four actual processes provision and register without losing an existing source fence', async () => {
     const script = `import {AskHumanProtectionRegistry} from './src/core/ask-human-guards.ts';
@@ -189,10 +204,11 @@ describe('piece3 real shared Lark egress functions with fake provider only', () 
     protectedFixture(); sdk.request.mockRejectedValueOnce(Error('read failed'));
     await expect(replyMessage('app', 'unknown-id', 'secret')).rejects.toMatchObject({ code: 'OUTPUT_TARGET_UNPROVEN' }); expect(sdk.reply).not.toHaveBeenCalled();
   });
-  it('a fence appearing during target lookup is checked immediately before write', async () => {
+  it('an answer lease appearing during source reply lookup does not mute the work group', async () => {
     registry.provision(); const c = consumer(); registry.bindSource(f, c); registry.registerRoom(f, 'report-chat', 'request-key', 'human_decision');
     sdk.request.mockImplementationOnce(async () => { registry.protectAnswer(f); return { code: 0, data: { items: [{ chat_id: 'source-chat' }] } }; });
-    await expect(replyMessage('app', 'source-msg', 'answer')).rejects.toMatchObject({ code: 'OUTPUT_GUARD_BLOCKED' }); expect(sdk.reply).not.toHaveBeenCalled();
+    await replyMessage('app', 'source-msg', 'answer'); expect(sdk.reply).toHaveBeenCalledOnce();
+    expect(registry.answerGuarded(f)).toBe(true);
   });
   it('an unrelated group and another app source remain usable while protected sources are held', async () => {
     protectedFixture(); await sendMessage('app', 'ordinary-chat', 'ordinary'); await replyMessage('app', 'ordinary-id', 'ordinary');

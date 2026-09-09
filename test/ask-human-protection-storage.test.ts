@@ -55,7 +55,7 @@ describe('piece5-B protection index fault recovery', () => {
     const result = registry.repairIndex(repairInput(), () => {});
     expect(result.status).toBe('REPAIRED'); expect(readFileSync(join(registry.root, 'index.json'))).toEqual(prior);
     assertAskHumanWorkerAllowed(base, 'ordinary'); expect(() => assertAskHumanWorkerAllowed(base, 'room')).toThrow();
-    expect(() => assertAskHumanOutbound(registry.root, { appId: 'app', chatId: 'source', operation: 'send' })).toThrow();
+    expect(() => assertAskHumanOutbound(registry.root, { appId: 'app', chatId: 'source', operation: 'send' })).not.toThrow();
     expect(() => assertAskHumanDirectMessage(registry.root, 'app', 'ou_human')).toThrow();
     expect(registry.room('room')?.sealed).toBe(true);
     const files = readdirSync(join(registry.root, 'index-repairs')); expect(files).toHaveLength(3);
