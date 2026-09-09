@@ -337,12 +337,25 @@ export function attachOrdinaryTurnRecovery<TTimer>(
     dispose: () => coordinator.dispose(),
   });
   if (session.ordinaryTurnRecovery) {
-    if (session.ordinaryTurnRecovery.status === 'dispatching') {
+    // Attach only ever runs while a worker process is being (re)established:
+    // the daemon restore pass, or worker startup. So a persisted `dispatching`
+    // *or* `running` slot belongs to a process that is provably gone.
+    // 2026-09-09: only `dispatching` was reconciled, so a turn interrupted by a
+    // daemon restart left the slot `running` forever — and because `begin()`
+    // refuses to replace a running slot, that session silently lost recovery
+    // for *every* later turn (each one fell through to the "未启动自动续跑"
+    // warning). Two live sessions were found stuck this way.
+    const staleOwnerCode = session.ordinaryTurnRecovery.status === 'dispatching'
+      ? 'recovery_dispatch_interrupted'
+      : session.ordinaryTurnRecovery.status === 'running'
+        ? 'recovery_worker_lost'
+        : undefined;
+    if (staleOwnerCode) {
       const wasAlreadyDispatched = session.ordinaryTurnRecovery.warningDispatched === true;
       const interrupted = {
         ...session.ordinaryTurnRecovery,
         status: 'attention_required' as const,
-        lastErrorCode: 'recovery_dispatch_interrupted',
+        lastErrorCode: staleOwnerCode,
         alertSentAt: session.ordinaryTurnRecovery.alertSentAt ?? Date.now(),
         warningDispatched: true,
       };

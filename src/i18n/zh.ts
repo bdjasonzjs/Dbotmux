@@ -947,6 +947,7 @@ export const messages: Record<string, string> = {
   'worker.ordinary_recovery_enqueue_failed': '⚠️ Claude 因暂态模型服务故障中断，但 Botmux 无法安全提交自动续跑。会话已停止自动操作；请检查 Web 终端后，再发送一条消息继续。',
   'worker.ordinary_recovery_delivery_failed': '⚠️ Claude 因暂态模型服务故障中断，但自动续跑未能送达 Worker。会话已停止自动操作；请检查 Web 终端后，再发送一条消息继续。',
   'worker.ordinary_recovery_dispatch_interrupted': '⚠️ Botmux 在自动续跑交接期间重启，当前执行状态无法确认。为避免重复外部操作，Botmux 没有重放本次续跑；请检查 Web 终端后，再发送一条消息继续。',
+  'worker.ordinary_recovery_worker_lost': '⚠️ 上一轮对话被 daemon 重启打断，自动续跑没有接上。发一条消息即可继续。',
   'worker.ordinary_recovery_non_retryable': '⚠️ Claude 本轮执行失败，且当前错误不能安全自动续跑。为避免重复外部操作，Botmux 已停止自动处理；请检查 Web 终端和模型服务状态后，再发送一条消息继续。',
   'worker.claude_terminal_failure_unrecovered': '⚠️ Claude 本轮因模型服务错误中断（{errorCode}），当前投递通道未启动自动续跑。请检查 Web 终端后重试，或发送一条消息继续。',
 

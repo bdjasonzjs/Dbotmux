@@ -1307,6 +1307,9 @@ function ordinaryTurnRecoveryWarning(
   if (state.lastErrorCode === 'recovery_dispatch_interrupted') {
     return tr('worker.ordinary_recovery_dispatch_interrupted', undefined, locale);
   }
+  if (state.lastErrorCode === 'recovery_worker_lost') {
+    return tr('worker.ordinary_recovery_worker_lost', undefined, locale);
+  }
   return tr('worker.ordinary_recovery_non_retryable', undefined, locale);
 }
 

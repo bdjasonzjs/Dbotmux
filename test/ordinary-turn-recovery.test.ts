@@ -272,7 +272,6 @@ describe('ordinary recovery session registry', () => {
     const timers: Array<() => void> = [];
     const session = {
       sessionId: 'session-one',
-      ordinaryTurnRecovery: state(),
       turnReplyContexts: { om_original: { target: { mode: 'thread', rootMessageId: 'om_root' } } },
       replyTargets: { om_original: { updatedAt: '2026-08-13T00:00:00.000Z', senderOpenId: 'ou_user' } },
     } as any;
@@ -289,6 +288,9 @@ describe('ordinary recovery session registry', () => {
       randomId: () => 'persisted',
       backoffMs: [2_000, 8_000],
     });
+    // 打开这一轮之后再让它失败：attach 时就已经是 running 的 slot 属于"已死进程"，
+    // 现在会被 reconcile 掉（见重启回归用例），那是另一个场景。
+    beginOrdinaryTurnRecovery(session, 'om_original');
     handleOrdinaryTurnRecoveryTerminal(session, {
       turnId: 'om_original', status: 'failed', retryable: true,
       errorCode: 'provider_unexpected_eof',
@@ -401,13 +403,16 @@ describe('ordinary recovery session registry', () => {
     });
   });
 
-  it('fails closed exactly once when worker delivery of a continuation is exhausted', () => {
+  it('reconciles a running slot stranded by a daemon restart so later turns keep recovery', () => {
+    // 2026-09-09 回归：daemon 重启把正在跑的一轮掐断后，slot 永远停在 running，
+    // 而 begin() 不会替换 running 的 slot —— 于是这个会话之后**每一次**中断都不再自动续跑。
     const warn = vi.fn();
+    const enqueue = vi.fn(() => true);
     const session = {
-      sessionId: 'session-delivery-failed',
+      sessionId: 'session-restart-stranded',
       ordinaryTurnRecovery: state({
-        currentTurnId: 'bmx-recovery-undelivered',
-        continuationsStarted: 1,
+        currentTurnId: 'om_interrupted_by_restart',
+        continuationsStarted: 0,
         status: 'running',
       }),
     } as any;
@@ -416,9 +421,45 @@ describe('ordinary recovery session registry', () => {
       schedule: (_delay, run) => run,
       cancel: vi.fn(),
       persist: vi.fn(),
+      enqueue,
+      warn,
+    });
+
+    expect(enqueue).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(session.ordinaryTurnRecovery).toMatchObject({
+      status: 'attention_required',
+      lastErrorCode: 'recovery_worker_lost',
+      alertSentAt: expect.any(Number),
+      warningDispatched: true,
+    });
+
+    // 关键：下一轮必须能重新登记，否则这个会话就永久失去自动续跑
+    const next = beginOrdinaryTurnRecovery(session, 'om_next_turn');
+    expect(next).toMatchObject({
+      status: 'running',
+      logicalTurnId: 'om_next_turn',
+      currentTurnId: 'om_next_turn',
+      continuationsStarted: 0,
+    });
+  });
+
+  it('fails closed exactly once when worker delivery of a continuation is exhausted', () => {
+    const warn = vi.fn();
+    // Start from an empty slot and open the running turn *after* attach:
+    // a slot that is already `running` when attach happens belongs to a dead
+    // process and is now reconciled to attention_required (see the restart
+    // regression below), which is a different scenario from this one.
+    const session = { sessionId: 'session-delivery-failed' } as any;
+
+    attachOrdinaryTurnRecovery(session, {
+      schedule: (_delay, run) => run,
+      cancel: vi.fn(),
+      persist: vi.fn(),
       enqueue: vi.fn(() => true),
       warn,
     });
+    beginOrdinaryTurnRecovery(session, 'bmx-recovery-undelivered');
 
     requireOrdinaryTurnRecoveryAttention(
       session,
