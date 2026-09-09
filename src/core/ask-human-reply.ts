@@ -13,6 +13,10 @@ export interface AskHumanSendReceipt {
   sender?: { type: 'user' | 'bot'; id: string };
 }
 export class AskHumanUserUnavailable extends Error {}
+/** A read-only preparation failed, so no message-send call was entered. */
+export class AskHumanReplyNotSent extends AskHumanPreflightError {
+  constructor() { super('REPLY_NOT_SENT', '回复尚未发送：发送前的原提问 bot 成员查询失败'); }
+}
 
 /** Only a definite identity refusal permits switching sender. Timeouts and
  * unknown results remain with the original attempt; they can already be sent. */
@@ -49,7 +53,7 @@ async function larkCli(args: string[], userOperation?: 'read' | 'send'): Promise
     try { response = JSON.parse(e.stderr ?? ''); } catch { /* unknown delivery */ }
     if (!e.killed && response?.error && askHumanUserIdentityRefused(response.error, userOperation)) throw new AskHumanUserUnavailable('USER_IDENTITY_UNAVAILABLE');
     // execFile errors include argv and message content: never propagate those.
-    throw new AskHumanPreflightError('REPLY_TRANSPORT_UNCERTAIN', '回复传输未获确定结果，保留原发送意图');
+    throw new AskHumanPreflightError('REPLY_TRANSPORT_UNCERTAIN', '回复发送调用已启动但结果未确定，保留原发送意图');
   }
   let response: Record<string, any>;
   try { response = JSON.parse(stdout); } catch { throw new AskHumanPreflightError('REPLY_SEND_UNCERTAIN', '发送回执不可解析'); }
@@ -60,12 +64,17 @@ async function larkCli(args: string[], userOperation?: 'read' | 'send'): Promise
 /** Resolve the source app in the actual sending profile's member view.
  * Member records carry app_id, so no display-name or cross-app open_id reuse. */
 export async function askHumanReplyMention(profile: string, identity: 'user' | 'bot', chatId: string, sourceAppId: string): Promise<string> {
-  const response = await larkCli(['im', '+chat-members-list', '--profile', profile, '--as', identity,
-    '--chat-id', chatId, '--member-types', 'bot', '--page-all', '--format', 'json'], identity === 'user' ? 'read' : undefined);
-  const bots = response.data?.bots as Array<{ app_id?: string; member_id?: string }> | undefined;
-  const source = bots?.find(b => b.app_id === sourceAppId);
-  if (!source?.member_id) throw new AskHumanPreflightError('REPLY_MENTION_UNAVAILABLE', '发送方成员视角未找到原提问 bot');
-  return source.member_id;
+  try {
+    const response = await larkCli(['im', '+chat-members-list', '--profile', profile, '--as', identity,
+      '--chat-id', chatId, '--member-types', 'bot', '--page-all', '--format', 'json'], identity === 'user' ? 'read' : undefined);
+    const bots = response.data?.bots as Array<{ app_id?: string; member_id?: string }> | undefined;
+    const source = bots?.find(b => b.app_id === sourceAppId);
+    if (!source?.member_id) throw new AskHumanReplyNotSent();
+    return source.member_id;
+  } catch (error) {
+    if (error instanceof AskHumanUserUnavailable) throw error;
+    throw new AskHumanReplyNotSent();
+  }
 }
 
 export async function sendAskHumanViaProfile(profile: string, identity: 'user' | 'bot', chatId: string, text: string, uuid: string,

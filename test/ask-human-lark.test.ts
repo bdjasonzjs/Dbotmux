@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AskHumanTransportReceipts, askHumanLarkMessage, createAskHumanLarkTransport, type AskHumanLarkApi } from '../src/core/ask-human-lark.js';
+import { AskHumanReplyNotSent } from '../src/core/ask-human-reply.js';
 
 let root: string;
 beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'human-lark-')); });
@@ -67,6 +68,18 @@ describe('real Lark wire adapter contract (synthetic API responses, no network)'
     await expect(t.ports.send(input)).rejects.toThrow(/未知/);
     expect(t.api.sendText).toHaveBeenCalledTimes(1);
     expect(await t.ports.lookupSend({ ...input, attemptId: 'a' })).toEqual({ status: 'UNKNOWN' });
+  });
+  it('persists a pre-send refusal separately and allows an explicit same-payload retry after recreation', async () => {
+    const t = setup(), input = { appId: 'cli_app', chatId: 'oc_room', uuid: 'reply-key', body: '原话', mentions: ['ou_bot_member'], replyAsUser: true, userOpenId: 'ou_human' };
+    t.api.sendReply = vi.fn(async () => { throw new AskHumanReplyNotSent(); });
+    await expect(t.ports.send(input)).rejects.toMatchObject({ code: 'REPLY_NOT_SENT' });
+    const t2 = setup();
+    expect(await t2.ports.lookupSend({ ...input, attemptId: 'a' })).toMatchObject({ status: 'NOT_SENT', receiptId: expect.stringMatching(/^pre-send:/) });
+    await expect(t2.ports.send({ ...input, body: 'changed' })).rejects.toThrow(/不允许/);
+    t2.api.sendReply = vi.fn(async () => ({ messageId: 'om_reply', sender: { type: 'user', id: 'ou_human' } }));
+    await expect(t2.ports.send(input)).resolves.toMatchObject({ messageId: 'om_reply' });
+    expect(t2.api.sendReply).toHaveBeenCalledTimes(1);
+    expect(await t2.ports.lookupSend({ ...input, attemptId: 'b' })).toMatchObject({ status: 'FOUND', messageId: 'om_reply' });
   });
   it('same UUID cannot replace the critical risk', async () => {
     const t = setup(), input = { appId: 'cli_app', chatId: 'oc_room', uuid: 'k', body: '永久丢失', mentions: [] };

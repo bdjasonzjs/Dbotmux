@@ -12,11 +12,11 @@ import { askHumanHash, AskHumanPreflightError } from './ask-human-preflight.js';
 import { askHumanContentText, askHumanTextWire, type AskHumanWireContent } from './ask-human-message.js';
 import type { AskHumanReadMessage } from './ask-human-ledger.js';
 import type { AskHumanExecutorPorts } from './ask-human-executor.js';
-import { sendAskHumanReply, sendAskHumanViaProfile, askHumanReplyMention, type AskHumanReplyConfig, type AskHumanSendReceipt } from './ask-human-reply.js';
+import { sendAskHumanReply, sendAskHumanViaProfile, askHumanReplyMention, AskHumanReplyNotSent, type AskHumanReplyConfig, type AskHumanSendReceipt } from './ask-human-reply.js';
 
 type Transport = Pick<AskHumanExecutorPorts, 'createBotOnlyRoom' | 'readRoom' | 'inviteHuman' | 'send' | 'readMessage' | 'lookupSend'>;
 const nonempty = z.string().min(1);
-const receiptSchema = z.object({ key: nonempty, fingerprint: nonempty, result: nonempty.optional() }).strict();
+const receiptSchema = z.object({ key: nonempty, fingerprint: nonempty, result: nonempty.optional(), notSent: nonempty.optional() }).strict();
 function fail(code: string, message: string): never { throw new AskHumanPreflightError(code, message); }
 
 /** Small provider receipt index, NOT a second queue. The ledger still owns all
@@ -37,20 +37,31 @@ export class AskHumanTransportReceipts {
     }
   }
   lookup(key: string): string | undefined { return this.read(key)?.result; }
+  notSent(key: string): string | undefined { return this.read(key)?.notSent; }
   async once(key: string, payload: unknown, effect: () => Promise<string>): Promise<string> {
     const fingerprint = askHumanHash(JSON.stringify(payload));
     const existing = withFileLockSync(this.path(key), () => {
       const old = this.read(key);
       if (old) {
         if (old.fingerprint !== fingerprint) return fail('TRANSPORT_CONFLICT', '原 UUID 不允许换正文、群或身份');
-        if (!old.result) return fail('TRANSPORT_UNCERTAIN', '原传输结果未知，禁止重发或重建');
-        return old.result;
+        if (old.result) return old.result;
+        if (!old.notSent) return fail('TRANSPORT_UNCERTAIN', '原传输结果未知，禁止重发或重建');
       }
       atomicWriteFileSync(this.path(key), JSON.stringify({ key, fingerprint }), { durable: true, mode: 0o600, followTargetSymlink: false });
       return undefined;
     });
     if (existing) return existing;
-    const result = await effect();
+    let result: string;
+    try { result = await effect(); }
+    catch (error) {
+      if (error instanceof AskHumanReplyNotSent) withFileLockSync(this.path(key), () => {
+        const r = this.read(key);
+        if (!r || r.fingerprint !== fingerprint || r.result) return fail('TRANSPORT_CONFLICT', '传输回执已变化');
+        atomicWriteFileSync(this.path(key), JSON.stringify({ ...r, notSent: `pre-send:${askHumanHash(key)}` }),
+          { durable: true, mode: 0o600, followTargetSymlink: false });
+      });
+      throw error;
+    }
     nonempty.parse(result);
     withFileLockSync(this.path(key), () => {
       const r = this.read(key);
@@ -189,10 +200,13 @@ export function createAskHumanLarkTransport(options: {
     },
     async lookupSend(input) {
       sameApp(input.appId);
-      const messageId = receipts.lookup(key('send', input.chatId, input.uuid));
+      const receiptKey = key('send', input.chatId, input.uuid);
+      const messageId = receipts.lookup(receiptKey);
       // No documented provider GET-by-UUID is assumed. Only our original
       // provider acceptance receipt can establish FOUND; absence is UNKNOWN.
-      return messageId ? { status: 'FOUND', ...(messageId.startsWith('{') ? JSON.parse(messageId) as AskHumanSendReceipt : { messageId }) } : { status: 'UNKNOWN' };
+      if (messageId) return { status: 'FOUND', ...(messageId.startsWith('{') ? JSON.parse(messageId) as AskHumanSendReceipt : { messageId }) };
+      const notSent = receipts.notSent(receiptKey);
+      return notSent ? { status: 'NOT_SENT', receiptId: notSent } : { status: 'UNKNOWN' };
     },
   };
 }

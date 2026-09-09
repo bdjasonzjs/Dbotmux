@@ -5,7 +5,7 @@
 import { lstatSync, mkdirSync, realpathSync, statSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import { askHumanCommandSchema, type AskHumanCommand } from './ask-human-api.js';
-import { AskHumanProtectionRegistry, interceptAskHumanRoom, type AskHumanGuardConsumer, type AskHumanProtectedRoom } from './ask-human-guards.js';
+import { AskHumanProtectionRegistry, interceptAskHumanRoom, bindAskHumanRoomConnector, type AskHumanGuardConsumer, type AskHumanProtectedRoom } from './ask-human-guards.js';
 import { AskHumanLedger, type AskHumanFrame } from './ask-human-ledger.js';
 import { createAskHumanDaemonRuntime, resolveAskHumanLiveSource, type AskHumanRuntimeInstallation } from './ask-human-runtime.js';
 import { bindAskHumanTrigger } from './ask-human-source.js';
@@ -213,6 +213,8 @@ export function createAskHumanSourceRuntime(host: AskHumanSourceHost, testPorts:
     connections.get(command.sessionId)!.turns.add(turnKey(current.frame.sourceTurnId, current.ds.workerGeneration!));
     return current;
   }
+  const unbindRoomConnector = host.installation?.()?.replyForward
+    ? bindAskHumanRoomConnector(guards.root, host.appId, async room => { await connectRoom(room); }) : undefined;
   return {
     /** Internal notification after a genuine current-worker origin rotation.
      * Old local panes lack the isolation-channel environment variable; expose
@@ -392,6 +394,6 @@ export function createAskHumanSourceRuntime(host: AskHumanSourceHost, testPorts:
     },
     /** Lifecycle cleanup of memory callbacks ONLY. Persistent fences and
      * journals stay intact. Not exposed through CLI/IPC. */
-    disconnect(): void { for (const c of connections.values()) c.unbind(); connections.clear(); },
+    disconnect(): void { unbindRoomConnector?.(); for (const c of connections.values()) c.unbind(); connections.clear(); },
   };
 }

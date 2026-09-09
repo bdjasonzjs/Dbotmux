@@ -45,6 +45,14 @@ export interface AskHumanGuardConsumer {
   receiveRoomEvent(room: Readonly<Room>, data: unknown): Promise<void>;
 }
 const consumers = new Map<string, Map<string, AskHumanGuardConsumer>>();
+const roomConnectors = new Map<string, Map<string, (room: AskHumanProtectedRoom) => Promise<void>>>();
+/** Reattach the existing source consumer on incoming room traffic after a
+ * daemon reload. Registration is memory-only and performs no scan or send. */
+export function bindAskHumanRoomConnector(root: string, appId: string, connect: (room: AskHumanProtectedRoom) => Promise<void>): () => void {
+  let byApp = roomConnectors.get(root); if (!byApp) roomConnectors.set(root, byApp = new Map());
+  byApp.set(appId, connect);
+  return () => { if (byApp!.get(appId) === connect) byApp!.delete(appId); };
+}
 const permits = new WeakMap<object, { root: string; appId: string; chatId: string; content: string; uuid: string; valid(): void }>();
 
 export class AskHumanProtectionRegistry {
@@ -255,7 +263,12 @@ export async function interceptAskHumanRoom(root: string, appId: string, chatId:
       if (old.raw !== raw) return fail('ROOM_EVENT_CONFLICT');
     } else atomicWriteFileSync(path, JSON.stringify({ appId, room, raw, delivered: false }), { durable: true, mode: 0o600, followTargetSymlink: false });
   });
-  const consumer = new AskHumanProtectionRegistry(root).probeSource(room.frame);
+  const registry = new AskHumanProtectionRegistry(root);
+  let consumer = registry.probeSource(room.frame);
+  if (!consumer) {
+    await roomConnectors.get(root)?.get(appId)?.(structuredClone(room));
+    consumer = registry.probeSource(room.frame);
+  }
   if (!consumer) return fail('ROOM_CONSUMER_UNAVAILABLE');
   // Replay is intentionally delegated to the source's existing event-ID
   // inbox dedupe. A guard receipt is NOT a business-consumption ACK.

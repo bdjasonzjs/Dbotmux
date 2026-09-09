@@ -7,6 +7,10 @@ if (process.env.NODE_CHANNEL_FD || process.env.NODE_CHANNEL_SERIALIZATION_MODE) 
 appendFileSync(process.env.ASK_HUMAN_TEST_LOG, JSON.stringify(args) + '\n');
 const identity = flag('--as');
 if (args.includes('+chat-members-list')) {
+  if (process.env.ASK_HUMAN_TEST_MODE === 'read-failed') {
+    process.stderr.write(JSON.stringify({ ok: false, error: { type: 'authorization' } }));
+    process.exit(1);
+  }
   console.log(JSON.stringify({ ok: true, data: { bots: [{ app_id: 'cli_source', member_id: `ou_source_from_${identity}` }] } }));
 } else if (identity === 'user' && process.env.ASK_HUMAN_TEST_MODE !== 'success') {
   const error = process.env.ASK_HUMAN_TEST_MODE === 'refused'

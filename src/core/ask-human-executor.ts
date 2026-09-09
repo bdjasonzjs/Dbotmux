@@ -6,7 +6,7 @@
 import { AskHumanAdmission, type AskHumanReaders, type AskHumanSourceBinding } from './ask-human-admission.js';
 import { AskHumanLedger, type AskHumanEntry, type AskHumanFrame, type AskHumanReadMessage, type AskHumanSendIntent, type AskHumanSendPurpose } from './ask-human-ledger.js';
 import { AskHumanPreflightError } from './ask-human-preflight.js';
-import type { AskHumanSendReceipt } from './ask-human-reply.js';
+import { AskHumanReplyNotSent, type AskHumanSendReceipt } from './ask-human-reply.js';
 
 export interface AskHumanExecutorPorts {
   readonly runtimeAppId: string;
@@ -187,7 +187,8 @@ export class AskHumanExecutor {
     try { result = await this.ports.send({ appId: source.appId, chatId: intent.chatId, body: intent.body, mentions: intent.mentions, uuid: intent.uuid,
       ...(intent.replyAsUser ? { replyAsUser: true, userOpenId: source.decisionOpenId } : {}) }); }
     catch (e) {
-      this.ledger.finishSend(source, direction, requestId, intent.key, intent.attemptId, { status: 'UNCERTAIN', error: (e as Error).message || '发送结果未知' });
+      this.ledger.finishSend(source, direction, requestId, intent.key, intent.attemptId, {
+        status: e instanceof AskHumanReplyNotSent ? 'NOT_SENT' : 'UNCERTAIN', error: (e as Error).message || '发送结果未知' });
       throw e;
     }
     this.ledger.finishSend(source, direction, requestId, intent.key, intent.attemptId, { status: 'CONFIRMED', ...result });

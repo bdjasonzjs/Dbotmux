@@ -18,6 +18,7 @@ import { runAskHumanCli } from '../src/cli/ask-human.js';
 import { setAskHumanIpcApi, startIpcServer, setIpcAuthSecret } from '../src/core/dashboard-ipc-server.js';
 import { config } from '../src/config.js';
 import { readAskHumanCliOrigin } from '../src/core/ask-human-cli-origin.js';
+import { askHumanTextWire } from '../src/core/ask-human-message.js';
 
 let root: string;
 const time = 1700000000000, cap = 'b'.repeat(64);
@@ -103,6 +104,29 @@ beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'human-source-runtime-')); 
 afterEach(() => { vi.restoreAllMocks(); rmSync(root, { recursive: true, force: true }); });
 
 describe('piece4 connected source consumer and safe release (no live provider)', () => {
+  it.each([true, false])('reply forwarding reattaches on room ingress after reload without a source CLI call, source live=%s', async live => {
+    const x = setup(); await x.prepare('assistant_answer'); const r = await x.call('present', 'assistant_answer');
+    x.terminal(); x.ds.managedTurnOrigin = undefined;
+    x.grant.replyForward = { userProfile: 'user', fallbackProfile: 'only-fallback', fallbackAppId: 'fallback-app' };
+    x.sdk.sendReply = vi.fn(async input => {
+      const wire = askHumanTextWire(input.body, input.mentions), id = 'native-reply';
+      x.messages.set(id, { message_id: id, chat_id: input.chatId, create_time: String(time + 20), deleted: false,
+        msg_type: 'text', sender: { id: f.source.decisionOpenId, sender_type: 'user', id_type: 'open_id' },
+        body: { content: wire.content }, mentions: [{ key: '@_user_1', id: 'ou_bot', id_type: 'open_id' }] });
+      return { messageId: id, sender: { type: 'user', id: f.source.decisionOpenId } };
+    });
+    x.restart(); if (!live) x.active.clear();
+    const incoming = x.incoming(x.human(r.roomId, 'after-reload'));
+    if (live) {
+      await expect(incoming).resolves.toBe(true);
+      expect(x.sdk.sendReply).toHaveBeenCalledOnce(); expect(x.trigger).not.toHaveBeenCalled();
+      const saved = new AskHumanLedger(join(x.stateDir, 'ledger'), () => time).get(f.source, 'assistant_answer', 'r1');
+      expect(saved.events[0]).toMatchObject({ inboxAck: true, sourceMessageId: 'native-reply' });
+    } else {
+      await expect(incoming).rejects.toBeDefined(); expect(x.sdk.sendReply).not.toHaveBeenCalled();
+    }
+    expect(x.ds.managedTurnOrigin).toBeUndefined();
+  });
   it('publishes a real local source origin only after current-source validation; cached old origin cannot call IPC', async () => {
     const x = setup(), dir = join(root, 'cli-data');
     x.runtime.publishCliOrigin(x.ds, dir);

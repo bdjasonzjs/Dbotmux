@@ -11,6 +11,7 @@ import { AskHumanLedger, type AskHumanReadMessage, type AskHumanFrame } from '..
 import { AskHumanRouting, askHumanOutputAllowed, type AskHumanRouteInput } from '../src/core/ask-human-routing.js';
 import { AskHumanExecutor, type AskHumanExecutorPorts } from '../src/core/ask-human-executor.js';
 import { askHumanTextWire } from '../src/core/ask-human-message.js';
+import { AskHumanReplyNotSent } from '../src/core/ask-human-reply.js';
 
 // All sources, messages, groups, and model reports below are TEST FIXTURES.
 // These are U tests, not P model runs, I production-entry tests or E Lark E2E.
@@ -352,6 +353,21 @@ describe('local executor with isolated fake ports; no real Lark operations', () 
     await executor.receive(source, 'human_decision', 'd1', m);
     const r = ledger.get(source, 'human_decision', 'd1'); expect(r.events[0].raw.body).toBe(m.body); expect(r.wake).toBe('DISPATCHED'); expect(r.state).not.toBe('COMPLETED');
     expect(t.order.filter(x => x === 'wake')).toHaveLength(1); await executor.receive(source, 'human_decision', 'd1', m); expect(t.order.filter(x => x === 'wake')).toHaveLength(1);
+  });
+  it('records a preparation failure as NOT_SENT and reuses the same relay UUID on explicit retry', async () => {
+    const a = prepare('human_decision', 'd1'), t = transport(), executor = new AskHumanExecutor(ledger, t.ports);
+    await executor.present(a, frame, 'd1', readers); now += 10;
+    const m = message('fake-room', 'A', 'human-message', 'user'); t.messages.set(m.messageId, m);
+    const send = t.ports.send;
+    t.ports.send = async () => { throw new AskHumanReplyNotSent(); };
+    await expect(executor.receive(source, 'human_decision', 'd1', m)).rejects.toMatchObject({ code: 'REPLY_NOT_SENT' });
+    const failed = ledger.get(source, 'human_decision', 'd1').intents.at(-1)!;
+    expect(failed.status).toBe('NOT_SENT'); expect(t.order).not.toContain('sendSource');
+    t.ports.send = send;
+    await executor.receive(source, 'human_decision', 'd1', m);
+    const retried = ledger.get(source, 'human_decision', 'd1').intents.at(-1)!;
+    expect(retried.status).toBe('CONFIRMED'); expect(retried.uuid).toBe(failed.uuid);
+    expect(t.order.filter(x => x === 'sendSource')).toHaveLength(1);
   });
   it('recovers the persisted inbox ACK -> pending wake window without relaying twice', async () => {
     const a = prepare('human_decision', 'd1'), t = transport(), executor = new AskHumanExecutor(ledger, t.ports);
