@@ -4,14 +4,16 @@ import { createReadStream } from 'node:fs';
 import { askHumanCommandSchema, type AskHumanCommand } from '../core/ask-human-api.js';
 import { ASK_HUMAN_IPC_MAX_BYTES, ASK_HUMAN_IPC_ROUTE } from '../core/ask-human-ipc.js';
 
-export const ASK_HUMAN_CLI_USAGE = `人类会话（尚未启用）
+export const ASK_HUMAN_CLI_USAGE = `汇报能力 — botmux-report 技能的底层命令
+使用说明：botmux skill show botmux-report
 botmux human-session --input <JSON文件|->
 兼容入口：botmux ask-human --input <JSON文件|->
 JSON必填：operation、requestId、direction（human_decision / assistant_answer）。
 操作：read_rules / confirm_read / freeze_facts / check / approve_understanding /
 present / reconcile / status / cancel / claim_event / consume_event / route_event。
 各操作的附加字段遵循严格API格式；不能提交sessionId、originCapability、身份或检查报告。
-当前片仅接线，无enable或细则发布命令；HTTP结果未知时不会自动重试。
+可用性由当前 bot 的运行配置决定；NOT_ENABLED 表示当前会话未启用。
+无enable或细则发布命令；HTTP结果未知时不会自动重试。
 退出码：0=调用成功（不等于业务完成）；2=用法错误；3=本次调用在操作前被拒绝；
 4=可能已产生状态/成本/发送，结果未证实，只能对账，不得换请求编号重试。`;
 

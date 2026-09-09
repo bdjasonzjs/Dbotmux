@@ -3,22 +3,16 @@ import {
   type GlobalConfig,
 } from '../global-config.js';
 
-/** Root-approved copy. Keep byte-for-byte: do not translate, reflow or escape. */
-export const HUMAN_SESSION_ROUTING_PROMPT = `凡是要跟人说话——你要问他、他问了你要答、你要向他汇报进展或结果——都走「人类会话」开新群，不要在原群直接 @ 他。
+/** One business entry, distinct from ordinary work-group creation. */
+export const HUMAN_SESSION_ROUTING_PROMPT = `向用户提问、答复或汇报，使用 botmux-report 技能（通过 botmux skill show botmux-report 读取）。
+用户明确要求本群回复，或 bot 间沟通，用 botmux send。
+create-group 只用于创建工作子群，不用于汇报。`;
 
-默认律：除非他明确说过"就在当前群回复我"，否则一律开新群。在原群 @ 他，他收不到——他不会为了看你们在做什么逐个点进工作群，也没有那个精力。原群里的 @ 等于没说。
+/** Replace, rather than contradict, the ordinary send-only reminder. */
+export const REPORT_DELIVERY_REMINDER = '请通过上述入口实际发送，终端输出用户看不到。不是发给你的消息才只输出 BOTMUX_NOTHING_TO_SEND；已经送达的内容不要重复发送。';
 
-分四种情况：
-1. 你需要人拿主意 → 开新群，群名 \`汇报·<短标题>\`，一个群只放一件事、只问一个问题。
-2. 人在群里 @ 你问了问题 → 同样开新群回答，群名同上；原群不写实质答案，最多留一条纯链接指过去。
-3. 你要向他汇报进展、结论或交付结果 → 同样开新群，群名同上。不要因为"只是同步一下、不用他回"就留在原群。
-4. 人明确说了"直接在当前群回复"或同等意思 → 就在当前群回，不开新群。
-
-判断顺序：先看有没有第 4 条豁免，有就地回；没有再按 1、2、3 开新群。
-一个群只装一件事；哪怕在已有的专属群里冒出新问题，也另开新群。`;
-
-/** The required copy names this exact callable capability. A dependency that
- * publishes a differently named entry must not silently enable the prompt. */
+/** Legacy installation key, retained so existing grants keep working.
+ * User-facing discovery is the shipped botmux-report skill. */
 export const HUMAN_SESSION_REQUIRED_SKILL_ENTRY = '人类会话';
 export const HUMAN_SESSION_ROUTING_OVERRIDE_ENV = 'BOTMUX_HUMAN_SESSION_ROUTING_PROMPT_ENABLED';
 

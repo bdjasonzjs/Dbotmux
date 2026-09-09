@@ -961,17 +961,12 @@ describe('human-session routing prompt publication gate', () => {
     },
   } as const;
 
-  it('pins the root-approved copy byte-for-byte, including branch order and exemption', () => {
-    expect(Buffer.byteLength(HUMAN_SESSION_ROUTING_PROMPT, 'utf8')).toBe(1138);
-    expect(createHash('sha256').update(HUMAN_SESSION_ROUTING_PROMPT).digest('hex'))
-      .toBe('79a250e616bebff471ce0baa10900e688576518bf47dd16058cdbb1f4f8bb096');
-    expect(HUMAN_SESSION_ROUTING_PROMPT.indexOf('4. 人明确说了"直接在当前群回复"'))
-      .toBeLessThan(HUMAN_SESSION_ROUTING_PROMPT.indexOf('判断顺序：先看有没有第 4 条豁免'));
-    expect(HUMAN_SESSION_ROUTING_PROMPT).toContain('在原群 @ 他，他收不到');
-    expect(HUMAN_SESSION_ROUTING_PROMPT)
-      .toContain('3. 你要向他汇报进展、结论或交付结果');
-    expect(HUMAN_SESSION_ROUTING_PROMPT).toContain('哪怕在已有的专属群里冒出新问题，也另开新群。');
-    expect(HUMAN_SESSION_ROUTING_PROMPT).toContain('群名 `汇报·<短标题>`');
+  it('names the discoverable report skill and keeps in-chat/work-group purposes distinct', () => {
+    expect(HUMAN_SESSION_ROUTING_PROMPT).toBe([
+      '向用户提问、答复或汇报，使用 botmux-report 技能（通过 botmux skill show botmux-report 读取）。',
+      '用户明确要求本群回复，或 bot 间沟通，用 botmux send。',
+      'create-group 只用于创建工作子群，不用于汇报。',
+    ].join('\n'));
   });
 
   it('is absent by default on opening/system/follow-up paths while botmux send stays intact', () => {
@@ -1055,6 +1050,11 @@ describe('human-session routing prompt publication gate', () => {
     for (const rendered of [shellOpening, systemOpening, englishSystemOpening, codexFollowUp, claudeFollowUp]) {
       expect(rendered.split(HUMAN_SESSION_ROUTING_PROMPT)).toHaveLength(2);
       expect(rendered).toContain('botmux send');
+      expect(rendered).not.toContain('把消息发给用户（唯一方式）');
+      expect(rendered).not.toContain('至少用 `botmux send` 回应一次');
+      expect(rendered).not.toContain('至少 botmux send 回应一次');
+      expect(rendered).not.toContain('回复通过 botmux send 发送到飞书话题');
+      expect(rendered).not.toContain('在原群 @ 他，他收不到');
     }
     expect(shellOpening.indexOf(HUMAN_SESSION_ROUTING_PROMPT))
       .toBeLessThan(shellOpening.indexOf('<user_message>'));

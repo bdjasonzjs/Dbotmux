@@ -12,6 +12,23 @@ import { ASK_SKILL, BUILTIN_SKILLS, RETIRED_SKILL_NAMES, WHITEBOARD_SKILL, WHITE
  *  a skill lives in. */
 const ALL_DEFINED_SKILLS = [...BUILTIN_SKILLS, ...WORKFLOW_FEATURE_SKILLS];
 
+describe('built-in botmux-report skill', () => {
+  it('is discoverable with a complete example and one existing implementation entry', () => {
+    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-report')!;
+    expect(skill.content).toContain('name: botmux-report');
+    expect(skill.content).toContain('botmux human-session --input');
+    expect(skill.content).toContain('用户明确要求本群回复');
+    const example = JSON.parse(/```json\n([\s\S]*?)\n```/.exec(skill.content)![1]);
+    expect(example.answers).toHaveLength(1);
+    expect(example).not.toHaveProperty('sessionId');
+    expect(example).not.toHaveProperty('originCapability');
+    expect(skill.content).not.toContain('create-group --');
+    const send = BUILTIN_SKILLS.find(s => s.name === 'botmux-send')!;
+    expect(send.content).toContain('botmux-report');
+    expect(send.content).not.toContain('想让用户看到的内容**必须**');
+  });
+});
+
 describe('built-in botmux-send skill', () => {
   it('teaches safe multiline sends across Unix and Windows shells', () => {
     const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-send');

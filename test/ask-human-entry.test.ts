@@ -164,7 +164,8 @@ describe('S3-B1 CLI transport to real loopback IPC', () => {
   });
   it('real CLI main switch exposes both names without contacting a daemon', async () => {
     const result = await promisify(execFile)(process.execPath, ['--import', 'tsx', 'src/cli.ts', 'human-session', '--help'], { cwd: process.cwd(), env: { ...process.env, BOTS_CONFIG: join(root, 'absent-bots.json') }, timeout: 20000 });
-    expect(result.stdout).toContain('人类会话（尚未启用）');
+    expect(result.stdout).toContain('botmux skill show botmux-report');
+    expect(result.stdout).not.toContain('尚未启用');
     expect(readFileSync('src/cli.ts', 'utf8')).toContain("case 'ask-human':");
   }, 25000);
   it.each(['human-session', 'ask-human'])('real CLI %s resolves its temporary session/capability and roundtrips', async name => {

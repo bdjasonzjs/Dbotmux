@@ -18,7 +18,7 @@ import { isWorkflowFeatureEnabled } from '../../global-config.js';
 import { config } from '../../config.js';
 import { escapeXmlTagLikeTokens, escapeXmlText } from '../../utils/xml.js';
 import { resolveConditionalLine } from '../../skills/effective-builtins.js';
-import { activeHumanSessionRoutingPrompt } from '../../core/human-session-routing-prompt.js';
+import { activeHumanSessionRoutingPrompt, REPORT_DELIVERY_REMINDER } from '../../core/human-session-routing-prompt.js';
 
 /** The gated "no visible output is OK" hint reads `config.noVisibleOutputHint`
  *  by default, but a user customization can force it on/off. Keyed by the i18n
@@ -81,10 +81,10 @@ export function buildBotmuxShellHints(locale?: Locale): string[] {
   const hints = [
     t('ai.shell.intro', undefined, locale),
     t('ai.shell.commands_are_shell', undefined, locale),
-    t('ai.shell.how_to_send', undefined, locale),
+    t(humanSessionRoutingPrompt ? 'ai.shell.how_to_send_report' : 'ai.shell.how_to_send', undefined, locale),
     ...multilineHeredocLines(locale),
     t('ai.shell.helpers', undefined, locale),
-    t('ai.shell.when_to_send', undefined, locale),
+    humanSessionRoutingPrompt ? REPORT_DELIVERY_REMINDER : t('ai.shell.when_to_send', undefined, locale),
     feedbackResponseKindHint(locale),
     // Experimental anti-resend guidance — opt-in via dashboard Settings
     // (dashboard.noVisibleOutputHint). Default OFF, so the rendered hints match

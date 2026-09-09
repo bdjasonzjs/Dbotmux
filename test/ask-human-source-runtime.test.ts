@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { createAskHumanSourceRuntime, type AskHumanSourceGrant } from '../src/core/ask-human-source-runtime.js';
 import { AskHumanProtectionRegistry, interceptAskHumanRoom, assertAskHumanOutbound, assertAskHumanDirectMessage } from '../src/core/ask-human-guards.js';
 import { AskHumanLedger, type AskHumanFrame } from '../src/core/ask-human-ledger.js';
+import { REPORT_SKILL } from '../src/skills/report.js';
 import { createAskHumanLarkTransport, type AskHumanLarkApi } from '../src/core/ask-human-lark.js';
 import { publishAskHumanRules } from '../src/core/ask-human-preflight.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -104,6 +105,43 @@ beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'human-source-runtime-')); 
 afterEach(() => { vi.restoreAllMocks(); rmSync(root, { recursive: true, force: true }); });
 
 describe('piece4 connected source consumer and safe release (no live provider)', () => {
+  it('published report skill example runs through the existing API, room registration, user reply and consumption', async () => {
+    const x = setup();
+    const d = JSON.parse(/```json\n([\s\S]*?)\n```/.exec(REPORT_SKILL)![1]);
+    d.expiresAt = time + 60000;
+    const call = (operation: string, extra = {}) => x.call(operation, d.direction, d.requestId, extra);
+    const read = await call('read_rules');
+    await call('confirm_read', { token: read.receiptToken, hash: read.rules.sha256 });
+    await call('freeze_facts', { draft: d });
+    x.fetchImpl.mockResolvedValueOnce(new Response(JSON.stringify({ choices: [{ finish_reason: 'stop',
+      message: { role: 'assistant', content: JSON.stringify(report(d)) } }] })));
+    const checked = await call('check', { draft: d });
+    await call('approve_understanding', { reportHash: checked.reportHash });
+    const r = await call('present');
+    expect(r).toMatchObject({ state: 'COMPLETED', roomName: `汇报·${d.shortTitle}` });
+    expect(x.guards.room(r.roomId)?.frame.source).toEqual(f.source);
+    expect(x.sdk.create).toHaveBeenCalledOnce();
+    expect(x.sdk.sendText).toHaveBeenCalledTimes(2); // report + original source link, no manual send
+    x.grant.replyForward = { userProfile: 'user', fallbackProfile: 'only-fallback', fallbackAppId: 'fallback-app' };
+    x.sdk.sendReply = vi.fn(async input => {
+      const wire = askHumanTextWire(input.body, input.mentions), id = 'report-native-reply';
+      x.messages.set(id, { message_id: id, chat_id: input.chatId, create_time: String(time + 20), deleted: false,
+        msg_type: 'text', sender: { id: f.source.decisionOpenId, sender_type: 'user', id_type: 'open_id' },
+        body: { content: wire.content }, mentions: [{ key: '@_user_1', id: 'ou_bot', id_type: 'open_id' }] });
+      return { messageId: id, sender: { type: 'user', id: f.source.decisionOpenId } };
+    });
+    const original = '先核实线上结果，再告诉我。';
+    await expect(x.incoming(x.human(r.roomId, 'report-human-reply', original))).resolves.toBe(true);
+    expect(x.sdk.sendReply).toHaveBeenCalledOnce();
+    expect(x.sdk.sendReply).toHaveBeenCalledWith(expect.objectContaining({ chatId: f.source.chatId,
+      replyAsUser: true, mentions: ['ou_bot'], body: expect.stringContaining(original) }));
+    const saved = await call('status'), e = saved.events[0];
+    expect(e).toMatchObject({ inboxAck: true, sourceMessageId: 'report-native-reply' });
+    const claim = await call('claim_event', { eventId: e.eventId });
+    expect(claim.state).toBe('CLAIMED');
+    await call('consume_event', { eventId: e.eventId, token: claim.token, receipt: 'business-result' });
+    expect((await call('claim_event', { eventId: e.eventId })).state).toBe('CONSUMED');
+  });
   it.each([true, false])('reply forwarding reattaches on room ingress after reload without a source CLI call, source live=%s', async live => {
     const x = setup(); await x.prepare('assistant_answer'); const r = await x.call('present', 'assistant_answer');
     x.terminal(); x.ds.managedTurnOrigin = undefined;
