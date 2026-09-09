@@ -75,8 +75,31 @@ export function createAskHumanSourceRuntime(host: AskHumanSourceHost, testPorts:
       completeMentionsVerified: mentions.every(m => m.openId === grant.botMemberOpenId || m.openId === frame.source.decisionOpenId),
       requiresMultiplePerspectives: false, outputPathsGuarded: false };
   };
+  const sourceFrames = (grant: AskHumanSourceGrant): readonly AskHumanFrame[] => {
+    if (!grant.sourceDefaults) return grant.sources;
+    const defaults = grant.sourceDefaults, known = guards.registeredFrames(host.appId);
+    return [...host.triggerDeps.activeSessions.values()]
+      .filter(ds => ds.larkAppId === host.appId && ds.session.status === 'active' && !ds.session.vcMeetingReceiver
+        && ds.chatId.startsWith('oc_') && host.lookupSession(ds.session.sessionId) === ds)
+      .map(ds => {
+        const saved = known.find(f => f.source.sessionId === ds.session.sessionId && f.source.chatId === ds.chatId
+          && f.source.tenantId === defaults.tenantId && f.source.decisionUserId === defaults.decisionUserId
+          && f.source.decisionOpenId === defaults.decisionOpenId && f.botSenderId === host.appId);
+        return saved ?? { source: { ...defaults, appId: host.appId, sessionId: ds.session.sessionId, chatId: ds.chatId,
+          taskId: `session-${ds.session.sessionId}`, revision: 'session-v1' },
+          sourceMessageId: ds.session.rootMessageId, sourceTurnId: ds.session.rootMessageId, botSenderId: host.appId };
+      });
+  };
   const derived = (): AskHumanRuntimeInstallation | undefined => {
     const grant = host.installation?.(); if (!grant) return undefined;
+    if (grant.sourceDefaults) {
+      // Stable installation identity; an unrelated session/turn must not
+      // revoke an in-flight model check. auth() still rechecks its OWN turn.
+      if (!cached || cached.grant !== grant) cached = { grant, fingerprint: '', installed: { ...grant,
+        get sources() { return sourceFrames(grant).map(f => ({ ...f,
+          sourceTurnId: host.lookupSession(f.source.sessionId)?.managedTurnOrigin?.turnId ?? '' })); }, trigger, routeMetadata } };
+      return cached.installed;
+    }
     const sources = grant.sources.map(f => {
       const live = host.lookupSession(f.source.sessionId);
       return { ...f, sourceTurnId: live?.managedTurnOrigin?.turnId ?? '' };
@@ -96,7 +119,7 @@ export function createAskHumanSourceRuntime(host: AskHumanSourceHost, testPorts:
     const grant = host.installation?.(); if (!grant) return undefined;
     const fingerprint = askHumanHash(JSON.stringify(grant));
     if (!intakeCached || intakeCached.grant !== grant || intakeCached.fingerprint !== fingerprint)
-      intakeCached = { grant, fingerprint, installed: { ...grant, trigger, routeMetadata } };
+      intakeCached = { grant, fingerprint, installed: { ...grant, get sources() { return sourceFrames(grant); }, trigger, routeMetadata } };
     return intakeCached.installed;
   };
   const intakeRuntime = createAskHumanDaemonRuntime({ appId: host.appId, protectionRoot: host.protectionRoot,
@@ -110,7 +133,7 @@ export function createAskHumanSourceRuntime(host: AskHumanSourceHost, testPorts:
     const registered = [...host.triggerDeps.activeSessions.values()].filter(s => s.session.sessionId === room.frame.source.sessionId);
     const frames = installed.sources.filter(f => f.source.sessionId === room.frame.source.sessionId);
     if (installed.appId !== host.appId || host.triggerDeps.larkAppId !== host.appId || !installed.grantId.trim()
-      || !Number.isSafeInteger(installed.expiresAt) || now() >= installed.expiresAt) return fail();
+      || (installed.expiresAt !== undefined && (!Number.isSafeInteger(installed.expiresAt) || now() >= installed.expiresAt))) return fail();
     if (!ds || registered.length !== 1 || registered[0] !== ds || ds.larkAppId !== host.appId
       || ds.session.status !== 'active' || ds.session.vcMeetingReceiver || ds.chatId !== room.frame.source.chatId
       || frames.length !== 1 || !same(frames[0].source, room.frame.source)
@@ -134,7 +157,7 @@ export function createAskHumanSourceRuntime(host: AskHumanSourceHost, testPorts:
   const beforeConnect = (command: Pick<AskHumanCommand, 'sessionId' | 'originCapability'>) => {
     const installed = derived(); if (!installed) return fail();
     if (installed.appId !== host.appId || host.triggerDeps.larkAppId !== host.appId
-      || !installed.grantId.trim() || !Number.isSafeInteger(installed.expiresAt) || now() >= installed.expiresAt) return fail();
+      || !installed.grantId.trim() || (installed.expiresAt !== undefined && (!Number.isSafeInteger(installed.expiresAt) || now() >= installed.expiresAt))) return fail();
     const ds = host.lookupSession(command.sessionId);
     const registered = [...host.triggerDeps.activeSessions.values()].filter(s => s.session.sessionId === command.sessionId);
     if (registered.length !== 1 || registered[0] !== ds) return fail('ORIGIN_UNPROVEN');
@@ -196,7 +219,7 @@ export function createAskHumanSourceRuntime(host: AskHumanSourceHost, testPorts:
      * their SAME live capability without enabling host-HMAC authentication. */
     publishCliOrigin(ds: DaemonSession, dataDir: string): void {
       if (!host.installation?.()) return;
-      if (!host.installation()!.sources.some(f => f.source.sessionId === ds.session.sessionId)) return;
+      if (!host.installation()!.sourceDefaults && !host.installation()!.sources.some(f => f.source.sessionId === ds.session.sessionId)) return;
       try {
         const current = beforeConnect({ sessionId: ds.session.sessionId, originCapability: ds.managedTurnOrigin?.capability ?? '' });
         if (current.ds !== ds) return fail('ORIGIN_UNPROVEN');
@@ -242,7 +265,8 @@ export function createAskHumanSourceRuntime(host: AskHumanSourceHost, testPorts:
         // Restart may have lost the memory binding. Ignore unrelated ordinary
         // sources, but NEVER silently swallow a configured source's terminal.
         const grant = host.installation?.();
-        if (!connection && !grant?.sources.some(f => f.source.sessionId === ds.session.sessionId)) return;
+        if (!connection && !(grant?.sources.some(f => f.source.sessionId === ds.session.sessionId)
+          || (grant?.sourceDefaults && guards.registeredFrames(host.appId).some(f => f.source.sessionId === ds.session.sessionId)))) return;
         const eventId = askHumanHash(JSON.stringify([host.appId, ds.session.sessionId, terminal.turnId, context.workerGeneration]));
         trace = { eventId, sessionId: ds.session.sessionId, appId: host.appId, turnId: terminal.turnId, workerGeneration: context.workerGeneration };
         stateDir = connection?.stateDir ?? (grant && isAbsolute(grant.stateDir) ? realpathSync(grant.stateDir) : undefined);
@@ -253,7 +277,7 @@ export function createAskHumanSourceRuntime(host: AskHumanSourceHost, testPorts:
           const current = derived(), registered = [...host.triggerDeps.activeSessions.values()].filter(s => s.session.sessionId === ds.session.sessionId);
           const sources = installed?.sources.filter(s => same(s.source, connection.frame.source)) ?? [];
           if (!installed || current !== installed || installed.appId !== host.appId || !installed.grantId.trim()
-            || !Number.isSafeInteger(installed.expiresAt) || now() >= installed.expiresAt
+            || (installed.expiresAt !== undefined && (!Number.isSafeInteger(installed.expiresAt) || now() >= installed.expiresAt))
             || sources.length !== 1 || sources[0].botSenderId !== connection.frame.botSenderId
             || sources[0].sourceMessageId !== connection.frame.sourceMessageId
             || realpathSync(installed.stateDir) !== stateDir) return fail('NOT_ENABLED');
@@ -333,10 +357,10 @@ export function createAskHumanSourceRuntime(host: AskHumanSourceHost, testPorts:
         const proof = readAskHumanTerminalProof(stateDir, eventId), pinnedHash = askHumanHash(JSON.stringify(grant));
         const ds = host.lookupSession(proof.frame.source.sessionId);
         const validate = () => {
-          const current = host.installation?.(), frames = current?.sources.filter(f => f.source.sessionId === proof.frame.source.sessionId) ?? [];
+          const current = host.installation?.(), frames = current ? sourceFrames(current).filter(f => f.source.sessionId === proof.frame.source.sessionId) : [];
           if (current !== grant || askHumanHash(JSON.stringify(current)) !== pinnedHash || proof.grantHash !== pinnedHash
             || grant.appId !== host.appId || host.triggerDeps.larkAppId !== host.appId
-            || !Number.isSafeInteger(grant.expiresAt) || now() >= grant.expiresAt || realpathSync(grant.stateDir) !== stateDir) return fail();
+            || (grant.expiresAt !== undefined && (!Number.isSafeInteger(grant.expiresAt) || now() >= grant.expiresAt)) || realpathSync(grant.stateDir) !== stateDir) return fail();
           const registered = [...host.triggerDeps.activeSessions.values()].filter(s => s.session.sessionId === proof.frame.source.sessionId);
           if (!ds || registered.length !== 1 || registered[0] !== ds || host.lookupSession(ds.session.sessionId) !== ds
             || ds.session.status !== 'active' || ds.session.vcMeetingReceiver || ds.larkAppId !== host.appId || ds.chatId !== proof.frame.source.chatId

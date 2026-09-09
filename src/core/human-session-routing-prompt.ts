@@ -64,6 +64,9 @@ export function resolveHumanSessionRoutingPromptGate(
     return { ...base, enabled: false, reason: 'disabled' };
   }
   if (configured?.enabled !== true) return { ...base, enabled: false, reason: 'disabled' };
+  if (configured.appIds && !configured.appIds.includes(env.BOTMUX_LARK_APP_ID ?? '')) {
+    return { ...base, enabled: false, reason: 'disabled' };
+  }
   if (configured?.dependencyReady !== true) {
     return { ...base, enabled: false, reason: 'dependency_not_ready' };
   }

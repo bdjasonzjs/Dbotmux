@@ -116,6 +116,8 @@ export interface WorkflowFeatureGlobalConfig {
  * publish a matching callable entry plus concrete readiness evidence. */
 export interface HumanSessionRoutingPromptConfig {
   enabled?: boolean;
+  /** When supplied, publish only for these installed apps. */
+  appIds?: string[];
   dependencyReady?: boolean;
   skillEntry?: string;
   capabilityEvidence?: string;
@@ -544,6 +546,7 @@ function readHumanSessionRoutingPrompt(raw: unknown): HumanSessionRoutingPromptC
   const value = raw as Record<string, unknown>;
   const out: HumanSessionRoutingPromptConfig = {};
   if (typeof value.enabled === 'boolean') out.enabled = value.enabled;
+  if (Array.isArray(value.appIds)) out.appIds = [...new Set(value.appIds.filter((id): id is string => typeof id === 'string' && !!id.trim()).map(id => id.trim()))];
   if (typeof value.dependencyReady === 'boolean') out.dependencyReady = value.dependencyReady;
   if (typeof value.skillEntry === 'string' && value.skillEntry.trim()) {
     out.skillEntry = value.skillEntry.trim();

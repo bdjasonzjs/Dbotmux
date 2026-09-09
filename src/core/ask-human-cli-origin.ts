@@ -10,7 +10,7 @@ import { readManagedOriginAuthorityFile } from './managed-origin-capability.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 const claimSchema = z.object({ appId: z.string().min(1), sessionId: z.string().min(1),
   capability: z.string().regex(/^[a-f0-9]{32,128}$/i), turnId: z.string().min(1),
-  expiresAt: z.number().int().positive(),
+  expiresAt: z.number().int().positive().optional(),
 }).strict();
 type Claim = z.infer<typeof claimSchema>;
 const claimPath = (dataDir: string, appId: string, sessionId: string) =>
@@ -27,6 +27,6 @@ export function readAskHumanCliOrigin(dataDir: string, appId: string, sessionId:
     const raw = readManagedOriginAuthorityFile(claimPath(dataDir, appId, sessionId), 8192);
     if (!raw) return null;
     const c = claimSchema.parse(JSON.parse(raw));
-    return c.appId === appId && c.sessionId === sessionId && now < c.expiresAt ? c : null;
+    return c.appId === appId && c.sessionId === sessionId && (c.expiresAt === undefined || now < c.expiresAt) ? c : null;
   } catch { return null; }
 }

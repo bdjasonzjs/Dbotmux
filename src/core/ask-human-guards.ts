@@ -179,6 +179,10 @@ export class AskHumanProtectionRegistry {
     });
   }
   room(chatId: string): Room | undefined { return read(this.root)?.rooms.find(r => r.chatId === chatId); }
+  /** Retain the source identity of existing requests across app-wide reloads. */
+  registeredFrames(appId: string): AskHumanFrame[] {
+    return read(this.root)?.sources.filter(s => s.frame.source.appId === appId).map(s => s.frame) ?? [];
+  }
   beginCreate(appId: string, uuid: string): void {
     text.parse(appId); text.parse(uuid);
     this.tx(i => { if (!i.creating.some(c => c.appId === appId && c.uuid === uuid)) i.creating.push({ appId, uuid }); return i; });

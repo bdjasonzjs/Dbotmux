@@ -26,11 +26,13 @@ type LiveSession = Pick<DaemonSession, 'larkAppId' | 'chatId' | 'managedTurnOrig
 export interface AskHumanRuntimeInstallation {
   /** A host-approved, bounded grant, NOT an enable bit from request JSON.
    * No grant loader or online configuration mutation is exposed by this slice. */
-  grantId: string; appId: string; botMemberOpenId: string; expiresAt: number;
+  grantId: string; appId: string; botMemberOpenId: string; expiresAt?: number;
   stateDir: string; rulesDir: string; checker: AskHumanCheckerConfig;
   /** Captured by the trusted source-turn adapter, not lastCaller/quoteTarget,
    * thread title, another task's binding, or model-generated data. */
   sources: readonly AskHumanFrame[];
+  /** App-wide installation: live sessions supply their own source identity. */
+  sourceDefaults?: Pick<AskHumanFrame['source'], 'tenantId' | 'decisionUserId' | 'decisionOpenId'>;
   trigger: Parameters<typeof createAskHumanSourcePorts>[0]['trigger'];
   routeMetadata: AskHumanApiDeps['routeMetadata'];
 }
@@ -80,7 +82,7 @@ export function createAskHumanDaemonRuntime(host: AskHumanRuntimeHost, testPorts
         requestId: incoming.room.requestId!, direction: incoming.room.direction,
         operation: 'reconcile' as const, originCapability: '' } : askHumanCommandSchema.parse(input);
       const fingerprint = (i: AskHumanRuntimeInstallation) => askHumanHash(JSON.stringify([
-        i.grantId, i.appId, i.botMemberOpenId, i.expiresAt, i.stateDir, i.rulesDir, i.checker, i.sources,
+        i.grantId, i.appId, i.botMemberOpenId, i.expiresAt, i.stateDir, i.rulesDir, i.checker, i.sourceDefaults ?? i.sources,
       ]));
       const pinned = fingerprint(installed);
       const resolveLive = (id: string) => resolveAskHumanLiveSource(host.appId, host.lookupSession(id), installed.sources);
@@ -111,7 +113,7 @@ export function createAskHumanDaemonRuntime(host: AskHumanRuntimeHost, testPorts
       const assertEnabled = (given: AskHumanFrame) => {
         const current = host.installation?.();
         if (current !== installed || fingerprint(current) !== pinned || !current.grantId.trim()
-          || current.appId !== host.appId || !Number.isSafeInteger(current.expiresAt) || now() >= current.expiresAt
+          || current.appId !== host.appId || (current.expiresAt !== undefined && (!Number.isSafeInteger(current.expiresAt) || now() >= current.expiresAt))
           || !current.botMemberOpenId.trim()) return fail('NOT_ENABLED');
         const currentFrame = auth();
         // A sandbox/remote/adopted CLI may see a different or masked data root.
