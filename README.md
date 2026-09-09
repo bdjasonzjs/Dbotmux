@@ -46,6 +46,16 @@ botmux start                 # 启动 daemon（botmux autostart enable 设开机
 
 然后私聊机器人、或 `botmux dashboard` 拉个群，直接开聊。完整步骤（含 Lark 国际版、`--no-open-platform-auto` 后手动配置权限 / 发版、排查）见 **[5 分钟快速接入](https://deepcoldy.github.io/botmux/quickstart)**。
 
+## 多级委派
+
+将任务沿“根群 → 中间群 → 叶群”逐级派发，再逐级回报。P5 运行资源随 botmux 分发，不需要复制开发者的工作目录。准备好自己的三个群和身份映射 `actors.json` 后，一条命令安装：
+
+```bash
+botmux delegation init --root "$REQUEST_MID" --task "$TASK" --path "$ROOT_CHAT,$MID_CHAT,$LEAF_CHAT" --actors ./actors.json
+```
+
+详见 [首次安装、建节点与三级回报教程](README.delegation.md)。默认安装到空的 `.botmux-delegation/`，不自动启用后台回调；教程区分真实接单/落账与模拟测试。需要 Python >= 3.9、Bash 和已登录的 lark-cli。
+
 ## 核心场景
 
 - **[实时流式卡片](https://deepcoldy.github.io/botmux/cards)** — 每轮对话一张实时刷新的卡片，终端画面原样截图回传；一键显示/隐藏输出、翻屏、重启/关闭/接管会话。

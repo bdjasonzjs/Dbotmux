@@ -7412,6 +7412,10 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   schedule pause|resume <id>           暂停/恢复
   schedule run <id>                    标记立即执行
 
+多级委派（独立目录，不自动接线）:
+  delegation init --root <MID> --task <名称> --path <根群,中间群,叶群> --actors <JSON>
+  delegation doctor|node|run|status    详见 botmux delegation help
+
 飞书消息（在 CLI 会话内自动推断 session）:
   chat rename <新群名称>               修改当前会话所在群的名称
        --proactive                    标记为 AI 主动改名（应用 10 分钟防抖）
@@ -14595,6 +14599,11 @@ switch (command) {
     // `botmux user-prompt-hook` — Claude 家族 UserPromptSubmit hook 客户端，
     // 按内容指纹读回 per-turn sidecar 并注入为该轮 system-reminder（#794）。
     await cmdUserPromptHook();
+    break;
+  }
+  case 'delegation': {
+    const { cmdDelegation } = await import('./cli/delegation.js');
+    await cmdDelegation(process.argv[3] ?? '', process.argv.slice(4));
     break;
   }
   case 'workflow': {
