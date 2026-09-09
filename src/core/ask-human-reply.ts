@@ -36,9 +36,13 @@ export function askHumanUserIdentityRefused(error: { type?: string; code?: numbe
 }
 async function larkCli(args: string[], userOperation?: 'read' | 'send'): Promise<Record<string, any>> {
   let stdout: string;
+  // PM2's IPC descriptor belongs to the daemon, not this non-IPC child.
+  // Inheriting it makes the CLI abort even after a successful API read.
+  const env: NodeJS.ProcessEnv = { ...process.env, LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' };
+  delete env.NODE_CHANNEL_FD;
+  delete env.NODE_CHANNEL_SERIALIZATION_MODE;
   try {
-    ({ stdout } = await run('lark-cli', args, { timeout: 30_000, maxBuffer: 1024 * 1024,
-      env: { ...process.env, LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' } }));
+    ({ stdout } = await run('lark-cli', args, { timeout: 30_000, maxBuffer: 1024 * 1024, env }));
   } catch (error) {
     const e = error as { stderr?: string; killed?: boolean };
     let response: { error?: { type?: string; code?: number; subtype?: string } } | undefined;
