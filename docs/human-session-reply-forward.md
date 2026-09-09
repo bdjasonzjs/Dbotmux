@@ -4,7 +4,7 @@
 
 向用户提问、答复或汇报，读取 `botmux skill show botmux-report` 并按技能调用。该内置技能包装现有 `botmux human-session --input <JSON文件|->`，不新增第二套汇报实现。原群、原会话和来源 bot 由实际运行上下文提供；现有能力负责建汇报群、登记来源、展示正文和回复回源。
 
-启用汇报能力的会话在既有每轮提示里看到三条分流说明：面向用户走 `botmux-report`；用户明确要求本群回复或 bot 间沟通走 `botmux send`；`create-group` 只用于工作子群。初始共享说明、send 技能描述和底层命令帮助同步使用这一区分。未启用的会话保持原提示；安装配置里的旧 `skillEntry` 名称不变，不借此扩大启用范围。
+启用汇报能力的会话在既有每轮提示里看到三条分流说明：面向用户走 `botmux-report`，每次独立汇报、回复回原群、继续答复再用一次；用户明确要求本群回复或 bot 间沟通走 `botmux send`；`create-group` 只用于工作子群。初始共享说明、send 技能描述和底层命令帮助同步使用这一区分。未启用的会话保持原提示；安装配置里的旧 `skillEntry` 名称不变，不借此扩大启用范围。
 
 按 bot 启用时，提示生成使用会话传入的真实 `larkAppId`：daemon 的新消息/续轮来自 `ds.larkAppId`，CLI 初始 system prompt 来自 worker 的 `cfg.larkAppId`。daemon 启动本来就会清除继承的会话环境变量，不能依赖其中的 `BOTMUX_LARK_APP_ID` 判断提示是否启用；不修改这项清理或配置开关。
 

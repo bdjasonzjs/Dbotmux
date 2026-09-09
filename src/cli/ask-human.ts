@@ -8,10 +8,10 @@ export const ASK_HUMAN_CLI_USAGE = `汇报能力 — botmux-report 技能的底�
 使用说明：botmux skill show botmux-report
 botmux human-session --input <JSON文件|->
 兼容入口：botmux ask-human --input <JSON文件|->
-JSON必填：operation、requestId、direction（human_decision / assistant_answer）。
-操作：read_rules / confirm_read / freeze_facts / check / approve_understanding /
-present / reconcile / status / cancel / claim_event / consume_event / route_event。
-一次性汇报：operation=report、direction=assistant_answer，附加 title 和 body；一次调用完成投递，无需领取或消费回复。
+独立汇报：operation=report、direction=assistant_answer，必填 requestId、title、body。
+每次独立汇报，回复作为普通消息回原群；继续答复再用一次，无需领取、消费或标记结束。
+兼容旧请求的操作（新汇报不用）：read_rules / confirm_read / freeze_facts / check /
+approve_understanding / present / reconcile / status / cancel / claim_event / consume_event / route_event。
 各操作的附加字段遵循严格API格式；不能提交sessionId、originCapability、身份或检查报告。
 可用性由当前 bot 的运行配置决定；NOT_ENABLED 表示当前会话未启用。
 无enable或细则发布命令；HTTP结果未知时不会自动重试。
