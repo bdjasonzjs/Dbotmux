@@ -75,9 +75,9 @@ function hiddenContextDefense(locale?: Locale): string {
   return escapeXmlText(text);
 }
 
-export function buildBotmuxShellHints(locale?: Locale): string[] {
+export function buildBotmuxShellHints(locale?: Locale, larkAppId?: string): string[] {
   const workflowHint = workflowDiscoveryHint(locale);
-  const humanSessionRoutingPrompt = activeHumanSessionRoutingPrompt();
+  const humanSessionRoutingPrompt = activeHumanSessionRoutingPrompt(larkAppId);
   const hints = [
     t('ai.shell.intro', undefined, locale),
     t('ai.shell.commands_are_shell', undefined, locale),
@@ -141,6 +141,7 @@ export function buildBotmuxSystemPromptText(opts: {
   locale?: Locale;
   botName?: string;
   botOpenId?: string;
+  larkAppId?: string;
   /** Optional built-in skill catalog / help pointer for injectsSessionContext
    *  CLIs that have a global `skillsDir` (genius/grok) running in `prompt` / `off`
    *  mode — appended after the routing/identity blocks. Claude Code delivers
@@ -150,7 +151,7 @@ export function buildBotmuxSystemPromptText(opts: {
   const { locale, botName, botOpenId, builtinSkillBlock } = opts;
   const unknown = t('ai.identity.unknown', undefined, locale);
   const workflowHint = workflowDiscoveryHint(locale);
-  const humanSessionRoutingPrompt = activeHumanSessionRoutingPrompt();
+  const humanSessionRoutingPrompt = activeHumanSessionRoutingPrompt(opts.larkAppId);
   const prose = (key: string): string =>
     escapeXmlTagLikeTokens(t(key, undefined, locale));
   const identityBlock =

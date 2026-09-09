@@ -1085,6 +1085,28 @@ describe('human-session routing prompt publication gate', () => {
     })).toMatchObject({ enabled: false, reason: 'disabled' });
   });
 
+  it.each([undefined, 'stale-caller-app'])('uses the actual session app after daemon env scrub, inherited app=%s', (inherited) => {
+    const saved = process.env.BOTMUX_LARK_APP_ID;
+    if (inherited === undefined) delete process.env.BOTMUX_LARK_APP_ID;
+    else process.env.BOTMUX_LARK_APP_ID = inherited;
+    try {
+      mergeGlobalConfig({ humanSessionRoutingPrompt: { ...readyConfig.humanSessionRoutingPrompt, appIds: ['source-app'] } });
+      const opening = (app: string) => buildNewTopicPrompt('report', 'sid-explicit-app', 'codex', undefined,
+        undefined, undefined, undefined, undefined, undefined, undefined, undefined, { larkAppId: app });
+      for (const app of ['source-app', 'other-app']) {
+        const prompts = [opening(app), buildBotmuxSystemPromptText({ larkAppId: app }),
+          ...(['codex', 'claude-code'] as const).map(cliId => buildFollowUpContent('report', 'sid-explicit-app', { cliId, larkAppId: app }))];
+        for (const prompt of prompts) expect(prompt.includes(HUMAN_SESSION_ROUTING_PROMPT)).toBe(app === 'source-app');
+      }
+      // A live caller marker must not enable a different app's prompt.
+      process.env.BOTMUX_LARK_APP_ID = 'source-app';
+      expect(opening('other-app')).not.toContain(HUMAN_SESSION_ROUTING_PROMPT);
+    } finally {
+      if (saved === undefined) delete process.env.BOTMUX_LARK_APP_ID;
+      else process.env.BOTMUX_LARK_APP_ID = saved;
+    }
+  });
+
   it('switching back to disabled restores the byte-identical prompt and preserves dependency audit fields', () => {
     const baselineOpening = buildNewTopicPrompt('hello', 'sid-human-restore', 'codex');
     const baselineFollowUp = buildFollowUpContent('continue', 'sid-human-restore', { cliId: 'codex' });

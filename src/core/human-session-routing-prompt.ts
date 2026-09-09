@@ -86,8 +86,11 @@ export function resolveHumanSessionRoutingPromptGate(
   return { ...base, enabled: true, reason: 'enabled' };
 }
 
-export function activeHumanSessionRoutingPrompt(): string | undefined {
-  return resolveHumanSessionRoutingPromptGate().enabled
+export function activeHumanSessionRoutingPrompt(larkAppId?: string): string | undefined {
+  // Daemons scrub session env at boot. Prompt builders already know the
+  // actual source app; never depend on a caller's inherited app marker there.
+  const env = larkAppId === undefined ? process.env : { ...process.env, BOTMUX_LARK_APP_ID: larkAppId };
+  return resolveHumanSessionRoutingPromptGate(readGlobalConfig(), env).enabled
     ? HUMAN_SESSION_ROUTING_PROMPT
     : undefined;
 }

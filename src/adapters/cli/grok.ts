@@ -189,6 +189,7 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
           locale,
           botName,
           botOpenId,
+          larkAppId,
           builtinSkillBlock: builtinSkillBlockForInjectsSessionContext(larkAppId, locale, {
             asksViaHook: false,
             whiteboardEnabled: whiteboardEnabled(),

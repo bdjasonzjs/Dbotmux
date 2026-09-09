@@ -1147,7 +1147,7 @@ export function buildNewTopicPrompt(
   // (Claude Code builds its own via --append-system-prompt). Source hints
   // freshly from i18n so they respect the resolved locale instead of the
   // static `adapter.systemHints` array that was baked at module load.
-  const hints = adapter.injectsSessionContext ? [] : buildBotmuxShellHints(locale);
+  const hints = adapter.injectsSessionContext ? [] : buildBotmuxShellHints(locale, opts?.larkAppId);
 
   const routingBlock = hints.length > 0
     ? `<botmux_routing>\n${hints.join('\n')}\n</botmux_routing>`
@@ -1444,7 +1444,7 @@ function buildFollowUpBlocks(
       ? 'ai.followup.reminder_hook'
       : config.noVisibleOutputHint ? 'ai.followup.reminder_no_resend' : 'ai.followup.reminder';
     const baseReminder = t(reminderKey, undefined, opts?.locale);
-    const humanSessionRoutingPrompt = activeHumanSessionRoutingPrompt();
+    const humanSessionRoutingPrompt = activeHumanSessionRoutingPrompt(opts?.larkAppId);
     const reminder = humanSessionRoutingPrompt
       ? `${humanSessionRoutingPrompt}\n${REPORT_DELIVERY_REMINDER}`
       : baseReminder;
