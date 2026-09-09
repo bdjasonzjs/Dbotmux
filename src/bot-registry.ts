@@ -1604,6 +1604,9 @@ export interface BotConfig {
    * the shared tmux/zellij server env. Missing/empty → undefined.
    */
   env?: Record<string, string>;
+  /** Daemon-only projection of the persisted human-session config path.
+   * Reserved BOTMUX_* keys remain excluded from child CLI env injection. */
+  humanSessionConfig?: string;
   /**
    * Optional per-bot priority skill policy. Missing means botmux does not alter
    * the underlying CLI's native skill discovery or spawn arguments.
@@ -2885,6 +2888,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     // sanitizePerBotEnv 过滤非法/保留键、字符串化基本类型；空 → undefined（保持 bots.json 干净）。
     const sanitizedEnv = sanitizePerBotEnv(entry.env);
     const env = Object.keys(sanitizedEnv).length > 0 ? sanitizedEnv : undefined;
+    const humanSessionConfig = typeof entry.env?.BOTMUX_HUMAN_SESSION_CONFIG === 'string'
+      ? entry.env.BOTMUX_HUMAN_SESSION_CONFIG : undefined;
 
     const skills = readBotSkillPolicy(entry.skills);
     // Presence is semantic for plugins: [] is an exact "none" override, while
@@ -3039,6 +3044,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       tuiSlashAllow,
       startupCommands,
       env,
+      humanSessionConfig,
       skills,
       plugins,
       lang: isLocale(entry.lang) ? entry.lang : undefined,

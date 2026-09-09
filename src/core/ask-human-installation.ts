@@ -15,9 +15,10 @@ export const ASK_HUMAN_CONFIG_ENV = 'BOTMUX_HUMAN_SESSION_CONFIG';
  * This is a private loader snapshot, not injection into the daemon's global
  * environment or any sibling app. Explicit bot settings take precedence.
  */
-export function loadAskHumanBotInstallation(bot: { larkAppId: string; env?: Record<string, string> },
+export function loadAskHumanBotInstallation(bot: { larkAppId: string; env?: Record<string, string>; humanSessionConfig?: string },
   env: NodeJS.ProcessEnv = process.env, now: () => number = Date.now): AskHumanSourceGrant | undefined {
-  return loadAskHumanInstallation(bot.larkAppId, { ...env, ...bot.env }, now);
+  return loadAskHumanInstallation(bot.larkAppId, { ...env, ...bot.env,
+    ...(bot.humanSessionConfig === undefined ? {} : { [ASK_HUMAN_CONFIG_ENV]: bot.humanSessionConfig }) }, now);
 }
 const text = z.string().trim().min(1);
 const configuration = z.object({

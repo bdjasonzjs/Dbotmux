@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadAskHumanInstallation, loadAskHumanBotInstallation, ASK_HUMAN_CONFIG_ENV } from '../src/core/ask-human-installation.js';
+import { parseBotConfigsFromText } from '../src/bot-registry.js';
 
 let root: string;
 const now = 1700000000000;
@@ -21,11 +22,17 @@ function fixture() {
 }
 describe('explicit daemon installation snapshot, without activation side effects', () => {
   it('ordinary restart loads the persisted bot config and model key without injected process env', () => {
-    const f = fixture(), env = Object.freeze({}), bot = { larkAppId: 'app', env: f.env };
+    const f = fixture(), env = Object.freeze({});
+    const [bot, other] = parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'app', larkAppSecret: 'fixture-only', cliId: 'codex', env: f.env },
+      { larkAppId: 'other', larkAppSecret: 'fixture-only', cliId: 'codex' },
+    ]));
+    expect(bot.env?.[ASK_HUMAN_CONFIG_ENV]).toBeUndefined(); // child env filtering is unchanged
+    expect(bot.humanSessionConfig).toBe(f.env[ASK_HUMAN_CONFIG_ENV]);
     const first = loadAskHumanBotInstallation(bot, env, () => now)!;
     const restarted = loadAskHumanBotInstallation(bot, env, () => now)!;
     expect(restarted).toEqual(first); expect(restarted.checker.apiKey).toBe(f.env.FIXTURE_CHECKER_KEY);
-    expect(env).toEqual({}); expect(loadAskHumanBotInstallation({ larkAppId: 'other' }, env)).toBeUndefined();
+    expect(env).toEqual({}); expect(loadAskHumanBotInstallation(other, env)).toBeUndefined();
     expect(loadAskHumanBotInstallation({ larkAppId: 'other', env: f.env }, env, () => now)).toBeUndefined();
     expect(readdirSync(f.value.stateDir)).toEqual([]); expect(readdirSync(f.value.rulesDir)).toEqual([]);
   });
