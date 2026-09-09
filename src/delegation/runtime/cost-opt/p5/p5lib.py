@@ -778,7 +778,7 @@ def send_message(chat, text, as_user=False, idempotency_key=None):
 
 # ---------- marker ----------
 MARK_RE = re.compile(r'\[p5:([A-Za-z0-9_\-=]+)\]')
-MARK_CANDIDATE_RE = re.compile(r'\[p5:([^\]]*)(\]|$)')
+MARK_CANDIDATE_RE = re.compile(r'\[p5:([^\[\]]*)(\]|(?=\[)|$)')
 # 写端仍用 encode_marker 的 URL-safe base64；读端兼容标准 base64 的 + 和 /。非 base64 字符的候选
 # （如会话卡标题里截断的 [p5:… — 工作中]）必然不是 marker，扫描时跳过而非 raise，避免噪音消息打崩 in-scan。
 MARK_BASE64_ALPHABET_RE = re.compile(r'[A-Za-z0-9_\-+/=]+')
@@ -786,18 +786,19 @@ def encode_marker(obj):
     return '[p5:' + base64.urlsafe_b64encode(canonical(obj).encode()).decode().rstrip('=') + ']'
 def find_markers(text):
     out = []
-    # Read both alphabets; reject corrupt encoded data, skip prose placeholders.
-    # encode_marker keeps its existing canonical URL-safe output.
-    for number, match in enumerate(MARK_CANDIDATE_RE.finditer(text or ''), 1):
+    # Scanning is tolerant; successful objects still go through the caller's
+    # unchanged field/role/version validation. A new '[' ends a bad candidate,
+    # so an unclosed prose prefix cannot swallow a later genuine marker.
+    # encode_marker keeps its byte-identical canonical URL-safe output.
+    for match in MARK_CANDIDATE_RE.finditer(text or ''):
         try:
             g, closing = match.groups()
-            if not MARK_BASE64_ALPHABET_RE.fullmatch(g):
-                continue  # 散文无需闭括号；仅编码候选才进入协议格式检查。
-            if not closing: raise ValueError('missing closing bracket')
+            if closing != ']' or not MARK_BASE64_ALPHABET_RE.fullmatch(g): continue
             pad = '=' * (-len(g) % 4)
-            out.append(json.loads(base64.b64decode(g + pad, altchars=b'-_', validate=True).decode()))
-        except Exception as error:
-            raise ValueError(f'invalid p5 marker #{number} offset={match.start()}: {error}') from error
+            value=json.loads(base64.b64decode(g + pad, altchars=b'-_', validate=True).decode())
+            if isinstance(value,dict): out.append(value)
+        except Exception:
+            continue  # Candidate syntax/encoding failure is not an event.
     return out
 
 # ---------- taskbook 有效性 ----------

@@ -82,3 +82,21 @@ test('installed event ingest passes ordinary unclosed-marker prose before upstre
   expect(record.downstream_deliveries).toHaveLength(2);
   expect(record.live_lark_verified).toBe(false);
 });
+
+test('tolerant scan keeps real event field validation and finds subsequent receipts', () => {
+  const f = fixture(); f.args[3] = 'om_fixture1'; initializeDelegation(f.args);
+  const transport = join(f.root, 'transport');
+  copyFileSync(new URL('./fixtures/delegation/transport.py', import.meta.url), transport); chmodSync(transport, 0o755);
+  const result = spawnSync('python3', [new URL('./fixtures/delegation/three-level.py', import.meta.url).pathname, f.home, transport], {
+    encoding: 'utf8', timeout: 30_000,
+    env: { ...process.env, DELEGATION_FIXTURE_BAD_EVENT_FIELDS: '1',
+      DELEGATION_FIXTURE_PROSE: 'noise [p5:abcde] [p5:pg==] [p5:AAAA] [p5:W10] [p5:unfinished prose', },
+  });
+  expect(result.status, result.stderr || result.stdout).toBe(0);
+  const record = JSON.parse(result.stdout);
+  expect(record.semantic_rejections.map((r: any) => [r.field, r.rc])).toEqual([
+    ['task_version', 9], ['event_type', 9], ['origin_chat', 9],
+  ]);
+  expect(record.all_three_nodes).toBe('pending_review');
+  expect(record.live_lark_verified).toBe(false);
+});
