@@ -130,7 +130,7 @@ describe('piece4 connected source consumer and safe release (no live provider)',
     const daemon = readFileSync('src/daemon.ts', 'utf8');
     expect(daemon).toContain('setAskHumanIpcApi(humanSessionSource)');
     expect(daemon).toContain('humanSessionSources.get(ds.larkAppId)?.onTurnTerminal(ds, terminal, context)');
-    expect(daemon).toContain('loadAskHumanInstallation(cfg.larkAppId)');
+    expect(daemon).toContain('loadAskHumanBotInstallation(cfg)');
     expect(daemon).toContain('installation: () => humanSessionInstallation');
     expect(daemon).toContain('humanSessionSources.get(ds.larkAppId)?.publishCliOrigin(ds, config.session.dataDir)');
     const worker = readFileSync('src/core/worker-pool.ts', 'utf8');
@@ -265,12 +265,13 @@ describe('piece4 connected source consumer and safe release (no live provider)',
     expect(() => x.terminal()).not.toThrow(); expect(x.out).toThrow();
     expect(x.runtime.terminalFailures()[0]).toMatchObject({ code: 'NOT_ENABLED', persisted: true });
   });
-  it('one completed answer does not release another unpresented answer in the same source', async () => {
+  it('an abandoned preparation releases without pretending it was delivered', async () => {
     const x = setup(); await x.prepare('assistant_answer', 'r1'); await x.prepare('assistant_answer', 'r2');
-    await x.call('present', 'assistant_answer', 'r1'); x.terminal(); expect(x.out).toThrow();
-    expect(x.guards.answerReleased(f, 'r1')).toBe(true); expect(x.guards.answerReleased(f, 'r2')).toBe(false);
+    await x.call('present', 'assistant_answer', 'r1'); x.terminal(); expect(x.out).not.toThrow();
+    expect(x.guards.answerReleased(f, 'r1')).toBe(true); expect(x.guards.answerReleased(f, 'r2')).toBe(true);
     x.ds.managedTurnOrigin = { turnId: 'turn-2', capability: 'd'.repeat(64) };
-    await x.call('present', 'assistant_answer', 'r2'); expect(x.out).not.toThrow();
+    await expect(x.call('present', 'assistant_answer', 'r2')).rejects.toMatchObject({ code: 'REQUEST_ENDED' });
+    expect(x.sdk.create).toHaveBeenCalledOnce();
   });
   it('terminal before failed readback never releases an unproven answer', async () => {
     const x = setup(); await x.prepare('assistant_answer'); vi.mocked(x.sdk.detail).mockRejectedValueOnce(Error('read failed'));
@@ -339,11 +340,38 @@ describe('piece4 connected source consumer and safe release (no live provider)',
     for (const operation of ['receiveRoomEvent', 'recordAnswerTerminal', 'releaseCompletedAnswers', 'terminalFailures', 'recoverRoom', 'recoverTerminal', 'disconnect']) await expect(x.call(operation)).rejects.toBeDefined();
     expect(x.bindTrigger).not.toHaveBeenCalled();
   });
-  it('terminal without a presented/confirmed answer leaves its preparation fence intact', async () => {
-    const x = setup(); await x.call('read_rules', 'assistant_answer'); x.terminal();
-    expect(x.out).toThrow(); expect(x.guards.answerReleased(f, 'r1')).toBe(false);
-    // Abandoned preparation is a bounded-recovery prerequisite, not implicit consent.
+  it('read-only preparation cannot leave the source and DM locked after its turn closes', async () => {
+    const x = setup(); await x.call('read_rules', 'assistant_answer');
+    const ledger = new AskHumanLedger(join(x.stateDir, 'ledger'), () => time);
+    expect(ledger.find(f.source, 'assistant_answer', 'r1')).toBeUndefined();
+    expect(x.out).toThrow(); // while this turn is still generating an answer
+    x.ds.managedTurnOrigin = undefined;
+    x.terminal(); // real worker ordering, not a live capability in the fixture
+    x.ds.session.status = 'closed'; x.active.delete('s'); x.restart();
+    expect(x.out).not.toThrow(); expect(x.guards.answerReleased(f, 'r1')).toBe(true);
+    expect(() => assertAskHumanDirectMessage(x.guards.root, 'a', 'ou_person')).not.toThrow();
+    expect(ledger.find(f.source, 'assistant_answer', 'r1')).toBeUndefined(); // no invented completion
     expect(x.sdk.create).not.toHaveBeenCalled(); expect(x.fetchImpl).not.toHaveBeenCalled();
+  });
+  it('an ended preparation cannot reuse its released lease but a new request can run', async () => {
+    const x = setup(); await x.prepare('assistant_answer');
+    const old = x.cmd('present', 'assistant_answer'); x.ds.managedTurnOrigin = undefined; x.terminal();
+    await expect(x.runtime.handle(old)).rejects.toMatchObject({ code: 'ORIGIN_UNPROVEN' });
+    x.ds.managedTurnOrigin = { turnId: 'turn-2', capability: 'd'.repeat(64) }; x.ds.workerGeneration = 8;
+    for (const operation of ['read_rules', 'present', 'reconcile'])
+      await expect(x.call(operation, 'assistant_answer')).rejects.toMatchObject({ code: 'REQUEST_ENDED' });
+    expect(x.sdk.create).not.toHaveBeenCalled(); expect(x.out).not.toThrow();
+    await x.prepare('assistant_answer', 'fresh'); expect(x.out).toThrow();
+    await x.call('present', 'assistant_answer', 'fresh'); x.ds.managedTurnOrigin = undefined; x.terminal('turn-2', 8);
+    expect(x.out).not.toThrow(); expect(x.sdk.create).toHaveBeenCalledOnce();
+  });
+  it('unreadable ledger is not mistaken for an abandoned preparation', async () => {
+    const x = setup(); await x.call('read_rules', 'assistant_answer');
+    const ledger = new AskHumanLedger(join(x.stateDir, 'ledger'), () => time);
+    writeFileSync(join(x.stateDir, 'ledger', ledger.lane(f.source, 'assistant_answer') + '.json'), 'broken');
+    x.ds.managedTurnOrigin = undefined; x.terminal();
+    expect(x.out).toThrow(); expect(x.guards.answerReleased(f, 'r1')).toBe(false);
+    expect(x.runtime.terminalFailures()[0]).toMatchObject({ code: 'STORE_UNREADABLE' });
   });
 });
 

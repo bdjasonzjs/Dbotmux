@@ -141,6 +141,8 @@ export class AskHumanProtectionRegistry {
   /** Lock order: protection index -> ledger lane. No ledger callback may
    * acquire the protection lock. COMPLETED proves source-confirmed readback;
    * terminal prevents the still-running source worker leaking a trailing final.
+   * A preparation that never reached enqueue has no delivery to wait for:
+   * release it on the same terminal, without manufacturing a completed entry.
    * Retain room-purpose tombstones and all other outstanding source leases. */
   releaseCompletedAnswers(frame: AskHumanFrame, ledger: AskHumanLedger): void {
     this.tx(i => {
@@ -148,7 +150,11 @@ export class AskHumanProtectionRegistry {
         for (const a of s.answerLeases ?? []) {
           if (!a.terminal || a.released) continue;
           const r = ledger.find(frame.source, 'assistant_answer', a.requestId);
-          if (!r || r.state !== 'COMPLETED' || !r.sealed || !r.presented || r.events.some(e => !e.inboxAck)
+          // Every room/send effect requires enqueue first. A healthy journal
+          // with no entry therefore proves this was only preparation. Read
+          // errors still throw; they are not evidence of an absent request.
+          if (!r) { a.released = true; continue; }
+          if (r.state !== 'COMPLETED' || !r.sealed || !r.presented || r.events.some(e => !e.inboxAck)
             || r.intents.some(it => it.status !== 'NOT_SENT' && (it.status !== 'CONFIRMED' || !it.readback))) continue;
           a.released = true;
         }

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { loadAskHumanInstallation, ASK_HUMAN_CONFIG_ENV } from '../src/core/ask-human-installation.js';
+import { loadAskHumanInstallation, loadAskHumanBotInstallation, ASK_HUMAN_CONFIG_ENV } from '../src/core/ask-human-installation.js';
 
 let root: string;
 const now = 1700000000000;
@@ -20,6 +20,21 @@ function fixture() {
   return { value, env, save };
 }
 describe('explicit daemon installation snapshot, without activation side effects', () => {
+  it('ordinary restart loads the persisted bot config and model key without injected process env', () => {
+    const f = fixture(), env = Object.freeze({}), bot = { larkAppId: 'app', env: f.env };
+    const first = loadAskHumanBotInstallation(bot, env, () => now)!;
+    const restarted = loadAskHumanBotInstallation(bot, env, () => now)!;
+    expect(restarted).toEqual(first); expect(restarted.checker.apiKey).toBe(f.env.FIXTURE_CHECKER_KEY);
+    expect(env).toEqual({}); expect(loadAskHumanBotInstallation({ larkAppId: 'other' }, env)).toBeUndefined();
+    expect(loadAskHumanBotInstallation({ larkAppId: 'other', env: f.env }, env, () => now)).toBeUndefined();
+    expect(readdirSync(f.value.stateDir)).toEqual([]); expect(readdirSync(f.value.rulesDir)).toEqual([]);
+  });
+  it('selected bot settings override stale supervisor env and explicit disable remains effective', () => {
+    const f = fixture(), stale = { [ASK_HUMAN_CONFIG_ENV]: '/missing/stale.json', FIXTURE_CHECKER_KEY: 'old' };
+    expect(loadAskHumanBotInstallation({ larkAppId: 'app', env: f.env }, stale, () => now)?.checker.apiKey).toBe(f.env.FIXTURE_CHECKER_KEY);
+    expect(loadAskHumanBotInstallation({ larkAppId: 'app', env: { [ASK_HUMAN_CONFIG_ENV]: '' } }, f.env, () => now)).toBeUndefined();
+    expect(stale.FIXTURE_CHECKER_KEY).toBe('old');
+  });
   it('absent opt-in does not read paths or touch the filesystem', () => {
     const env = new Proxy({}, { get: (_target, key) => { expect(key).toBe(ASK_HUMAN_CONFIG_ENV); return undefined; } });
     expect(loadAskHumanInstallation('app', env)).toBeUndefined(); expect(readdirSync(root)).toEqual([]);

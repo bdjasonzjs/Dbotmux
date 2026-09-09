@@ -11,6 +11,14 @@ import { AskHumanPreflightError } from './ask-human-preflight.js';
 import type { AskHumanSourceGrant } from './ask-human-source-runtime.js';
 
 export const ASK_HUMAN_CONFIG_ENV = 'BOTMUX_HUMAN_SESSION_CONFIG';
+/** Use the selected bot's persisted settings on EVERY ordinary daemon start.
+ * This is a private loader snapshot, not injection into the daemon's global
+ * environment or any sibling app. Explicit bot settings take precedence.
+ */
+export function loadAskHumanBotInstallation(bot: { larkAppId: string; env?: Record<string, string> },
+  env: NodeJS.ProcessEnv = process.env, now: () => number = Date.now): AskHumanSourceGrant | undefined {
+  return loadAskHumanInstallation(bot.larkAppId, { ...env, ...bot.env }, now);
+}
 const text = z.string().trim().min(1);
 const configuration = z.object({
   version: z.literal(1), grantId: text, appId: text, botMemberOpenId: text,

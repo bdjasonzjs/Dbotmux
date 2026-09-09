@@ -237,6 +237,12 @@ export function createAskHumanSourceRuntime(host: AskHumanSourceHost, testPorts:
       // for new effects after releasing output. The next business turn gets
       // a new daemon-managed origin; status alone remains available.
       if (command.operation !== 'status' && guards.sourceTurnTerminated(before.frame, before.ds.workerGeneration!)) return fail('ORIGIN_UNPROVEN');
+      // Released without a ledger entry means the preparing turn ended before
+      // presentation. Do not reuse that old ID to send under a released fence;
+      // a later turn can start a fresh request normally.
+      if (command.direction === 'assistant_answer' && guards.answerReleased(before.frame, command.requestId)
+        && !new AskHumanLedger(join(before.installed.stateDir, 'ledger'), now).find(before.frame.source, command.direction, command.requestId))
+        return fail('REQUEST_ENDED');
       try {
         const { frame, ds, installed } = await connect(command);
         if (command.direction === 'assistant_answer' && command.operation === 'read_rules' && !guards.answerReleased(frame, command.requestId)) {

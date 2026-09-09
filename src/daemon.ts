@@ -206,7 +206,7 @@ import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcReq
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import { setAskHumanIpcApi } from './core/dashboard-ipc-server.js';
 import { createAskHumanSourceRuntime } from './core/ask-human-source-runtime.js';
-import { loadAskHumanInstallation } from './core/ask-human-installation.js';
+import { loadAskHumanBotInstallation } from './core/ask-human-installation.js';
 const humanSessionSources = new Map<string, ReturnType<typeof createAskHumanSourceRuntime>>();
 import { reconcileContainmentHandlesOnBoot } from './core/mojo-containment.js';
 import {
@@ -21766,8 +21766,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // Opt-in host configuration only. No file configured => the existing zero-IO
   // dormant path. Loading never provisions protection, publishes rules or sends
   // anything. An invalid capability configuration must NOT stop ordinary bots.
-  let humanSessionInstallation: ReturnType<typeof loadAskHumanInstallation>;
-  try { humanSessionInstallation = loadAskHumanInstallation(cfg.larkAppId); }
+  let humanSessionInstallation: ReturnType<typeof loadAskHumanBotInstallation>;
+  try { humanSessionInstallation = loadAskHumanBotInstallation(cfg); }
   catch { logger.error('[human-session] INSTALLATION_CONFIG_INVALID; capability disabled'); }
   const humanSessionSource = createAskHumanSourceRuntime({
     appId: cfg.larkAppId, lookupSession: id => findActiveBySessionId(id),
