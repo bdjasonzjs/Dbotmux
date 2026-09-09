@@ -63,8 +63,10 @@ export function resolveHumanSessionRoutingPromptGate(
   if (override.present && !override.enabled) {
     return { ...base, enabled: false, reason: 'disabled' };
   }
-  if (configured?.enabled !== true) return { ...base, enabled: false, reason: 'disabled' };
-  if (configured.appIds && !configured.appIds.includes(env.BOTMUX_LARK_APP_ID ?? '')) {
+  const enabledHere = configured?.appIds
+    ? configured.appIds.includes(env.BOTMUX_LARK_APP_ID ?? '')
+    : configured?.enabled === true;
+  if (!enabledHere) {
     return { ...base, enabled: false, reason: 'disabled' };
   }
   if (configured?.dependencyReady !== true) {

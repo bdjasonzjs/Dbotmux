@@ -116,7 +116,7 @@ export interface WorkflowFeatureGlobalConfig {
  * publish a matching callable entry plus concrete readiness evidence. */
 export interface HumanSessionRoutingPromptConfig {
   enabled?: boolean;
-  /** When supplied, publish only for these installed apps. */
+  /** Per-app publication when supplied; legacy global enabled is ignored. */
   appIds?: string[];
   dependencyReady?: boolean;
   skillEntry?: string;
