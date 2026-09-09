@@ -1,5 +1,5 @@
-/** Explicit, inert-until-called Lark adapter. Uses the existing bot SDK/client;
- * never a user token, shim override, history search, worker or scheduler.
+/** Explicit, inert-until-called Lark adapter. Presentations use the bot client;
+ * human replies use the configured user transport and one designated fallback.
  * The daemon must install purpose guards BEFORE granting write readiness.
  */
 import { mkdirSync, readFileSync } from 'node:fs';
@@ -12,6 +12,7 @@ import { askHumanHash, AskHumanPreflightError } from './ask-human-preflight.js';
 import { askHumanContentText, askHumanTextWire, type AskHumanWireContent } from './ask-human-message.js';
 import type { AskHumanReadMessage } from './ask-human-ledger.js';
 import type { AskHumanExecutorPorts } from './ask-human-executor.js';
+import { sendAskHumanReply, sendAskHumanViaProfile, askHumanReplyMention, type AskHumanReplyConfig, type AskHumanSendReceipt } from './ask-human-reply.js';
 
 type Transport = Pick<AskHumanExecutorPorts, 'createBotOnlyRoom' | 'readRoom' | 'inviteHuman' | 'send' | 'readMessage' | 'lookupSend'>;
 const nonempty = z.string().min(1);
@@ -68,6 +69,7 @@ export interface AskHumanLarkApi {
   sendText(appId: string, chatId: string, text: string, uuid: string): Promise<string>;
   detail(appId: string, messageId: string): Promise<unknown>;
   bots(appId: string, chatId: string): Promise<{ openId: string }[]>;
+  sendReply?(input: Parameters<AskHumanExecutorPorts['send']>[0]): Promise<AskHumanSendReceipt>;
 }
 
 const responseSchema = z.object({ code: z.literal(0), data: z.record(z.unknown()) }).passthrough();
@@ -165,6 +167,14 @@ export function createAskHumanLarkTransport(options: {
       sameApp(input.appId);
       options.assertWrite({ operation: 'send', appId, target: input.chatId, uuid: input.uuid });
       const wire = askHumanTextWire(input.body, input.mentions);
+      if (input.replyAsUser) {
+        const result = await receipts.once(key('send', input.chatId, input.uuid), input, async () => {
+          options.assertWrite({ operation: 'send', appId, target: input.chatId, uuid: input.uuid });
+          if (!api.sendReply) return fail('REPLY_TRANSPORT_UNAVAILABLE', '用户回复传输未配置');
+          return JSON.stringify(await api.sendReply(input));
+        });
+        return JSON.parse(result) as AskHumanSendReceipt;
+      }
       const messageId = await receipts.once(key('send', input.chatId, input.uuid), input, () => {
         options.assertWrite({ operation: 'send', appId, target: input.chatId, uuid: input.uuid });
         return api.sendText(appId, input.chatId, JSON.parse(wire.content).text, input.uuid);
@@ -182,7 +192,7 @@ export function createAskHumanLarkTransport(options: {
       const messageId = receipts.lookup(key('send', input.chatId, input.uuid));
       // No documented provider GET-by-UUID is assumed. Only our original
       // provider acceptance receipt can establish FOUND; absence is UNKNOWN.
-      return messageId ? { status: 'FOUND', messageId } : { status: 'UNKNOWN' };
+      return messageId ? { status: 'FOUND', ...(messageId.startsWith('{') ? JSON.parse(messageId) as AskHumanSendReceipt : { messageId }) } : { status: 'UNKNOWN' };
     },
   };
 }
@@ -192,6 +202,8 @@ export function createAskHumanLarkTransport(options: {
  */
 export async function bindAskHumanLarkTransport(options: Omit<Parameters<typeof createAskHumanLarkTransport>[0], 'api'> & {
   outboundPermit?(request: { appId: string; chatId: string; content: string; uuid: string }): object;
+  replyForward?: AskHumanReplyConfig;
+  replyTo?: string;
 }): Promise<Transport> {
   const [{ getBotClient, getBot }, client] = await Promise.all([import('../bot-registry.js'), import('../im/lark/client.js')]);
   if (getBot(options.appId).botOpenId !== options.botMemberOpenId || options.botSenderId !== options.appId) return fail('IDENTITY_UNPROVEN', 'SDK 发件 app 和当前 bot 成员身份尚未一致核实');
@@ -204,5 +216,22 @@ export async function bindAskHumanLarkTransport(options: Omit<Parameters<typeof 
     }),
     detail: (app, id) => client.getMessageDetail(app, id, { timeoutMs: 15000 }),
     bots: (app, chat) => client.listCurrentChatBotMembers(app, chat),
+    sendReply: async input => {
+      const reply = options.replyForward;
+      if (!reply || !input.userOpenId) return fail('REPLY_TRANSPORT_UNAVAILABLE', '用户回复传输未配置');
+      const textFor = async (profile: string, identity: 'user' | 'bot') => {
+        const mention = await askHumanReplyMention(profile, identity, input.chatId, options.appId);
+        return JSON.parse(askHumanTextWire(input.body, [mention]).content).text as string;
+      };
+      return sendAskHumanReply({ userOpenId: input.userOpenId }, {
+        user: async () => sendAskHumanViaProfile(reply.userProfile, 'user', input.chatId, await textFor(reply.userProfile, 'user'), input.uuid, options.replyTo),
+        fallbackAppId: reply.fallbackAppId,
+        fallback: async () => {
+          options.assertWrite({ operation: 'send', appId: options.appId, target: input.chatId, uuid: input.uuid });
+          const body = await textFor(reply.fallbackProfile, 'bot');
+          return sendAskHumanViaProfile(reply.fallbackProfile, 'bot', input.chatId, body, input.uuid, options.replyTo);
+        },
+      });
+    },
   } });
 }

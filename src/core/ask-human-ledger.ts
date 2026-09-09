@@ -38,6 +38,8 @@ const intentSchema = z.object({
   key: text, attemptId: text, status: z.enum(['ATTEMPTING', 'UNCERTAIN', 'CONFIRMED', 'NOT_SENT']),
   startedAt: time, messageId: text.optional(), error: text.optional(),
   purpose: purposeSchema, uuid: text, chatId: text, body: text, mentions: z.array(text),
+  replyAsUser: z.boolean().optional(),
+  sender: z.object({ type: z.enum(['user', 'bot']), id: text }).strict().optional(),
   readback: messageSchema.optional(),
 }).strict();
 export type AskHumanSendIntent = z.infer<typeof intentSchema>;
@@ -239,14 +241,14 @@ export class AskHumanLedger {
   private renderRelay(r: AskHumanEntry, e: AskHumanEntry['events'][number]): string {
     // Raw text kept in its own JSON field as well as byte-for-byte in the body.
     const notice = e.kind === 'routing_notice' || e.kind === 'human_message'
-      ? `\n来源业务提示：${e.reason ?? '回答型群后续消息'}。请在原业务判断是否需要为新问题另开“汇报·短标题”群；本消息不是旧问题的答案或授权，不能恢复旧任务。` : '';
-    return `人类会话：以下由 bot 原文转述，非冒用用户身份。\n回答者：${r.frame.source.decisionOpenId}\n任务：${r.frame.source.taskId}\n请求：${r.requestId}\n源消息：${e.raw.messageId}\n事件：${e.eventId}\n类型：${e.kind}${notice}\n\n原话开始\n${e.raw.body}\n原话结束`;
+      ? `\n来源业务提示：${e.reason ?? '汇报后的补充回复'}。请结合当前任务处理这条回复。` : '';
+    return `人类会话回复\n任务：${r.frame.source.taskId}\n请求：${r.requestId}\n方向：${r.direction}\n汇报消息：${r.presented?.messageId ?? ''}\n回复消息：${e.raw.messageId}\n事件：${e.eventId}\n类型：${e.kind}${notice}\n\n原问题／汇报内容\n${r.body}\n\n以下是对此消息的真人原回复\n原话开始\n${e.raw.body}\n原话结束\n\n接手：沿原任务继续处理。使用上述请求、方向和事件 ID，通过 botmux human-session 的 claim_event 领取原事件；处理完成后用 consume_event 提交业务回执。`;
   }
   /** Durable domain outbox intent: reuses existing bot-send/UUID adapter later.
    * There is no automatic resend of ATTEMPTING/UNCERTAIN, even after restart.
    * bodyHash ties retries to bytes, and the direction-specific lock ends before IO.
    */
-  beginSend(source: AskHumanSourceBinding, direction: AskHumanDirection, requestId: string, purpose: AskHumanSendPurpose, admission?: AskHumanAdmission, readers?: AskHumanReaders): AskHumanSendIntent {
+  beginSend(source: AskHumanSourceBinding, direction: AskHumanDirection, requestId: string, purpose: AskHumanSendPurpose, admission?: AskHumanAdmission, readers?: AskHumanReaders, replyBotOpenId?: string): AskHumanSendIntent {
     purposeSchema.parse(purpose);
     const persist = (approved?: { body: string; reportHash: string }) => this.tx(source, direction, j => {
       this.expire(j); const r = this.entry(j, source, requestId);
@@ -262,13 +264,15 @@ export class AskHumanLedger {
         const event = r.events.find(e => e.eventId === purpose.eventId);
         if (!event?.readback) fail('READBACK_REQUIRED', '没有回读过的真人原文');
         chatId = source.chatId; body = this.renderRelay(r, event);
+        if (replyBotOpenId) mentions = [replyBotOpenId];
       }
       const key = askHumanHash(JSON.stringify([r.key, purpose, chatId, body]));
       const old = r.intents.find(i => i.key === key);
       if (old && old.status !== 'NOT_SENT') fail('SEND_UNCERTAIN', '不得重复发送；请按原意图与原消息对账');
       const attemptId = randomUUID();
       if (old) { old.attemptId = attemptId; old.status = 'ATTEMPTING'; old.startedAt = this.now(); delete old.error; delete old.messageId; delete old.readback; return old; }
-      const intent: AskHumanSendIntent = { key, uuid: dispatchUuidForKey(`human-session:${key}`), attemptId, status: 'ATTEMPTING', startedAt: this.now(), purpose, chatId, body, mentions };
+      const intent: AskHumanSendIntent = { key, uuid: dispatchUuidForKey(`human-session:${key}`), attemptId, status: 'ATTEMPTING', startedAt: this.now(), purpose, chatId, body, mentions,
+        ...(typeof purpose === 'object' && replyBotOpenId ? { replyAsUser: true } : {}) };
       r.intents.push(intent); return intent;
     });
     if (purpose !== 'presentation') return persist();
@@ -280,13 +284,14 @@ export class AskHumanLedger {
   /** CONFIRMED here means sender result only; never presentation/inbox ACK.
    * Only verified no-send responses may be NOT_SENT. A timeout is UNCERTAIN.
    */
-  finishSend(source: AskHumanSourceBinding, direction: AskHumanDirection, requestId: string, key: string, attemptId: string, result: { status: 'CONFIRMED'; messageId: string } | { status: 'NOT_SENT' | 'UNCERTAIN'; error: string }): void {
+  finishSend(source: AskHumanSourceBinding, direction: AskHumanDirection, requestId: string, key: string, attemptId: string, result: { status: 'CONFIRMED'; messageId: string; sender?: AskHumanSendIntent['sender'] } | { status: 'NOT_SENT' | 'UNCERTAIN'; error: string }): void {
     this.tx(source, direction, j => {
       const r = this.entry(j, source, requestId), intent = r.intents.find(i => i.key === key);
       if (!intent || intent.attemptId !== attemptId || !['ATTEMPTING', 'UNCERTAIN'].includes(intent.status)) fail('STALE_ATTEMPT', '发送结果属于旧意图');
       if (result.status === 'CONFIRMED') {
         if (!result.messageId.trim()) fail('INVALID_RESULT', '发送结果缺少消息编号');
         intent.status = result.status; intent.messageId = result.messageId;
+        if (result.sender) intent.sender = result.sender;
       } else {
         if (!result.error.trim()) fail('INVALID_RESULT', '故障必须可查询');
         intent.status = result.status; intent.error = result.error;
@@ -301,12 +306,15 @@ export class AskHumanLedger {
   /** A trustworthy UUID lookup only supplies a candidate ID. Read that exact
    * message and validate all bindings BEFORE promoting an uncertain intent.
    */
-  recordSendReadback(source: AskHumanSourceBinding, direction: AskHumanDirection, requestId: string, key: string, attemptId: string, input: AskHumanReadMessage): void {
+  recordSendReadback(source: AskHumanSourceBinding, direction: AskHumanDirection, requestId: string, key: string, attemptId: string, input: AskHumanReadMessage, sender?: AskHumanSendIntent['sender']): void {
     const m = messageSchema.parse(input);
     this.tx(source, direction, j => {
       const r = this.entry(j, source, requestId), i = r.intents.find(i => i.key === key);
       if (!i || i.attemptId !== attemptId || i.status === 'NOT_SENT') fail('STALE_ATTEMPT', '对账不属于当前发送意图');
-      if ((i.messageId && i.messageId !== m.messageId) || m.deleted || m.appId !== source.appId || m.chatId !== i.chatId || m.senderType !== 'bot' || m.senderId !== r.frame.botSenderId || m.createdAt < i.startedAt || !askHumanReadbackMatches(i.body, i.mentions, m)) fail('READBACK_MISMATCH', '对账消息与原发送意图不符');
+      const expected = i.replyAsUser ? i.sender ?? sender : { type: 'bot' as const, id: r.frame.botSenderId };
+      if (!expected || (expected.type === 'user' && expected.id !== source.decisionOpenId)
+        || (i.messageId && i.messageId !== m.messageId) || m.deleted || m.appId !== source.appId || m.chatId !== i.chatId || m.senderType !== expected.type || m.senderId !== expected.id || m.createdAt < i.startedAt || !askHumanReadbackMatches(i.body, i.mentions, m)) fail('READBACK_MISMATCH', '对账消息与原发送意图不符');
+      if (i.replyAsUser) i.sender = expected;
       i.status = 'CONFIRMED'; i.messageId = m.messageId; i.readback = m;
     });
   }
@@ -315,7 +323,10 @@ export class AskHumanLedger {
     const m = messageSchema.parse(input);
     return this.tx(source, direction, j => {
       const r = this.entry(j, source, requestId), e = r.events.find(e => e.eventId === eventId);
-      if (!e?.readback || m.deleted || m.chatId !== source.chatId || m.appId !== source.appId || m.senderType !== 'bot' || m.senderId !== r.frame.botSenderId || !askHumanReadbackMatches(this.renderRelay(r, e), [], m)) fail('READBACK_MISMATCH', '回传展示必须真实回读且绑定正确任务');
+      const intent = r.intents.find(i => typeof i.purpose === 'object' && i.purpose.eventId === eventId);
+      const valid = intent?.replyAsUser ? JSON.stringify(intent.readback) === JSON.stringify(m)
+        : m.senderType === 'bot' && m.senderId === r.frame.botSenderId && askHumanReadbackMatches(intent?.body ?? this.renderRelay(r, e!), intent?.mentions ?? [], m);
+      if (!e?.readback || m.deleted || m.chatId !== source.chatId || m.appId !== source.appId || !valid) fail('READBACK_MISMATCH', '回传展示必须真实回读且绑定正确任务');
       if (e.inboxAck) return false;
       e.sourceMessageId = m.messageId; e.inboxAck = true;
       if (e.kind === 'human_candidate') r.wake = 'PENDING';

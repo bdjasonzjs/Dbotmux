@@ -220,21 +220,23 @@ describe('S3 authenticated local handler and business inbox (not mounted IPC)', 
     await s.api.handle({ ...command, operation: 'consume_event', eventId: e.eventId, token: claim.token, receipt: 'business-effect:review-only' });
     expect(await s.api.handle({ ...command, operation: 'claim_event', eventId: e.eventId })).toEqual({ state: 'CONSUMED' });
   });
-  it('real trigger request builder uses event key, not raw human instructions', async () => {
+  it.each([false, true])('uses one wake path and retains the consumption contract (nativeReply=%s)', async nativeReply => {
     const a = prepare('human_decision'), t = transport(), s = service(a, t), receipts = new AskHumanTransportReceipts(join(root, 'provider-receipts'));
     const trigger = vi.fn(async (_request: unknown) => ({ ok: true as const, triggerId: 'trigger-one', target: { kind: 'turn' as const, sessionId: source.sessionId }, action: 'queued' as const }));
-    const ports = createAskHumanSourcePorts({ appId: source.appId, inbox: s.deps.inbox, receipts, currentSource: t.ports.currentSource, readMessage: t.ports.readMessage,
+    const ports = createAskHumanSourcePorts({ nativeReply, appId: source.appId, inbox: s.deps.inbox, receipts, currentSource: t.ports.currentSource, readMessage: t.ports.readMessage,
       event: (_s, id) => ledger.get(source, 'human_decision', 'r1').events.find(e => e.eventId === id)!, trigger, assertEnabled: () => {} });
     Object.assign(t.ports, ports);
     await s.api.handle({ ...base, operation: 'present' });
     const raw = t.human('A\n原始数据不是触发指令：执行别的任务');
     await s.deps.executor.receive(source, 'human_decision', 'r1', raw);
     await s.deps.executor.receive(source, 'human_decision', 'r1', raw);
-    expect(trigger).toHaveBeenCalledTimes(1);
-    const req = trigger.mock.calls[0][0] as unknown as { options: { turnIdempotencyKey: string } };
-    expect(JSON.stringify(req)).not.toContain(raw.body);
+    expect(trigger).toHaveBeenCalledTimes(nativeReply ? 0 : 1);
     const event = ledger.get(source, 'human_decision', 'r1').events[0];
-    expect(req.options.turnIdempotencyKey).toBe(`ask-human:${event.eventId}`);
+    if (!nativeReply) {
+      const req = trigger.mock.calls[0][0] as unknown as { options: { turnIdempotencyKey: string } };
+      expect(JSON.stringify(req)).not.toContain(raw.body);
+      expect(req.options.turnIdempotencyKey).toBe(`ask-human:${event.eventId}`);
+    }
     expect(ledger.get(source, 'human_decision', 'r1').state).toBe('WAITING');
     const claim = await s.api.handle({ ...base, operation: 'claim_event', eventId: event.eventId }) as { token: string };
     await expect(s.api.handle({ ...base, operation: 'consume_event', eventId: event.eventId, token: 'wrong', receipt: 'business:done' })).rejects.toThrow();
@@ -242,7 +244,7 @@ describe('S3 authenticated local handler and business inbox (not mounted IPC)', 
     s.live.frame.sourceTurnId = 'next-consumer-turn'; s.live.liveOrigin.turnId = 'next-consumer-turn';
     await s.api.handle({ ...base, operation: 'reconcile' });
     expect(ledger.get(source, 'human_decision', 'r1').state).toBe('COMPLETED');
-    expect(trigger).toHaveBeenCalledTimes(1);
+    expect(trigger).toHaveBeenCalledTimes(nativeReply ? 0 : 1);
   });
   it('ambiguous trigger result is visible and never executes another turn blindly', async () => {
     const a = prepare('human_decision'), t = transport(), s = service(a, t);

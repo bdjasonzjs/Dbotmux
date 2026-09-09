@@ -20,10 +20,11 @@ import { AskHumanProtectionRegistry, type AskHumanProtectedRoom } from './ask-hu
 import { askHumanTextWire } from './ask-human-message.js';
 
 type LiveSession = Pick<DaemonSession, 'larkAppId' | 'chatId' | 'managedTurnOrigin'> & {
-  session: Pick<DaemonSession['session'], 'sessionId' | 'status' | 'vcMeetingReceiver'>;
+  session: Pick<DaemonSession['session'], 'sessionId' | 'status' | 'vcMeetingReceiver' | 'scope'>;
   initConfig?: Pick<NonNullable<DaemonSession['initConfig']>, 'sandbox' | 'readIsolation' | 'backendType' | 'adoptMode'>;
 };
 export interface AskHumanRuntimeInstallation {
+  replyForward?: import('./ask-human-reply.js').AskHumanReplyConfig;
   /** A host-approved, bounded grant, NOT an enable bit from request JSON.
    * No grant loader or online configuration mutation is exposed by this slice. */
   grantId: string; appId: string; botMemberOpenId: string; expiresAt?: number;
@@ -178,6 +179,8 @@ export function createAskHumanDaemonRuntime(host: AskHumanRuntimeHost, testPorts
         assertEnabled(frame);
         transport ??= (testPorts.bindLark ?? bindAskHumanLarkTransport)({ appId: host.appId,
           botSenderId: frame.botSenderId, botMemberOpenId: installed.botMemberOpenId, receipts, assertWrite,
+          replyForward: installed.replyForward,
+          ...(installed.replyForward && host.lookupSession(frame.source.sessionId)?.session.scope !== 'chat' ? { replyTo: frame.sourceMessageId } : {}),
           outboundPermit: request => guards.permit(frame, entry().key, c.direction, request, () => {
             assertWrite({ operation: 'send', appId: request.appId, target: request.chatId, uuid: request.uuid });
             const intent = entry().intents.find(i => i.uuid === request.uuid && i.chatId === request.chatId);
@@ -193,6 +196,7 @@ export function createAskHumanDaemonRuntime(host: AskHumanRuntimeHost, testPorts
         return (await lark()).readMessage(id);
       };
       const sourcePorts = createAskHumanSourcePorts({ appId: host.appId, inbox, receipts, readMessage,
+        nativeReply: !!installed.replyForward,
         location: () => ({ requestId: c.requestId, direction: c.direction }),
         currentSource: async id => { assertEnabled(frame); return incoming
           ? (id === frame.source.sessionId ? auth().source : null) : resolveLive(id)?.frame.source ?? null; },
@@ -208,6 +212,7 @@ export function createAskHumanDaemonRuntime(host: AskHumanRuntimeHost, testPorts
         },
       });
       const ports: AskHumanExecutorPorts = { ...sourcePorts, runtimeAppId: host.appId,
+        ...(installed.replyForward ? { replyBotOpenId: installed.botMemberOpenId } : {}),
         outputGuardReady: f => { assertEnabled(f); return guards.answerGuarded(f) || guards.answerReleased(f, c.requestId); },
         createBotOnlyRoom: async request => {
           assertWrite({ operation: 'create', appId: request.appId, target: request.name, uuid: request.uuid });
@@ -232,7 +237,8 @@ export function createAskHumanDaemonRuntime(host: AskHumanRuntimeHost, testPorts
         },
         send: async request => {
           const i = entry().intents.find(i => i.uuid === request.uuid && i.chatId === request.chatId);
-          if (!i || i.body !== request.body || !equal(i.mentions, request.mentions)) return fail('WRITE_SCOPE_MISMATCH');
+          if (!i || i.body !== request.body || !equal(i.mentions, request.mentions)
+            || !!i.replyAsUser !== !!request.replyAsUser || (request.replyAsUser && request.userOpenId !== frame.source.decisionOpenId)) return fail('WRITE_SCOPE_MISMATCH');
           assertWrite({ operation: 'send', appId: request.appId, target: request.chatId, uuid: request.uuid });
           return (await lark()).send(request);
         }, readMessage,

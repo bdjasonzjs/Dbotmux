@@ -71,9 +71,11 @@ export function askHumanTextWire(body: string, mentions: string[] = []): AskHuma
   return { type: 'text', content: JSON.stringify({ text: [...metadata.map(m => m.key), body].join(' ') }), mentions: metadata };
 }
 
-export function askHumanReadbackMatches(body: string, mentions: string[], message: { body: string; wire?: AskHumanWireContent }): boolean {
+export function askHumanReadbackMatches(body: string, mentions: string[], message: { body: string; wire?: AskHumanWireContent; senderType?: string }): boolean {
   const expected = askHumanContentText(askHumanTextWire(body, mentions), mentions);
   const actual = askHumanContentText(message.wire ?? message.body, mentions);
   // A real adapter includes wire and exposes exactly its extracted pure text.
-  return actual === expected && (!message.wire || actual === askHumanContentText(message.body));
+  const rawUser = message.senderType === 'user' && message.wire?.type === 'text'
+    && JSON.parse(message.wire.content).text === message.body;
+  return actual === expected && (!message.wire || rawUser || actual === askHumanContentText(message.body));
 }

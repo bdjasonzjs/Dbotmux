@@ -6,21 +6,23 @@
 import { AskHumanAdmission, type AskHumanReaders, type AskHumanSourceBinding } from './ask-human-admission.js';
 import { AskHumanLedger, type AskHumanEntry, type AskHumanFrame, type AskHumanReadMessage, type AskHumanSendIntent, type AskHumanSendPurpose } from './ask-human-ledger.js';
 import { AskHumanPreflightError } from './ask-human-preflight.js';
+import type { AskHumanSendReceipt } from './ask-human-reply.js';
 
 export interface AskHumanExecutorPorts {
   readonly runtimeAppId: string;
+  readonly replyBotOpenId?: string;
   /** Verified protection of ALL output paths for exactly sourceSession/turn. */
   outputGuardReady(frame: AskHumanFrame): boolean;
   createBotOnlyRoom(input: { appId: string; uuid: string; name: string }): Promise<string>;
   readRoom(roomId: string): Promise<{ roomId: string; appId: string; name: string; private: boolean; memberIds: string[] }>;
   registerPurpose(input: { roomId: string; requestKey: string; noWorker: true; noObserver: true }): Promise<void>;
   inviteHuman(input: { roomId: string; openId: string; appId: string }): Promise<void>;
-  send(input: { appId: string; chatId: string; body: string; mentions: string[]; uuid: string }): Promise<{ messageId: string }>;
+  send(input: { appId: string; chatId: string; body: string; mentions: string[]; uuid: string; replyAsUser?: boolean; userOpenId?: string }): Promise<AskHumanSendReceipt>;
   readMessage(messageId: string): Promise<AskHumanReadMessage>;
   /** Authoritative transport lookup, not a text search. NOT_SENT must prove
    * this attempt can no longer be accepted; absence in a message page is UNKNOWN.
    */
-  lookupSend(input: { appId: string; chatId: string; uuid: string; attemptId: string }): Promise<{ status: 'FOUND'; messageId: string } | { status: 'NOT_SENT'; receiptId: string } | { status: 'UNKNOWN' }>;
+  lookupSend(input: { appId: string; chatId: string; uuid: string; attemptId: string }): Promise<({ status: 'FOUND' } & AskHumanSendReceipt) | { status: 'NOT_SENT'; receiptId: string } | { status: 'UNKNOWN' }>;
   currentSource(sessionId: string): Promise<AskHumanSourceBinding | null>;
   /** Real source delivery inbox, called only with verified message readback.
    * It is not a read receipt from the human and grants no business authority.
@@ -108,6 +110,7 @@ export class AskHumanExecutor {
   }
   private async readIntent(source: AskHumanSourceBinding, direction: AskHumanAdmission['direction'], requestId: string, intent: AskHumanSendIntent): Promise<AskHumanReadMessage> {
     let messageId = intent.messageId;
+    let sender = intent.sender;
     if (intent.status !== 'CONFIRMED') {
       if (intent.status === 'NOT_SENT') throw new AskHumanPreflightError('SEND_NOT_SENT', '已证实未发；可使用原意图显式重试');
       const lookup = await this.ports.lookupSend({ appId: source.appId, chatId: intent.chatId, uuid: intent.uuid, attemptId: intent.attemptId });
@@ -117,19 +120,20 @@ export class AskHumanExecutor {
       }
       if (lookup.status !== 'FOUND') throw new AskHumanPreflightError('RECONCILIATION_REQUIRED', '发送结果仍未知；保留意图，不盲重发');
       messageId = lookup.messageId;
+      sender = lookup.sender;
     }
     if (!messageId?.trim()) throw new AskHumanPreflightError('READBACK_REQUIRED', '对账缺少原消息 ID');
     const readback = await this.ports.readMessage(messageId);
     if (readback.messageId !== messageId) throw new AskHumanPreflightError('READBACK_MISMATCH', '回读的不是原意图消息');
     if (!readback.wire) throw new AskHumanPreflightError('RAW_CONTENT_REQUIRED', '真实发送回读必须保留原始 content 和 mention 身份');
-    this.ledger.recordSendReadback(source, direction, requestId, intent.key, intent.attemptId, readback);
+    this.ledger.recordSendReadback(source, direction, requestId, intent.key, intent.attemptId, readback, sender);
     return readback;
   }
   private async deliver(source: AskHumanSourceBinding, direction: AskHumanAdmission['direction'], requestId: string, purpose: AskHumanSendPurpose, admission?: AskHumanAdmission, readers?: AskHumanReaders): Promise<AskHumanReadMessage> {
     const old = this.ledger.findSend(source, direction, requestId, purpose);
     if (old && old.status !== 'NOT_SENT') return this.readIntent(source, direction, requestId, old);
     if (purpose !== 'presentation') await this.liveSource(source);
-    const intent = this.ledger.beginSend(source, direction, requestId, purpose, admission, readers);
+    const intent = this.ledger.beginSend(source, direction, requestId, purpose, admission, readers, this.ports.replyBotOpenId);
     const messageId = await this.sendIntent(source, direction, requestId, intent);
     return this.readIntent(source, direction, requestId, { ...intent, status: 'CONFIRMED', messageId });
   }
@@ -179,13 +183,14 @@ export class AskHumanExecutor {
     }
   }
   private async sendIntent(source: AskHumanSourceBinding, direction: AskHumanAdmission['direction'], requestId: string, intent: ReturnType<AskHumanLedger['beginSend']>): Promise<string> {
-    let result: { messageId: string };
-    try { result = await this.ports.send({ appId: source.appId, chatId: intent.chatId, body: intent.body, mentions: intent.mentions, uuid: intent.uuid }); }
+    let result: AskHumanSendReceipt;
+    try { result = await this.ports.send({ appId: source.appId, chatId: intent.chatId, body: intent.body, mentions: intent.mentions, uuid: intent.uuid,
+      ...(intent.replyAsUser ? { replyAsUser: true, userOpenId: source.decisionOpenId } : {}) }); }
     catch (e) {
       this.ledger.finishSend(source, direction, requestId, intent.key, intent.attemptId, { status: 'UNCERTAIN', error: (e as Error).message || '发送结果未知' });
       throw e;
     }
-    this.ledger.finishSend(source, direction, requestId, intent.key, intent.attemptId, { status: 'CONFIRMED', messageId: result.messageId });
+    this.ledger.finishSend(source, direction, requestId, intent.key, intent.attemptId, { status: 'CONFIRMED', ...result });
     return result.messageId;
   }
   /** Caller routes a verified raw message from a registered room, BEFORE any

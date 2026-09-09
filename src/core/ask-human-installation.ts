@@ -32,6 +32,7 @@ const configuration = z.object({
   }).strict(),
   sources: z.array(z.unknown().transform(parseAskHumanFrame)).min(1).optional(),
   sourceDefaults: z.object({ tenantId: text, decisionUserId: text, decisionOpenId: text }).strict().optional(),
+  replyForward: z.object({ userProfile: text, fallbackProfile: text, fallbackAppId: text }).strict().optional(),
 }).strict().refine(c => Boolean(c.sources) !== Boolean(c.sourceDefaults), 'choose app-wide or legacy source bindings');
 
 function freeze<T>(value: T): T {
@@ -69,7 +70,8 @@ export function loadAskHumanInstallation(appId: string, env: NodeJS.ProcessEnv =
     createAskHumanChecker(checker, { assertEnabled() {} });
     return freeze({ grantId: c.grantId, appId, botMemberOpenId: c.botMemberOpenId,
       ...(c.expiresAt === undefined ? {} : { expiresAt: c.expiresAt }), stateDir, rulesDir, checker, sources,
-      ...(c.sourceDefaults ? { sourceDefaults: c.sourceDefaults } : {}) });
+      ...(c.sourceDefaults ? { sourceDefaults: c.sourceDefaults } : {}),
+      ...(c.replyForward ? { replyForward: c.replyForward } : {}) });
   } catch {
     // Never reflect the file, provider credentials or parser input to logs.
     throw new AskHumanPreflightError('INSTALLATION_CONFIG_INVALID', '人类会话启动配置无效；此能力保持停用');

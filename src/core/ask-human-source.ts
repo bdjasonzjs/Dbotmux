@@ -86,6 +86,7 @@ export function askHumanWakeRequest(source: AskHumanSourceBinding, eventId: stri
 }
 
 export function createAskHumanSourcePorts(options: {
+  nativeReply?: boolean;
   appId: string; inbox: AskHumanSourceInbox; receipts: AskHumanTransportReceipts;
   currentSource: AskHumanExecutorPorts['currentSource']; readMessage: AskHumanExecutorPorts['readMessage'];
   event(source: AskHumanSourceBinding, eventId: string): AskHumanEntry['events'][number];
@@ -103,6 +104,12 @@ export function createAskHumanSourcePorts(options: {
     const event = o.event(source, eventId);
     if (event.eventId !== eventId) throw new AskHumanPreflightError('SOURCE_MISMATCH', '来源事件键错配');
     o.inbox.offer(source, event);
+    if (o.nativeReply) {
+      // The user/bot message really mentions this source bot. Its ordinary IM
+      // ingress resumes the conversation; do not also enqueue a trigger turn.
+      await o.receipts.once(key(source, eventId), { sourceMessageId: event.sourceMessageId }, async () => event.sourceMessageId!);
+      return 'DISPATCHED';
+    }
     const request = askHumanWakeRequest(source, eventId, turnIdempotencyKey);
     if (o.location) request.envelope.payload = { ...request.envelope.payload as object, ...o.location(), kind: event.kind, originalMessageId: event.raw.messageId,
       next: 'botmux human-session --input - : claim_event, then route_event only for human_message/routing_notice; consume_event only after real business effects are reconciled under eventId' };

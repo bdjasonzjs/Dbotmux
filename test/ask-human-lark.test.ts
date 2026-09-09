@@ -105,4 +105,15 @@ describe('real Lark wire adapter contract (synthetic API responses, no network)'
     await expect(t.ports.readMessage('om_wrong')).rejects.toThrow(/另一条/);
     expect((await t.ports.readMessage('om_test')).body).toBe('正文');
   });
+  it('persists reply sender together with the message ID and reuses it across transport recreation', async () => {
+    const t = setup(), input = { appId: 'cli_app', chatId: 'oc_source', uuid: 'reply', body: '原问题\n原话', mentions: ['ou_bot_member'], replyAsUser: true, userOpenId: 'ou_human' };
+    const receipt = { messageId: 'om_reply', sender: { type: 'user' as const, id: 'ou_human' } };
+    t.api.sendReply = vi.fn(async () => receipt);
+    expect(await t.ports.send(input)).toEqual(receipt);
+    expect(t.api.sendText).not.toHaveBeenCalled();
+    const next = setup();
+    expect(await next.ports.send(input)).toEqual(receipt);
+    expect(await next.ports.lookupSend({ ...input, attemptId: 'a' })).toEqual({ status: 'FOUND', ...receipt });
+    expect(t.api.sendReply).toHaveBeenCalledTimes(1);
+  });
 });

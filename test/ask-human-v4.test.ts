@@ -365,4 +365,35 @@ describe('local executor with isolated fake ports; no real Lark operations', () 
     await executor.receive(source, 'human_decision', 'd1', m);
     expect(t.order.filter(x => x === 'sendSource')).toHaveLength(1); expect(t.order.filter(x => x === 'wake')).toHaveLength(1);
   });
+  it.each(['user', 'bot'] as const)('forwards exact reply and question with a real source mention, sender=%s', async senderType => {
+    const a = prepare('human_decision', 'd1'), t = transport();
+    Object.assign(t.ports, { replyBotOpenId: 'ou_requester' });
+    const send = t.ports.send;
+    t.ports.send = async input => {
+      const result = await send(input);
+      if (!input.replyAsUser) return result;
+      expect(input.mentions).toEqual(['ou_requester']);
+      expect(input.userOpenId).toBe(source.decisionOpenId);
+      const sender = { type: senderType, id: senderType === 'user' ? source.decisionOpenId : 'cli_fallback' };
+      const m = t.messages.get(result.messageId)!;
+      const wire = askHumanTextWire(input.body, input.mentions);
+      t.messages.set(result.messageId, { ...m, senderType, senderId: sender.id, wire,
+        body: senderType === 'user' ? JSON.parse(wire.content).text : input.body });
+      return { ...result, sender };
+    };
+    const executor = new AskHumanExecutor(ledger, t.ports);
+    await executor.present(a, frame, 'd1', readers); now += 10;
+    const original = message('fake-room', '  A\r\n 保留 $() 和原话！\n', 'human-message', 'user');
+    t.messages.set(original.messageId, original);
+    await executor.receive(source, 'human_decision', 'd1', original);
+    await executor.receive(source, 'human_decision', 'd1', original);
+    const r = ledger.get(source, 'human_decision', 'd1'), intent = r.intents.find(i => i.replyAsUser)!;
+    expect(intent.body).toContain(r.body);
+    expect(intent.body).toContain(r.presented!.messageId);
+    expect(intent.body).toContain(original.messageId);
+    expect(intent.body).toContain(`原话开始\n${original.body}\n原话结束`);
+    expect(intent.readback?.senderType).toBe(senderType);
+    expect(r.events[0].inboxAck).toBe(true);
+    expect(t.order.filter(v => v === 'sendSource')).toHaveLength(1);
+  });
 });
