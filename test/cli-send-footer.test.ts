@@ -145,4 +145,39 @@ describe('botmux send footer flags', () => {
     expect(JSON.stringify(proseCard)).not.toContain('ou_relay_sender_scope');
     expect(JSON.stringify(proseCard)).toContain('ou_owner');
   });
+
+  it('a legacy latched session without a relay app id must not strip any mention', async () => {
+    // Sessions that latched suppressRelayMentions before suppressRelayMentionAppId
+    // existed used to fall back to the retired ByteDance Claude app id. Cross-app
+    // open-id resolution mapped that dead id onto the live Claude bot and silently
+    // dropped legitimate mentions of it (2026-09-10 delegation relay incident).
+    writeFileSync(join(dataDir, 'sessions.json'), JSON.stringify({
+      s_footer: {
+        sessionId: 's_footer',
+        chatId: 'oc_footer',
+        rootMessageId: 'om_root',
+        scope: 'thread',
+        title: 'footer test',
+        status: 'active',
+        createdAt: new Date(0).toISOString(),
+        larkAppId: 'app_footer',
+        ownerOpenId: 'ou_owner',
+        quoteTargetSenderOpenId: 'ou_owner',
+        suppressRelayMentions: true,
+      },
+    }));
+    // The retired app must be resolvable the same way it was in production:
+    // bots-info still lists it, and its botName cross-refs to the LIVE bot's
+    // open id in the sender's scope. Without this the fallback resolves to an
+    // empty set and the bug cannot reproduce.
+    writeFileSync(join(dataDir, 'bots-info.json'), JSON.stringify([
+      { larkAppId: 'app_footer', botOpenId: 'ou_self', botName: 'FooterBot', cliId: 'codex' },
+      { larkAppId: 'app_relay', botOpenId: 'ou_relay_self', botName: 'RelayBot', cliId: 'claude-code' },
+      { larkAppId: 'cli_a9771799e8bb5bc3', botOpenId: 'ou_retired_self', botName: 'RelayBot', cliId: 'claude-code' },
+    ]));
+    const { payload: card } = await sendPayload('--card', [
+      '--mention', 'ou_relay_sender_scope:RelayBot', '--no-footer',
+    ]);
+    expect(JSON.stringify(card)).toContain('ou_relay_sender_scope');
+  });
 });
