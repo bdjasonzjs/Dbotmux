@@ -20,6 +20,24 @@ import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.j
 import { canonicalMobileKey, isMobileEntry, normalizeMobileEntry } from '../../setup/bot-config-editor.js';
 import { stampBotmuxCallbackMarkers } from './callback-button-marker.js';
 import type { ChatContext } from '../../types.js';
+import { ASK_HUMAN_GUARD_DIRECTORY, askHumanHasProtection, assertAskHumanOutbound, assertAskHumanDirectMessage } from '../../core/ask-human-guards.js';
+import { AskHumanPreflightError } from '../../core/ask-human-preflight.js';
+
+/** Common SDK egress, including CLI processes. No cache: a fence published
+ * while resolving a reply target must be observed before the actual write. */
+async function guardHumanSessionOutput(appId: string, target: { chatId?: string; messageId?: string }, operation: string,
+  content?: string, uuid?: string, permit?: object): Promise<() => void> {
+  const root = join(config.session.dataDir, ASK_HUMAN_GUARD_DIRECTORY);
+  let chatId = target.chatId;
+  if (!chatId && askHumanHasProtection(root, appId)) {
+    chatId = target.messageId ? (await getMessageChatId(appId, target.messageId)) ?? undefined : undefined;
+    if (!chatId) throw new AskHumanPreflightError('OUTPUT_TARGET_UNPROVEN', '受保护输出无法核实目标群');
+  }
+  return () => {
+    if (!chatId && askHumanHasProtection(root, appId)) throw new AskHumanPreflightError('OUTPUT_TARGET_UNPROVEN', '受保护输出无法核实目标群');
+    if (chatId) assertAskHumanOutbound(root, { appId, chatId, operation, content, uuid, permit });
+  };
+}
 
 type LarkRequestParams = Record<string, string | number | boolean | undefined>;
 
@@ -252,6 +270,8 @@ const listBotsApiFailures = new Map<string, { reason: string; expiresAt: number 
  * the param and get exactly the pre-Step-6 behavior.
  */
 export interface OutboundMessageOptions {
+  /** In-process opaque, exact-ledger-send permit. JSON/CLI cannot forge it. */
+  humanSessionPermit?: object;
   /** The provider request is reconciling an already-attempted stable UUID.
    * Lark deduplicates the message, but the local outbound hook is a separate
    * side effect and must not be fired twice. */
@@ -269,7 +289,7 @@ async function emitOutboundHookIfAllowed(
   event: 'outbound.send' | 'outbound.reply',
   payload: Record<string, unknown>,
 ): Promise<void> {
-  if (options?.suppressHook) return;
+  if (options?.suppressHook || options?.humanSessionPermit) return;
   try {
     await options?.beforeHook?.();
   } catch (err) {
@@ -299,6 +319,7 @@ export async function sendMessage(
     : msgType === 'interactive' ? stampBotmuxCallbackMarkers(content) : content;
 
   let res: any;
+  (await guardHumanSessionOutput(larkAppId, { chatId }, msgType === 'text' ? 'send' : `send:${msgType}`, content, uuid, options?.humanSessionPermit))();
   try {
     res = await c.im.v1.message.create({
       params: { receive_id_type: 'chat_id' },
@@ -360,6 +381,7 @@ export async function replyMessage(
     : msgType === 'interactive' ? stampBotmuxCallbackMarkers(content) : content;
 
   let res: any;
+  (await guardHumanSessionOutput(larkAppId, { messageId }, 'reply', content, uuid))();
   try {
     res = await c.im.v1.message.reply({
       path: { message_id: messageId },
@@ -401,6 +423,7 @@ export async function replyMessage(
 export async function addReaction(larkAppId: string, messageId: string, emojiType: string): Promise<string> {
   assertLarkTransport(larkAppId, 'addReaction');
   const c = getBotClient(larkAppId);
+  (await guardHumanSessionOutput(larkAppId, { messageId }, 'reaction'))();
   const res = await (c as any).im.v1.messageReaction.create({
     path: { message_id: messageId },
     data: { reaction_type: { emoji_type: emojiType } },
@@ -416,6 +439,7 @@ export async function addReaction(larkAppId: string, messageId: string, emojiTyp
 export async function removeReaction(larkAppId: string, messageId: string, reactionId: string): Promise<void> {
   assertLarkTransport(larkAppId, 'removeReaction');
   const c = getBotClient(larkAppId);
+  (await guardHumanSessionOutput(larkAppId, { messageId }, 'reaction'))();
   const res = await (c as any).im.v1.messageReaction.delete({
     path: { message_id: messageId, reaction_id: reactionId },
   });
@@ -604,6 +628,7 @@ export async function sendUserMessage(
     ...(uuid ? { uuid } : {}),
   };
 
+  assertAskHumanDirectMessage(join(config.session.dataDir, ASK_HUMAN_GUARD_DIRECTORY), larkAppId, openId);
   const res = requestOptions
     ? await c.request({
       method: 'POST',
@@ -909,6 +934,7 @@ export async function getChatMode(
 export async function deleteMessage(larkAppId: string, messageId: string): Promise<boolean> {
   assertLarkTransport(larkAppId, 'deleteMessage');
   const c = getBotClient(larkAppId);
+  (await guardHumanSessionOutput(larkAppId, { messageId }, 'delete'))();
   try {
     const res: any = await c.im.v1.message.delete({ path: { message_id: messageId } });
     if (res && typeof res.code === 'number' && res.code !== 0) {
@@ -945,6 +971,7 @@ export async function sendEphemeralCard(
   } catch (err) {
     throw new Error(`Invalid ephemeral card JSON: ${err}`);
   }
+  (await guardHumanSessionOutput(larkAppId, { chatId }, 'ephemeral', cardJson))();
   const res: any = await (c as any).request({
     method: 'POST',
     url: '/open-apis/ephemeral/v1/send',
@@ -970,6 +997,7 @@ export async function sendEphemeralCard(
 export async function deleteEphemeralCard(larkAppId: string, messageId: string): Promise<boolean> {
   assertLarkTransport(larkAppId, 'deleteEphemeralCard');
   const c = getBotClient(larkAppId);
+  (await guardHumanSessionOutput(larkAppId, { messageId }, 'delete_ephemeral'))();
   try {
     const res: any = await (c as any).request({
       method: 'POST',
@@ -991,6 +1019,7 @@ export async function updateMessage(larkAppId: string, messageId: string, cardJs
   assertLarkTransport(larkAppId, 'updateMessage');
   const c = getBotClient(larkAppId);
   let res: any;
+  (await guardHumanSessionOutput(larkAppId, { messageId }, 'update', cardJson))();
   try {
     res = await c.im.v1.message.patch({
       path: { message_id: messageId },

@@ -204,6 +204,10 @@ import {
 import { waitAllWithin, trackProducerQuiet, trackProcessExited } from './core/producer-quiescence.js';
 import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
+import { setAskHumanIpcApi } from './core/dashboard-ipc-server.js';
+import { createAskHumanSourceRuntime } from './core/ask-human-source-runtime.js';
+import { loadAskHumanInstallation } from './core/ask-human-installation.js';
+const humanSessionSources = new Map<string, ReturnType<typeof createAskHumanSourceRuntime>>();
 import { reconcileContainmentHandlesOnBoot } from './core/mojo-containment.js';
 import {
   cancelSessionReadyAck,
@@ -21608,6 +21612,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     },
     enforceLiveSessionCap: () => enforceLiveSessionCap('session_change'),
     onQueuedActivationSubmitted,
+    onManagedTurnOrigin(ds) {
+      humanSessionSources.get(ds.larkAppId)?.publishCliOrigin(ds, config.session.dataDir);
+    },
     async onTurnTerminal(ds, terminal, context) {
       // VC reconcile first: it is in-memory and latency-sensitive, and must not
       // sit behind a synchronous SQLite write. (Master did only this enqueue.)
@@ -21638,6 +21645,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           ),
         });
       }
+      // No grant => exact no-op. Registered human-session sources release
+      // answer fences only after source-confirmed readback AND this terminal.
+      humanSessionSources.get(ds.larkAppId)?.onTurnTerminal(ds, terminal, context);
     },
     onDeferredScheduleTurnSettled(ds, context) {
       scheduleDeferredScheduleSettlement(ds, context);
@@ -21753,6 +21763,20 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // SessionRow.botName.
   setBotName(cfg.displayName ?? cfg.larkAppId);
   setLarkAppId(cfg.larkAppId);
+  // Opt-in host configuration only. No file configured => the existing zero-IO
+  // dormant path. Loading never provisions protection, publishes rules or sends
+  // anything. An invalid capability configuration must NOT stop ordinary bots.
+  let humanSessionInstallation: ReturnType<typeof loadAskHumanInstallation>;
+  try { humanSessionInstallation = loadAskHumanInstallation(cfg.larkAppId); }
+  catch { logger.error('[human-session] INSTALLATION_CONFIG_INVALID; capability disabled'); }
+  const humanSessionSource = createAskHumanSourceRuntime({
+    appId: cfg.larkAppId, lookupSession: id => findActiveBySessionId(id),
+    protectionRoot: join(config.session.dataDir, 'human-session-protection-v1'),
+    triggerDeps: { larkAppId: cfg.larkAppId, activeSessions },
+    installation: () => humanSessionInstallation,
+  });
+  humanSessionSources.set(cfg.larkAppId, humanSessionSource);
+  setAskHumanIpcApi(humanSessionSource);
   setDeviceIsolationDaemonIdentity({
     larkAppId: cfg.larkAppId,
     bootInstanceId: desc.bootInstanceId,

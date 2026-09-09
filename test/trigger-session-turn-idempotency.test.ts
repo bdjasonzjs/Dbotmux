@@ -145,6 +145,29 @@ afterEach(() => {
 });
 
 describe('turn-level idempotency — worker LIVE (sendWorkerInput) branch', () => {
+  it('human-session bind uses the real turn service and persists one dispatch lease, not a business ACK', async () => {
+    const { bindAskHumanTrigger, askHumanWakeRequest } = await import('../src/core/ask-human-source.js');
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any }), active = activeWith(ds);
+    const source = { appId: APP, sessionId: SID, chatId: CHAT, taskId: 'test-human-task', revision: 'v4', tenantId: 'tenant', decisionUserId: 'person', decisionOpenId: 'ou_person' };
+    const request = askHumanWakeRequest(source, 'event-1', 'ask-human:event-1');
+    const trigger = await bindAskHumanTrigger({ larkAppId: APP, activeSessions: active });
+    const first = await trigger(request), again = await trigger(request);
+    expect(first.ok).toBe(true); expect(again.triggerId).toBe(first.triggerId); expect(again.idempotent).toBe(true);
+    expect(mockSendWorkerInput).toHaveBeenCalledTimes(1); expect(mockForkWorker).not.toHaveBeenCalled();
+    expect(idempotencyStore.lookup(APP, `${SID}\u0000ask-human:event-1`, 'turn')?.state).toBe('attempting');
+    expect(first).not.toHaveProperty('consumed');
+    expect(() => trigger({ ...request, target: { ...request.target, botId: 'other-app' } })).toThrow();
+  });
+  it('human-session wake reaches the real dormant-worker branch with no managed origin', async () => {
+    const { bindAskHumanTrigger, askHumanWakeRequest } = await import('../src/core/ask-human-source.js');
+    const ds = existingDs({ worker: null, hasHistory: true, managedTurnOrigin: undefined });
+    const trigger = await bindAskHumanTrigger({ larkAppId: APP, activeSessions: activeWith(ds) });
+    const source = { appId: APP, sessionId: SID, chatId: CHAT, taskId: 'test-human-task', revision: 'v4', tenantId: 'tenant', decisionUserId: 'person', decisionOpenId: 'ou_person' };
+    const result = await trigger(askHumanWakeRequest(source, 'idle-event', 'ask-human:idle-event'));
+    expect(result.ok).toBe(true); expect(mockForkWorker).toHaveBeenCalledOnce(); expect(mockSendWorkerInput).not.toHaveBeenCalled();
+    expect(idempotencyStore.lookup(APP, `${SID}\u0000ask-human:idle-event`, 'turn')?.state).toBe('attempting');
+    expect(result).not.toHaveProperty('consumed');
+  });
   it('first follow-up: sends once, writes a turn:<sid>:<key> attempting lease, echoes turnIdempotencyKey', async () => {
     const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
     const res = await triggerSessionTurn(followUpReq('tk-1'), { larkAppId: APP, activeSessions: activeWith(ds) });

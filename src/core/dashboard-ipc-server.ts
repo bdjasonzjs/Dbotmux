@@ -45,6 +45,8 @@ import { claimPromptContext } from '../services/prompt-context-store.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { normalizeCliRuntimeConfig, type CliRuntimeConfig } from '../adapters/cli/runtime.js';
 import { evaluateReadIsolationGate } from '../adapters/cli/read-isolation.js';
+import { AskHumanIpcEndpoint, ASK_HUMAN_IPC_ROUTE, ASK_HUMAN_IPC_MAX_BYTES } from './ask-human-ipc.js';
+import type { AskHumanApi } from './ask-human-api.js';
 
 /** Whether read isolation can actually be ENFORCED for this bot right now — the
  *  SAME gate the worker fail-closes on (adapter support + no wrapperCli + macOS).
@@ -266,6 +268,11 @@ interface Route {
 }
 
 const routes: Route[] = [];
+const askHumanEndpoint = new AskHumanIpcEndpoint();
+
+/** Explicit daemon composition only. No default runtime, config flag or IPC
+ * enable operation; installing this route alone always returns NOT_ENABLED. */
+export function setAskHumanIpcApi(api: Pick<AskHumanApi, 'handle'> | null): void { askHumanEndpoint.install(api); }
 
 /** Requests that crossed the server-wide trusted-host gate. The legacy
  * write-link handlers consult this marker so they do not verify (and consume)
@@ -288,6 +295,17 @@ export function jsonRes(res: ServerResponse, status: number, body: unknown): voi
   res.writeHead(status, { 'content-type': 'application/json' });
   res.end(JSON.stringify(body));
 }
+
+ipcRoute('POST', ASK_HUMAN_IPC_ROUTE, async (req, res) => {
+  let body: unknown;
+  try { body = await readJsonBody(req, ASK_HUMAN_IPC_MAX_BYTES); }
+  catch (error) {
+    return jsonRes(res, error instanceof JsonBodyTooLargeError ? 413 : 400,
+      { ok: false, error: error instanceof JsonBodyTooLargeError ? 'BODY_TOO_LARGE' : 'INVALID_JSON' });
+  }
+  const outcome = await askHumanEndpoint.handle(body);
+  jsonRes(res, outcome.status, outcome.body);
+});
 
 function rejectProtectedSessionMutation(
   res: ServerResponse,
@@ -686,6 +704,9 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   // forge readiness or an ask for that session.
   if (method === 'POST' && pathname === '/api/session-ready') return true;
   if (method === 'POST' && pathname === '/api/asks') return true;
+  // This exact route always authenticates through AskHumanApi, even for host
+  // callers. No sibling paths, GET, publishing or enablement bypass the gate.
+  if (method === 'POST' && pathname === ASK_HUMAN_IPC_ROUTE) return true;
   // botmux slash / botmux role switch（角色切换）/ botmux delete（关闭自身）：合法调用方
   // 是会话内的 CLI 自身，沙箱 / 读隔离下读不到 host secret。handler 内验证
   // 该会话的 rotating per-turn

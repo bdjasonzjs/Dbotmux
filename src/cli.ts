@@ -14400,6 +14400,26 @@ if (LARK_FACING_COMMANDS.has(command) && managedOriginHasNoTransport()) {
 }
 
 switch (command) {
+  case 'human-session':
+  case 'ask-human': {
+    const { runAskHumanCli } = await import('./cli/ask-human.js');
+    process.exitCode = await runAskHumanCli(process.argv.slice(3), {
+      context: async () => {
+        const { sid, larkAppId } = await resolveSessionAppId(undefined);
+        const { readAskHumanCliOrigin } = await import('./core/ask-human-cli-origin.js');
+        const isolated = !!process.env.BOTMUX_SEND_RELAY || !!process.env.BOTMUX_ORIGIN_CHANNEL_ID;
+        const claim = isolated
+          ? readManagedOriginCapability(resolveDataDir(), sid, process.env.BOTMUX_SEND_RELAY, process.env.BOTMUX_ORIGIN_CHANNEL_ID)
+          : readAskHumanCliOrigin(resolveDataDir(), larkAppId, sid);
+        const { resolveDaemonIpcPort } = await import('./utils/daemon-discovery.js');
+        const ipcPort = resolveDaemonIpcPort(findDaemon(larkAppId)?.ipcPort, process.env.BOTMUX_DAEMON_IPC_PORT);
+        return { sessionId: sid, originCapability: claim?.capability ?? '', ipcPort: ipcPort ?? 0 };
+      },
+      stdout: text => process.stdout.write(`${text}\n`),
+      stderr: text => process.stderr.write(`${text}\n`),
+    });
+    break;
+  }
   case '__pm2-start-exact':
     await cmdInternalPm2StartExact(process.argv.slice(3));
     break;

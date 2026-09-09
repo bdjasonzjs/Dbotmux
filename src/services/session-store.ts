@@ -8,6 +8,7 @@ import { cleanupMaterializedDashboardImages } from '../core/dashboard-images.js'
 import { deleteFrozenCards } from './frozen-card-store.js';
 import { removePromptContextDir } from './prompt-context-store.js';
 import type { Session } from '../types.js';
+import { assertAskHumanWorkerAllowed } from '../core/ask-human-guards.js';
 
 let sessions: Map<string, Session> = new Map();
 let loaded = false;
@@ -459,6 +460,7 @@ export function createSession(
   chatType?: 'group' | 'p2p',
   scope?: 'thread' | 'chat',
 ): Session {
+  assertAskHumanWorkerAllowed(config.session.dataDir, chatId);
   loadForWrite();
   const session: Session = {
     sessionId: randomUUID(),

@@ -25,6 +25,7 @@ import { hookCommandFor } from '../adapters/hook-command.js';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { mayRestoreWriteAdmission } from '../adapters/backend/destroy-result.js';
 import { config } from '../config.js';
+import { assertAskHumanWorkerAllowed } from './ask-human-guards.js';
 import { readGlobalConfig, isWorkflowFeatureEnabled } from '../global-config.js';
 import * as sessionStore from '../services/session-store.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
@@ -647,6 +648,7 @@ export interface WorkerSessionReplyOptions {
 }
 
 export interface WorkerPoolCallbacks {
+  onManagedTurnOrigin?: (ds: DaemonSession) => void;
   sessionReply: (
     rootId: string,
     content: string,
@@ -6821,6 +6823,7 @@ export function sendWorkerSessionInput(
   ds: DaemonSession,
   message: TransferBufferedInput,
 ): boolean {
+  assertAskHumanWorkerAllowed(config.session.dataDir, ds.chatId ?? ds.session.chatId);
   if (bufferTransferInput(ds, message)) return true;
   if (!ds.worker || ds.worker.killed) return false;
   ds.worker.send(message);
@@ -8339,6 +8342,7 @@ export function sendWorkerInput(
     metadata?: PendingInputMetadata;
   } = {},
 ): boolean {
+  assertAskHumanWorkerAllowed(config.session.dataDir, ds.chatId ?? ds.session.chatId);
   const remoteRetirementPhase = remoteRetirementAdmissionPhase(ds);
   if (remoteRetirementPhase) {
     const remoteBackend = (ds.initConfig?.backendType ?? ds.session.backendType) === 'mojo'
@@ -9058,6 +9062,7 @@ export function forkWorker(
   promptInput: string | CliTurnPayload,
   resumeOrTurnId: ForkResumeOrTurnId = false,
 ): boolean {
+  assertAskHumanWorkerAllowed(config.session.dataDir, ds.chatId ?? ds.session.chatId);
   const gatedPrompt = typeof promptInput === 'string' ? { content: promptInput } : promptInput;
   const remoteRetirementPhase = remoteRetirementAdmissionPhase(ds);
   if (remoteRetirementPhase) {
@@ -12421,6 +12426,8 @@ function setupWorkerHandlers(
             ? { dispatchAttempt: msg.dispatchAttempt }
             : {}),
         };
+        try { cb.onManagedTurnOrigin?.(ds); }
+        catch { logger.error(`[${t}] Managed origin consumer notification failed`); }
         break;
       }
 
@@ -13656,6 +13663,7 @@ export function adoptSandboxBlocked(
 }
 
 export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata?: boolean; prompt?: string; turnId?: string }): void {
+  assertAskHumanWorkerAllowed(config.session.dataDir, ds.chatId ?? ds.session.chatId);
   if (isSessionTransferring(ds)) {
     logger.warn(`[${tag(ds)}] Adopt worker fork refused during routing transfer`);
     return;
