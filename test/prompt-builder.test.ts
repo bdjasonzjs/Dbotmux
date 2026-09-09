@@ -962,11 +962,14 @@ describe('human-session routing prompt publication gate', () => {
   } as const;
 
   it('pins the root-approved copy byte-for-byte, including branch order and exemption', () => {
-    expect(Buffer.byteLength(HUMAN_SESSION_ROUTING_PROMPT, 'utf8')).toBe(699);
+    expect(Buffer.byteLength(HUMAN_SESSION_ROUTING_PROMPT, 'utf8')).toBe(1138);
     expect(createHash('sha256').update(HUMAN_SESSION_ROUTING_PROMPT).digest('hex'))
-      .toBe('295bd0f325d395eb83ba78fa173f4b6d71f3ab7c6788039b0e23987c3f2901ff');
-    expect(HUMAN_SESSION_ROUTING_PROMPT.indexOf('3. 人明确说了"直接在当前群回复"'))
-      .toBeLessThan(HUMAN_SESSION_ROUTING_PROMPT.indexOf('判断顺序：先看有没有第 3 条豁免'));
+      .toBe('79a250e616bebff471ce0baa10900e688576518bf47dd16058cdbb1f4f8bb096');
+    expect(HUMAN_SESSION_ROUTING_PROMPT.indexOf('4. 人明确说了"直接在当前群回复"'))
+      .toBeLessThan(HUMAN_SESSION_ROUTING_PROMPT.indexOf('判断顺序：先看有没有第 4 条豁免'));
+    expect(HUMAN_SESSION_ROUTING_PROMPT).toContain('在原群 @ 他，他收不到');
+    expect(HUMAN_SESSION_ROUTING_PROMPT)
+      .toContain('3. 你要向他汇报进展、结论或交付结果');
     expect(HUMAN_SESSION_ROUTING_PROMPT).toContain('哪怕在已有的专属群里冒出新问题，也另开新群。');
     expect(HUMAN_SESSION_ROUTING_PROMPT).toContain('群名 `汇报·<短标题>`');
   });
