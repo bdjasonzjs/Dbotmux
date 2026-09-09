@@ -47,7 +47,8 @@ describe('human reply sender selection', () => {
     try {
       const send = async (profile: string, identity: 'user' | 'bot') => {
         const id = await askHumanReplyMention(profile, identity, 'oc_source', 'cli_source');
-        return sendAskHumanViaProfile(profile, identity, 'oc_source', `<at user_id="${id}"></at> original reply`, 'same-uuid');
+        return sendAskHumanViaProfile(profile, identity, 'oc_source', `<at user_id="${id}"></at> original reply`, 'same-uuid', undefined,
+          { appId: 'cli_source', sessionId: 'source-session', chatId: 'oc_source' });
       };
       const result = sendAskHumanReply({ userOpenId: 'ou_human' }, {
         user: () => send('user-profile', 'user'), fallback: () => send('only-fallback', 'bot'), fallbackAppId: 'cli_fallback',

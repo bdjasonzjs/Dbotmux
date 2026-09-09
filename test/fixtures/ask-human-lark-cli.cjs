@@ -18,5 +18,6 @@ if (args.includes('+chat-members-list')) {
   process.stderr.write(JSON.stringify({ ok: false, error }));
   process.exit(1);
 } else {
+  if (process.env.BOTMUX_CHAT_ID !== 'oc_source' || process.env.BOTMUX_SESSION_ID !== 'source-session' || process.env.BOTMUX_LARK_APP_ID !== 'cli_source') process.exit(98);
   console.log(JSON.stringify({ ok: true, data: { message_id: `om_${identity}` } }));
 }

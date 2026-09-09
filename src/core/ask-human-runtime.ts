@@ -180,6 +180,7 @@ export function createAskHumanDaemonRuntime(host: AskHumanRuntimeHost, testPorts
         transport ??= (testPorts.bindLark ?? bindAskHumanLarkTransport)({ appId: host.appId,
           botSenderId: frame.botSenderId, botMemberOpenId: installed.botMemberOpenId, receipts, assertWrite,
           replyForward: installed.replyForward,
+          replyOrigin: { appId: frame.source.appId, sessionId: frame.source.sessionId, chatId: frame.source.chatId },
           ...(installed.replyForward && host.lookupSession(frame.source.sessionId)?.session.scope !== 'chat' ? { replyTo: frame.sourceMessageId } : {}),
           outboundPermit: request => guards.permit(frame, entry().key, c.direction, request, () => {
             assertWrite({ operation: 'send', appId: request.appId, target: request.chatId, uuid: request.uuid });

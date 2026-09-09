@@ -12,6 +12,7 @@ export interface AskHumanSendReceipt {
   messageId: string;
   sender?: { type: 'user' | 'bot'; id: string };
 }
+export interface AskHumanReplyOrigin { appId: string; sessionId: string; chatId: string }
 export class AskHumanUserUnavailable extends Error {}
 /** A read-only preparation failed, so no message-send call was entered. */
 export class AskHumanReplyNotSent extends AskHumanPreflightError {
@@ -38,11 +39,14 @@ export function askHumanUserIdentityRefused(error: { type?: string; code?: numbe
   return !!operation && (error.type === 'authentication'
     || (operation === 'send' && (error.type === 'authorization' || error.code === 230027)));
 }
-async function larkCli(args: string[], userOperation?: 'read' | 'send'): Promise<Record<string, any>> {
+async function larkCli(args: string[], userOperation?: 'read' | 'send', origin?: AskHumanReplyOrigin): Promise<Record<string, any>> {
   let stdout: string;
   // PM2's IPC descriptor belongs to the daemon, not this non-IPC child.
   // Inheriting it makes the CLI abort even after a successful API read.
   const env: NodeJS.ProcessEnv = { ...process.env, LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' };
+  // A daemon has no ambient chat. Carry the already-bound SOURCE session,
+  // so local CLI routing/audit sees the real caller, not a missing/stale turn.
+  if (origin) Object.assign(env, { BOTMUX_LARK_APP_ID: origin.appId, BOTMUX_SESSION_ID: origin.sessionId, BOTMUX_CHAT_ID: origin.chatId });
   delete env.NODE_CHANNEL_FD;
   delete env.NODE_CHANNEL_SERIALIZATION_MODE;
   try {
@@ -78,10 +82,10 @@ export async function askHumanReplyMention(profile: string, identity: 'user' | '
 }
 
 export async function sendAskHumanViaProfile(profile: string, identity: 'user' | 'bot', chatId: string, text: string, uuid: string,
-  replyTo?: string): Promise<string> {
+  replyTo?: string, origin?: AskHumanReplyOrigin): Promise<string> {
   const response = await larkCli(['im', replyTo ? '+messages-reply' : '+messages-send', '--profile', profile, '--as', identity,
     ...(replyTo ? ['--message-id', replyTo, '--reply-in-thread'] : ['--chat-id', chatId]),
-    '--text', text, '--idempotency-key', uuid, '--format', 'json'], identity === 'user' ? 'send' : undefined);
+    '--text', text, '--idempotency-key', uuid, '--format', 'json'], identity === 'user' ? 'send' : undefined, origin);
   if (!response.data?.message_id) throw new AskHumanPreflightError('REPLY_SEND_UNCERTAIN', '发送缺少消息回执');
   return response.data.message_id;
 }

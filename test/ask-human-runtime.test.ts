@@ -98,6 +98,7 @@ describe('piece2 dormant daemon / trusted runtime composition', () => {
     // Quality checks and source approval alone never construct the Lark SDK.
     expect(x.bind).not.toHaveBeenCalled();
     expect(await x.runtime.handle(command('present'))).toMatchObject({ state: 'WAITING', roomName: `汇报·${draft.shortTitle}` });
+    expect(x.bind.mock.calls[0][0].replyOrigin).toEqual({ appId: f.source.appId, sessionId: f.source.sessionId, chatId: f.source.chatId });
     expect(x.sdk.create).toHaveBeenCalledOnce(); expect(x.sdk.invite).toHaveBeenCalledOnce(); expect(x.sdk.sendText).toHaveBeenCalledOnce();
     expect(x.guards.room('fixture-room-0')).toMatchObject({ sealed: false, frame: f }); expect(x.config.trigger).not.toHaveBeenCalled();
     expect(await x.runtime.handle(command('status'))).toMatchObject({ state: 'WAITING' });

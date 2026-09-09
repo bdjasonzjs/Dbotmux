@@ -218,6 +218,7 @@ export async function bindAskHumanLarkTransport(options: Omit<Parameters<typeof 
   outboundPermit?(request: { appId: string; chatId: string; content: string; uuid: string }): object;
   replyForward?: AskHumanReplyConfig;
   replyTo?: string;
+  replyOrigin?: import('./ask-human-reply.js').AskHumanReplyOrigin;
 }): Promise<Transport> {
   const [{ getBotClient, getBot }, client] = await Promise.all([import('../bot-registry.js'), import('../im/lark/client.js')]);
   if (getBot(options.appId).botOpenId !== options.botMemberOpenId || options.botSenderId !== options.appId) return fail('IDENTITY_UNPROVEN', 'SDK 发件 app 和当前 bot 成员身份尚未一致核实');
@@ -238,12 +239,12 @@ export async function bindAskHumanLarkTransport(options: Omit<Parameters<typeof 
         return JSON.parse(askHumanTextWire(input.body, [mention]).content).text as string;
       };
       return sendAskHumanReply({ userOpenId: input.userOpenId }, {
-        user: async () => sendAskHumanViaProfile(reply.userProfile, 'user', input.chatId, await textFor(reply.userProfile, 'user'), input.uuid, options.replyTo),
+        user: async () => sendAskHumanViaProfile(reply.userProfile, 'user', input.chatId, await textFor(reply.userProfile, 'user'), input.uuid, options.replyTo, options.replyOrigin),
         fallbackAppId: reply.fallbackAppId,
         fallback: async () => {
           options.assertWrite({ operation: 'send', appId: options.appId, target: input.chatId, uuid: input.uuid });
           const body = await textFor(reply.fallbackProfile, 'bot');
-          return sendAskHumanViaProfile(reply.fallbackProfile, 'bot', input.chatId, body, input.uuid, options.replyTo);
+          return sendAskHumanViaProfile(reply.fallbackProfile, 'bot', input.chatId, body, input.uuid, options.replyTo, options.replyOrigin);
         },
       });
     },
