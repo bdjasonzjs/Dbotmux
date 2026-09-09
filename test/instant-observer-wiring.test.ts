@@ -114,6 +114,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 
 // ─── Imports must come AFTER vi.mock ───────────────────────────────────────
 import { startLarkEventDispatcher } from '../src/im/lark/event-dispatcher.js';
+import * as humanSessionGuards from '../src/core/ask-human-guards.js';
 
 const MY_APP_ID = 'app-bot-a';
 const MY_OPEN_ID = 'ou_bot_a_open_id';
@@ -171,6 +172,44 @@ describe('instant-observer event-dispatcher 接线', () => {
       isSessionOwner: () => false,
       onChatModeConverted: () => {},
     });
+  });
+
+  it.each(['accepted', 'consumer-unavailable'])('人类会话房间 %s 在 observer/unarchive/worker 之前截断', async outcome => {
+    const newTopic = vi.fn(async () => {}), threadReply = vi.fn(async () => {});
+    startLarkEventDispatcher(MY_APP_ID, 'secret', { handleCardAction: async () => undefined,
+      handleNewTopic: newTopic, handleThreadReply: threadReply, isSessionOwner: () => false, onChatModeConverted: () => {} });
+    const intercepted = vi.spyOn(humanSessionGuards, 'interceptAskHumanRoom').mockImplementation(async () => {
+      if (outcome === 'consumer-unavailable') throw Error('ROOM_CONSUMER_UNAVAILABLE');
+      return true;
+    });
+    try {
+      await dispatch(makeEvent({ senderType: 'user', senderOpenId: 'ou_human' }));
+      await vi.waitFor(() => expect(intercepted).toHaveBeenCalled());
+      expect(mockNote).not.toHaveBeenCalled(); expect(mockUnarchive).not.toHaveBeenCalled();
+      expect(newTopic).not.toHaveBeenCalled(); expect(threadReply).not.toHaveBeenCalled();
+    } finally { intercepted.mockRestore(); }
+  });
+
+  it('已登记或建群结果未知时，入群事件不自动拉owner/开worker', async () => {
+    const handleBotAdded = vi.fn();
+    startLarkEventDispatcher(MY_APP_ID, 'secret', { handleCardAction: async () => undefined, handleNewTopic: async () => {},
+      handleThreadReply: async () => {}, isSessionOwner: () => false, onChatModeConverted: () => {}, handleBotAdded });
+    const held = vi.spyOn(humanSessionGuards, 'askHumanBotJoinHeld').mockReturnValue(true);
+    try {
+      await capturedHandlers['im.chat.member.bot.added_v1']({ chat_id: TARGET_CHAT });
+      expect(held).toHaveBeenCalled(); expect(handleBotAdded).not.toHaveBeenCalled(); expect(mockNote).not.toHaveBeenCalled();
+    } finally { held.mockRestore(); }
+  });
+
+  it('人类会话房间里的卡片按钮不会触发普通handler', async () => {
+    const action = vi.fn(async () => undefined);
+    startLarkEventDispatcher(MY_APP_ID, 'secret', { handleCardAction: action, handleNewTopic: async () => {},
+      handleThreadReply: async () => {}, isSessionOwner: () => false, onChatModeConverted: () => {} });
+    const protectedRoom = vi.spyOn(humanSessionGuards, 'askHumanRoomProtected').mockReturnValue(true);
+    try {
+      expect(await capturedHandlers['card.action.trigger']({ event: { context: { open_chat_id: TARGET_CHAT } } })).toEqual({});
+      expect(action).not.toHaveBeenCalled();
+    } finally { protectedRoom.mockRestore(); }
   });
 
   it('群内人类消息 → note 被调用，senderOpenId/senderAppId 分域、botOpenId 已解析（ensureBotOpenId 之后）', async () => {

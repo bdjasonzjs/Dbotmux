@@ -81,6 +81,9 @@ import { markStale as digestMarkStale } from '../../services/main-bot-digest-sto
 import { isArchived as ctxIsArchived, unarchive as ctxUnarchive } from '../../services/chat-context-store.js';
 import { isTillyMainTopicConversationDenied } from '../../services/main-topic-config.js';
 import { expandLetters } from '../../services/mailbox.js';
+import { ASK_HUMAN_GUARD_DIRECTORY, askHumanRoomProtected, askHumanBotJoinHeld, recordAskHumanHeldJoin, interceptAskHumanRoom } from '../../core/ask-human-guards.js';
+
+function humanSessionGuardRoot(): string { return join(config.session.dataDir, ASK_HUMAN_GUARD_DIRECTORY); }
 
 // 大厅回执互教的防环闸：每进程对同一打卡者只回一次（见 hall swallow 分支）。
 const hallEchoReplied = new Set<string>();
@@ -2289,6 +2292,7 @@ async function dispatchHumanMessageViaHandlers(
   payload: PendingForwardTopicPayload,
   capMs?: number,
 ): Promise<void> {
+  if (await interceptAskHumanRoom(humanSessionGuardRoot(), larkAppId, payload.ctx.chatId, payload.data)) return;
   await serializeByAnchor(payload.ctx.anchor, () => {
     const ownsSession = handlers.isSessionOwner?.(payload.ctx.anchor, larkAppId) ?? payload.ownsSession;
     return ownsSession
@@ -2332,6 +2336,9 @@ async function pollMessageListenersOnce(larkAppId: string, handlers: EventHandle
   await ensureBotOpenId(larkAppId).catch(() => { /* degrade; heartbeat retries */ });
 
   for (const chatId of chatIds) {
+    // Ordinary listener polling must not read/interpret a relay-only room.
+    // Its dedicated, event-ID consumer owns catch-up (slice4/5).
+    if (askHumanRoomProtected(humanSessionGuardRoot(), chatId)) continue;
     let messages: any[];
     try {
       messages = await listChatMessagesUntil(larkAppId, chatId, {
@@ -3137,6 +3144,9 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       const message = data.message;
       const sender = data.sender;
       if (!message) return;
+      // Before bot probing, topology/digest, auto-unarchive, instant observer,
+      // command parsing, grant/oncall changes or worker startup.
+      if (await interceptAskHumanRoom(humanSessionGuardRoot(), larkAppId, message.chat_id, data)) return;
 
       // Close the open_id startup race: probeBotOpenId is fire-and-forget at
       // startup, so an @ arriving in that window would hit isBotMentioned with
@@ -4122,6 +4132,9 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
     // Requires this event to be subscribed for the app in the Feishu console.
     'im.chat.member.bot.added_v1': (data: any) => {
       const chatIdForKey: string | undefined = data?.chat_id;
+      if (askHumanBotJoinHeld(humanSessionGuardRoot(), larkAppId, chatIdForKey)) {
+        recordAskHumanHeldJoin(humanSessionGuardRoot(), larkAppId, chatIdForKey, data); return;
+      }
       const operatorForKey: string | undefined = data?.operator_id?.open_id;
       const eventKey = `im.chat.member.bot.added_v1:${larkAppId}:${eventIdForKey(data) ?? `${chatIdForKey ?? 'unknown'}:${operatorForKey ?? 'unknown'}`}`;
       // 飞书只把 bot.added 推给「进群的那个 bot 自己的 app」(官方文档语義,
@@ -4178,7 +4191,11 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       handleVcMeetingPushEventAckSafe(data, larkAppId, handlers, 'meeting_ended', VC_BOT_MEETING_ENDED_EVENT),
     [VC_PARTICIPANT_MEETING_JOINED_EVENT]: (data: any) =>
       handleVcMeetingPushEventAckSafe(data, larkAppId, handlers, 'participant_meeting_joined', VC_PARTICIPANT_MEETING_JOINED_EVENT),
-    'card.action.trigger': (data: any) => handleCardActionAckSafe(data, larkAppId, handlers),
+    'card.action.trigger': (data: any) => {
+      const chatId = data?.event?.context?.open_chat_id ?? data?.context?.open_chat_id ?? data?.open_chat_id;
+      if (askHumanRoomProtected(humanSessionGuardRoot(), chatId)) return {};
+      return handleCardActionAckSafe(data, larkAppId, handlers);
+    },
     // 表情回复事件——一旦在开发者后台订阅了 reaction，SDK 每收到一次都会因
     // 没有 handler 打 "no im.message.reaction.created_v1 handle" 警告刷屏。
     // botmux 不消费表情事件，注册显式 no-op 把这条噪声静默掉。
