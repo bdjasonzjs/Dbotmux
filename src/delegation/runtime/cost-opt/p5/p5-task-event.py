@@ -6,6 +6,8 @@ Commands:
        <event_type> <occurred_at> <evidence_message_id>
   ingest <parent_chat>
   flush <child_chat>
+  reconcile-sent <child_chat> <event_id> <event_sha256> <message_id>
+                 <receiver_confirmation_id> <confirmation_body_sha256>
   status <chat> <root_request_id> <task_id>
 
 An event is stored locally before a bubble is queued.  Each parent verifies the
@@ -128,9 +130,139 @@ def exact_event_message(m,ev,child):
     bubbles=lifecycle_of(read_state(child))['bubbles']['out']
     b=next((b for b in bubbles if b.get('kind')=='task_event' and b.get('event_id')==ev['event_id']),{})
     route=b.get('route') or {}; s=m.get('sender',{}); mentions=m.get('mentions') or []
-    return (route.get('sender_app') and s.get('sender_type')=='app' and s.get('id')==route['sender_app']
-            and exact_single_mention(m,{route.get('target_app'),route.get('target_open_id')})
-            and m.get('chat_id')==route.get('target_chat') and message_body(m)==event_text(ev,child,b.get('rejections',[]),b.get('summary')))
+    if not (route.get('sender_app') and s.get('sender_type')=='app' and s.get('id')==route['sender_app']
+            and m.get('chat_id')==route.get('target_chat')): return False
+    if exact_single_mention(m,{route.get('target_app'),route.get('target_open_id')}):
+        return message_body(m)==event_text(ev,child,b.get('rejections',[]),b.get('summary'))
+    return reconciled_event_message(m,ev,child,b)
+
+def reconciliation_evidence(child,b,mid,confirmation_id,confirmation_sha,message=None):
+    """Read an old delivery and the receiver's explicitly selected confirmation.
+
+    The operator must read the confirmation before supplying its body digest.
+    Natural-language intent is not parsed as an automatic receipt: this helper
+    checks the selected evidence, while reconcile-sent records the decision.
+    """
+    ev=b['event']; route=b.get('route') or {}; parent=route.get('target_chat')
+    st=read_state(child) or {}; pst=read_state(parent) or {}
+    if st.get('parent')!=parent or child not in (pst.get('children') or []):
+        raise RuntimeError('reconciliation topology differs from committed route')
+    if not route.get('sender_app') or not route.get('target_app'):
+        raise RuntimeError('reconciliation lacks original sender/receiver route')
+    if not re.fullmatch('[a-f0-9]{64}',confirmation_sha):
+        raise RuntimeError('invalid receiver confirmation body sha256')
+    messages=list_messages(parent,start=parse_time(b['pending_at'])-datetime.timedelta(minutes=10))
+    def selected(message_id):
+        matches=[x for x in messages if x.get('message_id')==message_id]
+        if len(matches)!=1: raise RuntimeError('reconciliation message missing/ambiguous: '+message_id)
+        return matches[0]
+    original=message if message is not None else selected(mid)
+    if original.get('message_id')!=mid or original.get('chat_id')!=parent:
+        raise RuntimeError('reconciliation original message target/id mismatch')
+    sender=original.get('sender') or {}
+    if sender.get('sender_type')!='app' or sender.get('id')!=route['sender_app']:
+        raise RuntimeError('reconciliation original sender mismatch')
+    if original.get('mentions'):
+        raise RuntimeError('reconciliation is only for a missing-mention delivery')
+    body=quoted_message(original).get('content') or ''
+    if body!=event_text(ev,child,b.get('rejections',[]),b.get('summary')):
+        raise RuntimeError('reconciliation original body differs from committed event')
+    confirmation=selected(confirmation_id); sender=confirmation.get('sender') or {}
+    if (confirmation_id==mid or confirmation.get('chat_id')!=parent
+            or sender.get('sender_type')!='app' or sender.get('id')!=route['target_app']):
+        raise RuntimeError('reconciliation confirmation is not from original receiver')
+    text=quoted_message(confirmation).get('content') or ''
+    if sha256b(text.encode())!=confirmation_sha or mid not in text:
+        raise RuntimeError('reconciliation confirmation body/id reference mismatch')
+    if msg_time(confirmation)<msg_time(original):
+        raise RuntimeError('reconciliation confirmation predates original delivery')
+    return {'kind':'receiver_confirmed_missing_mention','version':1,'source_chat':child,
+        'target_chat':parent,'event_id':ev['event_id'],'event_sha256':csha(ev),
+        'message_id':mid,'sender_app':route['sender_app'],'body_sha256':sha256b(body.encode()),
+        'confirmation':{'message_id':confirmation_id,'sender_app':route['target_app'],
+                        'body_sha256':confirmation_sha,'created_at':msg_time(confirmation).isoformat()}}
+
+def reconciled_event_message(m,ev,child,b):
+    audit=b.get('receipt_reconciliation')
+    if not audit or m.get('message_id')!=audit.get('message_id') or m.get('mentions'): return False
+    if b.get('state')!='sent' or b.get('sent_message_id')!=m['message_id']: return False
+    path=os.path.join(p_outbox(child),'event-'+ev['event_id']+'.sent')
+    with open(path,encoding='utf-8') as f: receipt=json.load(f)
+    if (receipt.get('reconciliation')!=audit or receipt.get('message_id')!=m['message_id']
+            or receipt.get('event_sha')!=csha(ev) or receipt.get('event_id')!=ev['event_id']
+            or receipt.get('source_chat')!=child or receipt.get('target_chat')!=m.get('chat_id')):
+        raise RuntimeError('reconciliation receipt differs from committed audit')
+    confirmation=audit.get('confirmation') or {}
+    actual=reconciliation_evidence(child,b,m['message_id'],confirmation.get('message_id'),
+                                   confirmation.get('body_sha256',''),message=m)
+    if any(audit.get(k)!=v for k,v in actual.items()):
+        raise RuntimeError('reconciliation readback differs from recorded evidence')
+    return True
+
+def cmd_reconcile_sent(child,eid,event_sha,mid,confirmation_id,confirmation_sha):
+    """Explicitly reconcile an already delivered message; never call send_report."""
+    if not re.fullmatch('[a-f0-9]{64}',eid): raise RuntimeError('invalid reconciliation event_id')
+    st=read_state(child); ok,why=managed_state(st)
+    if not ok: raise RuntimeError('reconciliation source not managed: '+why)
+    require_trial(st)
+    ob=p_outbox(child); os.makedirs(ob,exist_ok=True)
+    lock=os.open(os.path.join(ob,'event-'+eid+'.lock'),os.O_RDWR|os.O_CREAT,0o644)
+    fcntl.flock(lock,fcntl.LOCK_EX)
+    try:
+        st=read_state(child)
+        matches=[b for b in lifecycle_of(st)['bubbles']['out'] if b.get('kind')=='task_event' and b.get('event_id')==eid]
+        if len(matches)!=1: raise RuntimeError('reconciliation event missing/ambiguous')
+        b=matches[0]; ev=b['event']; validate_event(ev); verify_bubble_rejections(st,b)
+        if event_sha!=csha(ev): raise RuntimeError('reconciliation event sha256 mismatch')
+        if b.get('summary') is not None and csha(b['summary'])!=b.get('summary_sha256'):
+            raise RuntimeError('reconciliation committed summary mismatch')
+        prior=b.get('receipt_reconciliation')
+        expected_error='event send not verified on exact parent/message/sender/body: '+mid
+        if prior:
+            if b.get('state')!='sent' or b.get('sent_message_id')!=mid:
+                raise RuntimeError('reconciliation state/id differs from prior audit')
+        elif (b.get('state')!='sending' or b.get('last_error')!=expected_error
+              or not b.get('sending_at') or not b.get('attempts') or b.get('sent_message_id')):
+            raise RuntimeError('reconciliation requires the exact failed sending attempt')
+        evidence=reconciliation_evidence(child,b,mid,confirmation_id,confirmation_sha)
+        if prior and any(prior.get(k)!=v for k,v in evidence.items()):
+            raise RuntimeError('reconciliation differs from prior audit')
+        receipt_path=os.path.join(ob,'event-'+eid+'.sent')
+        saved=None
+        if os.path.exists(receipt_path):
+            with open(receipt_path,encoding='utf-8') as f: saved=json.load(f)
+        audit=prior or (saved or {}).get('reconciliation') or dict(evidence,
+            reconciled_at=ts(),previous_error=b.get('last_error'),previous_error_at=b.get('last_error_at'))
+        if any(audit.get(k)!=v for k,v in evidence.items()):
+            raise RuntimeError('reconciliation differs from saved receipt')
+        receipt={'message_id':mid,'at':audit['reconciled_at'],'source_chat':child,
+                 'target_chat':evidence['target_chat'],'event_id':eid,'event_sha':event_sha,'reconciliation':audit}
+        if saved is not None and saved!=receipt: raise RuntimeError('reconciliation will not overwrite a different receipt')
+        if prior:
+            if saved!=receipt: raise RuntimeError('reconciliation committed receipt missing')
+            print(json.dumps({'reconciled':True,'changed':False,'sent':True,'message_id':mid,
+                              'external_sends':0,'parent_landed':bool(b.get('parent_landed_at'))})); return
+        with ChatLock(child):
+            live=read_state(child); lc=lifecycle_of(live)
+            current=[x for x in lc['bubbles']['out'] if x.get('kind')=='task_event' and x.get('event_id')==eid]
+            if len(current)!=1 or current[0]!=b: raise RuntimeError('reconciliation bubble changed during readback')
+            if (live.get('parent')!=evidence['target_chat']
+                    or child not in ((read_state(evidence['target_chat']) or {}).get('children') or [])):
+                raise RuntimeError('reconciliation topology changed during readback')
+            verify_bubble_rejections(live,current[0])
+            # Same event lock as flush. A crash after this receipt is written
+            # can be completed by repeating the identical reconciliation.
+            if saved is None: atomic_write(receipt_path,json.dumps(receipt,ensure_ascii=False).encode())
+            cur=current[0]; cur.update(state='sent',sent_message_id=mid,sent_at=audit['reconciled_at'],receipt_reconciliation=audit)
+            cur.pop('last_error',None); cur.pop('last_error_at',None)
+            t=task_of(delegation(live),ev['root_request_id'],ev['task_id'],ev['origin_chat'],ev['task_version'])
+            if is_current_event(t,ev): t['sync_status']='sent_unconfirmed'; t['sync_error']=None
+            for rec in t['events']:
+                if rec.get('event_id')==eid: rec.update(forwarded_message_id=mid,forwarded_at=audit['reconciled_at'])
+            live['lifecycle']=lc; write_state(child,live)
+        print(json.dumps({'reconciled':True,'changed':True,'sent':True,'message_id':mid,
+                          'external_sends':0,'parent_landed':False,'reconciliation':audit},ensure_ascii=False))
+    finally: fcntl.flock(lock,fcntl.LOCK_UN); os.close(lock)
 
 def report_route(child,parent):
     # Resolve app-scoped mention handles through this sender's current runtime.
@@ -678,6 +810,7 @@ def main():
         elif op=='resumed-source' and len(sys.argv)==6: cmd_resumed_source(*sys.argv[2:])
         elif op=='ingest' and len(sys.argv)==3: cmd_ingest(sys.argv[2])
         elif op=='flush' and len(sys.argv)==3: cmd_flush(sys.argv[2])
+        elif op=='reconcile-sent' and len(sys.argv)==8: cmd_reconcile_sent(*sys.argv[2:])
         elif op=='status' and len(sys.argv)==5: cmd_status(*sys.argv[2:])
         elif op=='import-legacy-receipt' and len(sys.argv)==6: cmd_import_legacy_receipt(*sys.argv[2:])
         else: raise RuntimeError('bad arguments')

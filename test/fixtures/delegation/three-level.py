@@ -58,6 +58,8 @@ marker=command('source','--chat',leaf,'--type','result_pending_review','--event-
 mid=post(leaf,f'Example result is ready for review. root={root} task={task} '+marker)
 m=next(m for m in json.loads(Path(env['DELEGATION_FIXTURE_MESSAGES']).read_text()) if m['message_id']==mid)
 result=json.loads(tool('p5-task-event.py','emit',leaf,root,task,1,2,'result_pending_review',m['create_time'],mid)); assert result['applied']
+if os.environ.get('DELEGATION_FIXTURE_PAUSE_BEFORE_FLUSH'):
+    print(json.dumps({'setup_ready':True,'commands':records}));sys.exit(0)
 if os.environ.get('DELEGATION_FIXTURE_PROSE'):
     for parent in chats[:-1]:
         post(parent,os.environ['DELEGATION_FIXTURE_PROSE'])

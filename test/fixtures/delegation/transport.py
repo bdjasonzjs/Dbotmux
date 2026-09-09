@@ -14,7 +14,7 @@ def post(chat,body,kind='app',sender=None):
                      'sender':{'id':sender or ('ou_owner' if kind=='user' else 'cli_executor'),'sender_type':kind,'id_type':'open_id' if kind=='user' else 'app_id'},'mentions':mentions})
     path.write_text(json.dumps(messages)); return mid
 if args[:2]==['fixture','post']:
-    print(post(args[2],args[3],args[4] if len(args)>4 else 'app'))
+    print(post(args[2],args[3],args[4] if len(args)>4 else 'app',args[5] if len(args)>5 else None))
 elif args[:2]==['im','+chat-members-list']:
     print(json.dumps({'ok':True,'data':{'chat_id':option('--chat-id'),'users':[{'member_id':'ou_owner'}],
                                      'bots':[{'app_id':'cli_executor','member_id':'ou_executor'},{'app_id':'cli_observer','member_id':'ou_observer'}]}}))
@@ -32,7 +32,7 @@ elif args[:1]==['quoted']:
                       'msgType':'text','content':m['content'],'rawContent':{'text':m['content']},'createTime':str(int(at.timestamp()*1000))}))
 elif args[:1]==['send']:
     body=sys.stdin.read(); mid=post(option('--chat-id'),body)
-    messages[-1]['mentions']=[{'id':option('--mention'),'key':'@_user_1'}]
+    messages[-1]['mentions']=[] if os.environ.get('DELEGATION_FIXTURE_DROP_MENTION') else [{'id':option('--mention'),'key':'@_user_1'}]
     path.write_text(json.dumps(messages)); print(json.dumps({'success':True,'messageId':mid}))
 else:
     print('fixture refuses unsupported operation: '+repr(args),file=sys.stderr); sys.exit(2)

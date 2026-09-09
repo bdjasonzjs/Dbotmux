@@ -156,6 +156,20 @@ botmux delegation status
 
 通过标准：根→中间、中间→叶两次真实投递均有新接单；叶的同一 `RESULT_MID/event_id` 在叶、中间、根的分支状态都为 `pending_review`，每条上行消息可 quoted 下钻。**待审不等于 review PASS，更不等于整个项目完成。**
 
+## 消息已送达但缺少 mention 的旧回执对账
+
+仅用于旧出站缺陷留下的 `sending`：错误中已经记录了真实发送 MID，接收方也已回读该消息并明确确认接收。不要重新发送，也不要手改状态。
+
+原发送节点先备份安装目录，真读接收方确认正文，记录其正文 UTF-8 字节 SHA-256。将原事件完整对象的 canonical SHA-256 与两个真实 MID 交给显式入口：
+
+```bash
+botmux delegation run event reconcile-sent "$SOURCE_CHAT" "$EVENT_ID" "$EVENT_SHA256" "$SENT_MID" "$RECEIVER_CONFIRM_MID" "$CONFIRM_BODY_SHA256"
+```
+
+入口只认原失败发送对应的消息、发送者、父群与完整正文，以及原接收方的指定确认；不自动把任意自然语言当回执。通过后留下 `receipt_reconciliation` 与 `.sent` 记录，原错误保存在审计字段，原事件和原消息不变。相同参数重复执行不写业务状态、不重复外发。
+
+对账只恢复 `sent`，**不等于父节点已经落账**。随后由原父节点执行 `event ingest`，才能取得 `parent_landed`。未对账的普通无 mention 消息仍走原拒绝路径。
+
 ## 停用、复用与边界
 
 `init` 默认 `delegation_auto.enabled=false`、`version_migration.enabled=false`、`mode=dry-run`；不会修改共享 bots.json、服务、cron 或 instant。初次任务的显式派单/回报可运行；版本迁移和自动入口另行配置、按相应命令取得真实证据。
