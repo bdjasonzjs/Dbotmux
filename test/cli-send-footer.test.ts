@@ -146,7 +146,7 @@ describe('botmux send footer flags', () => {
     expect(JSON.stringify(proseCard)).toContain('ou_owner');
   });
 
-  it('a legacy latched session without a relay app id must not strip any mention', async () => {
+  it('a session latched onto a RETIRED relay app must not strip a live bot mention', async () => {
     // Sessions that latched suppressRelayMentions before suppressRelayMentionAppId
     // existed used to fall back to the retired ByteDance Claude app id. Cross-app
     // open-id resolution mapped that dead id onto the live Claude bot and silently
@@ -164,6 +164,7 @@ describe('botmux send footer flags', () => {
         ownerOpenId: 'ou_owner',
         quoteTargetSenderOpenId: 'ou_owner',
         suppressRelayMentions: true,
+        suppressRelayMentionAppId: 'cli_retired_app',
       },
     }));
     // The retired app must be resolvable the same way it was in production:
@@ -173,7 +174,7 @@ describe('botmux send footer flags', () => {
     writeFileSync(join(dataDir, 'bots-info.json'), JSON.stringify([
       { larkAppId: 'app_footer', botOpenId: 'ou_self', botName: 'FooterBot', cliId: 'codex' },
       { larkAppId: 'app_relay', botOpenId: 'ou_relay_self', botName: 'RelayBot', cliId: 'claude-code' },
-      { larkAppId: 'cli_a9771799e8bb5bc3', botOpenId: 'ou_retired_self', botName: 'RelayBot', cliId: 'claude-code' },
+      { larkAppId: 'cli_retired_app', botOpenId: 'ou_retired_self', botName: 'RelayBot', cliId: 'claude-code' },
     ]));
     const { payload: card } = await sendPayload('--card', [
       '--mention', 'ou_relay_sender_scope:RelayBot', '--no-footer',

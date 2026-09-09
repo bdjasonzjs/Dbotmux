@@ -8443,8 +8443,20 @@ function botOpenIdsForAppFromSenderApp(senderAppId: string | undefined, targetAp
     const entries: BotMentionEntry[] = Array.isArray(parsed) ? parsed : [];
     const target = entries.find(entry => entry.larkAppId === targetAppId);
     if (target?.botOpenId) ids.add(target.botOpenId);
+    // The cross-ref maps a DISPLAY NAME to an open id in the sender's scope, so
+    // it is only trustworthy while that name identifies exactly one app.
+    // bots-info is an append-mostly cache: a retired app keeps its row and its
+    // name, and a live bot commonly inherits the same name. Resolving through an
+    // ambiguous name then hands back the LIVE bot's id and silences a real
+    // recipient — that is how a delegation relay lost its mention on
+    // 2026-09-10 (retired cli_a9771799e8bb5bc3 and the live Claude app both sit
+    // in bots-info as 克劳德). The target's own botOpenId above stays exact and
+    // is enough to guard a genuine relay loop.
+    const sameName = target?.botName
+      ? entries.filter(entry => entry.botName === target.botName).length
+      : 0;
     const crossRefPath = join(dataDir, `bot-openids-${senderAppId}.json`);
-    if (target?.botName && existsSync(crossRefPath)) {
+    if (target?.botName && sameName === 1 && existsSync(crossRefPath)) {
       const crossRef: Record<string, string> = JSON.parse(readFileSync(crossRefPath, 'utf-8'));
       if (crossRef[target.botName]) ids.add(crossRef[target.botName]);
     }
