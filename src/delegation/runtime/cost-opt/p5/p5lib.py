@@ -791,9 +791,9 @@ def find_markers(text):
     for number, match in enumerate(MARK_CANDIDATE_RE.finditer(text or ''), 1):
         try:
             g, closing = match.groups()
-            if not closing: raise ValueError('missing closing bracket')
             if not MARK_BASE64_ALPHABET_RE.fullmatch(g):
-                continue  # 含非 base64 字符 → 非真实 marker（噪音/截断），跳过
+                continue  # 散文无需闭括号；仅编码候选才进入协议格式检查。
+            if not closing: raise ValueError('missing closing bracket')
             pad = '=' * (-len(g) % 4)
             out.append(json.loads(base64.b64decode(g + pad, altchars=b'-_', validate=True).decode()))
         except Exception as error:

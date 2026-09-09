@@ -67,3 +67,18 @@ test('installed scripts perform two downward deliveries and two upward landings 
   expect(record.downstream_deliveries).toHaveLength(2);
   expect(record.live_lark_verified).toBe(false);
 });
+
+test('installed event ingest passes ordinary unclosed-marker prose before upstream receipts (fixture only)', () => {
+  const f = fixture(); f.args[3] = 'om_fixture1'; initializeDelegation(f.args);
+  const transport = join(f.root, 'transport');
+  copyFileSync(new URL('./fixtures/delegation/transport.py', import.meta.url), transport); chmodSync(transport, 0o755);
+  const result = spawnSync('python3', [new URL('./fixtures/delegation/three-level.py', import.meta.url).pathname, f.home, transport], {
+    encoding: 'utf8', timeout: 25_000,
+    env: { ...process.env, DELEGATION_FIXTURE_PROSE: 'Documentation example: [p5: followed by explanatory prose, not an event.' },
+  });
+  expect(result.status, result.stderr || result.stdout).toBe(0);
+  const record = JSON.parse(result.stdout);
+  expect(record.all_three_nodes).toBe('pending_review');
+  expect(record.downstream_deliveries).toHaveLength(2);
+  expect(record.live_lark_verified).toBe(false);
+});
