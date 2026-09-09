@@ -1001,6 +1001,30 @@ describe('human-session routing prompt publication gate', () => {
       .not.toContain(HUMAN_SESSION_ROUTING_PROMPT);
   });
 
+  it('treats an explicit enabled:false as a veto that outranks the appIds allowlist', () => {
+    const allowlisted = {
+      humanSessionRoutingPrompt: {
+        ...readyConfig.humanSessionRoutingPrompt,
+        appIds: ['cli_app_a', 'cli_app_b'],
+      },
+    };
+    // Sanity: the allowlist alone does turn it on for a listed app.
+    expect(resolveHumanSessionRoutingPromptGate(allowlisted, {
+      BOTMUX_LARK_APP_ID: 'cli_app_a',
+    })).toMatchObject({ enabled: true, reason: 'enabled' });
+
+    // The emergency off switch writes enabled:false; it must win anyway.
+    expect(resolveHumanSessionRoutingPromptGate({
+      humanSessionRoutingPrompt: {
+        ...allowlisted.humanSessionRoutingPrompt,
+        enabled: false,
+      },
+    }, { BOTMUX_LARK_APP_ID: 'cli_app_a' })).toMatchObject({
+      enabled: false,
+      reason: 'disabled',
+    });
+  });
+
   it('requires the exact callable entry and non-empty capability evidence', () => {
     expect(resolveHumanSessionRoutingPromptGate({
       humanSessionRoutingPrompt: {

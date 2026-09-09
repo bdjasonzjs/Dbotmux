@@ -68,6 +68,12 @@ export function resolveHumanSessionRoutingPromptGate(
   if (override.present && !override.enabled) {
     return { ...base, enabled: false, reason: 'disabled' };
   }
+  // An explicit `enabled: false` is a veto and outranks any per-app allowlist.
+  // Without this, `botmux config disable-human-session-routing` writes a flag
+  // the appIds branch then ignores — the emergency off switch silently fails.
+  if (configured?.enabled === false) {
+    return { ...base, enabled: false, reason: 'disabled' };
+  }
   const enabledHere = configured?.appIds
     ? configured.appIds.includes(env.BOTMUX_LARK_APP_ID ?? '')
     : configured?.enabled === true;
