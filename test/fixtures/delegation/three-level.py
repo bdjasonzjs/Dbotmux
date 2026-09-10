@@ -79,10 +79,21 @@ if os.environ.get('DELEGATION_FIXTURE_PAUSE_BEFORE_FLUSH'):
 if os.environ.get('DELEGATION_FIXTURE_PROSE'):
     for parent in chats[:-1]:
         post(parent,os.environ['DELEGATION_FIXTURE_PROSE'])
+report_mentions=[];wakes=[]
 for child,parent in zip(reversed(chats[1:]),reversed(chats[:-1])):
-    tool('p5-task-event.py','flush',child); tool('p5-task-event.py','ingest',parent)
+    flushed=json.loads(tool('p5-task-event.py','flush',child))
+    posted=json.loads(Path(env['DELEGATION_FIXTURE_MESSAGES']).read_text())
+    for row in flushed['flushed']:
+        sent=next(x for x in posted if x['message_id']==row['message_id'])
+        # Every hop must wake the parent's own executor, not a bystander.
+        report_mentions.append({'child':child,'parent':parent,'mentions':[y.get('id') for y in (sent.get('mentions') or [])]})
+    # Same app on both ends here, so each flush must also nudge from another app.
+    woke=next(x for x in posted if x['message_id']==flushed['woke'])
+    wakes.append({'parent':parent,'sender':woke['sender']['id'],'chat':woke['chat_id'],
+                  'mentions':[y.get('id') for y in (woke.get('mentions') or [])],'has_marker':'[p5:' in woke['content']})
+    tool('p5-task-event.py','ingest',parent)
 for chat in chats:
     status=json.loads(tool('p5-task-event.py','status',chat,root,task))
     row=next(t for t in status['branches'] if t['origin_chat']==leaf)
     assert row['state']=='pending_review',row
-print(json.dumps({'ok':True,'transport':'local-fixture','live_lark_verified':False,'downstream_deliveries':deliveries,'result_source':mid,'all_three_nodes':'pending_review','commands':records,'semantic_rejections':semantic_rejections},ensure_ascii=False))
+print(json.dumps({'ok':True,'transport':'local-fixture','live_lark_verified':False,'downstream_deliveries':deliveries,'result_source':mid,'all_three_nodes':'pending_review','report_mentions':report_mentions,'wakes':wakes,'commands':records,'semantic_rejections':semantic_rejections},ensure_ascii=False))

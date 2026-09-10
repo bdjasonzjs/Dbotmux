@@ -68,6 +68,28 @@ test('installed scripts perform two downward deliveries and two upward landings 
   expect(record.live_lark_verified).toBe(false);
 });
 
+test('每一跳上报都圈父节点自己的执行者，同 app 不降级到观察者', () => {
+  const f = fixture(); f.args[3] = 'om_fixture1'; initializeDelegation(f.args);
+  const transport = join(f.root, 'transport');
+  copyFileSync(new URL('./fixtures/delegation/transport.py', import.meta.url), transport); chmodSync(transport, 0o755);
+  const result = spawnSync('python3', [new URL('./fixtures/delegation/three-level.py', import.meta.url).pathname, f.home, transport], { encoding: 'utf8', timeout: 25_000 });
+  expect(result.status, result.stderr || result.stdout).toBe(0);
+  const record = JSON.parse(result.stdout);
+  // Parent and child share cli_executor here, exactly the shape that used to be
+  // redirected at the observer, leaving the parent's own session unwoken.
+  expect(new Set(record.report_mentions.map((h: any) => `${h.child}->${h.parent}`)).size).toBe(2);
+  for (const hop of record.report_mentions) expect(hop.mentions).toEqual(['ou_executor']);
+  // The report alone cannot wake a parent that filters its own app, so each
+  // flush also nudges from the observer app — marker-free, so it can never be
+  // mistaken for a protocol event.
+  expect(record.wakes).toHaveLength(2);
+  for (const wake of record.wakes) {
+    expect(wake.sender).toBe('cli_observer');
+    expect(wake.mentions).toEqual(['ou_executor']);
+    expect(wake.has_marker).toBe(false);
+  }
+});
+
 test('installed event ingest passes ordinary unclosed-marker prose before upstream receipts (fixture only)', () => {
   const f = fixture(); f.args[3] = 'om_fixture1'; initializeDelegation(f.args);
   const transport = join(f.root, 'transport');

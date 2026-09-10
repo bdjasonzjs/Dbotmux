@@ -21,7 +21,10 @@ elif args[:2]==['im','+chat-members-list']:
 elif args[:2]==['im','+chat-messages-list']:
     print(json.dumps({'data':{'messages':[m for m in reversed(messages) if m['chat_id']==option('--chat-id')],'has_more':False}}))
 elif args[:2]==['im','+messages-send']:
-    print(json.dumps({'data':{'message_id':post(option('--chat-id'),option('--text'), 'user' if option('--as')=='user' else 'app')}}))
+    as_user=option('--as')=='user'
+    # Profile selects which app speaks; the observer profile is a different app.
+    sender=None if as_user else ('cli_observer' if option('--profile')=='dafeijing' else 'cli_executor')
+    print(json.dumps({'data':{'message_id':post(option('--chat-id'),option('--text'),'user' if as_user else 'app',sender)}}))
 elif args[:2]==['bots','list']:
     print(json.dumps({'bots':[{'larkAppId':'cli_executor','openId':'ou_executor','isSelf':True,'mentionable':True},
                               {'larkAppId':'cli_observer','openId':'ou_observer','isSelf':False,'mentionable':True}]}))

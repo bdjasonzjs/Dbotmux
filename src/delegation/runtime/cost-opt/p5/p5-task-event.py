@@ -19,6 +19,9 @@ import datetime, hashlib, json, os, re, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from p5lib import *
 import p5summary
+# Same lark-cli profile p5lib already uses to read as the observer app; the
+# wake nudge must come from an app the parent does not filter as its own.
+OBSERVER_PROFILE='dafeijing'
 
 EVENT_TYPES = {
     'accepted': ('accepted', 10), 'queued': ('queued', 20),
@@ -299,11 +302,44 @@ def report_route(child,parent):
     allowed=set(role_apps_for(read_state(child)).values())|{observer_app()}
     if not sender or sender not in allowed: raise RuntimeError('report sender is not a registered node role')
     target=executor_app(read_state(parent))
-    if target==sender: target=observer_app()
-    if target==sender: raise RuntimeError('no distinct parent receiver; self-mention cannot prove receipt')
+    # The parent's executor is the only reader who can act on this report, so it
+    # must be the one mentioned. Sharing an app id with the sender does NOT make
+    # this a self-mention: the parent chat runs its own session, and mentioning
+    # that app there is what wakes it. Redirecting to the observer instead left
+    # every codex->codex hop waking nobody but a bookkeeper (2026-09-10).
+    if parent==child: raise RuntimeError('no distinct parent receiver; self-mention cannot prove receipt')
+    if not target: raise RuntimeError('parent executor app unregistered; cannot address a reader')
     hits=[b for b in bots if b.get('larkAppId')==target and b.get('mentionable') and b.get('openId')]
     if len(hits)!=1: raise RuntimeError('parent receiver has no unambiguous runtime mention handle')
-    return {'sender_app':sender,'target_app':target,'target_open_id':hits[0]['openId'],'target_chat':parent}
+    # Same app on both ends: the report still addresses the parent's executor,
+    # but the parent daemon drops it as its own echo (event-dispatcher's
+    # isSelfMessage is app-wide, not per-chat), so the mention alone wakes
+    # nobody. The caller must follow up from a different app. See wake_parent.
+    return {'sender_app':sender,'target_app':target,'target_open_id':hits[0]['openId'],
+            'target_chat':parent,'self_filtered':sender==target}
+
+def wake_parent(parent,target_app,pending):
+    """Nudge a parent whose executor shares our app, from an app it will read.
+
+    The protocol report itself is untouched: it keeps the registered sender,
+    the exact single mention and the byte-exact body the parent's ingest
+    verifies. This is a separate, marker-free message whose only job is to make
+    the parent's session wake up and go read what already landed.
+    """
+    rc,out,err=run([LARK_BIN,'im','+chat-members-list','--chat-id',parent,'--profile',OBSERVER_PROFILE,
+                    '--as','bot','--member-types','bot'],timeout=60)
+    if rc: raise RuntimeError('wake roster failed: '+err[:120])
+    members=(parse_json_tail(out).get('data') or {}).get('bots') or []
+    hits=[b.get('member_id') for b in members if b.get('app_id')==target_app and b.get('member_id')]
+    if len(hits)!=1: raise RuntimeError('wake target has no unambiguous member id in parent chat')
+    text=(f'<at user_id="{hits[0]}"></at> 子群已投递 {pending} 条任务上报到本群，'
+          '因为收发双方是同一个应用，那几条不会自动唤醒你。请按既有入口读取并落账。')
+    rc,out,err=run([LARK_BIN,'im','+messages-send','--chat-id',parent,'--profile',OBSERVER_PROFILE,
+                    '--as','bot','--text',text],timeout=60)
+    if rc: raise RuntimeError('wake send failed: '+err[:120])
+    mid=(parse_json_tail(out).get('data') or {}).get('message_id')
+    if not mid: raise RuntimeError('wake send lacks message_id')
+    return mid
 
 def send_report(route,text):
     rc,out,err=run([BOTMUX_BIN,'send','--top-level','--no-quote','--chat-id',route['target_chat'],'--mention',route['target_open_id']],input=text,timeout=60)
@@ -737,7 +773,7 @@ def cmd_flush(child,scope=None):
             if b.get('kind')=='task_event' and b.get('state') in ('pending','sending'):
                 sync_failure(child,b['event'],'parent unavailable/unmanaged or child not registered')
         raise RuntimeError('parent unavailable/unmanaged or child not registered; pending events retained')
-    ob=p_outbox(child); os.makedirs(ob,exist_ok=True)
+    ob=p_outbox(child); os.makedirs(ob,exist_ok=True); self_filtered_target=None
     for cur in [x for x in lifecycle_of(read_state(child))['bubbles'].get('out',[]) if x.get('kind')=='task_event' and x.get('state') in ('pending','sending') and (not scope or in_scope(x.get('event',{}),scope))]:
         eid=cur['event_id']; ev=cur['event']; validate_event(ev); acquire=os.path.join(ob,'event-'+eid+'.lock')
         fd=os.open(acquire,os.O_RDWR|os.O_CREAT,0o644); fcntl.flock(fd,fcntl.LOCK_EX)
@@ -809,8 +845,18 @@ def cmd_flush(child,scope=None):
                     s['delegation']=d
                 s['lifecycle']=lc; write_state(child,s)
             done.append({'event_id':eid,'message_id':found})
+            if cur['route'].get('self_filtered'): self_filtered_target=cur['route']['target_app']
         finally: fcntl.flock(fd,fcntl.LOCK_UN); os.close(fd)
-    print(json.dumps({'flushed':done},ensure_ascii=False))
+    # One nudge per flush, not per event: the parent only needs to be told once
+    # that something is waiting. A failed nudge must not undo landed receipts —
+    # the reports are already sent and verified — so report it and exit nonzero.
+    woke=None
+    if done and self_filtered_target:
+        try: woke=wake_parent(parent,self_filtered_target,len(done))
+        except Exception as e:
+            print(json.dumps({'flushed':done,'woke':None,'wake_error':str(e)},ensure_ascii=False))
+            raise SystemExit(8)
+    print(json.dumps({'flushed':done,'woke':woke},ensure_ascii=False))
 
 def cmd_status(chat,root,task):
     st=read_state(chat) or {}

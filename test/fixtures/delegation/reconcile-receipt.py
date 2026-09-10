@@ -29,7 +29,8 @@ assert not json.loads(messages.read_text())[-1]['mentions']
 unresolved=json.loads(event('ingest',root))
 assert any(x['result']=='unresolved_receipt' for x in unresolved['ingested']),unresolved
 confirmation=f'I read the delivered message {mid}; this is the expected event. Keep its original body and do not resend.'
-cmid=run([str(transport),'fixture','post',root,confirmation,'app','cli_observer'])
+# The confirming reader is the parent's executor — the same app the report mentions.
+cmid=run([str(transport),'fixture','post',root,confirmation,'app','cli_executor'])
 import hashlib
 args=['reconcile-sent',child,ev['event_id'],csha(ev),mid,cmid,hashlib.sha256(confirmation.encode()).hexdigest()]
 before=business_files();count=message_count()
