@@ -166,7 +166,6 @@ import {
 } from './cli/pm2-god-retirement.js';
 import { pm2FleetMutationLockTarget, withPm2FleetMutationLock } from './cli/pm2-fleet-lock.js';
 import { LogFileFollower, type LogTailSource } from './cli/log-tail.js';
-import { LOGS_HELP, parseLogsArgs } from './cli/log-options.js';
 import {
   requestAttestedDaemonShutdown,
   requestAttestedDaemonShutdownBatch,
@@ -4354,24 +4353,16 @@ function warnIfLegacyBotmuxAlive(): void {
 }
 
 async function cmdLogs(): Promise<void> {
-  let options;
-  try {
-    options = parseLogsArgs(process.argv.slice(3), !!process.stdout.isTTY);
-  } catch (error) {
-    console.error(error instanceof Error ? error.message : String(error));
-    console.error(LOGS_HELP);
-    process.exitCode = 1;
-    return;
-  }
-  if (options.help) {
-    console.log(LOGS_HELP);
-    return;
-  }
   warnIfLegacyBotmuxAlive();
+  const lines = process.argv.includes('--lines')
+    ? process.argv[process.argv.indexOf('--lines') + 1] || '50'
+    : '50';
 
   const bots = loadBotsJson();
   // Support --bot <0-based-index|pm2-name|appId> to filter specific bot logs.
-  const botIdx = options.bot;
+  const botIdx = process.argv.includes('--bot')
+    ? process.argv[process.argv.indexOf('--bot') + 1]
+    : undefined;
 
   // No PM2 client at all: `pm2 logs` lazily births a God when none is alive
   // (Client.start → pingDaemon false → launchDaemon), which made this read
@@ -4405,12 +4396,13 @@ async function cmdLogs(): Promise<void> {
     sources = allBotmuxLogSources(bots);
   }
 
-  if (options.follow) {
-    console.error(`跟踪 ${sources.length} 个日志文件（Ctrl+C 退出；管道中需输出后退出请用 --no-follow）`);
-  }
+  // Not `|| 50`: an explicit --lines 0 (follow-only) must stay 0.
+  const rawLines = Number.parseInt(lines, 10);
+  const parsedLines = Number.isSafeInteger(rawLines) && rawLines >= 0 ? rawLines : 50;
+  console.log(`跟踪 ${sources.length} 个日志文件（Ctrl+C 退出；fleet 停止时也能查看历史并等待新日志）`);
   const follower = new LogFileFollower({ sources, writeLine: line => console.log(line) });
-  follower.printInitialTail(options.lines);
-  if (options.follow) follower.start();
+  follower.printInitialTail(parsedLines);
+  follower.start();
 }
 
 /** Log files of one core bot daemon — the exact paths ecosystemConfig pins. */
@@ -7347,7 +7339,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
               --include-pm2 在 fleet 安全退役并验证后，经 PM2_HOME socket 退役 PM2 God（绝不按 PID 发信号），再以当前干净环境全新启动——彻底重启整棵进程树；会先优雅停止全部插件 service（auto 的启动后自动恢复）
               首次升级若旧 daemon 缺少 shutdown protocol：先独立确认所有 Session/Riff 工作均 idle，再一次性运行
               botmux restart --bootstrap-shutdown-protocol --yes；普通 stop/restart 仍保持 fail-closed
-  logs        查看 daemon 日志（管道默认输出后退出；--follow 持续跟踪；--help 查看选项）
+  logs        查看 daemon 日志（--lines N, --bot <0-based-index|pm2-name|appId>）
   status      查看 daemon 状态
   upgrade     升级到最新版本（别名：update）
   dashboard current

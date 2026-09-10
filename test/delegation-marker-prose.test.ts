@@ -25,8 +25,22 @@ test.each([
   expect(parse(text)).toEqual({ markers: [] });
 });
 
-test.each(['[p5:eyJ0YXNrX2V2ZW50Ijoib2sifQ', '[p5:AAAA]', '[p5:abcde]'])('keeps explicit errors for corrupt protocol candidates: %s', (text) => {
-  expect(parse(text).error).toMatch(/^invalid p5 marker #1 offset=0: /);
+test.each([
+  '[p5:eyJ0YXNrX2V2ZW50Ijoib2sifQ', // missing close
+  '[p5:abcde]', // base64
+  '[p5:pg==]', // UTF-8 0xa6
+  '[p5:AAAA]', // JSON
+  '[p5:W10]', '[p5:bnVsbA]', '[p5:MQ]', // array/null/number, not objects
+])('skips failed candidates at the scan boundary: %s', (text) => {
+  expect(parse(text)).toEqual({ markers: [] });
+});
+
+test.each([
+  '[p5:unfinished prose ', '[p5:AAAA', '[p5:abcde] ', '[p5:pg==] ',
+  '[p5:AAAA] ', '[p5:W10] ', '[p5: [ordinary bracket] ',
+])('does not swallow a later valid marker after %s', (prefix) => {
+  const good = '[p5:eyJ0YXNrX2V2ZW50Ijoib2sifQ]';
+  expect(parse(prefix + good)).toEqual({ markers: [{ task_event: 'ok' }] });
 });
 
 test('canonical writer and both base64 alphabets still round-trip two markers', () => {

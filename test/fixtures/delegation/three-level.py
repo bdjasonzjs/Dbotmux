@@ -54,6 +54,22 @@ for parent,child in zip(chats,chats[1:]):
     sent=read_state(parent)['lifecycle']['decisions']['out'][-1]['sent_message_id']; deliveries.append(sent)
     tool('p5-task-binding.py','bind',child,root,task,1,sent); accept(child,sent)
 leaf=chats[-1]
+semantic_rejections=[]
+if os.environ.get('DELEGATION_FIXTURE_BAD_EVENT_FIELDS'):
+    noise=os.environ.get('DELEGATION_FIXTURE_PROSE','')
+    for field,bad in [('task_version',99),('event_type','failed'),('origin_chat',chats[0])]:
+        source={'root_request_id':root,'task_id':task,'task_version':1,'event_version':2,
+                'event_type':'result_pending_review','origin_chat':leaf}
+        source[field]=bad
+        bad_mid=post(leaf,f'root={root} task={task} '+noise+'\n'+encode_marker({'task_event_source':source}))
+        m=next(m for m in json.loads(Path(env['DELEGATION_FIXTURE_MESSAGES']).read_text()) if m['message_id']==bad_mid)
+        before={p.name:p.read_bytes() for p in (home/'webroot').glob('*.json')}
+        argv=['python3',str(p5/'p5-task-event.py'),'emit',leaf,root,task,'1','2','result_pending_review',m['create_time'],bad_mid]
+        rejected=subprocess.run(argv,env=env,text=True,capture_output=True)
+        record={'field':field,'argv':argv,'rc':rejected.returncode,'stdout':rejected.stdout,'stderr':rejected.stderr}
+        assert rejected.returncode==9 and 'event source envelope mismatch' in rejected.stdout,record
+        assert before=={p.name:p.read_bytes() for p in (home/'webroot').glob('*.json')}
+        semantic_rejections.append(record)
 marker=command('source','--chat',leaf,'--type','result_pending_review','--event-version','2') if cli else run(['python3',str(home/'bin/delegation-command.py'),'source',leaf,'result_pending_review','2'])
 mid=post(leaf,f'Example result is ready for review. root={root} task={task} '+marker)
 m=next(m for m in json.loads(Path(env['DELEGATION_FIXTURE_MESSAGES']).read_text()) if m['message_id']==mid)
@@ -69,4 +85,4 @@ for chat in chats:
     status=json.loads(tool('p5-task-event.py','status',chat,root,task))
     row=next(t for t in status['branches'] if t['origin_chat']==leaf)
     assert row['state']=='pending_review',row
-print(json.dumps({'ok':True,'transport':'local-fixture','live_lark_verified':False,'downstream_deliveries':deliveries,'result_source':mid,'all_three_nodes':'pending_review','commands':records},ensure_ascii=False))
+print(json.dumps({'ok':True,'transport':'local-fixture','live_lark_verified':False,'downstream_deliveries':deliveries,'result_source':mid,'all_three_nodes':'pending_review','commands':records,'semantic_rejections':semantic_rejections},ensure_ascii=False))
