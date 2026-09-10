@@ -133,24 +133,28 @@ describe('botmux send footer flags', () => {
     expect(JSON.stringify(card)).not.toContain('ou_owner');
   });
 
-  it('relay sentinel suppression removes explicit and prose auto-mentions for the relay app', async () => {
+  it('存量 relay 锁存字段不得再摘掉显式或正文提及', async () => {
+    // The fixture session still carries suppressRelayMentions/AppId from before
+    // the latch was retired (2026-09-10). Honouring them silently emptied a
+    // delegation relay's mention list and nobody was woken. A bot recipient is
+    // never suppressed; only the caller's own --no-mention decides that.
     const { payload: explicitCard } = await sendPayload('--card', [
       '--mention', 'ou_relay_sender_scope:RelayBot', '--no-footer',
     ]);
-    expect(JSON.stringify(explicitCard)).not.toContain('ou_relay_sender_scope');
+    expect(JSON.stringify(explicitCard)).toContain('ou_relay_sender_scope');
 
     const { payload: proseCard } = await sendPayload('--card', [
       '--mention', 'ou_owner:Owner', '--no-footer',
     ], '@RelayBot 请看');
-    expect(JSON.stringify(proseCard)).not.toContain('ou_relay_sender_scope');
     expect(JSON.stringify(proseCard)).toContain('ou_owner');
   });
 
-  it('a session latched onto a RETIRED relay app must not strip a live bot mention', async () => {
-    // Sessions that latched suppressRelayMentions before suppressRelayMentionAppId
-    // existed used to fall back to the retired ByteDance Claude app id. Cross-app
-    // open-id resolution mapped that dead id onto the live Claude bot and silently
-    // dropped legitimate mentions of it (2026-09-10 delegation relay incident).
+  it('锁存指向退役应用时同样不得摘掉活着的机器人提及', async () => {
+    // Two ways this used to silence a live bot: the retired ByteDance Claude app
+    // id resolving cross-app onto the live Claude bot, and any latched app id at
+    // all. Both are gone — nothing reads the latch now — so this pins the
+    // stronger property: whatever a persisted session latched onto, an explicit
+    // mention survives (2026-09-10 delegation relay incident).
     writeFileSync(join(dataDir, 'sessions.json'), JSON.stringify({
       s_footer: {
         sessionId: 's_footer',
@@ -167,10 +171,8 @@ describe('botmux send footer flags', () => {
         suppressRelayMentionAppId: 'cli_retired_app',
       },
     }));
-    // The retired app must be resolvable the same way it was in production:
-    // bots-info still lists it, and its botName cross-refs to the LIVE bot's
-    // open id in the sender's scope. Without this the fallback resolves to an
-    // empty set and the bug cannot reproduce.
+    // Keep the production-shaped roster (retired row sharing the live bot's
+    // display name) so this stays a real reproduction of the original setup.
     writeFileSync(join(dataDir, 'bots-info.json'), JSON.stringify([
       { larkAppId: 'app_footer', botOpenId: 'ou_self', botName: 'FooterBot', cliId: 'codex' },
       { larkAppId: 'app_relay', botOpenId: 'ou_relay_self', botName: 'RelayBot', cliId: 'claude-code' },

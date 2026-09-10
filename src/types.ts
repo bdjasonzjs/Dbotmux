@@ -416,9 +416,12 @@ export interface Session {
    *  Used by `botmux send` to address the card to the actual caller in oncall
    *  groups (where the caller is often not the session owner). */
   lastCallerOpenId?: string;
-  /** Relay-safety latch: replies in this session must not mention the relay bot. */
+  /** @deprecated Retired 2026-09-10. Persisted sessions still carry these keys;
+   *  nothing reads them. The latch suppressed BOT recipients for a whole session
+   *  — including explicit `--mention` — which is a need we do not have. Declared
+   *  only so old session JSON stays type-compatible; do not reintroduce a reader. */
   suppressRelayMentions?: boolean;
-  /** Lark app id of the relay bot whose mentions are suppressed. */
+  /** @deprecated Retired 2026-09-10 together with suppressRelayMentions. */
   suppressRelayMentionAppId?: string;
   /** Batch turns deliberately have no implicit single addressee. */
   suppressImplicitAddressing?: boolean;

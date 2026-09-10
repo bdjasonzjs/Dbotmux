@@ -3198,33 +3198,6 @@ const lastRepoScan: Map<string, import('./services/project-scanner.js').ProjectI
   new BoundedMap(500);
 const cliVersionCache = new Map<string, { version: string; lastCheckAt: number }>();
 const VERSION_CHECK_INTERVAL = 60_000; // cache 1 min
-const NO_MENTION_REPLY_SENTINEL = '本条消息的回复不圈任何人';
-
-export function hasNoMentionReplySentinel(content: unknown): boolean {
-  return typeof content === 'string' && content.includes(NO_MENTION_REPLY_SENTINEL);
-}
-
-export interface NoMentionReplySignal {
-  content: unknown;
-  senderAppId?: string;
-}
-
-export function applyNoMentionReplySentinelToSession(
-  session: Session,
-  signal: NoMentionReplySignal,
-): boolean {
-  if (!hasNoMentionReplySentinel(signal.content) || session.suppressRelayMentions) return false;
-  session.suppressRelayMentions = true;
-  session.suppressRelayMentionAppId = signal.senderAppId;
-  return true;
-}
-
-export function applyNoMentionReplySentinelToDaemonSession(
-  ds: Pick<DaemonSession, 'session'>,
-  signal: NoMentionReplySignal,
-): boolean {
-  return applyNoMentionReplySentinelToSession(ds.session, signal);
-}
 
 function parsePositiveIntEnv(name: string): number {
   const raw = process.env[name];
@@ -17534,10 +17507,6 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   const isForeignBotSender = isBotSenderType
     || (!!senderOpenId && senderOpenId !== getBot(larkAppId).botOpenId
         && isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId));
-  const relaySignal: NoMentionReplySignal = {
-    content: parsed.content,
-    senderAppId: lookupForeignBotAppId(senderOpenId, larkAppId, senderUnionId),
-  };
   const ownerOpenIdForSession = isForeignBotSender ? undefined : senderOpenId;
   const ownerUnionIdForSession = isForeignBotSender ? undefined : senderUnionId;
   const botCfg = getBot(larkAppId).config;
@@ -17770,7 +17739,6 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       session.lastCallerOpenId = senderOpenId;
       session.lastMessageAt = new Date(now).toISOString();
       session.scope = scope;
-      applyNoMentionReplySentinelToSession(session, relaySignal);
 
       // First-message `/repo`: seed the same pending-repo state the card flow
       // uses, so the `/repo` handler launches the CLI straight away —
@@ -18006,7 +17974,6 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   session.quoteTargetSenderIsBot = isForeignBotSender || parsed.senderType === 'app' || parsed.senderType === 'bot';
   session.lastMessageAt = new Date(now).toISOString();
   session.scope = scope;
-  applyNoMentionReplySentinelToSession(session, relaySignal);
   session.nativeSessionTitle = buildBotmuxLarkNativeSessionTitle(
     parsed.content,
     parsed.mentions,
@@ -18910,10 +18877,6 @@ async function handleThreadReplyAdmitted(
       isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenIdForPrefix));
   const senderUnionIdForPrefix = parsed.senderUnionId || data?.sender?.sender_id?.union_id;
   const foreignBotName = isForeignBot ? lookupForeignBotName(senderOpenIdForPrefix!, larkAppId, senderUnionIdForPrefix) : undefined;
-  const relaySignal: NoMentionReplySignal = {
-    content: parsed.content,
-    senderAppId: lookupForeignBotAppId(senderOpenIdForPrefix, larkAppId, senderUnionIdForPrefix),
-  };
   const botSenderPrefix = isForeignBot
     ? `${tr('daemon.foreign_bot_mention_prefix', { botName: foreignBotName! }, localeForBot(larkAppId))}\n`
     : '';
@@ -19104,9 +19067,6 @@ async function handleThreadReplyAdmitted(
       replyRootId,
     });
     const existingDs = activeSessions.get(sessionKey(anchor, larkAppId));
-    if (existingDs && applyNoMentionReplySentinelToDaemonSession(existingDs, relaySignal)) {
-      sessionStore.updateSession(existingDs.session);
-    }
     const effectiveThreadChatId = existingDs?.chatId ?? threadChatId;
     const restrictedText = grantRestrictedSlashCommandText(larkAppId, effectiveThreadChatId, threadSenderOpenId, cmd);
     if (restrictedText) {
@@ -19261,8 +19221,7 @@ async function handleThreadReplyAdmitted(
         session.lastCallerOpenId = threadSenderOpenId;
         session.lastMessageAt = new Date(now).toISOString();
         session.scope = scope;
-        applyNoMentionReplySentinelToSession(session, relaySignal);
-        let cmdPending: Partial<DaemonSession> | undefined;
+          let cmdPending: Partial<DaemonSession> | undefined;
         if (cmd === '/repo') {
           const { pinnedWorkingDir } = await resolvePinnedWorkingDir({ scope, anchor, chatId: threadChatId, chatType: ctxChatType, larkAppId });
           if (pinnedWorkingDir) session.workingDir = pinnedWorkingDir;
@@ -19355,9 +19314,6 @@ async function handleThreadReplyAdmitted(
 
   let ds = activeSessions.get(sessionKey(anchor, larkAppId));
 
-  if (ds && applyNoMentionReplySentinelToDaemonSession(ds, relaySignal)) {
-    sessionStore.updateSession(ds.session);
-  }
 
   // If another bot already owns this anchor, ignore unmentioned replies here as a
   // second line of defense. Explicit @mentions are still allowed to spin up/take over.
@@ -19833,8 +19789,7 @@ async function handleThreadReplyAdmitted(
     session.quoteTargetSenderIsBot = isForeignBot;
     session.lastMessageAt = new Date(now).toISOString();
     session.scope = scope;
-    applyNoMentionReplySentinelToSession(session, relaySignal);
-    const groupChatName = await groupChatNamePromise;
+      const groupChatName = await groupChatNamePromise;
     if (groupChatName) session.chatDisplayName = groupChatName;
     session.nativeSessionTitle = buildBotmuxLarkNativeSessionTitle(
       parsed.content,

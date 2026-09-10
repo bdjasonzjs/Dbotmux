@@ -348,7 +348,6 @@ const PM2_HOME = join(CONFIG_DIR, 'pm2');
 // serializes every botmux-internal mutation of the shared PM2_HOME.
 const PM2_FLEET_MUTATION_LOCK_TARGET = pm2FleetMutationLockTarget();
 const PM2_START_COMMAND_TIMEOUT_MS = 30_000;
-const NO_MENTION_REPLY_SENTINEL = '本条消息的回复不圈任何人';
 // `pm2 kill` with an already-empty fleet only tears down the God + socket.
 const PM2_GOD_KILL_COMMAND_TIMEOUT_MS = 30_000;
 const PM2_START_VERIFY_MIN_TIMEOUT_MS = 60_000;
@@ -4715,9 +4714,12 @@ interface SessionData {
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean };
   /** Per-turn reply targets（见 Session.replyTargets in types.ts）——排队/并发轮次各自的回复锚点。 */
   replyTargets?: Record<string, { rootMessageId?: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string }>;
-  /** Relay-safety latch: replies in this session must not mention the relay bot. */
+  /** @deprecated Retired 2026-09-10. Persisted sessions still carry these keys;
+   *  nothing reads them. The latch suppressed BOT recipients for a whole session
+   *  — including explicit `--mention` — which is a need we do not have. Declared
+   *  only so old session JSON stays type-compatible; do not reintroduce a reader. */
   suppressRelayMentions?: boolean;
-  /** Lark app id of the relay bot whose mentions are suppressed. */
+  /** @deprecated Retired 2026-09-10 together with suppressRelayMentions. */
   suppressRelayMentionAppId?: string;
   codexAppDispatchLedger?: CodexAppDispatchLedgerEntry[];
   codexAppGenerationCommits?: unknown;
@@ -8425,36 +8427,6 @@ function argValues(args: string[], ...flags: string[]): string[] {
  *  Relay suppression must cover both the target's self id and the cross-ref id
  *  observed by the sending app; Lark open_ids are app-scoped, so comparing only
  *  one representation can let the no-mention sentinel wake the relay again. */
-function botOpenIdsForAppFromSenderApp(senderAppId: string | undefined, targetAppId: string | undefined): Set<string> {
-  const ids = new Set<string>();
-  if (!senderAppId || !targetAppId) return ids;
-  try {
-    const dataDir = resolveDataDir();
-    const botInfoPath = join(dataDir, 'bots-info.json');
-    const parsed = existsSync(botInfoPath) ? JSON.parse(readFileSync(botInfoPath, 'utf-8')) : [];
-    const entries: BotMentionEntry[] = Array.isArray(parsed) ? parsed : [];
-    const target = entries.find(entry => entry.larkAppId === targetAppId);
-    if (target?.botOpenId) ids.add(target.botOpenId);
-    // The cross-ref maps a DISPLAY NAME to an open id in the sender's scope, so
-    // it is only trustworthy while that name identifies exactly one app.
-    // bots-info is an append-mostly cache: a retired app keeps its row and its
-    // name, and a live bot commonly inherits the same name. Resolving through an
-    // ambiguous name then hands back the LIVE bot's id and silences a real
-    // recipient — that is how a delegation relay lost its mention on
-    // 2026-09-10 (retired cli_a9771799e8bb5bc3 and the live Claude app both sit
-    // in bots-info as 克劳德). The target's own botOpenId above stays exact and
-    // is enough to guard a genuine relay loop.
-    const sameName = target?.botName
-      ? entries.filter(entry => entry.botName === target.botName).length
-      : 0;
-    const crossRefPath = join(dataDir, `bot-openids-${senderAppId}.json`);
-    if (target?.botName && sameName === 1 && existsSync(crossRefPath)) {
-      const crossRef: Record<string, string> = JSON.parse(readFileSync(crossRefPath, 'utf-8'));
-      if (crossRef[target.botName]) ids.add(crossRef[target.botName]);
-    }
-  } catch { /* best-effort; no identity evidence means no guessed suppression */ }
-  return ids;
-}
 
 function withCustomCardMentionFooter(
   card: Record<string, unknown>,
@@ -10382,28 +10354,15 @@ async function cmdSend(rest: string[]): Promise<void> {
       try { text = readFileSync(preparedContentFile, 'utf-8'); } catch { /* fall back safely below */ }
     }
 
-    // Claude→Codex relay loop guard. The daemon latches the sender app when it
-    // sees the sentinel. Remove both explicit/mention-back targets and prose
-    // auto-mentions for that exact relay app, while leaving unrelated
-    // recipients untouched.
-    //
-    // There is deliberately NO fallback app id for legacy sessions that latched
-    // the flag before `suppressRelayMentionAppId` existed. The old fallback was
-    // the ByteDance-tenant Claude app, retired 2026-08-26; cross-app open-id
-    // resolution then mapped that dead id onto the CURRENTLY live Claude bot and
-    // silently stripped legitimate mentions of it. 2026-09-10: that stripped the
-    // mention off a delegation relay into the root chat, so the intended reader
-    // was never woken. Guarding nobody is correct here — fail open rather than
-    // silence a live recipient.
-    const suppressRelayMentions = Boolean(s.suppressRelayMentions)
-      || text.includes(NO_MENTION_REPLY_SENTINEL);
-    const suppressedRelayAppId = s.suppressRelayMentionAppId;
-    const suppressedRelayOpenIds = botOpenIdsForAppFromSenderApp(appId, suppressedRelayAppId);
-    if (suppressRelayMentions && suppressedRelayOpenIds.size > 0) {
-      for (let i = mentions.length - 1; i >= 0; i--) {
-        if (suppressedRelayOpenIds.has(mentions[i].open_id)) mentions.splice(i, 1);
-      }
-    }
+    // A bot recipient is never suppressed. The old relay guard latched a session
+    // flag off one sentinel message and then stripped mentions of that app for
+    // the REST OF THE SESSION — explicit `--mention` included, silently. Its
+    // premise was wrong: there is no legitimate "do not mention a bot" need,
+    // only "do not mention a human", and that is the caller's `--no-mention`
+    // decision, not session state. The latch is what let a delegation relay go
+    // out with an empty mention list, so nobody was woken (2026-09-10).
+    // Stale `suppressRelayMentions` / `suppressRelayMentionAppId` keys survive
+    // in persisted sessions; they are deliberately ignored, not honoured.
 
     // `preparedContentFile` is presentation data produced inside an untrusted
     // sandbox and only TOCTOU-materialized by the host watcher. It is not an
@@ -10487,7 +10446,6 @@ async function cmdSend(rest: string[]): Promise<void> {
       }
       for (const entry of sortedEntries) {
         if (!entry.botName || entry.larkAppId === appId) continue;
-        if (suppressRelayMentions && suppressedRelayAppId && entry.larkAppId === suppressedRelayAppId) continue;
         const names = eligibleAutoMentionAliases({
           botName: entry.botName,
           cliId: entry.cliId ?? undefined,
