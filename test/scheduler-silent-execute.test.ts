@@ -47,6 +47,10 @@ vi.mock('../src/services/session-store.js', () => ({
 }));
 
 vi.mock('../src/services/message-queue.js', () => ({ ensureQueue: vi.fn() }));
+const runDelegationRoundEndMock = vi.fn();
+vi.mock('../src/services/delegation-round-end-runner.js', () => ({
+  runDelegationRoundEnd: (...a: any[]) => runDelegationRoundEndMock(...a),
+}));
 
 const sendMessageMock = vi.fn(async () => 'om_banner_123');
 const replyMessageMock = vi.fn(async () => 'om_reply_456');
@@ -187,6 +191,7 @@ beforeEach(() => {
   forkWorkerMock.mockClear();
   sendWorkerInputMock.mockClear();
   sendWorkerInputMock.mockReturnValue(true);
+  runDelegationRoundEndMock.mockClear();
   sendMessageMock.mockClear();
   replyMessageMock.mockClear();
   getChatModeMock.mockClear();
@@ -197,6 +202,17 @@ beforeEach(() => {
 });
 
 describe('executeScheduledTask — silent thread fire', () => {
+  it('runs a typed delegation action without creating or injecting an LLM session', async () => {
+    const active = new Map<string, DaemonSession>();
+    const action = { kind: 'delegation-round-end' as const, home: '/srv/p5' };
+    await executeScheduledTask(baseTask({ runtimeAction: action }), active, refreshCliVersion);
+
+    expect(runDelegationRoundEndMock).toHaveBeenCalledWith(expect.objectContaining({ runtimeAction: action }));
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    expect(sendWorkerInputMock).not.toHaveBeenCalled();
+    expect(active.size).toBe(0);
+  });
+
   it('posts nothing, anchors at rootMessageId, arms the exact forked turn, wraps the prompt', async () => {
     const active = new Map<string, DaemonSession>();
     await executeScheduledTask(baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }), active, refreshCliVersion);

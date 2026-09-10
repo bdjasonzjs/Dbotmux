@@ -847,6 +847,20 @@ export interface ParsedSchedule {
 
 export type ScheduleExecutionPosition = 'top-level' | 'topic' | 'new-topic';
 
+/**
+ * A deliberately narrow, daemon-owned action that can be attached to an
+ * existing schedule.  It is not a general command runner: the executor
+ * independently re-reads the delegation installation's scope before every
+ * invocation and only runs the fixed round-end entrypoint for that chat.
+ */
+export interface DelegationRoundEndScheduleAction {
+  kind: 'delegation-round-end';
+  /** Absolute P5 installation directory, e.g. /srv/delegation-home. */
+  home: string;
+}
+
+export type ScheduledRuntimeAction = DelegationRoundEndScheduleAction;
+
 export interface ScheduledTask {
   id: string;
   name: string;
@@ -904,6 +918,8 @@ export interface ScheduledTask {
    *  and fresh-topic schedules; a silent fresh topic is created lazily by the
    *  first successful `botmux send`. */
   silent?: boolean;
+  /** Optional typed daemon action. Absent tasks keep their existing LLM route. */
+  runtimeAction?: ScheduledRuntimeAction;
   // DEPRECATED — kept only for backward-compat migration
   type?: 'cron' | 'interval' | 'once';
 }

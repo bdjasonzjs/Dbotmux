@@ -21,7 +21,7 @@ import { computeInputHash } from '../utils/canonical-input-hash.js';
 import { withFileLockSync } from '../utils/file-lock.js';
 import { fsyncDirectorySyncPortable } from '../utils/fs-durability.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
-import type { ScheduledTask, ParsedSchedule, ScheduleExecutionPosition } from '../types.js';
+import type { ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, ScheduledRuntimeAction } from '../types.js';
 
 // ─── Idempotency types (events doc v0.1.2 §2.2) ─────────────────────────────
 
@@ -88,6 +88,7 @@ export function canonicalScheduleInput(t: {
   repeat?: { times: number | null; completed?: number };
   deliver?: 'origin' | 'local' | 'new-topic';
   silent?: boolean;
+  runtimeAction?: ScheduledRuntimeAction;
 }): unknown {
   return {
     name: t.name,
@@ -121,6 +122,7 @@ export function canonicalScheduleInput(t: {
     // `silent: false`/absent normalizes to undefined (dropped by
     // computeInputHash) so pre-existing tasks keep their canonical hash.
     silent: t.silent === true ? true : undefined,
+    runtimeAction: t.runtimeAction,
   };
 }
 
@@ -239,6 +241,13 @@ function migrate(raw: any): ScheduledTask | null {
         ? 'new-topic'
         : undefined;
 
+  const runtimeAction: ScheduledRuntimeAction | undefined =
+    raw.runtimeAction?.kind === 'delegation-round-end'
+      && typeof raw.runtimeAction.home === 'string'
+      && raw.runtimeAction.home.trim()
+      ? { kind: 'delegation-round-end', home: raw.runtimeAction.home.trim() }
+      : undefined;
+
   return {
     id: raw.id,
     name: raw.name,
@@ -268,6 +277,7 @@ function migrate(raw: any): ScheduledTask | null {
     repeat: raw.repeat,
     deliver: raw.deliver === 'local' ? 'local' : 'origin',
     silent: raw.silent === true ? true : undefined,
+    runtimeAction,
   };
 }
 
@@ -474,6 +484,7 @@ export function createTask(params: {
   repeat?: { times: number | null; completed: number };
   deliver?: 'origin' | 'local' | 'new-topic';
   silent?: boolean;
+  runtimeAction?: ScheduledRuntimeAction;
 }): ScheduledTask {
   // Route to the OWNING bot's file: a task explicitly created for another bot
   // (`--lark-app-id` / dashboard admin flows) must land in that bot's store so
@@ -531,6 +542,7 @@ export function createTask(params: {
       // explicit executionPosition field before reaching the store.
       deliver: params.deliver === 'local' ? 'local' : 'origin',
       silent: params.silent === true ? true : undefined,
+      runtimeAction: params.runtimeAction,
     };
     working.set(task.id, task);
     return { result: task, changed: true };
@@ -554,7 +566,7 @@ export function removeTask(id: string, appId?: string): boolean {
 export function updateTask(
   id: string,
   updates: Partial<Pick<ScheduledTask,
-    'enabled' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastError' | 'lastDeliveryError' | 'repeat' | 'rootMessageId' | 'scope' | 'executionPosition' | 'topicTitle' | 'chatType' | 'deliver' | 'name' | 'prompt' | 'schedule' | 'parsed' | 'silent' | 'workingDir'
+    'enabled' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastError' | 'lastDeliveryError' | 'repeat' | 'rootMessageId' | 'scope' | 'executionPosition' | 'topicTitle' | 'chatType' | 'deliver' | 'name' | 'prompt' | 'schedule' | 'parsed' | 'silent' | 'workingDir' | 'runtimeAction'
   >>,
   appId?: string,
 ): void {

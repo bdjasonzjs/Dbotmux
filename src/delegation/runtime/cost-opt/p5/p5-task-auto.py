@@ -7,6 +7,7 @@ All transport uses task-event/control's existing outbox. No scheduler or service
 is installed here. Saves workers/observers manually invoking emit/ingest/flush.
 """
 import contextlib, importlib.util, io, json, os, sys, fcntl, copy
+from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from p5lib import *
 import p5summary
@@ -100,16 +101,42 @@ def project(chat):
         write_state(chat,st)
     return result
 
+def prefetch_source_bodies(messages, role_apps):
+    """Bound card hydration to eight reads without changing scan order.
+
+    The P5 reader still verifies every card through quoted_message and its
+    original _reader_app_id.  This only overlaps independent reads; later
+    collect() consumes the original ordered snapshot and turns a per-message
+    read failure into that source's existing rejection record.
+    """
+    cards=[m for m in messages
+           if m.get('msg_type') in ('interactive','post')
+           and m.get('sender',{}).get('sender_type')=='app'
+           and m.get('sender',{}).get('id') in role_apps]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for offset in range(0,len(cards),8):
+            batch=cards[offset:offset+8]
+            jobs=[pool.submit(quoted_message,m) for m in batch]
+            for m,job in zip(batch,jobs):
+                try:
+                    q=job.result(); m['_auto_source_body']=q.get('content') or ''
+                except Exception as ex:
+                    m['_auto_source_error']=str(ex)
+
 def collect(chat,conf,E):
     ROOT,TASK=conf['root_request_id'],conf['task_id']
     st=read_state(chat); binding=task_binding(st,TASK); found=[]; failures=[]
     start=E.parse_time(conf['not_before'])
+    messages=sorted(list_messages(chat,start=start),key=msg_time)
+    prefetch_source_bodies(messages,set(role_apps_for(st).values()))
     def one(m):
         # Only source envelopes can emit progress. Session cards, ordinary
         # status prose and the bot's own forwarded events are not acceptances.
         sender=m.get('sender',{}); roles=role_apps_for(st)
         if sender.get('sender_type')!='app' or sender.get('id') not in set(roles.values()): return
-        body=E.message_body(m); markers=find_markers(body)
+        if '_auto_source_error' in m: raise RuntimeError('automatic source readback failed: '+m['_auto_source_error'])
+        body=m.get('_auto_source_body') if '_auto_source_body' in m else E.message_body(m)
+        markers=find_markers(body)
         sources=[x['task_event_source'] for x in markers if 'task_event_source' in x]
         if not sources: return
         if len(sources)!=1: raise RuntimeError('ambiguous automatic source envelope')
@@ -133,7 +160,7 @@ def collect(chat,conf,E):
         result=json.loads(out.getvalue()); found.append(result)
         if not result.get('applied') and result.get('reason')!='duplicate':
             failures.append({'message_id':m['message_id'],'error':'automatic source rejected: '+result.get('reason','unknown')})
-    for m in sorted(list_messages(chat,start=start),key=msg_time):
+    for m in messages:
         try: one(m)
         except Exception as ex:
             failures.append({'message_id':m['message_id'],'error':str(ex)})
