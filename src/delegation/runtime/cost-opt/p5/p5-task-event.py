@@ -796,7 +796,7 @@ def cmd_flush(child,scope=None):
                         if b.get('kind')=='task_event' and b.get('event_id')==eid: b['route']=route
                     s['lifecycle']=lc; write_state(child,s)
                 cur['route']=route
-            rcpt=os.path.join(ob,'event-'+eid+'.sent'); found=None
+            rcpt=os.path.join(ob,'event-'+eid+'.sent'); found=None; sent_now=False
             boundary=parse_time(cur['pending_at'])-datetime.timedelta(minutes=10)
             # Query before any resend, including after a crash with no .sent
             # receipt. A query failure stops the flush with the queue intact.
@@ -821,7 +821,7 @@ def cmd_flush(child,scope=None):
                     check=next((m for m in list_messages(parent,start=boundary) if m.get('message_id')==mid),None)
                     if not check or check.get('chat_id')!=parent or not exact_event_message(check,ev,child):
                         raise RuntimeError('event send not verified on exact parent/message/sender/body: '+mid)
-                    found=mid
+                    found=mid; sent_now=True
                 except Exception as e:
                     with ChatLock(child):
                         s=read_state(child); lc=lifecycle_of(s)
@@ -845,7 +845,11 @@ def cmd_flush(child,scope=None):
                     s['delegation']=d
                 s['lifecycle']=lc; write_state(child,s)
             done.append({'event_id':eid,'message_id':found})
-            if cur['route'].get('self_filtered'): self_filtered_target=cur['route']['target_app']
+            # Only a report that was actually sent this run needs a nudge. A
+            # replay that merely re-attaches a lost receipt found the message
+            # already sitting in the parent chat, so its wake went out with the
+            # original send; nudging again would re-ping the parent per crash.
+            if sent_now and cur['route'].get('self_filtered'): self_filtered_target=cur['route']['target_app']
         finally: fcntl.flock(fd,fcntl.LOCK_UN); os.close(fd)
     # One nudge per flush, not per event: the parent only needs to be told once
     # that something is waiting. A failed nudge must not undo landed receipts —
