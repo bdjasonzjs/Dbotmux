@@ -178,6 +178,16 @@ botmux delegation run event reconcile-sent "$SOURCE_CHAT" "$EVENT_ID" "$EVENT_SH
 
 运行目录保留 state、outbox、taskbook、journal 和 installation.json，不要删目录“修复”失败。自动回调若另行启用，可用 `botmux delegation run auto disable` 关闭本安装的自动入口；它不抹历史、不撤销迁移。
 
+### 将既有 observer 排程接到 round-end
+
+如果你已经有由同一 observer app 创建的定时 observer 排程，并且 `delegation_auto.enabled=true`，可在**已部署包含该命令的 botmux daemon** 后，为每一条已存在的、位于 `delegation_auto.allowed_path` 中的排程附加固定 round-end 动作：
+
+```bash
+botmux delegation wire-round-end --home /absolute/path/to/delegation-home --schedule "$SCHEDULE_ID"
+```
+
+该命令不会创建排程、改变 cron 表达式、扩大 `allowed_path` 或启用自动模式。它每次触发前都会重新读取 `p5-config.json`，只有排程的 app 与 `observer_app` 一致、目标群仍在 `allowed_path` 且自动模式仍已启用时，才以固定 argv 运行 `p5-round-end.sh <chat>`；否则本轮明确失败并保留错误。它不接受任意 shell 命令，也不会把自然语言提示当作实际执行。
+
 测试目录里的模拟 transport 只验证安装包的调用链。它不会联网，产生的 `om_fixture...` 不是真实飞书消息，不能作为上面真实三级验收的证明。
 
 开发者可从源码构建 tgz 后执行 `node scripts/test-delegation-package.mjs /absolute/path/botmux.tgz /absolute/path/new-report.json`：它新建空目录，真正 npm 安装该包，再通过安装后的 CLI 完成上述两次下发、两次结果上报；传输由明确标记的本地夹具替代。报告同时保留命令、退出码、目录、包 SHA 和 `live_lark_verified=false`。脚本不创建飞书群、不触发真实会话、不部署服务。

@@ -94,6 +94,7 @@ import { removePromptContextTurn, writePromptContext } from '../services/prompt-
 import { hasInstalledPromptHookCached } from '../adapters/hook-installer.js';
 import { isSharedAdoptPersistedSession, isSharedAdoptSession } from './shared-adopt.js';
 import { activeHumanSessionRoutingPrompt, REPORT_DELIVERY_REMINDER } from './human-session-routing-prompt.js';
+import { runDelegationRoundEnd } from '../services/delegation-round-end-runner.js';
 
 export { getAttachmentsDir } from './attachment-path.js';
 // Keep the fork's public prompt-builder API while the implementation lives in
@@ -3277,6 +3278,13 @@ export async function executeScheduledTask(
   activeSessions: Map<string, DaemonSession>,
   refreshCliVersion: RefreshCliVersion,
 ): Promise<void> {
+  // Typed actions are daemon-owned runtime work, never an LLM prompt.  This
+  // early exit prevents a schedule from claiming successful automatic work
+  // merely because a worker received natural-language instructions.
+  if (task.runtimeAction?.kind === 'delegation-round-end') {
+    await runDelegationRoundEnd(task);
+    return;
+  }
   // Resolve which bot to use — prefer the task's original bot so replies come from
   // the same account the user set up the schedule with.
   const allBots = getAllBots();

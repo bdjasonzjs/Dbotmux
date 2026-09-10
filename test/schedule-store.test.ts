@@ -113,6 +113,18 @@ describe('schedule-store', () => {
       expect(new Date(task.createdAt).toISOString()).toBe(task.createdAt);
     });
 
+    it('persists a typed runtime action without changing ordinary schedule fields', async () => {
+      const { createTask } = await freshImport();
+      const created = createTask({
+        ...TASK_PARAMS,
+        runtimeAction: { kind: 'delegation-round-end', home: '/srv/p5' },
+      });
+      expect(created.runtimeAction).toEqual({ kind: 'delegation-round-end', home: '/srv/p5' });
+
+      const { getTask } = await freshImport();
+      expect(getTask(created.id)?.runtimeAction).toEqual({ kind: 'delegation-round-end', home: '/srv/p5' });
+    });
+
     it('should persist the task to disk as JSON', async () => {
       const { createTask } = await freshImport();
       createTask(TASK_PARAMS);

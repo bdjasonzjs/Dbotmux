@@ -4,6 +4,7 @@ import { resolve, join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import * as scheduleStore from '../services/schedule-store.js';
 
 const runtime = fileURLToPath(new URL('../delegation/runtime/', import.meta.url));
 const defaultHome = () => resolve(process.env.P5_HOME || '.botmux-delegation');
@@ -56,6 +57,16 @@ function config(home: string): any {
   const path = configPath(home);
   if (!existsSync(path)) throw new Error(`配置不存在: ${path}；先执行 botmux delegation init`);
   return JSON.parse(readFileSync(path, 'utf8'));
+}
+
+function delegationAutoScope(conf: any): { observerApp: string; allowedPath: string[] } {
+  const scope = conf?.delegation_auto;
+  if (!scope || scope.enabled !== true) throw new Error('delegation_auto 未启用；拒绝连接自动 round-end');
+  if (!Array.isArray(scope.allowed_path) || scope.allowed_path.some((chat: unknown) => typeof chat !== 'string' || !chat.trim())) {
+    throw new Error('delegation_auto.allowed_path 缺失或格式错误');
+  }
+  if (typeof conf.observer_app !== 'string' || !conf.observer_app.trim()) throw new Error('配置缺少 observer_app');
+  return { observerApp: conf.observer_app, allowedPath: scope.allowed_path };
 }
 
 function runtimeEnv(home: string): NodeJS.ProcessEnv {
@@ -151,6 +162,8 @@ dispatch --from <父群> --to <子群> --basis <JSON文件> --body <正文文件
   调用原 propose/dispatch，输出实际 decision_id 和发送 MID，不代替子接单。
 source --chat <群ID> --type <事件类型> --event-version <序号> [--home <目录>]
   只打印本节点事件源 marker，不发送、不落账。
+wire-round-end --home <目录> --schedule <排程ID>
+  仅把已启用且位于 delegation_auto.allowed_path 的 observer 排程接到固定 p5-round-end 入口；不创建排程、不接收任意 shell 命令。
 
 完整上手流程见 README 中“多级委派”，未配置字段会明确报错。`);
       return;
@@ -172,6 +185,25 @@ source --chat <群ID> --type <事件类型> --event-version <序号> [--home <�
       const tool = rest.shift();
       if (!tool) throw new Error('缺参数: run <入口>');
       process.exitCode = run(home, tool, rest);
+      return;
+    }
+    if (sub === 'wire-round-end') {
+      const args = flags(argv, ['--home', '--schedule']);
+      required(args, ['--schedule']);
+      const home = resolve(args['--home'] || defaultHome());
+      const conf = config(home);
+      const { observerApp, allowedPath } = delegationAutoScope(conf);
+      const task = scheduleStore.getTask(args['--schedule'], observerApp);
+      if (!task) throw new Error(`observer 排程不存在: ${args['--schedule']}`);
+      if (task.larkAppId !== observerApp) throw new Error('排程 app 与 observer_app 不一致');
+      if (!task.enabled) throw new Error('排程未启用；拒绝连接自动 round-end');
+      if (!allowedPath.includes(task.chatId)) throw new Error(`排程目标不在 delegation_auto.allowed_path: ${task.chatId}`);
+      const runtimeAction = { kind: 'delegation-round-end' as const, home };
+      if (task.runtimeAction && (task.runtimeAction.kind !== runtimeAction.kind || task.runtimeAction.home !== home)) {
+        throw new Error('排程已绑定不同 runtimeAction；拒绝覆盖');
+      }
+      if (!task.runtimeAction) scheduleStore.updateTask(task.id, { runtimeAction }, observerApp);
+      console.log(JSON.stringify({ ok: true, changed: !task.runtimeAction, schedule_id: task.id, chat_id: task.chatId, runtime_action: runtimeAction }));
       return;
     }
     const names: Record<string, string[]> = {
