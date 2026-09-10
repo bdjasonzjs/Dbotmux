@@ -7414,6 +7414,12 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   schedule pause|resume <id>           暂停/恢复
   schedule run <id>                    标记立即执行
 
+多级委派（跨群，父子节点之间；同群开子话题派活是上面的 dispatch）:
+  delegate --to <chat_id> --to-app <lark_app_id> [--file <路径>|--text "正文"]
+                                       把任务派给子群：自动翻译 app-scoped 的 @ 目标、同应用时换第三方应用
+                                       代发、发完回读核验 @ 真生效，并登记「本群是它的父群」
+  bubble [--file <路径>|--text "正文"]  把结论冒泡给父群；不需要地址参数，父群和 @ 谁在派活时已记下
+
 多级委派（独立目录，不自动接线）:
   delegation init --root <MID> --task <名称> --path <根群,中间群,叶群> --actors <JSON>
   delegation doctor|node|run|status    详见 botmux delegation help
@@ -14655,6 +14661,22 @@ switch (command) {
   case 'report': await cmdReport(process.argv.slice(3)); break;
   case 'grant': await cmdExactChatGrant(process.argv.slice(3)); break;
   case 'create-group': await cmdCreateGroup(process.argv.slice(3)); break;
+  case 'delegate':
+  case 'bubble': {
+    const { runDelegateCli, runBubbleCli } = await import('./cli/delegation-relay.js');
+    const io = {
+      context: async () => {
+        const { sid, larkAppId, session } = await resolveSessionAppId(undefined);
+        void sid;
+        return { chatId: session.chatId, larkAppId };
+      },
+      stdout: (text: string) => process.stdout.write(`${text}\n`),
+      stderr: (text: string) => process.stderr.write(`${text}\n`),
+    };
+    const run = command === 'delegate' ? runDelegateCli : runBubbleCli;
+    process.exitCode = await run(process.argv.slice(3), io);
+    break;
+  }
   case 'create-company': await cmdCreateCompany(process.argv.slice(3)); break;
   case 'chat-mode': await cmdChatMode(process.argv.slice(3)); break;
   case 'context-delivery': await cmdContextDelivery(process.argv.slice(3)); break;

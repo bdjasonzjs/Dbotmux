@@ -33,6 +33,13 @@ export interface ChatContextInherited {
   parentChatId: string;
   /** Summary of the last 24h of relevant discussion in the parent chat. */
   parentDigest: string;
+  /**
+   * Lark app of the executor that handed work down from the parent chat.
+   * Written by `botmux dispatch`; lets `botmux bubble` report upward without
+   * the caller supplying any address. Absent on contexts created before this
+   * field existed, and on chats that were never dispatched to.
+   */
+  parentExecutorApp?: string;
 }
 
 /** Lifecycle status — archived chats are hidden from the collaboration
