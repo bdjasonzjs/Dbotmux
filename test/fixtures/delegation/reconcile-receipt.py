@@ -35,14 +35,28 @@ args=['reconcile-sent',child,ev['event_id'],csha(ev),mid,cmid,hashlib.sha256(con
 before=business_files();count=message_count()
 wrong=list(args);wrong[4]='om_wrong_receipt';event(*wrong,rc=9)
 assert before==business_files() and count==message_count()
+wrong_sha=list(args);wrong_sha[3]='0'*64
+assert 'reconciliation event sha256 mismatch' in event(*wrong_sha,rc=9)
+assert before==business_files() and count==message_count()
 saved=messages.read_bytes();ms=json.loads(saved)
-next(m for m in ms if m['message_id']==mid)['content']+=' changed'
-messages.write_text(json.dumps(ms));event(*args,rc=9)
-assert before==business_files();messages.write_bytes(saved)
+original=next(m for m in ms if m['message_id']==mid)
+original['rendered_content']=original['content'];original['content']+=' changed'
+messages.write_text(json.dumps(ms))
+assert 'reconciliation original body differs from committed event' in event(*args,rc=9)
+assert before==business_files() and count==message_count();messages.write_bytes(saved)
+ms=json.loads(saved);next(m for m in ms if m['message_id']==mid)['deleted']=True
+messages.write_text(json.dumps(ms))
+assert 'reconciliation original message deleted' in event(*args,rc=9)
+assert before==business_files() and count==message_count();messages.write_bytes(saved)
+# Display rendering may differ; only the unchanged raw body is compared.
+ms=json.loads(saved);next(m for m in ms if m['message_id']==mid)['rendered_content']='display only'
+messages.write_text(json.dumps(ms))
 first=json.loads(event(*args));assert first['changed'] and first['external_sends']==0 and not first['parent_landed'],first
 b2=next(x for x in bubbles() if x.get('event_id')==ev['event_id'])
 assert b2['state']=='sent' and b2['sent_message_id']==mid and not b2.get('parent_landed_at')
 assert b2['event']==ev and b2['receipt_reconciliation']['previous_error']==b['last_error']
+assert b2['receipt_reconciliation']['delivery_mode']=='reconciled_without_mention'
+assert b2['receipt_reconciliation']['original_readback']=={'deleted':False,'msg_type':'text','body_source':'rawContent.text'}
 after=business_files();repeat=json.loads(event(*args))
 assert not repeat['changed'] and after==business_files() and count==message_count(),repeat
 event('flush',child);assert count==message_count()
@@ -53,5 +67,6 @@ after=business_files();repeat_after_landing=json.loads(event(*args))
 assert not repeat_after_landing['changed'] and repeat_after_landing['parent_landed']
 assert after==business_files() and count==message_count()
 print(json.dumps({'ok':True,'initial_failed_send_rc':9,'zero_duplicate_external_sends':True,
- 'wrong_message_rejected':True,'wrong_body_rejected':True,'repeated_reconcile_zero_state_writes':True,
+ 'wrong_message_rejected':True,'wrong_body_rejected':True,'wrong_sha_rejected':True,'deleted_message_rejected':True,
+ 'raw_body_not_rendered_body':True,'explicit_missing_mention_audit':True,'repeated_reconcile_zero_state_writes':True,
  'parent_ingest_applied':True,'live_lark_verified':False,'commands':records}))

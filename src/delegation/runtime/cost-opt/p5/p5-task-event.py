@@ -136,6 +136,29 @@ def exact_event_message(m,ev,child):
         return message_body(m)==event_text(ev,child,b.get('rejections',[]),b.get('summary'))
     return reconciled_event_message(m,ev,child,b)
 
+def reconciliation_original_body(original):
+    """Read exact stored content, not the presentation-layer quoted text."""
+    if original.get('deleted') is not False:
+        raise RuntimeError('reconciliation original message deleted or deletion status unavailable')
+    q=quoted_message(original,raw=True)
+    if q.get('msgType')!=original.get('msg_type'):
+        raise RuntimeError('reconciliation original message type mismatch')
+    if q['msgType']=='text':
+        raw=q.get('rawContent')
+        if isinstance(raw,str): raw=json.loads(raw)
+        body=raw.get('text') if isinstance(raw,dict) else None
+        source='rawContent.text'
+    elif q['msgType']=='interactive':
+        card=q.get('cardJson')
+        if isinstance(card,str): card=json.loads(card)
+        elements=(card.get('body') or {}).get('elements') if isinstance(card,dict) else None
+        if not isinstance(elements,list) or len(elements)!=1 or elements[0].get('tag')!='markdown':
+            raise RuntimeError('reconciliation original card must contain one exact markdown body')
+        body=elements[0].get('content'); source='cardJson.body.elements[0].content'
+    else: raise RuntimeError('reconciliation unsupported original message type')
+    if not isinstance(body,str): raise RuntimeError('reconciliation original raw body unavailable')
+    return body,{'deleted':False,'msg_type':q['msgType'],'body_source':source}
+
 def reconciliation_evidence(child,b,mid,confirmation_id,confirmation_sha,message=None):
     """Read an old delivery and the receiver's explicitly selected confirmation.
 
@@ -156,7 +179,7 @@ def reconciliation_evidence(child,b,mid,confirmation_id,confirmation_sha,message
         matches=[x for x in messages if x.get('message_id')==message_id]
         if len(matches)!=1: raise RuntimeError('reconciliation message missing/ambiguous: '+message_id)
         return matches[0]
-    original=message if message is not None else selected(mid)
+    original=selected(mid)  # Always use the fresh list row, including deleted.
     if original.get('message_id')!=mid or original.get('chat_id')!=parent:
         raise RuntimeError('reconciliation original message target/id mismatch')
     sender=original.get('sender') or {}
@@ -164,7 +187,7 @@ def reconciliation_evidence(child,b,mid,confirmation_id,confirmation_sha,message
         raise RuntimeError('reconciliation original sender mismatch')
     if original.get('mentions'):
         raise RuntimeError('reconciliation is only for a missing-mention delivery')
-    body=quoted_message(original).get('content') or ''
+    body,readback=reconciliation_original_body(original)
     if body!=event_text(ev,child,b.get('rejections',[]),b.get('summary')):
         raise RuntimeError('reconciliation original body differs from committed event')
     confirmation=selected(confirmation_id); sender=confirmation.get('sender') or {}
@@ -176,7 +199,8 @@ def reconciliation_evidence(child,b,mid,confirmation_id,confirmation_sha,message
         raise RuntimeError('reconciliation confirmation body/id reference mismatch')
     if msg_time(confirmation)<msg_time(original):
         raise RuntimeError('reconciliation confirmation predates original delivery')
-    return {'kind':'receiver_confirmed_missing_mention','version':1,'source_chat':child,
+    return {'kind':'receiver_confirmed_missing_mention','version':1,
+        'delivery_mode':'reconciled_without_mention','original_readback':readback,'source_chat':child,
         'target_chat':parent,'event_id':ev['event_id'],'event_sha256':csha(ev),
         'message_id':mid,'sender_app':route['sender_app'],'body_sha256':sha256b(body.encode()),
         'confirmation':{'message_id':confirmation_id,'sender_app':route['target_app'],

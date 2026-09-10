@@ -14,6 +14,6 @@ test('explicit recovery of missing-mention receipt does not repeat the send and 
   copyFileSync(new URL('./fixtures/delegation/transport.py',import.meta.url),transport);chmodSync(transport,0o755);
   const p=spawnSync('python3',[new URL('./fixtures/delegation/reconcile-receipt.py',import.meta.url).pathname,home,transport],{encoding:'utf8',timeout:30000});
   expect(p.status,p.stderr||p.stdout).toBe(0);
-  expect(JSON.parse(p.stdout)).toMatchObject({ok:true,initial_failed_send_rc:9,zero_duplicate_external_sends:true,wrong_message_rejected:true,wrong_body_rejected:true,repeated_reconcile_zero_state_writes:true,parent_ingest_applied:true,live_lark_verified:false});
+  expect(JSON.parse(p.stdout)).toMatchObject({ok:true,initial_failed_send_rc:9,zero_duplicate_external_sends:true,wrong_message_rejected:true,wrong_body_rejected:true,wrong_sha_rejected:true,deleted_message_rejected:true,raw_body_not_rendered_body:true,explicit_missing_mention_audit:true,repeated_reconcile_zero_state_writes:true,parent_ingest_applied:true,live_lark_verified:false});
  } finally {rmSync(root,{recursive:true,force:true});}
 });

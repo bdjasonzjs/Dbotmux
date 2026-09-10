@@ -168,6 +168,8 @@ botmux delegation run event reconcile-sent "$SOURCE_CHAT" "$EVENT_ID" "$EVENT_SH
 
 入口只认原失败发送对应的消息、发送者、父群与完整正文，以及原接收方的指定确认；不自动把任意自然语言当回执。通过后留下 `receipt_reconciliation` 与 `.sent` 记录，原错误保存在审计字段，原事件和原消息不变。相同参数重复执行不写业务状态、不重复外发。
 
+只豁免缺少 mention。原消息必须在新鲜消息列表中明确 `deleted=false`；正文从 text 的 `rawContent.text` 或旧回传卡片唯一 markdown 元素的原始 `content` 逐字比较，不用展示正文、trim 或重算事件来凑一致。正文不符、事件 SHA 不符、消息已撤回均拒绝。审计显式写 `delivery_mode=reconciled_without_mention` 和原始正文读取位置，不冒充正常发送；原有 marker 语义校验不变。
+
 对账只恢复 `sent`，**不等于父节点已经落账**。随后由原父节点执行 `event ingest`，才能取得 `parent_landed`。未对账的普通无 mention 消息仍走原拒绝路径。
 
 ## 停用、复用与边界

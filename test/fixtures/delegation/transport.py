@@ -10,7 +10,7 @@ def post(chat,body,kind='app',sender=None):
     mid='om_fixture'+str(len(messages)+1)
     at=datetime.datetime(2026,1,1,10,1)+datetime.timedelta(seconds=len(messages))
     mentions=[{'id':m,'key':'@_user_1','name':'Executor'} for m in re.findall(r'<at user_id="([^"]+)">',body)]
-    messages.append({'message_id':mid,'chat_id':chat,'msg_type':'text','content':body,'create_time':at.strftime('%Y-%m-%d %H:%M:%S'),
+    messages.append({'message_id':mid,'chat_id':chat,'msg_type':'text','deleted':False,'content':body,'create_time':at.strftime('%Y-%m-%d %H:%M:%S'),
                      'sender':{'id':sender or ('ou_owner' if kind=='user' else 'cli_executor'),'sender_type':kind,'id_type':'open_id' if kind=='user' else 'app_id'},'mentions':mentions})
     path.write_text(json.dumps(messages)); return mid
 if args[:2]==['fixture','post']:
@@ -29,7 +29,7 @@ elif args[:1]==['quoted']:
     m=next(m for m in messages if m['message_id']==args[1])
     at=datetime.datetime.strptime(m['create_time'],'%Y-%m-%d %H:%M:%S').replace(tzinfo=datetime.timezone(datetime.timedelta(hours=8)))
     print(json.dumps({'messageId':m['message_id'],'rootId':messages[0]['message_id'],'senderId':m['sender']['id'],'senderType':m['sender']['sender_type'],
-                      'msgType':'text','content':m['content'],'rawContent':{'text':m['content']},'createTime':str(int(at.timestamp()*1000))}))
+                      'msgType':'text','content':m.get('rendered_content',m['content']),'rawContent':{'text':m['content']},'createTime':str(int(at.timestamp()*1000))}))
 elif args[:1]==['send']:
     body=sys.stdin.read(); mid=post(option('--chat-id'),body)
     messages[-1]['mentions']=[] if os.environ.get('DELEGATION_FIXTURE_DROP_MENTION') else [{'id':option('--mention'),'key':'@_user_1'}]
