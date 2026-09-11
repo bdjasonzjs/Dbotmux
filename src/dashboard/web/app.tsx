@@ -167,6 +167,12 @@ const NAV_ITEMS: NavItem[] = [
     icon: <><circle cx="5" cy="5" r="2.2" /><circle cx="11.5" cy="5.8" r="1.7" /><path d="M1.8 13c.4-2.7 1.7-4 3.5-4s3.1 1.3 3.5 4M9.3 12.5c.3-1.9 1.4-2.9 2.8-2.9 1.1 0 2 .6 2.5 1.8" /></>,
   },
   {
+    id: 'squad',
+    href: '#/squad',
+    label: '任务小组类型',
+    icon: <><rect x="2.2" y="2.6" width="5" height="5" rx="1.2" /><rect x="8.8" y="2.6" width="5" height="5" rx="1.2" /><rect x="2.2" y="8.8" width="5" height="5" rx="1.2" /><rect x="8.8" y="8.8" width="5" height="5" rx="1.2" /></>,
+  },
+  {
     id: 'topology',
     href: '#/topology',
     labelKey: 'nav.topology',
@@ -192,7 +198,7 @@ const NAV_ITEMS: NavItem[] = [
  */
 const NAV_GROUPS: Array<{ id: string; labelKey: string; items: string[] }> = [
   { id: 'overview', labelKey: 'nav.group.overview', items: ['overview'] },
-  { id: 'collab', labelKey: 'nav.group.collab', items: ['sessions', 'agent-workbench', 'groups', 'schedules', 'workflows', 'task-team', 'topology', 'office'] },
+  { id: 'collab', labelKey: 'nav.group.collab', items: ['sessions', 'agent-workbench', 'groups', 'schedules', 'workflows', 'squad', 'task-team', 'topology', 'office'] },
   { id: 'workforce', labelKey: 'nav.group.workforce', items: ['roles', 'skills', 'bot-defaults'] },
   { id: 'analytics', labelKey: 'nav.group.analytics', items: ['monitoring', 'insights', 'feedback'] },
   { id: 'manage', labelKey: 'nav.group.manage', items: ['connectors', 'team', 'plugins', 'whiteboards', 'settings'] },

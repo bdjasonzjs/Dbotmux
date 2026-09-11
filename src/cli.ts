@@ -14677,6 +14677,14 @@ switch (command) {
     process.exitCode = await run(process.argv.slice(3), io);
     break;
   }
+  case 'squad': {
+    const { runSquadCli } = await import('./cli/squad-cli.js');
+    process.exitCode = await runSquadCli(process.argv.slice(3), {
+      stdout: (text: string) => process.stdout.write(`${text}\n`),
+      stderr: (text: string) => process.stderr.write(`${text}\n`),
+    });
+    break;
+  }
   case 'create-company': await cmdCreateCompany(process.argv.slice(3)); break;
   case 'chat-mode': await cmdChatMode(process.argv.slice(3)); break;
   case 'context-delivery': await cmdContextDelivery(process.argv.slice(3)); break;

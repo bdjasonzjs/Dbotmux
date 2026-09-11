@@ -82,6 +82,7 @@ import {
 } from './workflows/v3/daemon-ipc-auth.js';
 import { handleDashboardTriggerApi } from './dashboard/trigger-api.js';
 import { handleConnectorApi } from './dashboard/connector-api.js';
+import { handleSquadApi } from './dashboard/squad-api.js';
 import {
   projectSessionEventForAudience,
   projectSessionsForAudience,
@@ -4830,6 +4831,11 @@ const server = createServer(async (req, res) => {
     }
 
     if (await handleConnectorApi(req, res, url)) {
+      return;
+    }
+
+    // 任务小组类型模板（只读）——模板随 botmux 发布，dashboard 从同一份资源读。
+    if (await handleSquadApi(req, res, url)) {
       return;
     }
 

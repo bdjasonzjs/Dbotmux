@@ -71,6 +71,7 @@ export const dashboardRoutes: DashboardRoute[] = [
     'renderTaskTeamBuilderPage',
   ),
   pageRoute('task-team', '#/task-team', () => import('./task-team.js'), 'renderTaskTeamPage'),
+  pageRoute('squad', '#/squad', () => import('./squad-page.js'), 'renderSquadPage'),
   pageRoute('topology', '#/topology', () => import('./topology.js'), 'renderTopologyPage'),
   pageRoute('groups', '#/groups', () => import('./groups-page.js'), 'renderGroupsPage'),
   pageRoute('settings', '#/settings', () => import('./settings-page.js'), 'renderSettingsPage'),

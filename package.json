@@ -20,7 +20,7 @@
     "access": "public"
   },
   "scripts": {
-    "build": "pnpm audit:domains && node scripts/clean-dist.mjs && tsc && pnpm typecheck:scripts && node scripts/copy-report-rules.mjs && node scripts/generate-runtime-build-id.mjs && cp src/setup/lark-scopes.json dist/setup/ && node scripts/copy-delegation-runtime.mjs && pnpm dashboard:bundle && chmod +x dist/cli.js && node scripts/audit-dist.mjs",
+    "build": "pnpm audit:domains && node scripts/clean-dist.mjs && tsc && pnpm typecheck:scripts && node scripts/copy-report-rules.mjs && node scripts/generate-runtime-build-id.mjs && cp src/setup/lark-scopes.json dist/setup/ && node scripts/copy-delegation-runtime.mjs && node scripts/copy-squad-templates.mjs && pnpm dashboard:bundle && chmod +x dist/cli.js && node scripts/audit-dist.mjs",
     "typecheck:scripts": "tsc -p tsconfig.scripts.json",
     "workflow-core:build": "node scripts/build-workflow-core-package.mjs",
     "workflow-core:test": "pnpm workflow-core:build && node scripts/test-workflow-core-package.mjs",
